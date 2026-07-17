@@ -71,15 +71,32 @@ JIT-backed kernel — with no virtual dispatch in the hot path.
 cmake -S . -B build -G Ninja
 cmake --build build
 ctest --test-dir build
-./build/linuxity
+
+# run a NATIVE Linux binary under the runtime (native speed, no VM):
+./build/linuxity /path/to/static-binary [args...]
 ```
 
 Requires a C++23 compiler (`std::expected`, concepts). Tested with GCC 16.
+Native execution currently uses a `ptrace(PTRACE_SYSEMU)` trap backend on
+Linux/x86-64: the guest runs its own instructions on the CPU and only its
+syscalls stop back into linuxity.
 
 ## Status
 
-Foundational skeleton: the type algebra, the subsystem concept lattice, the
-host boundary, and an end-to-end syscall dispatch path are in place and
-proven by tests. The subsystem *bodies* (a real VFS with tmpfs/procfs/overlay
-backends, CoW fork, futex, epoll, an ELF loader) are the road ahead — but the
-architecture they slot into is fixed and machine-checked.
+**A real native x86-64 ELF runs under the runtime today** — its instructions
+execute directly on the CPU and its `write`/`exit_group`/... syscalls are
+serviced by linuxity's subsystems (see `tests/run_native`). In place and
+proven by tests:
+
+- the type algebra, subsystem concept lattice, and authority boundary;
+- a real **VFS** (mount table, path resolution) with a **tmpfs** backend and
+  a **HostFs** backend that mounts a real on-disk rootfs directory as `/`;
+- an **ELF64 loader** (PT_LOAD mapping, .bss zero-fill, PT_INTERP detection)
+  into a typed guest **address space**, plus SysV AMD64 **stack/auxv** init;
+- an arch-neutral **syscall dispatcher** (per-arch number tables decode to a
+  canonical `Sysno`) driven by a concept-based **trap** loop.
+
+The road ahead: a writable overlay + procfs/sysfs backends, `mmap`/`brk`
+backed by the guest address space under SYSEMU, the dynamic-linker path
+(`ld-linux`), then clone/futex/epoll — enough to reach a shell from a real
+distro rootfs. The architecture they slot into is fixed and machine-checked.

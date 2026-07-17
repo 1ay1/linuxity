@@ -55,14 +55,25 @@ int main() {
     assert(chain(false).value() == 11);
     assert(!chain(true).has_value() && chain(true).error() == Errno::eio);
 
-    // Dispatch getpid through the ABI against the mock kernel.
+    // Dispatch getpid through the ABI against the mock kernel. The new
+    // dispatcher decodes an arch-specific number into a canonical Sysno, so
+    // we feed it the x86-64 number for getpid (39) with Arch::x86_64.
+    struct NullMem {
+        Status copy_in(UAddr, std::span<std::byte>) const { return ok(); }
+        Status copy_out(UAddr, std::span<const std::byte>) const { return ok(); }
+    } mem;
     MockKernel mk;
-    abi::Syscalls sys{mk};
-    abi::Regs r; r.nr = static_cast<std::uint64_t>(abi::Nr::getpid);
-    assert(sys.dispatch(r) == 42);
+    abi::Syscalls sys{mk, mem, abi::Arch::x86_64};
 
-    abi::Regs u; u.nr = 424242;
-    assert(sys.dispatch(u) == -int(Errno::enosys));
+    abi::Regs r; r.nr = 39; // x86-64 getpid
+    assert(sys.dispatch(r).ret == 42);
+
+    abi::Regs e; e.nr = 60; e.arg[0] = 7; // x86-64 exit(7)
+    auto o = sys.dispatch(e);
+    assert(o.exited && o.exit_code == 7);
+
+    abi::Regs u; u.nr = 424242; // no such syscall
+    assert(sys.dispatch(u).ret == -int(Errno::enosys));
 
     std::puts("all runtime type-algebra tests passed");
     return 0;

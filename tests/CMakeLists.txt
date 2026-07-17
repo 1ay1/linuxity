@@ -13,3 +13,11 @@ add_test(NAME vfs COMMAND test_vfs)
 add_executable(test_hostfs test_hostfs.cpp)
 target_link_libraries(test_hostfs PRIVATE linuxity_core)
 add_test(NAME hostfs COMMAND test_hostfs)
+
+add_executable(test_loader test_loader.cpp)
+target_link_libraries(test_loader PRIVATE linuxity_core)
+add_test(NAME loader COMMAND test_loader)
+
+add_executable(test_run_native test_run_native.cpp)
+target_link_libraries(test_run_native PRIVATE linuxity_core)
+add_test(NAME run_native COMMAND test_run_native)
