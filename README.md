@@ -175,6 +175,34 @@ linuxity services their syscalls. Proofs of the model:
   `/etc` — with two-path ops (`rename`/`link`) rewriting *both* operands and
   `chown`-to-root accepted as a vacuous no-op (the world is already root-owned,
   the host process is unprivileged). The pristine lower rootfs is never touched.
+- **`/dev` is a populated devtmpfs.** A bare rootfs ships an empty `/dev`, so
+  every program that reaches for `/dev/null`, `/dev/zero`, `/dev/urandom` or the
+  stdio nodes used to die on `can't open '/dev/null'`. linuxity synthesizes a
+  `/dev` that **redirects the character devices to the host's real nodes** —
+  the guest opens the true `/dev/null` (endless sink), `/dev/zero`, `/dev/urandom`
+  (real CSPRNG) with native `read`/`write`/`mmap` semantics — and wires
+  `/dev/std{in,out,err}` → `/proc/self/fd/{0,1,2}` so a shell's `> /dev/stdout`
+  reaches the real fd. Zero emulation: the devices are real, we just mount them.
+- **`#!` scripts run without double-rooting.** A rootfs scriptlet like
+  `#!/bin/sh -e` used to have the host kernel relaunch its interpreter with the
+  *host-translated* script path, which linuxity then re-translated
+  (`<rootfs>/<rootfs>/...`). Now the exec dispatcher resolves the shebang
+  itself and execs the interpreter — chaining its `ld.so` when the interpreter
+  is dynamic — with the script as a **guest** path, so `openat` redirects it
+  cleanly. Cross-mount **symlinks** resolve too: `/etc/mtab -> /proc/self/mounts`
+  crosses from the rootfs into the virtual `/proc`, and following it lands in
+  the virtual realm instead of fabricating a nonexistent host path.
+- **Arch's `pacman` installs a package end to end.** On a real Arch/glibc
+  bootstrap rootfs, glibc `bash` and `pacman` run, and
+  `pacman -U <pkg>.pkg.tar.zst --noconfirm` installs a package (exit 0): the
+  binary lands in the overlay, the package DB entry is written, and the
+  post-transaction **systemd hook** (a `#!/bin/sh` scriptlet) runs. pacman 7's
+  download sandbox is satisfied too — the privilege drop to the `alpm` user is
+  accepted vacuously and the **Landlock** ruleset calls are accepted no-ops
+  (linuxity's namespace already confines the guest). Networked `-Sy` connects
+  out (DNS, TLS, HTTP all forwarded to the host kernel) and downloads the repo
+  databases; committing a fully-networked `-S` across the multi-threaded
+  download workers is the current frontier.
 
 ### How the filesystem is virtualized
 
@@ -232,7 +260,7 @@ Memory (`mmap`/`brk`/`mprotect`) stays forwarded so native libc reaches
 `main()`; identity, credentials, lifecycle, `uname`, **signal delivery**,
 **per-task pid/session identity**, **`/proc` symlinks**, and now the **whole
 file path — reads AND mutations** — are virtualized. In place and proven by
-15 test suites:
+18 test suites:
 
 - the type algebra, subsystem concept lattice, and authority boundary;
 - a real **VFS** (mount table, path resolution) with **tmpfs** and a
