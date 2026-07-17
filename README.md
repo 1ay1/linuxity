@@ -98,6 +98,20 @@ Native execution uses a `ptrace` trap backend on Linux/x86-64: the guest runs
 its own instructions on the CPU; each syscall is either **virtualized** by
 linuxity's subsystems or **forwarded** to the host kernel acting on the guest.
 
+## Documentation
+
+- **[doc/MANUAL.md](doc/MANUAL.md)** — the user manual: install, get a rootfs,
+  every CLI flag and environment variable, a task cookbook, resource limits,
+  bind mounts, DNS, fake-root, package managers, troubleshooting, and an FAQ.
+  **Start here to *use* linuxity.**
+- **[doc/ARCHITECTURE.md](doc/ARCHITECTURE.md)** — the internals: the trap
+  backend, syscall fates, the seccomp fast path, the filesystem namespace and
+  copy-on-write overlay, shadow-metadata fake-root, the pid namespace, signals,
+  synthesized `/proc`/`/sys`/`/dev`, the loader/exec rewriting, resource
+  governance, and how to extend it. **Read this to *understand* linuxity.**
+- **[doc/reference-study.md](doc/reference-study.md)** — how the techniques map
+  from proot / termux-exec / proot-distro / ish onto linuxity, and why.
+
 ## Status
 
 **Real native Linux binaries — including dynamically-linked distro programs —
