@@ -2,13 +2,24 @@
 
 A **portable, type-theoretic implementation of the Linux userspace ABI**.
 
-Not an Arch emulator. Not a pile of faked syscalls. `linuxity` is a
-userspace re-implementation of the Linux *kernel–user contract*, organised —
-like the real kernel — around **subsystems**, and expressed in modern C++
-where the *type system carries the specification*.
+Not a VM. Not instruction emulation. `linuxity` is a userspace
+re-implementation of the Linux kernel/user contract: guest ELF binaries run
+**directly on the host CPU at native speed** while the runtime *is the
+kernel* — it services their syscalls.
 
-Give it a root filesystem (Arch ARM, Alpine, Debian, …) and, in principle,
-the same runtime boots any of them, on any host — Linux, macOS, iOS, Windows.
+The distro you install is decoupled from the instruction set:
+
+| | what it is | runs at |
+|---|---|---|
+| **the environment** | an Arch / Alpine / Debian rootfs — files, `/proc`, the package manager, the ABI contract | — |
+| **the guest code** | ELF binaries in that rootfs | **native CPU speed** |
+| **the ISA** | whatever the host is (x86-64 here) | native — no emulation |
+
+So on an x86-64 host you install the **x86-64 build** of the distro and every
+instruction runs bare on the CPU — no VM, no `/dev/kvm`, no interpreter. A
+*foreign*-arch rootfs is the only case that needs a binary-translation
+backend (FEX / Rosetta-style), and that plugs in behind the same ABI at the
+ISA boundary — it is not the core.
 
 ```
             Linux program (AArch64 ELF)
@@ -48,10 +59,11 @@ JIT-backed kernel — with no virtual dispatch in the hot path.
 ## Layout
 
 - `include/linuxity/abi/`    — `result.hpp`, `types.hpp`, `syscall.hpp`
-- `include/linuxity/kernel/` — `subsystem.hpp` (concepts), `kernel.hpp` (a real minimal kernel)
+- `include/linuxity/kernel/` — `subsystem.hpp` (concepts), `authority.hpp` (the host-authority boundary), `kernel.hpp`
+- `include/linuxity/vfs/`    — `inode.hpp` (FileSystem concept), `tmpfs.hpp` (in-memory backend), `vfs.hpp` (mount table + path resolution)
 - `include/linuxity/host/`   — `host.hpp` (the concept), `posix_host.hpp` (Linux/Darwin backend)
 - `src/main.cpp`             — wires host → kernel → ABI, issues guest syscalls
-- `tests/`                   — host-free type-algebra + dispatch tests
+- `tests/`                   — host-free type-algebra, authority, and VFS tests
 
 ## Build
 

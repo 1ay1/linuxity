@@ -27,7 +27,12 @@ public:
     constexpr explicit Id(Repr v) noexcept : v_{v} {}
 
     [[nodiscard]] constexpr Repr raw() const noexcept { return v_; }
-    [[nodiscard]] constexpr explicit operator bool() const noexcept { return v_ >= 0; }
+    // Valid iff not the all-ones sentinel — matches the kernel's own
+    // (uid_t)-1 / (pid_t)-1 "invalid" convention, and works for signed and
+    // unsigned reprs alike.
+    [[nodiscard]] constexpr explicit operator bool() const noexcept {
+        return v_ != invalid;
+    }
 
     friend constexpr auto operator<=>(Id, Id) = default;
 
@@ -35,7 +40,8 @@ public:
     constexpr Id& operator++() noexcept { ++v_; return *this; }
 
 private:
-    Repr v_{-1}; // -1 = the canonical "invalid" inhabitant
+    static constexpr Repr invalid = static_cast<Repr>(-1);
+    Repr v_{invalid}; // the canonical "invalid" inhabitant
 };
 
 // -- The tags. Empty structs; they exist only to distinguish Id<> instances.
