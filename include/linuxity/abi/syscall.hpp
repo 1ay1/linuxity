@@ -58,6 +58,15 @@ struct Outcome {
     bool                inject{false};  // splice a host memfd, return its fd
     bool                inject_dir{false}; // the injected node is a directory
     std::vector<std::byte> content;     // bytes to back the injected fd
+
+    // SIGNAL - the guest issued kill/tgkill/tkill against a GUEST pid. Guest
+    // pids are linuxity's own tiny namespace, unrelated to host pids, so we
+    // must NOT forward the raw number (it would hit an unrelated host task).
+    // The loop translates the target guest pid to its real host tid and
+    // delivers the real signal there.
+    bool         signal{false};
+    std::int32_t sig_pid{0};       // target GUEST pid (0 => current task)
+    std::int32_t sig_num{0};       // signal number to deliver
 };
 
 // A guest-memory accessor the dispatcher uses to copy_in/copy_out. Modeled as
@@ -87,6 +96,23 @@ public:
             case Sysno::exit:
             case Sysno::exit_group:
                 return fwd();
+
+            // -- signals: kill/tgkill/tkill target a GUEST pid in linuxity's
+            //    own namespace. Forwarding the raw number would signal an
+            //    unrelated HOST task (or fail). Emit a SIGNAL outcome; the
+            //    loop maps the guest pid to its host tid and delivers there.
+            //    kill(pid,sig): arg0=pid arg1=sig. tgkill(tgid,tid,sig):
+            //    arg0=tgid arg2=sig (we signal the process). tkill(tid,sig):
+            //    arg0=tid arg1=sig.
+            case Sysno::kill:
+                return sig(static_cast<std::int32_t>(r.arg[0]),
+                           static_cast<std::int32_t>(r.arg[1]));
+            case Sysno::tkill:
+                return sig(static_cast<std::int32_t>(r.arg[0]),
+                           static_cast<std::int32_t>(r.arg[1]));
+            case Sysno::tgkill:
+                return sig(static_cast<std::int32_t>(r.arg[1]),
+                           static_cast<std::int32_t>(r.arg[2]));
 
             // -- identity + credentials (virtual: our world is pid 1, root)
             case Sysno::getpid:  return val(k_.self().raw());
@@ -158,6 +184,10 @@ public:
 private:
     static Outcome val(std::int64_t v) { Outcome o{}; o.ret = v; return o; }
     static Outcome fwd() { Outcome o{}; o.forward = true; return o; }
+    static Outcome sig(std::int32_t pid, std::int32_t signum) {
+        Outcome o{}; o.signal = true; o.sig_pid = pid; o.sig_num = signum;
+        return o;
+    }
     static Outcome eno(Errno e) { return val(-static_cast<std::int64_t>(e)); }
 
     // Read a NUL-terminated C string from guest memory (bounded).

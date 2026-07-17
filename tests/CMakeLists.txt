@@ -37,3 +37,7 @@ add_test(NAME run_rootfs COMMAND test_run_rootfs)
 add_executable(test_run_multiproc test_run_multiproc.cpp)
 target_link_libraries(test_run_multiproc PRIVATE linuxity_core)
 add_test(NAME run_multiproc COMMAND test_run_multiproc)
+
+add_executable(test_run_signal test_run_signal.cpp)
+target_link_libraries(test_run_signal PRIVATE linuxity_core)
+add_test(NAME run_signal COMMAND test_run_signal)

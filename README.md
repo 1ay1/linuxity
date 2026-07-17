@@ -130,6 +130,12 @@ linuxity services their syscalls. Proofs of the model:
   shows every one with its real command line — `sh`, `sleep 10`, `yes`, `htop`
   — because the trap feeds every fork/exec/exit into linuxity's process table.
   `free`, `uptime`, `ls /proc`, `ls /proc/1` all work the same way.
+- **Signals reach the right task.** A guest `kill`/`tgkill`/`tkill` names a pid
+  in *linuxity's* namespace, so the raw number is never forwarded (it would
+  signal an unrelated host task). The runtime translates the target to the
+  traced task's real host tid and delivers the signal there — a shell can
+  background `sleep 30 &` then `kill`/`kill -9` it, `kill -0` probes liveness,
+  and an unknown pid returns `ESRCH`.
 
 ### How the filesystem is virtualized
 
@@ -176,8 +182,9 @@ exactly the same virtual namespace as its parent shell; it never escapes to
 the host filesystem.
 
 Memory (`mmap`/`brk`/`mprotect`) stays forwarded so native libc reaches
-`main()`; identity, credentials, lifecycle, `uname`, and now the **whole file
-path** are virtualized. In place and proven by 9 test suites:
+`main()`; identity, credentials, lifecycle, `uname`, **signal delivery**, and
+now the **whole file path** are virtualized. In place and proven by 11 test
+suites:
 
 - the type algebra, subsystem concept lattice, and authority boundary;
 - a real **VFS** (mount table, path resolution) with **tmpfs** and a
@@ -186,9 +193,9 @@ path** are virtualized. In place and proven by 9 test suites:
 - an **ELF64 loader** (PT_LOAD, .bss zero-fill, PT_INTERP) into a typed guest
   **address space**, plus SysV AMD64 **stack/auxv** init;
 - an arch-neutral **syscall dispatcher** (per-arch tables → canonical `Sysno`)
-  with a **virtualize / forward / redirect / inject** classifier, driven by a
-  concept-based **trap** loop and a real **multi-process** `ptrace` backend
-  that traces the entire forked/exec'd process tree.
+  with a **virtualize / forward / redirect / inject / signal** classifier,
+  driven by a concept-based **trap** loop and a real **multi-process** `ptrace`
+  backend that traces the entire forked/exec'd process tree.
 
 **The live process tree feeds `/proc`.** The `ptrace` backend observes every
 fork/vfork/exec/exit in the guest tree and emits neutral lifecycle events; the

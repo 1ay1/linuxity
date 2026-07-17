@@ -100,9 +100,10 @@ public:
             // our subsystems, forward it to the host kernel, or exit.
             abi::Outcome o = sys.dispatch(f.regs);
             if (const char* t = std::getenv("LINUXITY_TRACE"); t && *t) {
-                std::fprintf(trace_out(t), "[lx] nr=%llu -> %s%s%s%s ret=%lld %s\n",
+                std::fprintf(trace_out(t), "[lx] nr=%llu -> %s%s%s%s%s ret=%lld %s\n",
                     static_cast<unsigned long long>(f.regs.nr),
                     o.inject?"INJECT ":"", o.redirect?"REDIRECT ":"",
+                    o.signal?"SIGNAL ":"",
                     o.forward?"FORWARD ":"", o.exited?"EXIT ":"VIRT ",
                     static_cast<long long>(o.ret),
                     o.redirect?o.host_path.c_str():"");
@@ -127,6 +128,16 @@ public:
                 // let the kernel run it in the child (real fd for mmap).
                 auto ret = LX_TRY(trap_.redirect(o.path_arg, o.host_path));
                 sys.note_opened_fd(ret);
+            } else if (o.signal) {
+                // The guest signalled a GUEST pid. Deliver the real signal to
+                // that task's host tid (guarded so backends without the
+                // bridge just report failure), then hand the caller the
+                // result. The target's death, if fatal, is observed as a
+                // normal reap by next() on a later iteration.
+                std::int64_t ret = -static_cast<std::int64_t>(Errno::eperm);
+                if constexpr (requires { trap_.deliver_signal(0, 0); })
+                    ret = trap_.deliver_signal(o.sig_pid, o.sig_num);
+                LX_TRY(trap_.resume(ret));
             } else if (o.forward) {
                 // Let the host kernel run it IN the guest (mmap/brk/...).
                 (void)LX_TRY(trap_.forward());

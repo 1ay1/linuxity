@@ -24,11 +24,14 @@
 #include "linuxity/runtime/trap.hpp"
 
 #include <sys/ptrace.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/user.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <csignal>
+#include <cerrno>
 
 #include <cstring>
 #include <string>
@@ -290,6 +293,41 @@ public:
 
     // The current guest tid, so the loop can attribute a syscall to a pid.
     [[nodiscard]] ::pid_t current_tid() const noexcept { return cur_; }
+
+    // -- Signal delivery ---------------------------------------------------
+    // The guest issued kill/tgkill/tkill against a GUEST pid. Translate that
+    // pid to the real host tid of the traced task and deliver the signal
+    // THERE (never to the raw host pid, which is an unrelated task). Returns
+    // the guest-visible result: 0 on delivery, -ESRCH if the target guest pid
+    // is unknown, or -errno if the host kill(2) itself fails.
+    [[nodiscard]] std::int64_t deliver_signal(std::int32_t gpid,
+                                              std::int32_t signum) {
+        // gpid 0 in kill(2) means the caller's process group; we don't model
+        // groups, so target the current task. A negative pid (process group)
+        // likewise collapses to the current task in our tiny namespace.
+        ::pid_t tid = (gpid <= 0) ? cur_ : host_tid_of(gpid);
+        if (tid < 0) return -static_cast<std::int64_t>(Errno::esrch);
+        // Deliver to the specific THREAD so it lands on the traced task even
+        // when signal-0 probes or fatal signals race the group.
+        long rc = ::syscall(SYS_tgkill, tid, tid, signum);
+        if (rc != 0) rc = ::kill(tid, signum);   // fall back to process kill
+        return (rc == 0) ? 0 : -static_cast<std::int64_t>(Errno{errno});
+    }
+
+    // Reverse of gpid_of: a guest pid -> its host tid. pid 1 is the root task.
+    // Because fork/clone are FORWARDED, the guest actually learns the real
+    // HOST pid of its children (that's what $! / clone's return value carry),
+    // so a kill target may already BE a host tid we trace. Accept either: a
+    // known guest pid (our tiny namespace) or a raw traced host tid.
+    [[nodiscard]] ::pid_t host_tid_of(std::int32_t pid) const {
+        if (pid == 1) return root_pid_;
+        if (pid == root_pid_) return root_pid_;
+        auto host = static_cast<::pid_t>(pid);
+        if (tasks_.find(host) != tasks_.end()) return host;  // a traced host tid
+        for (const auto& [tid, g] : gpid_)
+            if (g == pid) return tid;                         // a guest pid
+        return -1;
+    }
 
     // -- GuestMem: the CURRENT task's pages ARE the guest memory. -----------
     [[nodiscard]] Status copy_in(UAddr src, std::span<std::byte> dst) const {
