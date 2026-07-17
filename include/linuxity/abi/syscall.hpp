@@ -175,6 +175,16 @@ public:
             case Sysno::getgid:  case Sysno::getegid:
                 return val(0);
 
+            // -- getresuid(ruid*,euid*,suid*) / getresgid(rgid*,egid*,sgid*):
+            //    bash and sudo read these at startup to populate $UID/$EUID.
+            //    Like getuid/geteuid they MUST answer 0 for our root-owned
+            //    world; forwarded raw they return the HOST uid (e.g. 1000),
+            //    which has no /etc/passwd entry -> bash's "I have no name!".
+            //    Write all three id-out pointers (arg0/1/2) to 0.
+            case Sysno::getresuid:
+            case Sysno::getresgid:
+                return do_getres(r);
+
             // -- benign process-init syscalls libc issues early ----------
             // set_tid_address carries no host resource; serve it trivially so
             // _start proceeds (return a plausible tid).
@@ -1345,6 +1355,17 @@ private:
             default:
                 return fwd();   // real host tty/device ioctl
         }
+    }
+
+    // getresuid/getresgid: write real=eff=saved id, all 0 (our root world),
+    // into the three uid_t* the guest passed (arg0/arg1/arg2). A NULL pointer
+    // (arg==0) is skipped. Answers identically to getuid/geteuid so bash's
+    // $UID/$EUID and sudo's credential check see uid 0.
+    [[nodiscard]] Outcome do_getres(const Regs& r) {
+        if (r.arg[0]) put_u32(r.arg[0], 0);
+        if (r.arg[1]) put_u32(r.arg[1], 0);
+        if (r.arg[2]) put_u32(r.arg[2], 0);
+        return val(0);
     }
 
     // struct utsname: 6 fixed-size NUL-terminated char[65] fields. We

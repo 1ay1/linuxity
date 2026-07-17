@@ -29,6 +29,10 @@ enum class Sysno {
     kill, tgkill, tkill, exit, exit_group,
     uname, arch_prctl, set_tid_address, ioctl, writev, readv,
     rt_sigaction, rt_sigprocmask, getuid, geteuid, getgid, getegid,
+    // The RESolved-uid queries bash/sudo use at startup to fill $UID/$EUID.
+    // These MUST answer 0 like getuid/geteuid, or the guest believes it's the
+    // host uid (no /etc/passwd match -> bash prints "I have no name!").
+    getresuid, getresgid,
     // File metadata & directory path family (virtualized through the VFS).
     stat, lstat, fstat, newfstatat, statx, lseek, pread64, pwrite64,
     getdents64, readlink, readlinkat, getcwd, chdir, fchdir,
@@ -148,6 +152,8 @@ enum class Sysno {
                 case 104: return Sysno::getgid;
                 case 107: return Sysno::geteuid;
                 case 108: return Sysno::getegid;
+                case 118: return Sysno::getresuid;
+                case 120: return Sysno::getresgid;
                 case 158: return Sysno::arch_prctl;
                 case 186: return Sysno::gettid;
                 case 218: return Sysno::set_tid_address;
@@ -307,6 +313,8 @@ enum class Sysno {
                 case 176: return Sysno::getgid;
                 case 175: return Sysno::geteuid;
                 case 177: return Sysno::getegid;
+                case 148: return Sysno::getresuid;
+                case 150: return Sysno::getresgid;
                 case 96:  return Sysno::set_tid_address;
                 case 56:  return Sysno::openat;
                 case 62:  return Sysno::lseek;

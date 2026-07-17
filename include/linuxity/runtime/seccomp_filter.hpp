@@ -56,6 +56,7 @@ inline constexpr int kTrappedX86_64[] = {
     // its pid; a monitor reads tid from /proc (already virtualized), so
     // running gettid natively is harmless.
     102, 104, 107, 108,          // getuid/getgid/geteuid/getegid
+    118, 120,                    // getresuid/getresgid (bash/sudo $UID at init)
     56, 57, 58,                  // clone/fork/vfork      (pid translated)
     // execve(59)/execveat(322) are NOT filtered. Trapping execve is what makes
     // the bootstrap fragile: the child must run execve after installing the

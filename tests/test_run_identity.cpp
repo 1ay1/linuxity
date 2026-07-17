@@ -8,6 +8,9 @@
 //
 // The probe:
 //   * parent getpid()==1, getppid()==0
+//   * getresuid/getresgid all report 0 (bash/sudo read these at init; a
+//     non-zero answer here is what made an interactive shell print
+//     "I have no name!")
 //   * fork()s a child; the child's getpid()!=1 and getppid()==1
 //   * readlink("/proc/self/exe") yields the guest path "/bin/idprobe"
 // Exit 0 iff all hold. Skips off Linux/x86-64, without static gcc, or ptrace.
@@ -24,10 +27,15 @@
 using namespace lx;
 
 static const char* kProbe =
+    "#define _GNU_SOURCE\n"
     "#include <unistd.h>\n#include <string.h>\n#include <sys/wait.h>\n"
     "int main(void){\n"
     "  if(getpid()!=1) return 10;\n"
     "  if(getppid()!=0) return 11;\n"
+    "  uid_t r,e,s; if(getresuid(&r,&e,&s)!=0) return 15;\n"
+    "  if(r||e||s) return 16;   /* all must be root (0) */\n"
+    "  gid_t gr,ge,gs; if(getresgid(&gr,&ge,&gs)!=0) return 17;\n"
+    "  if(gr||ge||gs) return 18;\n"
     "  char b[256]; long n=readlink(\"/proc/self/exe\",b,sizeof b-1);\n"
     "  if(n<=0) return 12; b[n]=0;\n"
     "  if(strcmp(b,\"/bin/idprobe\")!=0) return 13;\n"

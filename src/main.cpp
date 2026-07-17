@@ -230,6 +230,29 @@ int main(int argc, char** argv) {
     std::vector<std::string> genvp;
     for (char** e = environ; e && *e; ++e) genvp.emplace_back(*e);
 
+    // With a rootfs mounted, linuxity presents a ROOT-OWNED world (every guest
+    // uid/gid is scrubbed to 0). But the host shell that launched us exported
+    // its OWN identity — USER=ayush, LOGNAME=ayush, HOME=/home/ayush — and
+    // those leak straight into the guest. That's why an interactive bash shows
+    // `I have no name!`: its prompt resolves \u via getpwuid/LOGNAME, sees
+    // "ayush" (a name that doesn't exist in the rootfs's /etc/passwd), and
+    // falls back. It also points HOME at a host path the rootfs doesn't have.
+    // Overwrite the identity vars to the coherent root values so bash, sudo,
+    // ~ expansion, and $HOME/.config all agree with the uid=0 world we serve.
+    // (Purely cosmetic-to-correctness; syscalls were already virtualized.)
+    if (!root.empty()) {
+        auto set_env = [&genvp](std::string_view key, std::string_view val) {
+            std::string prefix = std::string{key} + "=";
+            for (auto& kv : genvp)
+                if (kv.rfind(prefix, 0) == 0) { kv = prefix + std::string{val}; return; }
+            genvp.emplace_back(prefix + std::string{val});
+        };
+        set_env("USER", "root");
+        set_env("LOGNAME", "root");
+        set_env("HOME", "/root");
+        set_env("SHELL", "/bin/bash");
+    }
+
     host::PosixHost hw;
     kernel::Kernel<host::PosixHost> k{hw};
 
