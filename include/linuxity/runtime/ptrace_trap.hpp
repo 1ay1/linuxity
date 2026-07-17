@@ -34,8 +34,6 @@
 #include <cerrno>
 
 #include <cstring>
-#include <cstdlib>
-#include <cstdio>
 #include <functional>
 #include <string>
 #include <unordered_map>

@@ -100,14 +100,16 @@ public:
             // our subsystems, forward it to the host kernel, or exit.
             abi::Outcome o = sys.dispatch(f.regs);
             if (const char* t = std::getenv("LINUXITY_TRACE"); t && *t) {
-                std::fprintf(trace_out(t), "[lx] nr=%llu -> %s%s%s%s%s%s ret=%lld %s\n",
+                std::fprintf(trace_out(t), "[lx] nr=%llu -> %s%s%s%s%s%s ret=%lld %s%s%s\n",
                     static_cast<unsigned long long>(f.regs.nr),
                     o.inject?"INJECT ":"", o.redirect?"REDIRECT ":"",
                     o.signal?"SIGNAL ":"",
                     o.exec_interp?"EXECINT ":"",
                     o.forward?"FORWARD ":"", o.exited?"EXIT ":"VIRT ",
                     static_cast<long long>(o.ret),
-                    o.redirect?o.host_path.c_str():"");
+                    o.redirect?o.host_path.c_str():"",
+                    (o.redirect && o.path_arg2>=0)?" -> ":"",
+                    (o.redirect && o.path_arg2>=0)?o.host_path2.c_str():"");
             }
             if (o.exited) return ok(o.exit_code);
 
