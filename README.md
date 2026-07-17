@@ -119,6 +119,9 @@ linuxity services their syscalls. Proofs of the model:
 - `--root <rootfs> /bin/sh -c '/bin/cat /etc/os-release | /bin/head -1'` runs a
   **shell that forks and execs coreutils**, and every child stays inside the
   rootfs — the whole process tree lives in linuxity's world, no host escape.
+- the guest can **write** (`/tmp`, `/run`, `/var`, …) and the writes land in a
+  copy-on-write **overlay upper** layer — the on-disk rootfs stays **pristine**,
+  never mutated by the guest.
 
 ### How the filesystem is virtualized
 
@@ -130,7 +133,10 @@ Every path-taking syscall (`openat`, `newfstatat`, `statx`, `access`,
   host path under the rootfs, and the syscall is **redirected** (its path
   register is rewritten in the child, then forwarded). Because the child ends
   up with a real host fd, native `ld.so` `mmap`s the actual library file —
-  this is what carries a dynamically-linked distro binary to `main()`.
+  this is what carries a dynamically-linked distro binary to `main()`. A
+  write-intent open (`O_WRONLY`/`O_RDWR`/`O_CREAT`/`O_TRUNC`) resolves to a
+  copy-on-write **overlay upper** dir (copying the file up from the read-only
+  lower first), so the pristine rootfs is never mutated.
 - **virtual** (`/proc`, and future `/sys`, tmpfs, overlays): the bytes are
   synthesized and either written straight into guest memory (`read`/`stat`) or
   materialized into a real fd the child can read *and* `mmap` (**inject**).
@@ -163,7 +169,6 @@ path** are virtualized. In place and proven by 9 test suites:
   concept-based **trap** loop and a real **multi-process** `ptrace` backend
   that traces the entire forked/exec'd process tree.
 
-The road ahead: a writable overlay (tmpfs upper over the rootfs), `getdents64`
-synthesis for virtual dirs, `futex`/`epoll` for threaded programs, then a full
-interactive shell from a pristine distro rootfs. The architecture is fixed and
-machine-checked.
+The road ahead: `getdents64` synthesis for virtual dirs (so `ls /proc` works),
+`futex`/`epoll` for threaded programs, then a full interactive shell from a
+pristine distro rootfs. The architecture is fixed and machine-checked.

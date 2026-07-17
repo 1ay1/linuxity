@@ -25,6 +25,10 @@
 #include "linuxity/abi/result.hpp"
 #include "linuxity/abi/types.hpp"
 
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -59,17 +63,23 @@ public:
     using Producer = std::function<Result<VirtualFile>(std::string_view /*abs path*/)>;
 
     // Mount a real host directory at an absolute guest prefix ("/" for the
-    // rootfs). `host_base` is the on-disk directory it maps to.
-    void mount_host(std::string prefix, std::string host_base) {
+    // rootfs). `host_base` is the on-disk directory it maps to. `upper`, if
+    // given, is a WRITABLE on-disk scratch dir stacked over `host_base`: the
+    // rootfs stays read-only (pristine) and all guest writes copy-up into the
+    // upper layer — exactly the overlayfs lowerdir/upperdir model.
+    void mount_host(std::string prefix, std::string host_base,
+                    std::string upper = {}) {
         if (prefix.size() > 1 && prefix.back() == '/') prefix.pop_back();
         if (!host_base.empty() && host_base.back() == '/') host_base.pop_back();
-        mounts_.push_back(Mount{std::move(prefix), std::move(host_base), {}});
+        if (!upper.empty() && upper.back() == '/') upper.pop_back();
+        mounts_.push_back(Mount{std::move(prefix), std::move(host_base),
+                                std::move(upper), {}});
     }
 
     // Mount a virtual producer at an absolute guest prefix ("/proc", "/sys").
     void mount_virtual(std::string prefix, Producer prod) {
         if (prefix.size() > 1 && prefix.back() == '/') prefix.pop_back();
-        mounts_.push_back(Mount{std::move(prefix), {}, std::move(prod)});
+        mounts_.push_back(Mount{std::move(prefix), {}, {}, std::move(prod)});
     }
 
     [[nodiscard]] std::string_view cwd() const noexcept { return cwd_; }
@@ -89,9 +99,13 @@ public:
     }
 
     // Classify an ABSOLUTE, normalized guest path into its realm. For
-    // host-backed paths, returns the translated real host path (existence is
-    // NOT checked here; the forwarded host syscall reports ENOENT itself).
-    [[nodiscard]] PathClass classify(std::string_view abs) const {
+    // host-backed paths, returns the translated real host path. `for_write`
+    // selects the overlay UPPER layer (copying the file up from the read-only
+    // lower first, and creating parent dirs), so the pristine rootfs is never
+    // mutated. Existence is NOT checked for reads — the forwarded host syscall
+    // reports ENOENT itself.
+    [[nodiscard]] PathClass classify(std::string_view abs,
+                                     bool for_write = false) const {
         const Mount* m = deepest(abs);
         if (!m) return PathClass{Realm2::absent, {}, Errno::enoent};
         if (m->producer) {
@@ -99,15 +113,26 @@ public:
             if (!vf) return PathClass{Realm2::absent, {}, vf.error()};
             return PathClass{Realm2::virtual_file, {}, Errno::enoent};
         }
-        // host-backed: base + (abs minus prefix)
         std::string_view rel = abs;
         rel.remove_prefix(m->prefix == "/" ? 0 : m->prefix.size());
-        std::string hp = m->host_base;
-        if (!rel.empty()) {
-            if (rel.front() != '/') hp += '/';
-            hp += rel;
+        while (!rel.empty() && rel.front() == '/') rel.remove_prefix(1);
+
+        // Overlay: an upper layer means writes (and files already copied up)
+        // resolve to upper; reads of not-yet-copied files fall through to the
+        // read-only lower.
+        if (!m->upper.empty()) {
+            std::string up = join_host(m->upper, rel);
+            std::string lo = join_host(m->host_base, rel);
+            if (for_write) {
+                copy_up(up, lo);
+                return PathClass{Realm2::host_backed, std::move(up), Errno::enoent};
+            }
+            if (exists(up.c_str()))
+                return PathClass{Realm2::host_backed, std::move(up), Errno::enoent};
+            return PathClass{Realm2::host_backed, std::move(lo), Errno::enoent};
         }
-        return PathClass{Realm2::host_backed, std::move(hp), Errno::enoent};
+        return PathClass{Realm2::host_backed, join_host(m->host_base, rel),
+                         Errno::enoent};
     }
 
     // Produce the bytes of a virtual file (for read/open/getdents on it).
@@ -160,9 +185,58 @@ public:
 private:
     struct Mount {
         std::string prefix;      // absolute guest prefix
-        std::string host_base;   // real dir (empty for virtual mounts)
+        std::string host_base;   // real (lower) dir; empty for virtual mounts
+        std::string upper;       // writable overlay upper dir; empty = no COW
         Producer    producer;    // set for virtual mounts
     };
+
+    static std::string join_host(std::string_view base, std::string_view rel) {
+        std::string p{base};
+        if (!rel.empty()) { p += '/'; p += rel; }
+        return p;
+    }
+
+    static bool exists(const char* path) {
+        struct ::stat st{};
+        return ::lstat(path, &st) == 0;
+    }
+
+    // Ensure `up` exists in the upper layer, copying its bytes up from the
+    // read-only lower `lo` on first write and creating parent directories.
+    // Best-effort: if the lower doesn't exist this just preps the parent dirs
+    // so an O_CREAT open can make the new file in upper.
+    static void copy_up(const std::string& up, const std::string& lo) {
+        make_parents(up);
+        if (exists(up.c_str())) return;                 // already copied up
+        int in = ::open(lo.c_str(), O_RDONLY | O_CLOEXEC);
+        if (in < 0) return;                             // no lower => new file
+        int out = ::open(up.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (out < 0) { ::close(in); return; }
+        char buf[65536];
+        for (;;) {
+            ::ssize_t n = ::read(in, buf, sizeof buf);
+            if (n <= 0) break;
+            for (::ssize_t off = 0; off < n; ) {
+                ::ssize_t w = ::write(out, buf + off, static_cast<std::size_t>(n - off));
+                if (w <= 0) { off = n; break; }
+                off += w;
+            }
+        }
+        ::close(in); ::close(out);
+    }
+
+    // mkdir -p for the directory component of a host path.
+    static void make_parents(const std::string& path) {
+        std::size_t slash = path.find_last_of('/');
+        if (slash == std::string::npos || slash == 0) return;
+        std::string dir = path.substr(0, slash);
+        for (std::size_t i = 1; i <= dir.size(); ++i) {
+            if (i == dir.size() || dir[i] == '/') {
+                std::string sub = dir.substr(0, i);
+                ::mkdir(sub.c_str(), 0755);   // ignore EEXIST
+            }
+        }
+    }
 
     [[nodiscard]] const Mount* deepest(std::string_view abs) const {
         const Mount* best = nullptr;

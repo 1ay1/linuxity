@@ -8,6 +8,7 @@
 
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 
 using namespace lx;
@@ -94,7 +95,51 @@ int main() {
     f.unbind_fd(7);
     assert(f.path_of_fd(7).empty());
 
+    // -- Overlay (copy-up upper over read-only lower). --------------------
+    {
+        std::string lower = "/tmp/lx_fns_lower";
+        std::string upper = "/tmp/lx_fns_upper";
+        std::system(("rm -rf " + lower + " " + upper +
+                     " && mkdir -p " + lower + "/etc " + upper).c_str());
+        { std::FILE* lf = std::fopen((lower + "/etc/conf").c_str(), "w");
+          std::fputs("pristine\n", lf); std::fclose(lf); }
+
+        FN ov;
+        ov.mount_host("/", lower, upper);
+
+        // A READ of an un-copied file resolves to the lower (pristine).
+        {
+            auto pc = ov.classify("/etc/conf", /*for_write=*/false);
+            assert(pc.realm == Realm2::host_backed);
+            assert(pc.host_path == lower + "/etc/conf");
+        }
+        // A WRITE copies it up: the target is now in the upper, and the copy
+        // carries the lower's bytes; the lower stays untouched.
+        {
+            auto pc = ov.classify("/etc/conf", /*for_write=*/true);
+            assert(pc.realm == Realm2::host_backed);
+            assert(pc.host_path == upper + "/etc/conf");
+            std::FILE* uf = std::fopen(pc.host_path.c_str(), "r");
+            assert(uf);
+            char b[32] = {}; std::fread(b, 1, sizeof b - 1, uf); std::fclose(uf);
+            assert(std::string(b) == "pristine\n");   // copied up
+        }
+        // After copy-up, a READ resolves to the upper.
+        {
+            auto pc = ov.classify("/etc/conf", false);
+            assert(pc.host_path == upper + "/etc/conf");
+        }
+        // The pristine lower is never mutated.
+        {
+            std::FILE* lf = std::fopen((lower + "/etc/conf").c_str(), "r");
+            assert(lf);
+            char b[32] = {}; std::fread(b, 1, sizeof b - 1, lf); std::fclose(lf);
+            assert(std::string(b) == "pristine\n");
+        }
+        std::system(("rm -rf " + lower + " " + upper).c_str());
+    }
+
     std::puts("file_namespace: mount table, normalization, realm "
-              "classification, and synthesized /proc all correct");
+              "classification, synthesized /proc, and copy-up overlay correct");
     return 0;
 }

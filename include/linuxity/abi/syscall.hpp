@@ -196,7 +196,14 @@ private:
     // real fd it can read AND mmap — so native ld.so works.
     [[nodiscard]] Outcome path_open(const Regs& r, int path_arg, bool at) {
         std::string abs = resolve_arg(r, path_arg, at);
-        auto pc = k_.files().classify(abs);
+        // Open flags follow the path arg: openat(dirfd,path,flags,mode) ->
+        // arg[2]; open(path,flags,mode) -> arg[1]. Write intent (O_WRONLY /
+        // O_RDWR / O_CREAT / O_TRUNC) selects the overlay upper layer.
+        std::uint64_t flags = r.arg[static_cast<std::size_t>(path_arg) + 1];
+        constexpr std::uint64_t kWrOnly = 1, kRdWr = 2, kCreat = 0100, kTrunc = 01000;
+        bool for_write = (flags & 3) == kWrOnly || (flags & 3) == kRdWr ||
+                         (flags & kCreat) || (flags & kTrunc);
+        auto pc = k_.files().classify(abs, for_write);
         if (pc.realm == kernel::Realm2::host_backed) {
             Outcome o{};
             o.redirect  = true;

@@ -12,6 +12,7 @@
 #include "linuxity/runtime/trap.hpp"
 #include "linuxity/vfs/procfs.hpp"
 
+#include <sys/stat.h>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -59,7 +60,12 @@ int main(int argc, char** argv) {
     // real host path underneath the rootfs before the syscall runs. /proc is
     // synthesized to report linuxity's own identity, not the host's.
     if (!root.empty()) {
-        k.files().mount_host("/", root);
+        // Stack a writable, per-run overlay over the read-only rootfs so the
+        // guest can write (to /tmp, /run, /var, ...) WITHOUT mutating the
+        // pristine rootfs on disk — copy-up happens on first write.
+        std::string upper = "/tmp/linuxity-upper-" + std::to_string(::getpid());
+        (void)::mkdir(upper.c_str(), 0755);
+        k.files().mount_host("/", root, upper);
         k.files().mount_virtual("/proc",
             vfs::make_procfs(k.self().raw(), "6.6.0-linuxity", "linuxity"));
     } else {
