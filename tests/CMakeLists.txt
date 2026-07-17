@@ -94,6 +94,10 @@ add_executable(test_run_foreign_exec test_run_foreign_exec.cpp)
 target_link_libraries(test_run_foreign_exec PRIVATE linuxity_core)
 add_test(NAME run_foreign_exec COMMAND test_run_foreign_exec)
 
+add_executable(test_run_untranslated test_run_untranslated.cpp)
+target_link_libraries(test_run_untranslated PRIVATE linuxity_core)
+add_test(NAME run_untranslated COMMAND test_run_untranslated)
+
 add_executable(test_resources test_resources.cpp)
 target_link_libraries(test_resources PRIVATE linuxity_core)
 add_test(NAME resources COMMAND test_resources)

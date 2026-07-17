@@ -238,6 +238,11 @@ public:
             //    real, unprivileged Linux world.
             case Sysno::open:        return path_open(r, 0, /*at=*/false);
             case Sysno::openat:      return path_open(r, 1, /*at=*/true);
+            // openat2(dirfd, path, struct open_how*, size): the modern openat.
+            // Its open flags live in the FIRST 8 bytes of the open_how struct
+            // (arg[2]) rather than a register, so read them from guest memory
+            // and drive the same translation/injection path as openat.
+            case Sysno::openat2:     return path_openat2(r);
             case Sysno::stat:        return path_stat(r, 0, false, true);
             case Sysno::lstat:       return path_stat(r, 0, false, false);
             case Sysno::access:      return path_at(r, 0, false);
@@ -250,6 +255,40 @@ public:
             case Sysno::readlinkat:  return do_readlink(r, 1, true);
             case Sysno::getcwd:      return do_getcwd(r);
             case Sysno::getdents64:  return do_getdents64(r);
+
+            // -- statfs(path, buf): translate the path and REDIRECT so the
+            //    host reports the overlay filesystem's stats. fstatfs acts on
+            //    an already-open (already-translated) fd — forward it. Virtual
+            //    procfs/sysfs paths have no real backing fs, so synthesize a
+            //    plausible statfs (tmpfs-like) for them instead of leaking the
+            //    host's numbers.
+            case Sysno::statfs:      return path_statfs(r);
+            case Sysno::fstatfs:     return fwd();
+
+            // -- chroot(path): a guest chroot would chroot our HOST child to
+            //    an untranslated host path — an isolation break. linuxity's
+            //    path translation already confines the guest to the rootfs, so
+            //    accept it vacuously (the guest believes it chrooted; the host
+            //    process is unchanged) after verifying the target exists.
+            case Sysno::chroot:      return do_chroot(r);
+
+            // -- extended attributes. The path variants (get/set/list/remove
+            //    xattr and their l* no-follow forms) carry a guest path in
+            //    arg0 that must be translated to the overlay host path; the f*
+            //    variants act on an already-open fd and just forward. Writes
+            //    (set/remove) go through for_write so they land in the upper
+            //    layer, matching `setcap`, `tar --xattrs`, `cp -a`.
+            case Sysno::getxattr:
+            case Sysno::listxattr:    return path_xattr(r, /*for_write=*/false);
+            case Sysno::lgetxattr:
+            case Sysno::llistxattr:   return path_xattr(r, /*for_write=*/false, /*follow=*/false);
+            case Sysno::setxattr:
+            case Sysno::removexattr:  return path_xattr(r, /*for_write=*/true);
+            case Sysno::lsetxattr:
+            case Sysno::lremovexattr: return path_xattr(r, /*for_write=*/true, /*follow=*/false);
+            case Sysno::fgetxattr:    case Sysno::fsetxattr:
+            case Sysno::flistxattr:   case Sysno::fremovexattr:
+                return fwd();
 
             // -- execve/execveat: translate the program path to its real
             //    host location under the rootfs, then let the kernel exec it.
@@ -438,11 +477,35 @@ private:
     // virtual file into a memfd (INJECT). Either way the child ends up with a
     // real fd it can read AND mmap — so native ld.so works.
     [[nodiscard]] Outcome path_open(const Regs& r, int path_arg, bool at) {
-        std::string abs = resolve_arg(r, path_arg, at);
         // Open flags follow the path arg: openat(dirfd,path,flags,mode) ->
-        // arg[2]; open(path,flags,mode) -> arg[1]. Write intent (O_WRONLY /
-        // O_RDWR / O_CREAT / O_TRUNC) selects the overlay upper layer.
+        // arg[2]; open(path,flags,mode) -> arg[1].
         std::uint64_t flags = r.arg[static_cast<std::size_t>(path_arg) + 1];
+        return path_open_flags(r, path_arg, at, flags);
+    }
+
+    // openat2(dirfd, path, struct open_how*, size): the modern openat. Its
+    // open flags are NOT in a register — they sit in the first 8 bytes of the
+    // `struct open_how` at arg[2] (the layout is { __u64 flags; __u64 mode;
+    // __u64 resolve; }). Read them from guest memory, then drive the same
+    // translation/injection core as openat. path_arg is 1 (dirfd is arg[0]).
+    [[nodiscard]] Outcome path_openat2(const Regs& r) {
+        std::uint64_t flags = 0;
+        std::array<std::byte, 8> raw{};
+        if (mem_.copy_in(uaddr(r.arg[2]), raw)) {
+            for (std::size_t i = 0; i < 8; ++i)
+                flags |= static_cast<std::uint64_t>(std::to_integer<unsigned>(raw[i])) << (i * 8);
+        }
+        return path_open_flags(r, /*path_arg=*/1, /*at=*/true, flags);
+    }
+
+    // The shared open core: `flags` is already resolved (from a register for
+    // open/openat, or from the open_how struct for openat2). Selects the
+    // overlay upper layer on write intent and REDIRECTs or INJECTs.
+    [[nodiscard]] Outcome path_open_flags(const Regs& r, int path_arg, bool at,
+                                          std::uint64_t flags) {
+        std::string abs = resolve_arg(r, path_arg, at);
+        // Write intent (O_WRONLY / O_RDWR / O_CREAT / O_TRUNC) selects the
+        // overlay upper layer.
         constexpr std::uint64_t kWrOnly = 1, kRdWr = 2, kCreat = 0100, kTrunc = 01000;
         bool for_write = (flags & 3) == kWrOnly || (flags & 3) == kRdWr ||
                          (flags & kCreat) || (flags & kTrunc);
@@ -733,6 +796,61 @@ private:
         return val(0);
     }
 
+    // chroot(path): a guest chroot would chroot our real HOST child to an
+    // UNTRANSLATED host path — either failing (unprivileged) or, worse,
+    // escaping linuxity's namespace onto the host tree. linuxity already
+    // confines the guest by translating every path through the rootfs, so we
+    // accept chroot as a satisfied no-op: verify the target exists in the
+    // guest namespace (so a bogus chroot still ENOENTs like the real call),
+    // then report success without touching the host process. Programs that
+    // chroot-then-serve (sshd, some init scripts) proceed believing they are
+    // jailed; the jail is linuxity itself.
+    [[nodiscard]] Outcome do_chroot(const Regs& r) {
+        std::string abs = k_.files().absolutize(read_cstr(uaddr(r.arg[0])),
+                                                k_.files().cwd());
+        auto pc = k_.files().classify(abs);
+        if (pc.realm == kernel::Realm2::absent) return eno(pc.error);
+        return val(0);
+    }
+
+    // statfs(path, buf): translate the path and REDIRECT so the host fills the
+    // guest buffer with the OVERLAY filesystem's real statistics (block size,
+    // free space) — what `df`, glibc statvfs, and installer space checks read.
+    // A virtual procfs/sysfs path has no backing block device, so synthesize a
+    // plausible tmpfs-like statfs rather than leak the host's numbers or fail.
+    [[nodiscard]] Outcome path_statfs(const Regs& r) {
+        std::string abs = resolve_arg(r, 0, /*at=*/false);
+        auto pc = k_.files().classify(abs);
+        if (pc.realm == kernel::Realm2::host_backed) {
+            Outcome o{};
+            o.redirect = true; o.path_arg = 0; o.host_path = std::move(pc.host_path);
+            return o;   // host fills arg[1] with the real overlay-fs statfs
+        }
+        if (pc.realm == kernel::Realm2::virtual_file)
+            return write_statfs(uaddr(r.arg[1]));
+        return eno(pc.error);
+    }
+
+    // Extended-attribute path family: get/set/list/remove xattr and their l*
+    // (no-follow) forms. All carry the guest path in arg0; translate it to the
+    // overlay host path and REDIRECT so the operation lands on the ROOTFS
+    // inode, not the host's. Writes (set/remove) pass for_write=true so the
+    // leaf is copied up into the writable upper layer first — matching
+    // `setcap`, `tar --xattrs -x`, `cp --preserve=xattr`. Virtual paths carry
+    // no xattrs (ENOTSUP); absent paths yield their errno.
+    [[nodiscard]] Outcome path_xattr(const Regs& r, bool for_write,
+                                     bool follow = true) {
+        std::string abs = resolve_arg(r, 0, /*at=*/false);
+        auto pc = for_write
+            ? k_.files().classify(abs, /*for_write=*/true, follow, Wi::copy_leaf)
+            : k_.files().classify(abs, /*for_write=*/false, follow);
+        if (pc.realm == kernel::Realm2::virtual_file) return eno(Errno::enotsup);
+        if (pc.host_path.empty()) return eno(pc.error);
+        Outcome o{};
+        o.redirect = true; o.path_arg = 0; o.host_path = std::move(pc.host_path);
+        return o;
+    }
+
     [[nodiscard]] Outcome do_getcwd(const Regs& r) {
         std::string_view cwd = k_.files().cwd();
         std::size_t need = cwd.size() + 1;
@@ -998,6 +1116,40 @@ private:
         st.st_blksize = 4096;
         st.st_blocks  = static_cast<std::int64_t>((size + 511) / 512);
         if (!mem_.copy_out(buf, {reinterpret_cast<const std::byte*>(&st), sizeof st}))
+            return eno(Errno::efault);
+        return val(0);
+    }
+
+    // Synthesize a `struct statfs` for a VIRTUAL path (procfs/sysfs), which
+    // has no backing block device. We report a tmpfs-like filesystem so `df`
+    // and statvfs on /proc or /sys return coherent numbers instead of the
+    // host's real device stats. The layout is the x86-64 kernel `struct
+    // statfs` (64-bit fields; f_type..f_spare) used by statfs(2)/fstatfs(2).
+    [[nodiscard]] Outcome write_statfs(UAddr buf) {
+        struct Statfs {
+            std::int64_t  f_type;
+            std::int64_t  f_bsize;
+            std::uint64_t f_blocks, f_bfree, f_bavail;
+            std::uint64_t f_files, f_ffree;
+            struct { std::int32_t v[2]; } f_fsid;
+            std::int64_t  f_namelen;
+            std::int64_t  f_frsize;
+            std::int64_t  f_flags;
+            std::int64_t  f_spare[4];
+        } sf{};
+        constexpr std::int64_t kTmpfsMagic = 0x01021994;   // TMPFS_MAGIC
+        sf.f_type    = kTmpfsMagic;
+        sf.f_bsize   = 4096;
+        sf.f_frsize  = 4096;
+        sf.f_namelen = 255;
+        // A synthesized in-memory fs: advertise capacity but report it as
+        // fully free (procfs/sysfs never "fill up").
+        sf.f_blocks  = 1u << 20;   // 4 GiB @ 4 KiB blocks
+        sf.f_bfree   = sf.f_blocks;
+        sf.f_bavail  = sf.f_blocks;
+        sf.f_files   = 1u << 16;
+        sf.f_ffree   = sf.f_files;
+        if (!mem_.copy_out(buf, {reinterpret_cast<const std::byte*>(&sf), sizeof sf}))
             return eno(Errno::efault);
         return val(0);
     }

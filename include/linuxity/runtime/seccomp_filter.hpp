@@ -81,13 +81,23 @@ inline constexpr int kTrappedX86_64[] = {
     16,                          // ioctl
     // -- filesystem namespace (path args resolved through OUR tree) --------
     2, 257,                      // open/openat
+    437,                         // openat2
     4, 6, 262,                   // stat/lstat/newfstatat
     332,                         // statx
+    137,                         // statfs        (path -> overlay redirect)
     21, 269, 439,                // access/faccessat/faccessat2
     80,                          // chdir
+    161,                         // chroot        (accepted namespace no-op)
     89, 267,                     // readlink/readlinkat
     79,                          // getcwd
     217,                         // getdents64
+    // extended attributes: the path variants translate to the overlay; the
+    // f* variants act on an already-open fd (still trapped so the dispatcher
+    // can forward them uniformly).
+    191, 192, 193,               // getxattr/lgetxattr/fgetxattr
+    188, 189, 190,               // setxattr/lsetxattr/fsetxattr
+    194, 195, 196,               // listxattr/llistxattr/flistxattr
+    197, 198, 199,               // removexattr/lremovexattr/fremovexattr
     // close(3) is intentionally NOT filtered: it fires constantly (every fd
     // teardown) and linuxity only uses it for fd->path bookkeeping, which is
     // non-essential (readlink recovers paths lazily). Trapping it would also

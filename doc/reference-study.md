@@ -95,6 +95,23 @@ coherent tiny pid namespace (which proot does NOT have — proot leaks host pids
    the guest lives in one tiny pid space (root == 1). **linuxity is already ahead
    of proot here.**
 
+9. **path-carrying syscall coverage** (proot's syscall-translation completeness
+   lesson) — DONE. proot translates a broad path-syscall table; any path
+   syscall it MISSES leaks the host FS. An audit of linuxity's dispatcher found
+   several common path-carriers falling through to the raw host-forward default:
+   `statfs`, `openat2` (the modern openat replacement glibc/toolchains prefer),
+   the whole `*xattr` family (get/set/list/remove + l* forms), and `chroot`.
+   These now route through path translation: statfs redirects to the overlay (or
+   synthesizes a tmpfs statfs for virtual /proc,/sys), openat2 reads its flags
+   from the guest `open_how` struct and drives the same redirect/inject core as
+   openat, xattr path variants redirect to the overlay upper, and a guest chroot
+   is accepted as a satisfied no-op (linuxity's namespace already confines).
+   CRITICAL companion fix: every newly-serviced number was added to the
+   seccomp trap filter (kTrappedX86_64) — a dispatcher case is dead unless the
+   filter also traps that number. Regression: tests/test_run_untranslated.cpp
+   (statfs(/proc)=tmpfs, openat2 reads the ROOTFS marker, no host leak), plus
+   real-rootfs `df -T /` -> rootfs and `stat -f /proc` -> tmpfs.
+
 ## Order of attack
 
 1. seccomp-BPF acceleration (perf — unlocks heavy workloads). ✓ DONE
@@ -102,3 +119,4 @@ coherent tiny pid namespace (which proot does NOT have — proot leaks host pids
 3. `--bind` flag over FileNamespace (ergonomics). ✓ DONE
 4. single-read file-header inspection + foreign-arch refusal (termux-exec). ✓ DONE
 5. host-resolv.conf DNS provisioning (proot-distro). ✓ DONE
+6. path-carrying syscall coverage: statfs/openat2/xattr/chroot + seccomp lock-step. ✓ DONE

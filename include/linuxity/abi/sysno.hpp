@@ -33,6 +33,24 @@ enum class Sysno {
     stat, lstat, fstat, newfstatat, statx, lseek, pread64, pwrite64,
     getdents64, readlink, readlinkat, getcwd, chdir, fchdir,
     access, faccessat, faccessat2, dup, dup2, dup3, fcntl,
+    // The modern openat replacement (glibc/systemd/newer toolchains prefer
+    // it). Its flags live in a `struct open_how` in guest memory, not a
+    // register, so it needs its own decode + a flags-from-struct read.
+    openat2,
+    // Filesystem statistics: statfs names a PATH (translate); fstatfs acts on
+    // an already-translated fd (forward is correct).
+    statfs, fstatfs,
+    // chroot: the guest would chroot the HOST child to an untranslated host
+    // path — accepted as a namespace no-op (path translation already confines).
+    chroot,
+    // Extended-attribute family. The *-path variants carry a guest path in
+    // arg0 that must be translated to the overlay host path; `f`-variants act
+    // on an already-open fd and forward. tar --xattrs / cp -a / setcap rely
+    // on these round-tripping against the ROOTFS, not the host.
+    getxattr, lgetxattr, fgetxattr,
+    setxattr, lsetxattr, fsetxattr,
+    listxattr, llistxattr, flistxattr,
+    removexattr, lremovexattr, fremovexattr,
     // Namespace / mount ops we own.
     mount, umount2, getpgrp, getppid, sysinfo, sched_getaffinity,
     // Time (virtualized to linuxity's own boot epoch + monotonic clock).
@@ -153,6 +171,22 @@ enum class Sysno {
                 case 141: return Sysno::setpriority;
                 case 332: return Sysno::statx;
                 case 439: return Sysno::faccessat2;
+                case 437: return Sysno::openat2;
+                case 137: return Sysno::statfs;
+                case 138: return Sysno::fstatfs;
+                case 161: return Sysno::chroot;
+                case 191: return Sysno::getxattr;
+                case 192: return Sysno::lgetxattr;
+                case 193: return Sysno::fgetxattr;
+                case 188: return Sysno::setxattr;
+                case 189: return Sysno::lsetxattr;
+                case 190: return Sysno::fsetxattr;
+                case 194: return Sysno::listxattr;
+                case 195: return Sysno::llistxattr;
+                case 196: return Sysno::flistxattr;
+                case 197: return Sysno::removexattr;
+                case 198: return Sysno::lremovexattr;
+                case 199: return Sysno::fremovexattr;
                 // -- namespace mutation (path args need translation) ------
                 case 83:  return Sysno::mkdir;
                 case 258: return Sysno::mkdirat;
@@ -241,6 +275,22 @@ enum class Sysno {
                 case 50:  return Sysno::fchdir;
                 case 48:  return Sysno::faccessat;
                 case 439: return Sysno::faccessat2;
+                case 437: return Sysno::openat2;
+                case 43:  return Sysno::statfs;
+                case 44:  return Sysno::fstatfs;
+                case 51:  return Sysno::chroot;
+                case 8:   return Sysno::getxattr;
+                case 9:   return Sysno::lgetxattr;
+                case 10:  return Sysno::fgetxattr;
+                case 5:   return Sysno::setxattr;
+                case 6:   return Sysno::lsetxattr;
+                case 7:   return Sysno::fsetxattr;
+                case 11:  return Sysno::listxattr;
+                case 12:  return Sysno::llistxattr;
+                case 13:  return Sysno::flistxattr;
+                case 14:  return Sysno::removexattr;
+                case 15:  return Sysno::lremovexattr;
+                case 16:  return Sysno::fremovexattr;
                 case 23:  return Sysno::dup;
                 case 24:  return Sysno::dup3;
                 case 25:  return Sysno::fcntl;
