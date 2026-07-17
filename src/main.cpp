@@ -123,6 +123,11 @@ int main(int argc, char** argv) {
     // reality. Flags may appear in any order before the program.
     std::string root;
     kernel::ResourceSpec res;
+    // --bind host[:guest] mounts a real host directory into the guest tree at
+    // `guest` (default: same path). Thin wrapper over FileNamespace::mount_host
+    // — exactly proot's -b / bubblewrap's --bind, but riding linuxity's own
+    // path-translation namespace (no privilege, no real mount(2)).
+    std::vector<std::pair<std::string, std::string>> binds;
     int i = 1;
     auto need = [&](const char* what) -> const char* {
         if (i + 1 >= argc) {
@@ -145,6 +150,23 @@ int main(int argc, char** argv) {
         }
         else if (f == "--pids")   { res.pids_max = std::strtoull(need("--pids"), nullptr, 10); }
         else if (f == "--cpuset") { res.cpuset = need("--cpuset"); }
+        else if (f == "--bind" || f == "-b") {
+            // host[:guest] — split on the LAST ':' so a Windows-free host path
+            // with no colon binds to itself; guest defaults to the host path.
+            std::string spec = need("--bind");
+            auto colon = spec.rfind(':');
+            std::string host = colon == std::string::npos ? spec
+                                                          : spec.substr(0, colon);
+            std::string guest = colon == std::string::npos ? spec
+                                                           : spec.substr(colon + 1);
+            if (host.empty() || guest.empty() || guest.front() != '/') {
+                std::fprintf(stderr,
+                    "linuxity: bad --bind '%s' (want host[:/guest-abs])\n",
+                    spec.c_str());
+                return 2;
+            }
+            binds.emplace_back(std::move(host), std::move(guest));
+        }
         else break;   // first non-flag: the program
     }
 
@@ -160,6 +182,8 @@ int main(int argc, char** argv) {
             "  --memory-swap <SZ>  combined memory+swap ceiling\n"
             "  --pids <N>          max tasks in the guest tree (fork-bomb guard)\n"
             "  --cpuset <LIST>     pin to CPUs (e.g. 0-1, 0,2,4)\n"
+            "  --bind host[:guest] expose a host dir in the guest tree\n"
+            "                      (guest defaults to the same path)\n"
             "\n"
             "  The resource bounds are enforced by the HOST kernel (cgroup v2,\n"
             "  or setrlimit where a cgroup can't be created unprivileged) and\n"
@@ -258,6 +282,19 @@ int main(int argc, char** argv) {
         k.files().mount_virtual("/proc", vfs::make_procfs(k.procs(), k.machine()));
         k.files().mount_virtual("/sys", vfs::make_sysfs(k.machine()));
         k.files().mount_virtual("/dev", vfs::make_devfs());
+    }
+
+    // --bind mounts: expose real host directories at guest prefixes. Registered
+    // AFTER the rootfs so a deeper/explicit bind wins by longest-prefix (e.g.
+    // --bind /home/me/proj:/proj shadows whatever /proj the rootfs had). These
+    // are host-backed and WRITABLE in place (no overlay) — the point of a bind
+    // is to share a live host directory with the guest, so writes land on the
+    // real host files, exactly like a bind mount.
+    for (auto& [host_dir, guest_at] : binds) {
+        std::string norm = kernel::FileNamespace::normalize(guest_at);
+        k.files().mount_host(norm, host_dir);
+        std::fprintf(stderr, "linuxity: bind %s -> %s\n",
+                     norm.c_str(), host_dir.c_str());
     }
 
     // The rootfs makes the translation unprivileged, so we no longer need to
