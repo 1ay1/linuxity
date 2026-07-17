@@ -8,6 +8,7 @@
 // our kernel.
 #include "linuxity/host/posix_host.hpp"
 #include "linuxity/kernel/kernel.hpp"
+#include "linuxity/loader/interp.hpp"
 #include "linuxity/runtime/ptrace_trap.hpp"
 #include "linuxity/runtime/trap.hpp"
 #include "linuxity/vfs/procfs.hpp"
@@ -115,7 +116,36 @@ int main(int argc, char** argv) {
         auto pc = k.files().classify(abs);
         if (pc.realm == kernel::Realm2::host_backed) exec_path = pc.host_path;
     }
-    runtime::PtraceTrap trap{exec_path, gargv, genvp, {}};
+
+    // A dynamically-linked guest names its interpreter (ld-linux / ld-musl) in
+    // PT_INTERP. The HOST kernel would resolve that path against the HOST root
+    // at execve time — where a guest rootfs's /lib/ld-musl-x86_64.so.1 does
+    // not exist, so the exec fails silently. Instead, read the interp, map it
+    // through linuxity's namespace to its real host location, and exec the
+    // INTERPRETER directly with the program as argv[1]. The loader then opens
+    // every shared library via ordinary (redirected) openat syscalls, all
+    // inside the rootfs — no chroot, no privilege. argv[0] stays the guest
+    // program name so the process sees itself correctly.
+    std::vector<std::string> child_argv = gargv;
+    if (std::string interp = loader::read_elf_interp(exec_path); !interp.empty()) {
+        std::string interp_abs = k.files().absolutize(interp);
+        auto ipc = k.files().classify(interp_abs);
+        std::string interp_host = interp;
+        if (ipc.realm == kernel::Realm2::host_backed) interp_host = ipc.host_path;
+        // ld.so <host-prog> <original-args...>; keep gargv[0] as argv[1] so the
+        // guest program's own argv[0] is preserved by the loader.
+        child_argv.clear();
+        child_argv.push_back(interp_host);   // the interpreter to exec (host path)
+        // The program the loader should open is named in the GUEST namespace:
+        // the loader's own openat on it is virtualized/redirected into the
+        // rootfs. Passing the host path would make linuxity re-translate it
+        // (rootfs-under-rootfs) and fail. Use the guest path the user named.
+        child_argv.push_back(k.files().absolutize(path));
+        for (std::size_t j = 1; j < gargv.size(); ++j)
+            child_argv.push_back(gargv[j]);  // the guest program's args
+        exec_path = interp_host;             // exec the interpreter itself
+    }
+    runtime::PtraceTrap trap{exec_path, child_argv, genvp, {}};
 
     // PtraceTrap is BOTH the trap backend and the guest-memory accessor
     // (it shares the child's real pages via process_vm_readv/writev).
