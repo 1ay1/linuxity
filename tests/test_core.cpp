@@ -72,8 +72,15 @@ int main() {
     auto o = sys.dispatch(e);
     assert(o.exited && o.exit_code == 7);
 
-    abi::Regs u; u.nr = 424242; // no such syscall
-    assert(sys.dispatch(u).ret == -int(Errno::enosys));
+    // An unrecognized/real syscall is FORWARDED to the host kernel (the
+    // dispatcher only virtualizes identity/lifecycle; everything else runs
+    // natively in the guest). So we get forward=true, not ENOSYS.
+    abi::Regs u; u.nr = 424242;
+    assert(sys.dispatch(u).forward);
+
+    // getuid is virtualized to root (0).
+    abi::Regs g; g.nr = 102; // x86-64 getuid
+    assert(sys.dispatch(g).ret == 0 && !sys.dispatch(g).forward);
 
     std::puts("all runtime type-algebra tests passed");
     return 0;

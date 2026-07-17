@@ -1,18 +1,23 @@
 // linuxity/runtime/ptrace_trap.hpp
 //
-// A real, native-execution SyscallTrap backend using ptrace(PTRACE_SYSEMU).
+// A real, native-execution SyscallTrap backend using ptrace.
 //
-// This is the proof that the model works: the traced child executes its own
-// instructions DIRECTLY on the host CPU at native speed. PTRACE_SYSEMU makes
-// the kernel stop the child at every syscall entry WITHOUT executing it, hand
-// us the register file, and wait — so *we* become the kernel for that child.
-// We decode the registers into abi::Regs, and the runtime's subsystems
-// service the call; we write the result into RAX and continue. Ordinary
-// instructions never trap: only syscalls pay the stop/continue cost.
+// The traced child executes its own instructions DIRECTLY on the host CPU at
+// native speed. Its syscalls stop back into us at syscall-entry; for each we
+// choose one of two fates:
 //
-// This backend runs on Linux/x86-64 hosts. It models runtime::SyscallTrap,
-// so runtime::Cpu drives it unchanged — the same loop that would drive a
-// seccomp+SIGSYS or in-process backend.
+//   * VIRTUALIZE — we service it from linuxity's subsystems and skip the real
+//     syscall (getpid, uname, our identity/credential world). Implemented by
+//     rewriting the syscall number to -1 (invalid) so the host kernel runs a
+//     no-op, then overwriting the return register with our value.
+//
+//   * FORWARD — we let the real host kernel run it IN THE CHILD (mmap, brk,
+//     mprotect, and — for now — file I/O against a mounted rootfs). This is
+//     how the child gets real pages in its own address space and how native
+//     libc reaches main(). We observe the result on syscall-exit.
+//
+// Ordinary instructions never trap; only syscalls pay a stop/continue. This
+// models runtime::SyscallTrap (+ abi::GuestMem via process_vm_*).
 #pragma once
 
 #include "linuxity/abi/syscall.hpp"
@@ -30,75 +35,100 @@
 
 namespace lx::runtime {
 
-// Executes a real host binary as the guest, trapping its syscalls. (For the
-// bring-up demo we exec a real static ELF so libc/_start run natively; the
-// in-tree Loader path replaces exec once the in-process trampoline lands.)
 class PtraceTrap {
 public:
-    // `path` + `argv` name the guest program; it is exec'd under the tracer.
-    PtraceTrap(std::string path, std::vector<std::string> argv)
-        : path_{std::move(path)}, argv_{std::move(argv)} {}
+    PtraceTrap(std::string path, std::vector<std::string> argv,
+               std::vector<std::string> envp = {}, std::string root = {})
+        : path_{std::move(path)}, argv_{std::move(argv)},
+          envp_{std::move(envp)}, root_{std::move(root)} {}
 
     [[nodiscard]] Status start(UAddr /*entry*/, UAddr /*sp*/) {
         pid_ = ::fork();
         if (pid_ < 0) return err(Errno::eagain);
         if (pid_ == 0) {
-            // -- child: become traceable, then exec the guest natively. ---
+            // Optionally enter the guest rootfs (needs privilege; if it
+            // fails we run against the host fs, still useful for bring-up).
+            if (!root_.empty()) {
+                if (::chroot(root_.c_str()) == 0) (void)::chdir("/");
+            }
             ::ptrace(PTRACE_TRACEME, 0, nullptr, nullptr);
             std::vector<char*> cargv;
             for (auto& a : argv_) cargv.push_back(a.data());
             cargv.push_back(nullptr);
-            char* envp[] = {nullptr};
-            ::execve(path_.c_str(), cargv.data(), envp);
-            ::_exit(127); // exec failed
+            std::vector<char*> cenvp;
+            for (auto& e : envp_) cenvp.push_back(e.data());
+            cenvp.push_back(nullptr);
+            ::execve(path_.c_str(), cargv.data(), cenvp.data());
+            ::_exit(127);
         }
-        // -- parent: wait for the initial exec-stop. ----------------------
         int st = 0;
         ::waitpid(pid_, &st, 0);
-        // Use SYSEMU so syscalls are trapped and NOT run by the host kernel.
         ::ptrace(PTRACE_SETOPTIONS, pid_, 0, PTRACE_O_EXITKILL);
-        armed_ = true;
         return ok();
     }
 
-    // Advance to the next syscall-entry stop. Fills `f` with the guest regs.
-    // Returns false when the guest exits.
+    // Advance to the next syscall-ENTRY stop and fill `f`. Returns false on
+    // guest exit. We stop at every syscall so the dispatcher can decide its
+    // fate; the actual execution is controlled by resume()/forward().
     [[nodiscard]] Result<bool> next(TrapFrame& f) {
-        // Ask the kernel to stop the child at the next syscall entry, but
-        // NOT execute the syscall (SYSEMU) — we will service it ourselves.
-        if (::ptrace(PTRACE_SYSEMU, pid_, 0, 0) < 0) return err<bool>(Errno::esrch);
-        int st = 0;
-        ::waitpid(pid_, &st, 0);
-        if (WIFEXITED(st)) { exit_code_ = WEXITSTATUS(st); return ok(false); }
-        if (WIFSIGNALED(st)) { exit_code_ = 128 + WTERMSIG(st); return ok(false); }
+        if (!at_entry_) {
+            if (::ptrace(PTRACE_SYSCALL, pid_, 0, 0) < 0) return err<bool>(Errno::esrch);
+            int st = 0;
+            ::waitpid(pid_, &st, 0);
+            if (WIFEXITED(st)) { exit_code_ = WEXITSTATUS(st); return ok(false); }
+            if (WIFSIGNALED(st)) { exit_code_ = 128 + WTERMSIG(st); return ok(false); }
+        }
+        at_entry_ = false;
 
-        struct user_regs_struct r{};
-        ::ptrace(PTRACE_GETREGS, pid_, 0, &r);
-        // x86-64 Linux syscall ABI: nr=rax, args=rdi,rsi,rdx,r10,r8,r9.
-        f.regs.nr     = r.orig_rax;
-        f.regs.arg[0] = r.rdi;
-        f.regs.arg[1] = r.rsi;
-        f.regs.arg[2] = r.rdx;
-        f.regs.arg[3] = r.r10;
-        f.regs.arg[4] = r.r8;
-        f.regs.arg[5] = r.r9;
-        f.pc          = r.rip;
-        last_ = r;
+        ::ptrace(PTRACE_GETREGS, pid_, 0, &last_);
+        f.regs.nr     = last_.orig_rax;
+        f.regs.arg[0] = last_.rdi;
+        f.regs.arg[1] = last_.rsi;
+        f.regs.arg[2] = last_.rdx;
+        f.regs.arg[3] = last_.r10;
+        f.regs.arg[4] = last_.r8;
+        f.regs.arg[5] = last_.r9;
+        f.pc          = last_.rip;
         return ok(true);
     }
 
-    // Write the syscall's return value into RAX and let the guest resume.
+    // VIRTUALIZE: neutralize the real syscall (set nr = -1 so the kernel
+    // rejects it as ENOSYS harmlessly), then write our return value at exit.
     [[nodiscard]] Status resume(std::int64_t ret) {
-        last_.rax = static_cast<unsigned long long>(ret);
-        ::ptrace(PTRACE_SETREGS, pid_, 0, &last_);
+        struct user_regs_struct r = last_;
+        r.orig_rax = static_cast<unsigned long long>(-1); // no real syscall
+        ::ptrace(PTRACE_SETREGS, pid_, 0, &r);
+        // Step over the (neutralized) syscall to its exit stop.
+        int st = 0;
+        ::ptrace(PTRACE_SYSCALL, pid_, 0, 0);
+        ::waitpid(pid_, &st, 0);
+        if (WIFEXITED(st)) { exit_code_ = WEXITSTATUS(st); exited_ = true; return ok(); }
+        // Overwrite the return register with linuxity's answer.
+        ::ptrace(PTRACE_GETREGS, pid_, 0, &r);
+        r.rax = static_cast<unsigned long long>(ret);
+        ::ptrace(PTRACE_SETREGS, pid_, 0, &r);
         return ok();
     }
 
+    // FORWARD: let the real host kernel execute this syscall in the child,
+    // then return the kernel's own result. Used for mmap/brk/mprotect (and,
+    // during bring-up, file I/O against the real rootfs).
+    [[nodiscard]] Result<std::int64_t> forward() {
+        int st = 0;
+        // Run the real syscall (regs already hold the original orig_rax).
+        ::ptrace(PTRACE_SYSCALL, pid_, 0, 0);
+        ::waitpid(pid_, &st, 0);
+        if (WIFEXITED(st)) { exit_code_ = WEXITSTATUS(st); exited_ = true;
+                             return ok(std::int64_t{0}); }
+        struct user_regs_struct r{};
+        ::ptrace(PTRACE_GETREGS, pid_, 0, &r);
+        return ok(static_cast<std::int64_t>(r.rax));
+    }
+
+    [[nodiscard]] bool exited() const noexcept { return exited_; }
     [[nodiscard]] int exit_code() const noexcept { return exit_code_; }
 
-    // -- GuestMem: share the child's real address space via process_vm_*. --
-    // The child's pages ARE the guest memory; we read/write them directly,
-    // no translation table needed (ptrace model). This models abi::GuestMem.
+    // -- GuestMem: the child's pages ARE the guest memory. -----------------
     [[nodiscard]] Status copy_in(UAddr src, std::span<std::byte> dst) const {
         ::iovec local{dst.data(), dst.size()};
         ::iovec remote{reinterpret_cast<void*>(value(src)), dst.size()};
@@ -115,9 +145,12 @@ public:
 private:
     std::string path_;
     std::vector<std::string> argv_;
+    std::vector<std::string> envp_;
+    std::string root_;
     ::pid_t pid_{-1};
-    bool armed_{false};
     int exit_code_{0};
+    bool exited_{false};
+    bool at_entry_{false};
     struct user_regs_struct last_{};
 };
 

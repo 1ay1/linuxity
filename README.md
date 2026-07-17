@@ -73,30 +73,49 @@ cmake --build build
 ctest --test-dir build
 
 # run a NATIVE Linux binary under the runtime (native speed, no VM):
-./build/linuxity /path/to/static-binary [args...]
+./build/linuxity /path/to/binary [args...]
+
+# ...including real distro binaries with the dynamic linker:
+./build/linuxity /usr/bin/uname -a
+#   -> Linux linuxity 6.6.0-linuxity #1 linuxity portable Linux ABI x86_64
+./build/linuxity /usr/bin/id
+#   -> uid=0(root) gid=0(root) ...      (identity VIRTUALIZED by linuxity)
+
+# mount an extracted distro rootfs as the guest '/':
+./build/linuxity --root ./alpine-rootfs /bin/sh
 ```
 
 Requires a C++23 compiler (`std::expected`, concepts). Tested with GCC 16.
-Native execution currently uses a `ptrace(PTRACE_SYSEMU)` trap backend on
-Linux/x86-64: the guest runs its own instructions on the CPU and only its
-syscalls stop back into linuxity.
+Native execution uses a `ptrace` trap backend on Linux/x86-64: the guest runs
+its own instructions on the CPU; each syscall is either **virtualized** by
+linuxity's subsystems or **forwarded** to the host kernel acting on the guest.
 
 ## Status
 
-**A real native x86-64 ELF runs under the runtime today** — its instructions
-execute directly on the CPU and its `write`/`exit_group`/... syscalls are
-serviced by linuxity's subsystems (see `tests/run_native`). In place and
-proven by tests:
+**Real native Linux binaries — including dynamically-linked distro programs —
+run under the runtime today.** `/bin/echo`, `/usr/bin/id`, `/usr/bin/uname`,
+`date` all execute natively on the CPU while linuxity services their
+syscalls. Two proofs of the model:
+
+- `uname -a` reports **`Linux linuxity 6.6.0-linuxity`** (not the host
+  kernel) — we intercept `uname`, synthesize linuxity's identity, and
+  `copy_out` into the guest buffer.
+- `id` / `whoami` report **`uid=0(root)`** — our virtualized `getuid`/`getgid`
+  return the virtual world's root, not the host user.
+
+Memory (`mmap`/`brk`/`mprotect`) and host-resource syscalls are forwarded so
+native libc and the dynamic linker reach `main()`; identity, credentials,
+lifecycle, and `uname` are virtualized. In place and proven by tests:
 
 - the type algebra, subsystem concept lattice, and authority boundary;
-- a real **VFS** (mount table, path resolution) with a **tmpfs** backend and
-  a **HostFs** backend that mounts a real on-disk rootfs directory as `/`;
-- an **ELF64 loader** (PT_LOAD mapping, .bss zero-fill, PT_INTERP detection)
-  into a typed guest **address space**, plus SysV AMD64 **stack/auxv** init;
-- an arch-neutral **syscall dispatcher** (per-arch number tables decode to a
-  canonical `Sysno`) driven by a concept-based **trap** loop.
+- a real **VFS** (mount table, path resolution) with **tmpfs** and a
+  **HostFs** backend that mounts a real on-disk rootfs directory as `/`;
+- an **ELF64 loader** (PT_LOAD, .bss zero-fill, PT_INTERP) into a typed guest
+  **address space**, plus SysV AMD64 **stack/auxv** init;
+- an arch-neutral **syscall dispatcher** (per-arch tables → canonical `Sysno`)
+  with a **virtualize-vs-forward** classifier, driven by a concept-based
+  **trap** loop and a real `ptrace` backend.
 
-The road ahead: a writable overlay + procfs/sysfs backends, `mmap`/`brk`
-backed by the guest address space under SYSEMU, the dynamic-linker path
-(`ld-linux`), then clone/futex/epoll — enough to reach a shell from a real
-distro rootfs. The architecture they slot into is fixed and machine-checked.
+The road ahead: virtualize the file path through the VFS (so `--root` needs
+no privilege and `/proc` is synthesized), then clone/futex/epoll and a shell
+from a pristine distro rootfs. The architecture is fixed and machine-checked.
