@@ -9,3 +9,7 @@ add_test(NAME authority COMMAND test_authority)
 add_executable(test_vfs test_vfs.cpp)
 target_link_libraries(test_vfs PRIVATE linuxity_core)
 add_test(NAME vfs COMMAND test_vfs)
+
+add_executable(test_hostfs test_hostfs.cpp)
+target_link_libraries(test_hostfs PRIVATE linuxity_core)
+add_test(NAME hostfs COMMAND test_hostfs)

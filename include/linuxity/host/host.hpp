@@ -19,6 +19,8 @@
 #include <concepts>
 #include <cstddef>
 #include <span>
+#include <string>
+#include <vector>
 
 namespace lx::host {
 
@@ -55,6 +57,39 @@ concept Host = requires(H h, std::size_t n, void* p, Nanos t,
     { h.write(0, std::span<const std::byte>{}) }
                                 -> std::same_as<Result<std::size_t>>;
     { h.close(0) }              -> std::same_as<Status>;
+};
+
+// -- Host path access (an OPTIONAL capability) -----------------------------
+// The base Host contract is deliberately fd-only. HostFs — the backend that
+// exposes a real on-disk rootfs directory as the guest's "/" — additionally
+// needs to open host paths and enumerate host directories. We express that
+// as a SEPARATE concept so the core stays minimal: a host that can't touch
+// the filesystem (a pure-sandbox iOS build) simply doesn't model HostFiles,
+// and HostFs won't compile against it — the type system states the dependency.
+
+enum class HFileType : std::uint8_t { regular, directory, symlink, other };
+
+struct HStat {
+    HFileType type{HFileType::regular};
+    std::uint64_t size{};
+    std::uint32_t mode{};   // host permission bits (st_mode & 0777)
+    std::uint64_t mtime_ns{};
+};
+
+struct HDirent {
+    std::string name;
+    HFileType   type{};
+};
+
+template <class H>
+concept HostFiles = Host<H> &&
+    requires(H h, const char* path, int hfd, std::uint64_t off,
+             std::span<std::byte> buf) {
+    // Open a host path read-only; returns an opaque host fd (>=0).
+    { h.open_path(path) }       -> std::same_as<Result<int>>;
+    { h.stat_path(path) }       -> std::same_as<Result<HStat>>;
+    { h.pread(hfd, off, buf) }  -> std::same_as<Result<std::size_t>>;
+    { h.list_dir(path) }        -> std::same_as<Result<std::vector<HDirent>>>;
 };
 
 } // namespace lx::host
