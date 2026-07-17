@@ -156,6 +156,13 @@ linuxity services their syscalls. Proofs of the model:
   programs are rewritten the same way — so a shell spawns real coreutils.
   `uname -a` reports linuxity, `cat /etc/alpine-release` reads the real distro
   file, `id` is root, a pipeline of 82 busybox applets counts correctly.
+- **The guest sees a root-owned world.** A rootfs unpacked by an unprivileged
+  user is owned on disk by *that* user, and a host-backed `stat` is redirected,
+  so the host kernel fills the guest buffer with the host owner. linuxity
+  scrubs the owner fields to `0` in the same stopped syscall-exit window (a
+  post-redirect hook, before the task can read the buffer and race the write),
+  so `ls -la` shows **`root root`** for every entry and a monitor's USER column
+  reads `root` — the world is coherently owned by init, not the box's user.
 
 ### How the filesystem is virtualized
 
@@ -182,7 +189,9 @@ Every path-taking syscall (`openat`, `newfstatat`, `statx`, `access`,
 cmdline,filesystems,mounts,sys/...}` plus the per-process tree
 `/proc/<pid>/{stat,statm,status,cmdline,comm,io,maps,task/<tid>/...}`, all
 generated from linuxity's **process table** (pid 1 = init, uid 0, its own
-numbers). `/sys` is synthesized too — CPU topology (`devices/system/cpu`,
+numbers). Host-backed `stat`/`statx` are redirected but their **owner fields
+are scrubbed to `0`** afterwards, so a rootfs unpacked by an unprivileged user
+still presents as root-owned. `/sys` is synthesized too — CPU topology (`devices/system/cpu`,
 `cpufreq/policyN/scaling_cur_freq`), `hwmon` temperatures, one virtual block
 device, cgroup v2 stubs — so a hardware monitor discovers linuxity's virtual
 machine, not the box it runs on. That is why a process/hardware monitor shows
@@ -204,7 +213,7 @@ the host filesystem.
 Memory (`mmap`/`brk`/`mprotect`) stays forwarded so native libc reaches
 `main()`; identity, credentials, lifecycle, `uname`, **signal delivery**,
 **per-task pid/session identity**, **`/proc` symlinks**, and now the **whole
-file path** are virtualized. In place and proven by 12 test suites:
+file path** are virtualized. In place and proven by 13 test suites:
 
 - the type algebra, subsystem concept lattice, and authority boundary;
 - a real **VFS** (mount table, path resolution) with **tmpfs** and a
