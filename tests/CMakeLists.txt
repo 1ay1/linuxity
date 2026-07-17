@@ -58,6 +58,10 @@ add_executable(test_run_mutate test_run_mutate.cpp)
 target_link_libraries(test_run_mutate PRIVATE linuxity_core)
 add_test(NAME run_mutate COMMAND test_run_mutate)
 
+add_executable(test_run_dev test_run_dev.cpp)
+target_link_libraries(test_run_dev PRIVATE linuxity_core)
+add_test(NAME run_dev COMMAND test_run_dev)
+
 add_executable(test_resources test_resources.cpp)
 target_link_libraries(test_resources PRIVATE linuxity_core)
 add_test(NAME resources COMMAND test_resources)

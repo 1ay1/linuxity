@@ -69,6 +69,22 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
         const auto& release = mach.release;
         const auto& nodename= mach.nodename;
 
+        // ---- /proc/self/fd/N -> the guest's REAL host fd ----------------
+        // /dev/stdout, /dev/stdin and any dup-via-path go through here. The
+        // guest is a genuine host process, so the host kernel's own
+        // /proc/self/fd/N (resolved in the guest's context) IS the guest's
+        // fd N. Redirect to that literal host path so a write to /dev/stdout
+        // reaches the real fd 1. (Enumerating the fd DIRECTORY is left to the
+        // native host procfs via the same redirect.)
+        {
+            std::string q{abs};
+            if (q == "/proc/self/fd" || q.starts_with("/proc/self/fd/") ||
+                q == "/proc/thread-self/fd" || q.starts_with("/proc/thread-self/fd/")) {
+                kernel::VirtualFile vf; vf.redirect_host = std::move(q);
+                return ok(std::move(vf));
+            }
+        }
+
         // ---- /proc/self -> /proc/<pid 1> canonicalization ---------------
         std::string p{abs};
         // Our "self" is always pid 1 (the traced root / init).

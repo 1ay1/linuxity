@@ -512,8 +512,13 @@ private:
             o.host_path = std::move(pc.host_path);
             return o;
         }
-        if (pc.realm == kernel::Realm2::virtual_file)
-            return eno(Errno::einval);   // a virtual file is not a symlink
+        if (pc.realm == kernel::Realm2::virtual_file) {
+            // A synthesized symlink (e.g. /dev/stdin -> /proc/self/fd/0)
+            // carries its target in the produced node; serve it directly.
+            if (auto vf = k_.files().produce(abs); vf && !vf->symlink_target.empty())
+                return write_link(buf, cap, vf->symlink_target);
+            return eno(Errno::einval);   // a plain virtual file is not a symlink
+        }
         return eno(pc.error);
     }
 

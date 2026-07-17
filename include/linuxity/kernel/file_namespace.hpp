@@ -58,6 +58,19 @@ struct VirtualFile {
     std::vector<std::byte> bytes;
     bool is_dir{false};
     std::vector<VirtualDirent> entries;   // populated when is_dir
+
+    // A virtual node that is REALLY a host device/file: when set, classify()
+    // resolves this path to `redirect_host` in the HOST-BACKED realm instead
+    // of injecting bytes. This is how /dev/null, /dev/urandom, /dev/zero get
+    // TRUE character-device semantics — the guest ends up with a real host
+    // fd on the actual device node (endless sink/source, native mmap), not a
+    // frozen memfd snapshot. The producer still owns stat/getdents for the
+    // node, but open/read/write/mmap ride the real device.
+    std::string redirect_host;
+
+    // A virtual SYMLINK: its readlink(2) contents. Guest-absolute targets
+    // (e.g. /dev/stdin -> /proc/self/fd/0) resolve through OUR namespace.
+    std::string symlink_target;
 };
 
 // The filesystem namespace. Backends register two kinds of mounts:
@@ -131,6 +144,12 @@ public:
         if (m->producer) {
             auto vf = m->producer(abs);
             if (!vf) return PathClass{Realm2::absent, {}, vf.error()};
+            // A device node backed by a real host device (/dev/null, ...):
+            // resolve to the host path so open/read/write/mmap ride the true
+            // character device with native semantics.
+            if (!vf->redirect_host.empty())
+                return PathClass{Realm2::host_backed,
+                                 std::move(vf->redirect_host), Errno::enoent};
             return PathClass{Realm2::virtual_file, {}, Errno::enoent};
         }
         std::string_view rel = abs;

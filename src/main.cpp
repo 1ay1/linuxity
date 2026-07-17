@@ -13,6 +13,7 @@
 #include "linuxity/runtime/ptrace_trap.hpp"
 #include "linuxity/runtime/resource_governor.hpp"
 #include "linuxity/runtime/trap.hpp"
+#include "linuxity/vfs/devfs.hpp"
 #include "linuxity/vfs/procfs.hpp"
 #include "linuxity/vfs/sysfs.hpp"
 
@@ -221,6 +222,7 @@ int main(int argc, char** argv) {
         k.files().mount_host("/", root, upper);
         k.files().mount_virtual("/proc", vfs::make_procfs(k.procs(), k.machine()));
         k.files().mount_virtual("/sys", vfs::make_sysfs(k.machine()));
+        k.files().mount_virtual("/dev", vfs::make_devfs());
     } else {
         // No rootfs: the guest lives in the real host tree (paths translate
         // 1:1), but /proc and /sys are STILL synthesized so uname/pid/mounts
@@ -228,6 +230,7 @@ int main(int argc, char** argv) {
         k.files().mount_host("/", "/");
         k.files().mount_virtual("/proc", vfs::make_procfs(k.procs(), k.machine()));
         k.files().mount_virtual("/sys", vfs::make_sysfs(k.machine()));
+        k.files().mount_virtual("/dev", vfs::make_devfs());
     }
 
     // The rootfs makes the translation unprivileged, so we no longer need to
