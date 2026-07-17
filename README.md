@@ -59,8 +59,8 @@ JIT-backed kernel — with no virtual dispatch in the hot path.
 ## Layout
 
 - `include/linuxity/abi/`    — `result.hpp`, `types.hpp`, `syscall.hpp`
-- `include/linuxity/kernel/` — `subsystem.hpp` (concepts), `authority.hpp` (the host-authority boundary), `kernel.hpp`
-- `include/linuxity/vfs/`    — `inode.hpp` (FileSystem concept), `tmpfs.hpp` (in-memory backend), `vfs.hpp` (mount table + path resolution)
+- `include/linuxity/kernel/` — `subsystem.hpp` (concepts), `authority.hpp` (the host-authority boundary), `file_namespace.hpp` (mount table + cwd + fd table + realm classifier), `kernel.hpp`
+- `include/linuxity/vfs/`    — `inode.hpp` (FileSystem concept), `tmpfs.hpp` (in-memory backend), `hostfs.hpp` (on-disk rootfs backend), `procfs.hpp` (synthesized /proc), `vfs.hpp` (mount table + path resolution)
 - `include/linuxity/host/`   — `host.hpp` (the concept), `posix_host.hpp` (Linux/Darwin backend)
 - `src/main.cpp`             — wires host → kernel → ABI, issues guest syscalls
 - `tests/`                   — host-free type-algebra, authority, and VFS tests
@@ -81,8 +81,16 @@ ctest --test-dir build
 ./build/linuxity /usr/bin/id
 #   -> uid=0(root) gid=0(root) ...      (identity VIRTUALIZED by linuxity)
 
-# mount an extracted distro rootfs as the guest '/':
+# mount an extracted distro rootfs as the guest '/' (UNPRIVILEGED — no
+# chroot, no root): every guest path is translated to the real host path
+# under the rootfs before the syscall runs; /proc is synthesized.
 ./build/linuxity --root ./alpine-rootfs /bin/sh
+
+# proof the guest lives in the rootfs, not the host:
+./build/linuxity --root ./my-rootfs /bin/cat /etc/os-release
+#   -> the ROOTFS os-release, even though the host's is different
+./build/linuxity /bin/cat /proc/version
+#   -> Linux version 6.6.0-linuxity (linuxity@linuxity) ...  (SYNTHESIZED)
 ```
 
 Requires a C++23 compiler (`std::expected`, concepts). Tested with GCC 16.
@@ -93,29 +101,54 @@ linuxity's subsystems or **forwarded** to the host kernel acting on the guest.
 ## Status
 
 **Real native Linux binaries — including dynamically-linked distro programs —
-run under the runtime today.** `/bin/echo`, `/usr/bin/id`, `/usr/bin/uname`,
-`date` all execute natively on the CPU while linuxity services their
-syscalls. Two proofs of the model:
+run under the runtime today, and the guest's ENTIRE filesystem view is now
+linuxity's own virtual namespace.** `/bin/echo`, `/usr/bin/id`,
+`/usr/bin/uname`, `date`, `cat` all execute natively on the CPU while
+linuxity services their syscalls. Proofs of the model:
 
 - `uname -a` reports **`Linux linuxity 6.6.0-linuxity`** (not the host
   kernel) — we intercept `uname`, synthesize linuxity's identity, and
   `copy_out` into the guest buffer.
-- `id` / `whoami` report **`uid=0(root)`** — our virtualized `getuid`/`getgid`
-  return the virtual world's root, not the host user.
+- `id` / `whoami` report **`uid=0(root)`** — virtualized `getuid`/`getgid`
+  return the virtual world's root.
+- `cat /proc/version` reports **`Linux version 6.6.0-linuxity`**,
+  `/proc/self/status` reports **`Pid: 1`, `Uid: 0`**, `/proc/mounts` reports
+  **linuxity's** mount table — `/proc` is fully **synthesized**, not the host's.
+- `--root <rootfs> /bin/cat /etc/os-release` reads the **rootfs** file, not
+  the host's — and needs **no privilege and no chroot**.
 
-Memory (`mmap`/`brk`/`mprotect`) and host-resource syscalls are forwarded so
-native libc and the dynamic linker reach `main()`; identity, credentials,
-lifecycle, and `uname` are virtualized. In place and proven by tests:
+### How the filesystem is virtualized
+
+Every path-taking syscall (`openat`, `newfstatat`, `statx`, `access`,
+`readlinkat`, `chdir`, `getcwd`, …) is resolved through a **`FileNamespace`**
+— a mount table + guest cwd + guest-fd table — and classified into one realm:
+
+- **host-backed** (a rootfs mount): the guest path is translated to the real
+  host path under the rootfs, and the syscall is **redirected** (its path
+  register is rewritten in the child, then forwarded). Because the child ends
+  up with a real host fd, native `ld.so` `mmap`s the actual library file —
+  this is what carries a dynamically-linked distro binary to `main()`.
+- **virtual** (`/proc`, and future `/sys`, tmpfs, overlays): the bytes are
+  synthesized and either written straight into guest memory (`read`/`stat`) or
+  materialized into a real fd the child can read *and* `mmap` (**inject**).
+
+So the guest never sees the host tree: `--root` makes `/` the rootfs and
+`/proc` reports linuxity's world — all with zero privilege, no VM, no chroot.
+
+Memory (`mmap`/`brk`/`mprotect`) stays forwarded so native libc reaches
+`main()`; identity, credentials, lifecycle, `uname`, and now the **whole file
+path** are virtualized. In place and proven by 8 test suites:
 
 - the type algebra, subsystem concept lattice, and authority boundary;
 - a real **VFS** (mount table, path resolution) with **tmpfs** and a
-  **HostFs** backend that mounts a real on-disk rootfs directory as `/`;
+  **HostFs** backend, plus the **`FileNamespace`** the syscall path routes
+  through and a synthesized **procfs**;
 - an **ELF64 loader** (PT_LOAD, .bss zero-fill, PT_INTERP) into a typed guest
   **address space**, plus SysV AMD64 **stack/auxv** init;
 - an arch-neutral **syscall dispatcher** (per-arch tables → canonical `Sysno`)
-  with a **virtualize-vs-forward** classifier, driven by a concept-based
-  **trap** loop and a real `ptrace` backend.
+  with a **virtualize / forward / redirect / inject** classifier, driven by a
+  concept-based **trap** loop and a real `ptrace` backend.
 
-The road ahead: virtualize the file path through the VFS (so `--root` needs
-no privilege and `/proc` is synthesized), then clone/futex/epoll and a shell
-from a pristine distro rootfs. The architecture is fixed and machine-checked.
+The road ahead: a writable overlay (tmpfs upper over the rootfs), `getdents64`
+synthesis for virtual dirs, then `clone`/`futex`/`epoll` and a shell from a
+pristine distro rootfs. The architecture is fixed and machine-checked.

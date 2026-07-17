@@ -17,6 +17,7 @@
 
 #include "linuxity/abi/result.hpp"
 #include "linuxity/abi/types.hpp"
+#include "linuxity/kernel/file_namespace.hpp"
 
 #include <concepts>
 #include <cstddef>
@@ -46,6 +47,9 @@ concept Vfs = requires(V v, std::string_view path, Fd fd,
     { v.read(fd, rbuf) }     -> std::same_as<Result<std::size_t>>;
     { v.write(fd, wbuf) }    -> std::same_as<Result<std::size_t>>;
     { v.close(fd) }          -> std::same_as<Status>;
+    // The guest's filesystem namespace (mount table + cwd + fd table). The
+    // syscall path routes every path-taking call through it.
+    { v.files() }            -> std::same_as<FileNamespace&>;
 };
 
 // -- Process ---------------------------------------------------------------

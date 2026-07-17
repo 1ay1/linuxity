@@ -32,6 +32,11 @@
 
 #include <concepts>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
+#include <unistd.h>
 
 namespace lx::runtime {
 
@@ -62,6 +67,9 @@ concept SyscallTrap = requires(T t, TrapFrame& f, std::int64_t ret) {
     // FORWARD: let the real host kernel run this syscall in the guest and
     // return its result. For mmap/brk/mprotect and host-backed I/O.
     { t.forward() }               -> std::same_as<Result<std::int64_t>>;
+    // REDIRECT: rewrite a char* path argument to a translated host path, then
+    // forward. Carries the guest's virtual namespace onto real host files.
+    { t.redirect(0, std::string{}) } -> std::same_as<Result<std::int64_t>>;
     // Whether the guest exited during the last resume()/forward().
     { t.exited() }                -> std::same_as<bool>;
     // The guest's exit status once it has exited.
@@ -89,9 +97,32 @@ public:
             // The dispatcher classifies the trapped syscall: service it from
             // our subsystems, forward it to the host kernel, or exit.
             abi::Outcome o = sys.dispatch(f.regs);
+            if (const char* t = std::getenv("LINUXITY_TRACE"); t && *t) {
+                std::fprintf(stderr, "[lx] nr=%llu -> %s%s%s%s ret=%lld\n",
+                    static_cast<unsigned long long>(f.regs.nr),
+                    o.inject?"INJECT ":"", o.redirect?"REDIRECT ":"",
+                    o.forward?"FORWARD ":"", o.exited?"EXIT ":"VIRT ",
+                    static_cast<long long>(o.ret));
+            }
             if (o.exited) return ok(o.exit_code);
 
-            if (o.forward) {
+            if (o.inject) {
+                // A purely virtual file: materialize its bytes into a real
+                // host temp file, then redirect the open at it so the child
+                // gets a real, mmappable fd. The temp file is unlinked once
+                // opened (the fd keeps it alive), so nothing leaks into the
+                // guest's namespace.
+                std::string tmp = materialize(o.content);
+                auto fd = LX_TRY(trap_.redirect(o.path_arg ? o.path_arg : 1, tmp));
+                if (!tmp.empty()) std::remove(tmp.c_str());
+                sys.note_opened_fd(fd);
+            } else if (o.redirect) {
+                // Host-backed path: rewrite the arg to the real host path and
+                // let the kernel run it in the child (real fd for mmap). The
+                // kernel's result already sits in the guest return register.
+                auto ret = LX_TRY(trap_.redirect(o.path_arg, o.host_path));
+                sys.note_opened_fd(ret);
+            } else if (o.forward) {
                 // Let the host kernel run it IN the guest (mmap/brk/...).
                 (void)LX_TRY(trap_.forward());
             } else {
@@ -103,6 +134,22 @@ public:
     }
 
 private:
+    // Write bytes to a fresh host temp file, return its path ("" on failure).
+    // Used to back an INJECT (virtual file) with a real, mmappable fd.
+    static std::string materialize(const std::vector<std::byte>& bytes) {
+        char tmpl[] = "/tmp/linuxity-vfile-XXXXXX";
+        int fd = ::mkstemp(tmpl);
+        if (fd < 0) return {};
+        std::size_t off = 0;
+        while (off < bytes.size()) {
+            auto n = ::write(fd, bytes.data() + off, bytes.size() - off);
+            if (n <= 0) break;
+            off += static_cast<std::size_t>(n);
+        }
+        ::close(fd);
+        return std::string{tmpl};
+    }
+
     T& trap_;
     K& kernel_;
     M& mem_;

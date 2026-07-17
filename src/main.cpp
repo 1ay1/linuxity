@@ -10,6 +10,7 @@
 #include "linuxity/kernel/kernel.hpp"
 #include "linuxity/runtime/ptrace_trap.hpp"
 #include "linuxity/runtime/trap.hpp"
+#include "linuxity/vfs/procfs.hpp"
 
 #include <cstdio>
 #include <string>
@@ -51,7 +52,36 @@ int main(int argc, char** argv) {
 
     host::PosixHost hw;
     kernel::Kernel<host::PosixHost> k{hw};
-    runtime::PtraceTrap trap{path, gargv, genvp, root};
+
+    // Build the guest's filesystem namespace. When --root is given, the
+    // rootfs directory becomes the guest '/' via PATH TRANSLATION (no chroot,
+    // no privilege): every guest path the program names is rewritten to the
+    // real host path underneath the rootfs before the syscall runs. /proc is
+    // synthesized to report linuxity's own identity, not the host's.
+    if (!root.empty()) {
+        k.files().mount_host("/", root);
+        k.files().mount_virtual("/proc",
+            vfs::make_procfs(k.self().raw(), "6.6.0-linuxity", "linuxity"));
+    } else {
+        // No rootfs: the guest lives in the real host tree (paths translate
+        // 1:1), but /proc is STILL synthesized so uname/pid/mounts report
+        // linuxity's world rather than the host's.
+        k.files().mount_host("/", "/");
+        k.files().mount_virtual("/proc",
+            vfs::make_procfs(k.self().raw(), "6.6.0-linuxity", "linuxity"));
+    }
+
+    // The rootfs makes the translation unprivileged, so we no longer need to
+    // chroot the child. The one path the host kernel resolves itself is the
+    // exec target, so translate it up front: the child execs the REAL host
+    // path under the rootfs, then every syscall it makes is virtualized.
+    std::string exec_path = path;
+    {
+        std::string abs = k.files().absolutize(path);
+        auto pc = k.files().classify(abs);
+        if (pc.realm == kernel::Realm2::host_backed) exec_path = pc.host_path;
+    }
+    runtime::PtraceTrap trap{exec_path, gargv, genvp, {}};
 
     // PtraceTrap is BOTH the trap backend and the guest-memory accessor
     // (it shares the child's real pages via process_vm_readv/writev).

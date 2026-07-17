@@ -30,6 +30,10 @@ struct MockKernel {
     }
     Status close(Fd f) { return f ? ok() : err(Errno::ebadf); }
 
+    // The filesystem namespace (mount table + cwd + fd table).
+    kernel::FileNamespace fns{};
+    kernel::FileNamespace& files() noexcept { return fns; }
+
     // Memory
     Result<UAddr> mmap(UAddr, std::size_t) { return ok(uaddr(0x1000)); }
     Status munmap(UAddr, std::size_t) { return ok(); }

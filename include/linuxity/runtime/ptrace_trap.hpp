@@ -30,6 +30,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -123,6 +124,38 @@ public:
         struct user_regs_struct r{};
         ::ptrace(PTRACE_GETREGS, pid_, 0, &r);
         return ok(static_cast<std::int64_t>(r.rax));
+    }
+
+    // REDIRECT: rewrite the char* path argument in register `path_arg` to
+    // point at `host_path` (written into the child's stack red-zone scratch),
+    // then let the host kernel run the now-redirected syscall in the child.
+    // Returns the kernel's result (e.g. the real fd for openat). This is how
+    // the guest's virtual path resolves to a real host file it can mmap.
+    [[nodiscard]] Result<std::int64_t> redirect(int path_arg,
+                                                const std::string& host_path) {
+        struct user_regs_struct r = last_;
+        // Scratch lives well below the current stack pointer, in a page we
+        // ensure is writable by poking it (the red-zone + a fresh page).
+        std::uint64_t scratch = (last_.rsp - 8192) & ~std::uint64_t{15};
+        std::vector<std::byte> bytes(host_path.size() + 1);
+        std::memcpy(bytes.data(), host_path.c_str(), host_path.size() + 1);
+        if (!copy_out(uaddr(scratch), bytes)) return err<std::int64_t>(Errno::efault);
+        set_arg(r, path_arg, scratch);
+        ::ptrace(PTRACE_SETREGS, pid_, 0, &r);
+        return forward();
+    }
+
+    // Set the Nth syscall-argument register in a saved regfile.
+    static void set_arg(struct user_regs_struct& r, int n, std::uint64_t v) {
+        switch (n) {
+            case 0: r.rdi = v; break;
+            case 1: r.rsi = v; break;
+            case 2: r.rdx = v; break;
+            case 3: r.r10 = v; break;
+            case 4: r.r8  = v; break;
+            case 5: r.r9  = v; break;
+            default: break;
+        }
     }
 
     [[nodiscard]] bool exited() const noexcept { return exited_; }

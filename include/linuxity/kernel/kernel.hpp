@@ -11,6 +11,7 @@
 
 #include "linuxity/host/host.hpp"
 #include "linuxity/kernel/authority.hpp"
+#include "linuxity/kernel/file_namespace.hpp"
 #include "linuxity/kernel/subsystem.hpp"
 
 #include <unordered_map>
@@ -39,6 +40,11 @@ public:
     }
 
     [[nodiscard]] const Grants& grants() const noexcept { return grants_; }
+
+    // The filesystem namespace the guest lives in (mount table + cwd + fd
+    // table). The syscall dispatcher routes every path syscall through here.
+    [[nodiscard]] FileNamespace& files() noexcept { return files_; }
+    [[nodiscard]] const FileNamespace& files() const noexcept { return files_; }
 
     // -- Process subsystem --------------------------------------------------
     [[nodiscard]] Pid self() const noexcept { return self_; }
@@ -122,6 +128,7 @@ private:
     Grants grants_{};
     IdSpace<Pid> pids_{1};
     Pid self_{};
+    FileNamespace files_{};
     std::unordered_map<UAddr, std::size_t> maps_;
 };
 

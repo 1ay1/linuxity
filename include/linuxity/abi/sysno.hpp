@@ -23,11 +23,17 @@ enum class Arch { x86_64, aarch64 };
 // Canonical, arch-independent syscall identities. Extend as subsystems grow.
 enum class Sysno {
     unknown,
-    read, write, openat, close,
+    read, write, open, openat, close,
     mmap, munmap, mprotect, brk,
     getpid, gettid, clone, fork, execve, wait4, kill, exit, exit_group,
     uname, arch_prctl, set_tid_address, ioctl, writev, readv,
     rt_sigaction, rt_sigprocmask, getuid, geteuid, getgid, getegid,
+    // File metadata & directory path family (virtualized through the VFS).
+    stat, lstat, fstat, newfstatat, statx, lseek, pread64, pwrite64,
+    getdents64, readlink, readlinkat, getcwd, chdir, fchdir,
+    access, faccessat, faccessat2, dup, dup2, dup3, fcntl,
+    // Namespace / mount ops we own.
+    mount, umount2, getpgrp, getppid, sysinfo, sched_getaffinity,
 };
 
 // Decode an arch-specific raw syscall number into the canonical identity.
@@ -64,6 +70,34 @@ enum class Sysno {
                 case 218: return Sysno::set_tid_address;
                 case 231: return Sysno::exit_group;
                 case 257: return Sysno::openat;
+                case 2:   return Sysno::open;
+                case 4:   return Sysno::stat;
+                case 5:   return Sysno::fstat;
+                case 6:   return Sysno::lstat;
+                case 8:   return Sysno::lseek;
+                case 17:  return Sysno::pread64;
+                case 18:  return Sysno::pwrite64;
+                case 21:  return Sysno::access;
+                case 32:  return Sysno::dup;
+                case 33:  return Sysno::dup2;
+                case 72:  return Sysno::fcntl;
+                case 79:  return Sysno::getcwd;
+                case 80:  return Sysno::chdir;
+                case 81:  return Sysno::fchdir;
+                case 89:  return Sysno::readlink;
+                case 99:  return Sysno::sysinfo;
+                case 110: return Sysno::getppid;
+                case 111: return Sysno::getpgrp;
+                case 165: return Sysno::mount;
+                case 166: return Sysno::umount2;
+                case 217: return Sysno::getdents64;
+                case 262: return Sysno::newfstatat;
+                case 267: return Sysno::readlinkat;
+                case 269: return Sysno::faccessat;
+                case 292: return Sysno::dup3;
+                case 204: return Sysno::sched_getaffinity;
+                case 332: return Sysno::statx;
+                case 439: return Sysno::faccessat2;
                 default:  return Sysno::unknown;
             }
         case Arch::aarch64:
@@ -93,6 +127,27 @@ enum class Sysno {
                 case 177: return Sysno::getegid;
                 case 96:  return Sysno::set_tid_address;
                 case 56:  return Sysno::openat;
+                case 62:  return Sysno::lseek;
+                case 67:  return Sysno::pread64;
+                case 68:  return Sysno::pwrite64;
+                case 79:  return Sysno::newfstatat;
+                case 80:  return Sysno::fstat;
+                case 291: return Sysno::statx;
+                case 61:  return Sysno::getdents64;
+                case 78:  return Sysno::readlinkat;
+                case 17:  return Sysno::getcwd;
+                case 49:  return Sysno::chdir;
+                case 50:  return Sysno::fchdir;
+                case 48:  return Sysno::faccessat;
+                case 439: return Sysno::faccessat2;
+                case 23:  return Sysno::dup;
+                case 24:  return Sysno::dup3;
+                case 25:  return Sysno::fcntl;
+                case 40:  return Sysno::mount;
+                case 39:  return Sysno::umount2;
+                case 179: return Sysno::sysinfo;
+                case 173: return Sysno::getppid;
+                case 123: return Sysno::sched_getaffinity;
                 default:  return Sysno::unknown;
             }
     }
