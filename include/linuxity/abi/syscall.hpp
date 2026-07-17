@@ -983,10 +983,17 @@ private:
         return val(static_cast<std::int64_t>(bytes));
     }
 
-    // ioctl(fd, request, argp): virtualize ONLY the tty job-control requests
-    // whose payload is a PID (which would otherwise leak the host's pgrp into
-    // the guest's flat pid space and make a guest shell spin trying to seize
-    // its terminal). Everything else forwards to the real host fd.
+    // ioctl(fd, request, argp): MOST requests act on a real host fd (TCGETS,
+    // winsize, FIONREAD, ...) and forward. The JOB-CONTROL group reads/writes
+    // PIDs; we virtualize it so the guest session leader cleanly owns its tty.
+    // TIOCGPGRP/TIOCGSID report the caller's own pgrp and TIOCSPGRP is a
+    // satisfied no-op, so a guest shell settles at its prompt (and runs bg
+    // jobs) instead of spinning to seize the terminal. Forwarding these to the
+    // real tty is NOT reliable under ptrace: the terminal's foreground-group
+    // bookkeeping is against pids the guest doesn't own coherently, and a
+    // forwarded TIOCGPGRP that answers -1 makes bash disable job control
+    // outright ("cannot set terminal process group"). The stable contract is a
+    // fully virtualized job-control view.
     [[nodiscard]] Outcome do_ioctl(const Regs& r) {
         constexpr std::uint64_t kTIOCGPGRP = 0x540F;  // get fg process group
         constexpr std::uint64_t kTIOCSPGRP = 0x5410;  // set fg process group
@@ -994,9 +1001,8 @@ private:
         const std::uint64_t request = r.arg[1];
         switch (request) {
             // Report the caller's OWN pgrp as the terminal's foreground group
-            // (and its own sid as the session): the guest session leader owns
-            // its controlling tty, so the shell settles at the prompt instead
-            // of looping to acquire it. argp is a pid_t* out-parameter.
+            // (and its own sid as the session): the guest owns its tty, so the
+            // shell settles at the prompt instead of looping to acquire it.
             case kTIOCGPGRP:
             case kTIOCGSID: {
                 std::int32_t pgrp = ids().pid;
@@ -1006,8 +1012,7 @@ private:
                     return eno(Errno::efault);
                 return val(0);
             }
-            // Accept a foreground-group change vacuously: the guest believes
-            // it grabbed the terminal; our single host process is untouched.
+            // Accept a foreground-group change vacuously.
             case kTIOCSPGRP:
                 return val(0);
             default:

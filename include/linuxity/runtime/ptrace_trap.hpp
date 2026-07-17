@@ -24,6 +24,7 @@
 #include "linuxity/runtime/trap.hpp"
 
 #include <sys/ptrace.h>
+#include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/uio.h>
@@ -100,10 +101,15 @@ public:
             if (WIFEXITED(st) || WIFSIGNALED(st)) {
                 int code = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
                 if (w == root_pid_) exit_code_ = code;
-                if (auto it = gpid_.find(w); it != gpid_.end()) {
+                if (auto it = gpid_.find(w); it != gpid_.end())
                     proc_events_.push_back({ProcEvent::reap, it->second, 0, {}, {}});
-                    gpid_.erase(it);
-                }
+                // NB: do NOT erase gpid_[w] here. The parent's wait4() has not
+                // run its exit stop yet; when it does, finalize_exit translates
+                // the reaped HOST pid to its GUEST pid via this very map. If we
+                // dropped the entry now, gpid_of() would mint a FRESH number
+                // and $!/`wait N` would never match the pid the parent saw at
+                // fork. A dead child's identity must outlive it until reaped;
+                // guest pids are tiny ints, so retaining them is cheap.
                 tasks_.erase(w);
                 if (--live_ <= 0) { exited_ = true; return ok(false); }
                 continue;
@@ -166,6 +172,28 @@ public:
                     cur_ = w;
                     t.regs = rr;
                     t.in_call = true;
+                    // A forwarded wait4(pid, ...) carries a GUEST pid in arg0
+                    // (we handed the guest small pids from fork). The host
+                    // kernel only knows the real host tid, so a raw guest pid
+                    // would wait on nothing and return -1/ECHILD. Rewrite a
+                    // positive pid arg to its host tid before the kernel runs
+                    // the call; the reaped pid is translated back to the guest
+                    // pid at the exit stop (returns_pid). pid<=0 (any child /
+                    // process group / -pgid) passes through: our tree shares
+                    // the host's process-group membership natively.
+                    if (rr.orig_rax == 61 /*wait4*/) {
+                        auto gpid = static_cast<std::int32_t>(
+                            static_cast<long long>(rr.rdi));
+                        if (gpid > 0) {
+                            ::pid_t host = host_tid_of(gpid);
+                            if (host > 0) {
+                                struct user_regs_struct wr = rr;
+                                wr.rdi = static_cast<unsigned long long>(host);
+                                ::ptrace(PTRACE_SETREGS, w, 0, &wr);
+                                t.regs = wr;
+                            }
+                        }
+                    }
                     f.regs.nr     = rr.orig_rax;
                     f.regs.arg[0] = rr.rdi; f.regs.arg[1] = rr.rsi;
                     f.regs.arg[2] = rr.rdx; f.regs.arg[3] = rr.r10;
@@ -554,9 +582,43 @@ private:
             ::ptrace(PTRACE_GETREGS, w, 0, &r);
             r.rax = static_cast<unsigned long long>(t.ret);
             ::ptrace(PTRACE_SETREGS, w, 0, &r);
+        } else {
+            // A FORWARDED syscall ran natively. The process-management calls
+            // (fork/vfork/clone, wait4/waitid, getpgid/getsid/tcgetpgrp done
+            // via forwarded ioctl) return a real HOST pid in RAX. Left raw it
+            // would leak the host pid space into the guest — $! and jobs would
+            // print six-digit host pids, and `wait N` on a small guest pid
+            // would never match. Rewrite the returned pid to its small GUEST
+            // pid so the whole tree lives in one coherent tiny namespace, the
+            // way a PID-namespace container does. Only positive returns are
+            // pids; negative (errno) and 0 (the child side of fork) pass
+            // through untouched.
+            struct user_regs_struct r{};
+            ::ptrace(PTRACE_GETREGS, w, 0, &r);
+            if (returns_pid(r.orig_rax)) {
+                auto host = static_cast<::pid_t>(static_cast<long long>(r.rax));
+                if (host > 0) {
+                    r.rax = static_cast<unsigned long long>(gpid_of(host));
+                    ::ptrace(PTRACE_SETREGS, w, 0, &r);
+                }
+            }
         }
         t.action = Action::none;
         t.in_call = false;
+    }
+
+    // The forwarded syscalls whose successful return value IS a pid (x86-64
+    // numbers). We translate these host pids to guest pids at their exit stop
+    // so the guest never sees a host pid. fork=57, vfork=58, clone=56,
+    // clone3=435, wait4=61, waitid=247.
+    static bool returns_pid(unsigned long long nr) {
+        switch (nr) {
+            case 56: case 57: case 58: case 435:   // clone/fork/vfork/clone3
+            case 61:                               // wait4
+                return true;
+            default:
+                return false;
+        }
     }
 
     // Step ONE task from its syscall-ENTRY stop to its syscall-EXIT stop,
@@ -572,10 +634,10 @@ private:
             if (WIFEXITED(st) || WIFSIGNALED(st)) {
                 int code = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
                 if (w == root_pid_) exit_code_ = code;
-                if (auto it = gpid_.find(w); it != gpid_.end()) {
+                if (auto it = gpid_.find(w); it != gpid_.end())
                     proc_events_.push_back({ProcEvent::reap, it->second, 0, {}, {}});
-                    gpid_.erase(it);
-                }
+                // Retained past exit — see the note in next(): the parent's
+                // wait4 still needs to translate this reaped pid.
                 tasks_.erase(w);
                 if (--live_ <= 0) exited_ = true;
                 return false;

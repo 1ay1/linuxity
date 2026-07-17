@@ -70,6 +70,10 @@ add_executable(test_run_tty_jobcontrol test_run_tty_jobcontrol.cpp)
 target_link_libraries(test_run_tty_jobcontrol PRIVATE linuxity_core)
 add_test(NAME run_tty_jobcontrol COMMAND test_run_tty_jobcontrol)
 
+add_executable(test_run_pid_namespace test_run_pid_namespace.cpp)
+target_link_libraries(test_run_pid_namespace PRIVATE linuxity_core)
+add_test(NAME run_pid_namespace COMMAND test_run_pid_namespace)
+
 add_executable(test_resources test_resources.cpp)
 target_link_libraries(test_resources PRIVATE linuxity_core)
 add_test(NAME resources COMMAND test_resources)
