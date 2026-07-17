@@ -229,7 +229,39 @@ int main() {
         std::system(("rm -rf " + base).c_str());
     }
 
+    // -- Cross-mount symlink: a rootfs link into the virtual /proc. --------
+    // /etc/mtab -> /proc/self/mounts is the canonical case: following it must
+    // land in the VIRTUAL realm (so open injects the synthesized mount table),
+    // NOT fabricate a nonexistent <rootfs>/proc/self/mounts host path.
+    {
+        std::string base = "/tmp/lx_fnx_root";
+        std::system(("rm -rf " + base + " && mkdir -p " + base + "/etc").c_str());
+        std::system(("ln -sf ../proc/self/mounts " + base + "/etc/mtab").c_str());
+
+        FN xf;
+        xf.mount_host("/", base);
+        kernel::ProcessTable xprocs;
+        static const kernel::MachineSpec xmach;
+        xf.mount_virtual("/proc", vfs::make_procfs(xprocs, xmach));
+
+        // follow=true: the link resolves across the mount boundary into /proc.
+        auto pc = xf.classify("/etc/mtab");
+        assert(pc.realm == Realm2::virtual_file);
+        assert(pc.virtual_path == "/proc/self/mounts");   // resolved target
+        // And producing THAT path yields the synthesized mount table bytes.
+        auto vf = xf.produce(pc.virtual_path);
+        assert(vf.has_value());
+        assert(bytes_to_string(vf->bytes).find("rootfs / rootfs") != std::string::npos);
+
+        // follow=false (lstat): the LINK node itself is kept, host-backed.
+        auto lc = xf.classify("/etc/mtab", false, false);
+        assert(lc.realm == Realm2::host_backed);
+        assert(lc.host_path == base + "/etc/mtab");
+        std::system(("rm -rf " + base).c_str());
+    }
+
     std::puts("file_namespace: mount table, normalization, realm "
-              "classification, synthesized /proc, and copy-up overlay correct");
+              "classification, synthesized /proc, cross-mount symlinks, and "
+              "copy-up overlay correct");
     return 0;
 }

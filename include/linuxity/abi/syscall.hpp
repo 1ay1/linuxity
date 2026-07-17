@@ -411,13 +411,16 @@ private:
             return o;
         }
         if (pc.realm == kernel::Realm2::virtual_file) {
-            auto vf = k_.files().produce(abs);
+            // Follow a cross-mount symlink to the RESOLVED virtual path (e.g.
+            // /etc/mtab -> /proc/self/mounts); produce that, not the link.
+            const std::string& vp = pc.virtual_path.empty() ? abs : pc.virtual_path;
+            auto vf = k_.files().produce(vp);
             if (!vf) return eno(vf.error());
             Outcome o{};
             o.inject  = true;
             o.path_arg = path_arg;              // which reg holds the char* path
             o.content = std::move(vf->bytes);   // empty for a dir
-            pending_open_ = abs;
+            pending_open_ = vp;
             // A virtual DIRECTORY: stash its entries so getdents64 on the
             // resulting fd enumerates them (the backing temp node is a real
             // empty directory so O_DIRECTORY opens succeed).
@@ -447,7 +450,8 @@ private:
         }
         // Virtual stat: forward is impossible, so synthesize a stat64 buffer.
         if (pc.realm == kernel::Realm2::virtual_file) {
-            auto vf = k_.files().produce(abs);
+            const std::string& vp = pc.virtual_path.empty() ? abs : pc.virtual_path;
+            auto vf = k_.files().produce(vp);
             if (!vf) return eno(vf.error());
             // statbuf is arg[1] for stat/lstat, arg[2] for newfstatat.
             UAddr sb = at ? uaddr(r.arg[2]) : uaddr(r.arg[1]);
@@ -469,7 +473,8 @@ private:
             return o;
         }
         if (pc.realm == kernel::Realm2::virtual_file) {
-            auto vf = k_.files().produce(abs);
+            const std::string& vp = pc.virtual_path.empty() ? abs : pc.virtual_path;
+            auto vf = k_.files().produce(vp);
             if (!vf) return eno(vf.error());
             return write_statx(uaddr(r.arg[4]), vf->is_dir, vf->bytes.size());
         }

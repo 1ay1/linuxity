@@ -48,6 +48,11 @@ struct PathClass {
     Realm2      realm{Realm2::absent};
     std::string host_path;   // real on-disk path (host_backed only)
     Errno       error{Errno::enoent};  // meaningful when realm == absent
+    // For virtual_file results reached by following a cross-mount symlink
+    // (e.g. /etc/mtab -> /proc/self/mounts), this is the RESOLVED guest path
+    // whose producer must be consulted — not the original link path. Empty
+    // means "same as the path passed to classify".
+    std::string virtual_path;
 };
 
 // A synthesized virtual file: a producer of bytes for a virtual path. If
@@ -139,18 +144,27 @@ public:
                                      bool for_write = false,
                                      bool follow = true,
                                      WriteIntent wi = WriteIntent::copy_leaf) const {
+        return classify_impl(abs, for_write, follow, wi, 0);
+    }
+
+    [[nodiscard]] PathClass classify_impl(std::string_view abs,
+                                     bool for_write,
+                                     bool follow,
+                                     WriteIntent wi,
+                                     int depth) const {
         const Mount* m = deepest(abs);
-        if (!m) return PathClass{Realm2::absent, {}, Errno::enoent};
+        if (!m) return PathClass{Realm2::absent, {}, Errno::enoent, {}};
         if (m->producer) {
             auto vf = m->producer(abs);
-            if (!vf) return PathClass{Realm2::absent, {}, vf.error()};
+            if (!vf) return PathClass{Realm2::absent, {}, vf.error(), {}};
             // A device node backed by a real host device (/dev/null, ...):
             // resolve to the host path so open/read/write/mmap ride the true
             // character device with native semantics.
             if (!vf->redirect_host.empty())
                 return PathClass{Realm2::host_backed,
-                                 std::move(vf->redirect_host), Errno::enoent};
-            return PathClass{Realm2::virtual_file, {}, Errno::enoent};
+                                 std::move(vf->redirect_host), Errno::enoent, {}};
+            return PathClass{Realm2::virtual_file, {}, Errno::enoent,
+                             std::string{abs}};
         }
         std::string_view rel = abs;
         rel.remove_prefix(m->prefix == "/" ? 0 : m->prefix.size());
@@ -167,29 +181,23 @@ public:
                     // Resolve to the layer holding the target; don't create.
                     if (exists(up.c_str()))
                         return PathClass{Realm2::host_backed, std::move(up),
-                                         Errno::enoent};
+                                         Errno::enoent, {}};
                     return PathClass{Realm2::host_backed, std::move(lo),
-                                     Errno::enoent};
+                                     Errno::enoent, {}};
                 }
                 if (wi == WriteIntent::parents_only)
                     mirror_parents_from_lower(up, lo);
                 else
                     copy_up(up, lo);
-                return PathClass{Realm2::host_backed, std::move(up), Errno::enoent};
+                return PathClass{Realm2::host_backed, std::move(up), Errno::enoent, {}};
             }
-            if (exists(up.c_str()))
-                return PathClass{Realm2::host_backed,
-                                 follow ? reroot_symlink(*m, std::move(up))
-                                        : std::move(up), Errno::enoent};
-            return PathClass{Realm2::host_backed,
-                             follow ? reroot_symlink(*m, std::move(lo))
-                                    : std::move(lo), Errno::enoent};
+            std::string host = exists(up.c_str()) ? up : lo;
+            if (follow) return follow_symlink(*m, std::move(host), for_write, wi, depth);
+            return PathClass{Realm2::host_backed, std::move(host), Errno::enoent, {}};
         }
         std::string full = join_host(m->host_base, rel);
-        return PathClass{Realm2::host_backed,
-                         follow ? reroot_symlink(*m, std::move(full))
-                                : std::move(full),
-                         Errno::enoent};
+        if (follow) return follow_symlink(*m, std::move(full), for_write, wi, depth);
+        return PathClass{Realm2::host_backed, std::move(full), Errno::enoent, {}};
     }
 
     // Produce the bytes of a virtual file (for read/open/getdents on it).
@@ -294,19 +302,28 @@ private:
         return p;
     }
 
-    // Follow rootfs symlinks WITHIN the guest world. A rootfs is full of
-    // absolute symlinks (Alpine's /bin/sh -> /bin/busybox, /lib -> /usr/lib):
-    // their targets are GUEST-absolute, so the host kernel would resolve them
-    // against the HOST root and miss. Here we chase the chain ourselves,
-    // re-rooting every absolute target under the mount base (upper first, then
-    // lower), so the final host path lands inside the rootfs. Relative links
-    // resolve against the link's own directory, also within the rootfs.
-    // Bounded to avoid loops; returns the original path if not a symlink.
-    std::string reroot_symlink(const Mount& m, std::string host) const {
+    // Resolve a rootfs symlink to a PathClass. A rootfs is full of absolute
+    // symlinks (Alpine's /bin/sh -> /bin/busybox, /lib -> /usr/lib): their
+    // targets are GUEST-absolute, so the host kernel would resolve them against
+    // the HOST root and miss. Here we chase the chain ourselves, re-rooting
+    // each within-mount target under the mount base (upper first, then lower).
+    // Relative links resolve against the link's own directory.
+    //
+    // CROSS-MOUNT targets: a rootfs symlink can point into a DIFFERENT mount —
+    // /etc/mtab -> /proc/self/mounts crosses from the rootfs '/' mount into the
+    // virtual /proc. Re-rooting under '/' would fabricate a nonexistent
+    // <rootfs>/proc/self/mounts. So when a resolved guest-absolute target lands
+    // in a different mount, we RE-CLASSIFY it through the whole namespace: a
+    // virtual target correctly returns the virtual_file realm (so open injects
+    // it), a target in another host mount lands in that mount's base.
+    // Bounded to avoid symlink loops.
+    PathClass follow_symlink(const Mount& m, std::string host,
+                             bool for_write, WriteIntent wi, int depth) const {
         for (int hops = 0; hops < 40; ++hops) {
             char buf[4096];
             ::ssize_t n = ::readlink(host.c_str(), buf, sizeof buf - 1);
-            if (n < 0) return host;                 // not a symlink (or gone)
+            if (n < 0)                              // not a symlink (or gone)
+                return PathClass{Realm2::host_backed, std::move(host), Errno::enoent, {}};
             buf[n] = '\0';
             std::string target{buf};
             std::string guest_abs;
@@ -327,7 +344,15 @@ private:
                                     : guest_link.substr(0, slash);
                 guest_abs = normalize(dir + "/" + target);
             }
-            // Re-root the guest-absolute target under this mount (upper|lower).
+            // CROSS-MOUNT: the target belongs to a different mount than the
+            // link. Re-classify through the whole namespace (bounded recursion).
+            if (deepest(guest_abs) != &m) {
+                if (depth >= 8)
+                    return PathClass{Realm2::absent, {}, Errno::eloop, {}};
+                return classify_impl(guest_abs, for_write, /*follow=*/true, wi,
+                                     depth + 1);
+            }
+            // Within-mount: re-root the guest-absolute target here (upper|lower).
             std::string_view rel = guest_abs;
             if (m.prefix != "/") rel.remove_prefix(
                 std::min(rel.size(), m.prefix.size()));
@@ -337,7 +362,7 @@ private:
             std::string lo = join_host(m.host_base, rel);
             host = (!up.empty() && exists(up.c_str())) ? up : lo;
         }
-        return host;
+        return PathClass{Realm2::host_backed, std::move(host), Errno::enoent, {}};
     }
 
     static bool exists(const char* path) {

@@ -194,11 +194,25 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
             return ok(text_file("0.00 0.01 0.05 1/" + std::to_string(nproc) + " 1\n"));
         if (abs == "/proc/filesystems")
             return ok(text_file("nodev\tproc\nnodev\tsysfs\nnodev\ttmpfs\n\text4\n"));
-        if (abs == "/proc/mounts" || abs == "/proc/1/mounts")
+        // The mount table. /etc/mtab -> /proc/self/mounts, and pacman/df read
+        // it to determine filesystem mount points before checking free space,
+        // so /proc/mounts AND the per-pid /proc/<pid>/mounts (self canonicalized
+        // to pid 1) must all yield it. Compare against the canonicalized `p`.
+        if (p == "/proc/mounts" || p == "/proc/1/mounts" ||
+            p == "/proc/1/mountinfo" || p == "/proc/1/mountstats") {
+            if (p == "/proc/1/mountinfo")
+                return ok(text_file(
+                    "1 1 0:1 / / rw - rootfs rootfs rw\n"
+                    "2 1 0:2 / /proc rw,nosuid,nodev,noexec - proc proc rw\n"
+                    "3 1 0:3 / /sys rw,nosuid,nodev,noexec - sysfs sysfs rw\n"
+                    "4 1 0:4 / /dev rw,nosuid - devtmpfs devtmpfs rw\n"
+                    "5 1 0:5 / /tmp rw,nosuid,nodev - tmpfs tmpfs rw\n"));
             return ok(text_file(
                 "rootfs / rootfs rw 0 0\nproc /proc proc rw,nosuid,nodev,noexec 0 0\n"
                 "sysfs /sys sysfs rw,nosuid,nodev,noexec 0 0\n"
+                "devtmpfs /dev devtmpfs rw,nosuid 0 0\n"
                 "tmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n"));
+        }
         if (abs == "/proc/sys" || abs == "/proc/sys/kernel")
             return ok(dir_file({}));
         if (abs == "/proc/sys/kernel/osrelease") return ok(text_file(release + "\n"));
