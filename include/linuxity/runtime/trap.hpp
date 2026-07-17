@@ -100,14 +100,15 @@ public:
             // our subsystems, forward it to the host kernel, or exit.
             abi::Outcome o = sys.dispatch(f.regs);
             if (const char* t = std::getenv("LINUXITY_TRACE"); t && *t) {
-                std::fprintf(trace_out(t), "[lx] nr=%llu -> %s%s%s%s%s%s ret=%lld %s%s%s\n",
+                std::fprintf(trace_out(t), "[lx] nr=%llu -> %s%s%s%s%s%s%s ret=%lld %s%s%s\n",
                     static_cast<unsigned long long>(f.regs.nr),
                     o.inject?"INJECT ":"", o.redirect?"REDIRECT ":"",
+                    o.sock_rewrite?"SOCKREWRITE ":"",
                     o.signal?"SIGNAL ":"",
                     o.exec_interp?"EXECINT ":"",
                     o.forward?"FORWARD ":"", o.exited?"EXIT ":"VIRT ",
                     static_cast<long long>(o.ret),
-                    o.redirect?o.host_path.c_str():"",
+                    o.redirect?o.host_path.c_str():(o.sock_rewrite?o.host_path.c_str():""),
                     (o.redirect && o.path_arg2>=0)?" -> ":"",
                     (o.redirect && o.path_arg2>=0)?o.host_path2.c_str():"");
             }
@@ -149,6 +150,24 @@ public:
                     o.path_arg2, o.host_path2);
                 if (!retr) { LX_TRY(recover_syscall(retr.error())); continue; }
                 sys.note_opened_fd(*retr);
+            } else if (o.sock_rewrite) {
+                // AF_UNIX bind/connect: create the socket's parent chain in
+                // the overlay upper, then poke the translated host path into
+                // the guest's sun_path and forward. Guarded so backends
+                // without the primitive fall back to a plain forward (which
+                // uses the untranslated path — correct only under a real
+                // chroot, but at least well-formed).
+                make_host_parents(o.host_path);
+                if constexpr (requires {
+                        trap_.rewrite_sockaddr(UAddr{}, std::string{}, 0, 0ULL); }) {
+                    auto sr = trap_.rewrite_sockaddr(
+                        o.sock_path_addr, o.host_path,
+                        o.sock_len_arg, o.sock_new_len);
+                    if (!sr) { LX_TRY(recover_syscall(sr.error())); continue; }
+                } else {
+                    auto fr = trap_.forward();
+                    if (!fr) { LX_TRY(recover_syscall(fr.error())); continue; }
+                }
             } else if (o.signal) {
                 // The guest signalled a GUEST pid. Deliver the real signal to
                 // that task's host tid (guarded so backends without the

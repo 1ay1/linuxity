@@ -491,6 +491,21 @@ public:
             case Sysno::connect:
                 return do_sockaddr_un(r, /*for_bind=*/false);
 
+            // -- prctl(PR_SET_DUMPABLE, 0): a security-conscious guest
+            //    (gpg-agent, dirmngr, ssh-agent) makes itself non-dumpable so
+            //    other processes can't read its memory. But linuxity IS the
+            //    kernel: it MUST read guest memory to translate paths/sockaddrs
+            //    and service syscalls. A non-dumpable task also blocks our
+            //    unprivileged ptrace peek, breaking AF_UNIX path translation
+            //    (the socket then leaks to the host). So we ACCEPT the call
+            //    (return 0) without dropping dumpability. PR_GET_DUMPABLE then
+            //    reports the real (still-dumpable) state, forwarded normally.
+            //    Every other prctl forwards unchanged.
+            case Sysno::prctl:
+                if (static_cast<int>(r.arg[0]) == 4 /*PR_SET_DUMPABLE*/)
+                    return val(0);
+                return fwd();
+
             // -- ioctl: MOST requests act on a real host fd (TCGETS, winsize,
             //    FIONREAD, ...) and must forward. But the JOB-CONTROL group
             //    of tty ioctls read/write PIDs, and the host tty's foreground

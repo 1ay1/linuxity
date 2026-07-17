@@ -413,6 +413,30 @@ public:
         return ok(ret);
     }
 
+    // REWRITE_SOCKADDR: for an AF_UNIX bind/connect, poke the translated host
+    // path into the guest's sun_path and set the socklen register, then
+    // forward the call to the kernel. Like redirect(), the path bytes MUST go
+    // in via PTRACE_POKEDATA (ordered against the kernel's copy_from_user on
+    // resume) rather than process_vm_writev. The socket path lives in the
+    // guest's OWN memory (the sockaddr the caller passed), so we overwrite it
+    // in place; the new path is guaranteed by the dispatcher to fit in the
+    // 108-byte sun_path. Asynchronous like forward(): the kernel runs the
+    // bind/connect and lands the result in the guest's RAX itself.
+    [[nodiscard]] Status rewrite_sockaddr(UAddr path_addr,
+                                          const std::string& host_path,
+                                          int len_arg,
+                                          std::uint64_t new_len) {
+        Task& t = tasks_[cur_];
+        struct user_regs_struct r = t.regs;
+        if (!poke_path(value(path_addr), host_path))
+            return err(Errno::efault);
+        set_arg(r, len_arg, new_len);
+        ::ptrace(PTRACE_SETREGS, cur_, 0, &r);
+        t.action = Action::none;
+        ::ptrace(PTRACE_SYSCALL, cur_, 0, 0);   // run the real bind/connect
+        return ok();
+    }
+
     // EXEC_INTERP: the guest execve'd a dynamic binary. Rewrite the call in
     // place into `interp_host <prog_guest> <orig argv[1..]>` so the child
     // execs the real dynamic linker (which then opens the program and its
@@ -636,13 +660,57 @@ public:
         ::iovec local{dst.data(), dst.size()};
         ::iovec remote{reinterpret_cast<void*>(value(src)), dst.size()};
         auto n = ::process_vm_readv(cur_, &local, 1, &remote, 1, 0);
-        return (n >= 0 && std::size_t(n) == dst.size()) ? ok() : err(Errno::efault);
+        if (n >= 0 && std::size_t(n) == dst.size()) return ok();
+        // process_vm_readv is denied (EPERM) for a task that dropped its
+        // dumpable flag or changed credentials — e.g. gpg-agent/dirmngr call
+        // prctl(PR_SET_DUMPABLE,0) and setuid for security, which makes their
+        // memory unreadable via the /proc-mem path EVEN for the tracer. The
+        // ptrace peek path goes through the ptrace access check (we ARE the
+        // tracer) and still works, so fall back to it. Without this, reading a
+        // bind()'s sockaddr fails, the AF_UNIX path can't be translated, and
+        // the socket leaks onto the HOST filesystem.
+        return peek_in(value(src), dst);
+    }
+    // Word-granular read via PTRACE_PEEKDATA. Ordered against the tracee and
+    // permitted for any task we trace regardless of its dumpable/cred state.
+    [[nodiscard]] Status peek_in(std::uint64_t at, std::span<std::byte> dst) const {
+        std::size_t off = 0;
+        while (off < dst.size()) {
+            errno = 0;
+            long word = ::ptrace(PTRACE_PEEKDATA, cur_,
+                                 reinterpret_cast<void*>(at + off), nullptr);
+            if (word == -1 && errno != 0) return err(Errno::efault);
+            auto* wb = reinterpret_cast<const unsigned char*>(&word);
+            for (std::size_t i = 0; i < sizeof(long) && off + i < dst.size(); ++i)
+                dst[off + i] = static_cast<std::byte>(wb[i]);
+            off += sizeof(long);
+        }
+        return ok();
     }
     [[nodiscard]] Status copy_out(UAddr dst, std::span<const std::byte> src) const {
         ::iovec local{const_cast<std::byte*>(src.data()), src.size()};
         ::iovec remote{reinterpret_cast<void*>(value(dst)), src.size()};
         auto n = ::process_vm_writev(cur_, &local, 1, &remote, 1, 0);
-        return (n >= 0 && std::size_t(n) == src.size()) ? ok() : err(Errno::efault);
+        if (n >= 0 && std::size_t(n) == src.size()) return ok();
+        // Same rationale as copy_in: fall back to the ptrace poke path for a
+        // task whose /proc-mem write access is denied. Word-granular, reading
+        // each final partial word first to preserve bytes past src.
+        std::size_t off = 0;
+        const std::uint64_t at = value(dst);
+        while (off < src.size()) {
+            errno = 0;
+            long word = ::ptrace(PTRACE_PEEKDATA, cur_,
+                                 reinterpret_cast<void*>(at + off), nullptr);
+            if (word == -1 && errno != 0) return err(Errno::efault);
+            auto* wb = reinterpret_cast<unsigned char*>(&word);
+            for (std::size_t i = 0; i < sizeof(long) && off + i < src.size(); ++i)
+                wb[i] = static_cast<unsigned char>(src[off + i]);
+            if (::ptrace(PTRACE_POKEDATA, cur_, reinterpret_cast<void*>(at + off),
+                         reinterpret_cast<void*>(word)) != 0)
+                return err(Errno::efault);
+            off += sizeof(long);
+        }
+        return ok();
     }
 
     // Write a path string into the current task, preferring PTRACE_POKEDATA

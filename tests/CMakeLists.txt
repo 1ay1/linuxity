@@ -66,6 +66,10 @@ add_executable(test_run_dev test_run_dev.cpp)
 target_link_libraries(test_run_dev PRIVATE linuxity_core)
 add_test(NAME run_dev COMMAND test_run_dev)
 
+add_executable(test_run_socket test_run_socket.cpp)
+target_link_libraries(test_run_socket PRIVATE linuxity_core)
+add_test(NAME run_socket COMMAND test_run_socket)
+
 add_executable(test_run_shebang test_run_shebang.cpp)
 target_link_libraries(test_run_shebang PRIVATE linuxity_core)
 add_test(NAME run_shebang COMMAND test_run_shebang)

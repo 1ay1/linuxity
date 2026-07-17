@@ -123,6 +123,14 @@ inline constexpr int kTrappedX86_64[] = {
     // bind lands in the chroot's lower layer and diverges from the overlay,
     // and gpg-agent's connect then fails.
     49, 42,                      // bind/connect
+    // -- prctl: intercept PR_SET_DUMPABLE. A guest (gpg-agent, dirmngr, ssh)
+    // drops dumpable for security, which makes its memory unreadable via BOTH
+    // process_vm_readv AND ptrace peek for our unprivileged tracer — so we can
+    // no longer read a bind()'s sockaddr to translate the AF_UNIX path (the
+    // socket then leaks to the HOST). linuxity IS the kernel here; the guest
+    // must stay inspectable. We no-op PR_SET_DUMPABLE and forward every other
+    // prctl unchanged.
+    157,                         // prctl
     // -- privilege drops (vacuous in a root-owned world) -------------------
     105, 106, 114, 113, 117, 119, 122, 123, 116,
     // setuid/setgid/setregid/setreuid/setresuid/setresgid/setfsuid/setfsgid/setgroups
