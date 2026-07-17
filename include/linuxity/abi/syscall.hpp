@@ -465,6 +465,18 @@ public:
             case Sysno::landlock_restrict_self:
                 return val(0);
 
+            // -- AF_UNIX bind/connect: the chroot'd guest resolves an
+            //    absolute sun_path correctly on its own, so we forward the
+            //    call unchanged. For a bind we first materialize the socket's
+            //    parent directory chain in the writable overlay upper (via
+            //    do_sockaddr_un) so a socket whose parent only exists in the
+            //    lower layer still has a writable home. arg1 = sockaddr*,
+            //    arg2 = socklen.
+            case Sysno::bind:
+                return do_sockaddr_un(r, /*for_bind=*/true);
+            case Sysno::connect:
+                return do_sockaddr_un(r, /*for_bind=*/false);
+
             // -- ioctl: MOST requests act on a real host fd (TCGETS, winsize,
             //    FIONREAD, ...) and must forward. But the JOB-CONTROL group
             //    of tty ioctls read/write PIDs, and the host tty's foreground
@@ -1167,6 +1179,43 @@ private:
     // guest will later resolve through OUR namespace — so it must NOT be
     // rewritten to a host path. Only the linkpath (where the symlink lives)
     // is translated to its overlay upper host path.
+    // bind/connect(fd, const sockaddr* addr, socklen_t len): for an AF_UNIX
+    // socket the filesystem path lives in `addr->sun_path`. The guest runs
+    // chroot'd into the rootfs, so an ABSOLUTE guest sun_path already resolves
+    // to the correct file WITHOUT translation — and translating it to the
+    // longer overlay-upper host path would overflow the guest's declared
+    // socklen (the kernel reads only `len` bytes and would truncate the path).
+    // So we forward unchanged. We keep the syscall TRAPPED (rather than not
+    // filtering it) for two reasons: (1) it documents the AF_UNIX path
+    // semantics in one place, and (2) if a future overlay design needs the
+    // socket node copied up, this is the single hook to do it. The one thing
+    // we DO here is materialize the parent directory chain in the overlay
+    // upper for a bind, so a socket whose parent dir only exists in the lower
+    // layer still gets a writable home.
+    [[nodiscard]] Outcome do_sockaddr_un(const Regs& r, bool for_bind) {
+        constexpr std::uint16_t kAfUnix = 1;
+        const std::uint64_t addr = r.arg[1];
+        const std::size_t   len  = static_cast<std::size_t>(r.arg[2]);
+        if (!for_bind || addr == 0 || len < 3) return fwd();
+        if (get_u16(addr) != kAfUnix) return fwd();
+
+        const std::size_t path_bytes = std::min<std::size_t>(len - 2, 108);
+        std::vector<std::byte> pb(path_bytes);
+        if (!mem_.copy_in(uaddr(addr + 2), pb)) return fwd();
+        if (pb.empty() || pb[0] == std::byte{0}) return fwd();   // abstract
+        std::string guest_path(reinterpret_cast<const char*>(pb.data()),
+                               ::strnlen(reinterpret_cast<const char*>(pb.data()),
+                                         path_bytes));
+        if (guest_path.empty() || guest_path.front() != '/') return fwd();
+
+        // Copy the parent dir chain up into the writable overlay layer so the
+        // bind can create the socket node there; the guest's own (chroot'd)
+        // absolute path resolves onto that same upper directory.
+        (void)k_.files().classify(guest_path, /*for_write=*/true,
+                                  /*follow=*/false, Wi::parents_only);
+        return fwd();
+    }
+
     [[nodiscard]] Outcome path_symlink(const Regs& r, int /*target_arg*/,
                                        int link_arg, bool at) {
         std::string link = at ? resolve_second(r, link_arg, true)

@@ -361,8 +361,28 @@ public:
         std::size_t need = host_path.size() + 1;
         std::uint64_t scratch =
             (t.regs.rsp - 256 - need) & ~std::uint64_t{15};
-        if (!poke_bytes(scratch, host_path))
-            return err<std::int64_t>(Errno::efault);
+        if (!poke_path(scratch, host_path)) {
+            // The path could not be written into this task's memory at all
+            // (PTRACE_POKEDATA -> EIO and process_vm_writev -> EPERM). This
+            // happens for a DAEMONIZED guest task: gpg spawns gpg-agent, which
+            // double-forks + setsid()s; the resulting task sits in a ptrace
+            // stop we cannot poke. Failing the syscall with -EFAULT breaks the
+            // guest (gpg-agent's stat() returns "Bad address" and it refuses
+            // to start). The correct degradation is to run the syscall
+            // UNMODIFIED on the guest's own path: the guest is chroot'd into
+            // the rootfs, so an in-rootfs path resolves correctly as-is, and
+            // even an overlay/bind path fails no worse than before. Restore the
+            // entry registers and forward.
+            ::ptrace(PTRACE_SETREGS, cur_, 0, &t.regs);
+            if (!step_to_exit(cur_)) return ok(std::int64_t{-1});
+            struct user_regs_struct rr0{};
+            ::ptrace(PTRACE_GETREGS, cur_, 0, &rr0);
+            std::int64_t ret0 = static_cast<std::int64_t>(rr0.rax);
+            tasks_[cur_].in_call = false;
+            if (post_exit) post_exit(ret0);
+            resume_task(cur_);
+            return ok(ret0);
+        }
         set_arg(r, path_arg, scratch);
         // A two-path mutation (rename/link/symlink): park the SECOND host path
         // in a distinct, non-overlapping scratch slot below the first and
@@ -372,7 +392,7 @@ public:
             std::size_t need2 = host_path2.size() + 1;
             std::uint64_t scratch2 =
                 (scratch - 256 - need2) & ~std::uint64_t{15};
-            if (!poke_bytes(scratch2, host_path2))
+            if (!poke_path(scratch2, host_path2))
                 return err<std::int64_t>(Errno::efault);
             set_arg(r, path_arg2, scratch2);
         }
@@ -623,6 +643,20 @@ public:
         ::iovec remote{reinterpret_cast<void*>(value(dst)), src.size()};
         auto n = ::process_vm_writev(cur_, &local, 1, &remote, 1, 0);
         return (n >= 0 && std::size_t(n) == src.size()) ? ok() : err(Errno::efault);
+    }
+
+    // Write a path string into the current task, preferring PTRACE_POKEDATA
+    // (ordered against the tracee's own copy_from_user — see redirect()) and
+    // falling back to process_vm_writev when the poke is refused. The poke can
+    // fail with EIO on a task we can observe but not ptrace-poke (a daemonized
+    // child whose stop we reached indirectly); the vm write uses a different
+    // kernel access path and often still succeeds. Returns false only if BOTH
+    // paths fail, which the caller degrades to a forward-unmodified.
+    [[nodiscard]] bool poke_path(std::uint64_t at, const std::string& s) const {
+        if (poke_bytes(at, s)) return true;
+        std::vector<std::byte> b(s.size() + 1);
+        std::memcpy(b.data(), s.c_str(), s.size() + 1);
+        return static_cast<bool>(copy_out(uaddr(at), std::span<const std::byte>{b}));
     }
 
     // Write a NUL-terminated string into the CURRENT task at `at` using

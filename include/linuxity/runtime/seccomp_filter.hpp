@@ -115,6 +115,14 @@ inline constexpr int kTrappedX86_64[] = {
     82, 264, 316,                // rename/renameat/renameat2
     86, 265,                     // link/linkat
     88, 266,                     // symlink/symlinkat
+    // -- AF_UNIX socket path translation -----------------------------------
+    // bind/connect carry a filesystem path inside a `struct sockaddr_un`. An
+    // absolute guest path (e.g. gpg-agent's /etc/pacman.d/gnupg/S.gpg-agent)
+    // must be rewritten to its overlay-upper host path so the socket file is
+    // created/looked-up in the SAME place stat/chmod see it. Untrapped, the
+    // bind lands in the chroot's lower layer and diverges from the overlay,
+    // and gpg-agent's connect then fails.
+    49, 42,                      // bind/connect
     // -- privilege drops (vacuous in a root-owned world) -------------------
     105, 106, 114, 113, 117, 119, 122, 123, 116,
     // setuid/setgid/setregid/setreuid/setresuid/setresgid/setfsuid/setfsgid/setgroups

@@ -115,6 +115,9 @@ enum class Sysno {
     // we ACCEPT the sandbox calls as satisfied no-ops rather than let pacman
     // treat the failure as fatal.
     landlock_create_ruleset, landlock_add_rule, landlock_restrict_self,
+    // AF_UNIX sockets: bind/connect carry a filesystem path in sockaddr_un
+    // that must be translated to the overlay upper like any other path arg.
+    bind, connect,
     // Miscellany the guest may probe; forwarded or benign by default.
     prctl,
 };
@@ -283,6 +286,8 @@ enum class Sysno {
                 case 444: return Sysno::landlock_create_ruleset;
                 case 445: return Sysno::landlock_add_rule;
                 case 446: return Sysno::landlock_restrict_self;
+                case 49:  return Sysno::bind;
+                case 42:  return Sysno::connect;
                 default:  return Sysno::unknown;
             }
         case Arch::aarch64:
@@ -402,6 +407,8 @@ enum class Sysno {
                 case 276: return Sysno::renameat2;
                 case 37:  return Sysno::linkat;
                 case 36:  return Sysno::symlinkat;
+                case 200: return Sysno::bind;
+                case 203: return Sysno::connect;
                 default:  return Sysno::unknown;
             }
     }
