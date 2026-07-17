@@ -207,7 +207,9 @@ public:
     [[nodiscard]] Result<std::int64_t> redirect(int path_arg,
                                                 const std::string& host_path,
                                                 std::function<void(std::int64_t)>
-                                                    post_exit = {}) {
+                                                    post_exit = {},
+                                                int path_arg2 = -1,
+                                                const std::string& host_path2 = {}) {
         Task& t = tasks_[cur_];
         struct user_regs_struct r = t.regs;
         // Park the translated path in the child's own stack, below the red
@@ -227,6 +229,18 @@ public:
         if (!poke_bytes(scratch, host_path))
             return err<std::int64_t>(Errno::efault);
         set_arg(r, path_arg, scratch);
+        // A two-path mutation (rename/link/symlink): park the SECOND host path
+        // in a distinct, non-overlapping scratch slot below the first and
+        // rewrite its register too. Both operands are then translated before
+        // the kernel runs the single syscall.
+        if (path_arg2 >= 0 && !host_path2.empty()) {
+            std::size_t need2 = host_path2.size() + 1;
+            std::uint64_t scratch2 =
+                (scratch - 256 - need2) & ~std::uint64_t{15};
+            if (!poke_bytes(scratch2, host_path2))
+                return err<std::int64_t>(Errno::efault);
+            set_arg(r, path_arg2, scratch2);
+        }
         ::ptrace(PTRACE_SETREGS, cur_, 0, &r);
         if (!step_to_exit(cur_)) return ok(std::int64_t{-1});   // task exited
         struct user_regs_struct rr{};

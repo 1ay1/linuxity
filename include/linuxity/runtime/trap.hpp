@@ -130,9 +130,20 @@ public:
                 // host-backed stat leaves the HOST file's owner in the guest
                 // buffer; scrub it to root in the SAME stopped window, before
                 // the task resumes and could read the buffer (racing us).
+                //
+                // A MUTATION (mkdir/rename/...) may need its destination's
+                // parent host dirs to exist first (the overlay upper layer
+                // starts empty), and may carry a SECOND path to translate
+                // (rename/link/symlink). Build the parents and pass the
+                // second rewrite through to the trap.
+                if (o.make_parents) {
+                    make_host_parents(o.host_path);
+                    if (o.path_arg2 >= 0) make_host_parents(o.host_path2);
+                }
                 auto ret = LX_TRY(trap_.redirect(
                     o.path_arg, o.host_path,
-                    [&](std::int64_t rc) { if (rc == 0) sys.scrub_ids(o); }));
+                    [&](std::int64_t rc) { if (rc == 0) sys.scrub_ids(o); },
+                    o.path_arg2, o.host_path2));
                 sys.note_opened_fd(ret);
             } else if (o.signal) {
                 // The guest signalled a GUEST pid. Deliver the real signal to
@@ -258,6 +269,25 @@ private:
     void cleanup_temps() {
         for (const auto& t : temps_) { std::remove(t.c_str()); ::rmdir(t.c_str()); }
         temps_.clear();
+    }
+
+    // Ensure every parent directory of a host path exists (mkdir -p of the
+    // dirname). The overlay upper layer starts empty, so a create into a
+    // deep guest path (e.g. mkdir /var/lib/pacman/local/pkg) would ENOENT on
+    // the missing intermediate upper dirs; build them 0755 first. Idempotent;
+    // failures are ignored (the forwarded syscall reports the real error).
+    static void make_host_parents(const std::string& host_path) {
+        if (host_path.empty()) return;
+        auto slash = host_path.find_last_of('/');
+        if (slash == std::string::npos || slash == 0) return;
+        std::string dir = host_path.substr(0, slash);
+        // Walk the components, creating each level.
+        for (std::size_t p = 1; p <= dir.size(); ++p) {
+            if (p == dir.size() || dir[p] == '/') {
+                std::string seg = dir.substr(0, p);
+                if (!seg.empty()) (void)::mkdir(seg.c_str(), 0755);
+            }
+        }
     }
 
     T& trap_;

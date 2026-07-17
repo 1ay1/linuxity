@@ -104,6 +104,18 @@ public:
         return normalize(base);
     }
 
+    // How a write-intent classify should prepare the overlay upper layer.
+    //   copy_leaf  — copy the lower file up to upper (O_CREAT/O_WRONLY on an
+    //                existing file needs its bytes); the DEFAULT.
+    //   parents_only — the syscall CREATES the leaf itself (mkdir, mknod,
+    //                rename/link/symlink destination), so materializing it
+    //                would leave a bogus node the create then trips over.
+    //                Only the parent chain is mirrored into upper.
+    //   remove     — rmdir/unlink: DON'T materialize anything; resolve to the
+    //                layer where the target actually lives (upper if already
+    //                copied up, else the read-only lower).
+    enum class WriteIntent { copy_leaf, parents_only, remove };
+
     // Classify an ABSOLUTE, normalized guest path into its realm. For
     // host-backed paths, returns the translated real host path. `for_write`
     // selects the overlay UPPER layer (copying the file up from the read-only
@@ -112,7 +124,8 @@ public:
     // reports ENOENT itself.
     [[nodiscard]] PathClass classify(std::string_view abs,
                                      bool for_write = false,
-                                     bool follow = true) const {
+                                     bool follow = true,
+                                     WriteIntent wi = WriteIntent::copy_leaf) const {
         const Mount* m = deepest(abs);
         if (!m) return PathClass{Realm2::absent, {}, Errno::enoent};
         if (m->producer) {
@@ -131,7 +144,18 @@ public:
             std::string up = join_host(m->upper, rel);
             std::string lo = join_host(m->host_base, rel);
             if (for_write) {
-                copy_up(up, lo);
+                if (wi == WriteIntent::remove) {
+                    // Resolve to the layer holding the target; don't create.
+                    if (exists(up.c_str()))
+                        return PathClass{Realm2::host_backed, std::move(up),
+                                         Errno::enoent};
+                    return PathClass{Realm2::host_backed, std::move(lo),
+                                     Errno::enoent};
+                }
+                if (wi == WriteIntent::parents_only)
+                    mirror_parents_from_lower(up, lo);
+                else
+                    copy_up(up, lo);
                 return PathClass{Realm2::host_backed, std::move(up), Errno::enoent};
             }
             if (exists(up.c_str()))
@@ -330,9 +354,20 @@ private:
     // read-only lower `lo` on first write and creating parent directories.
     // Best-effort: if the lower doesn't exist this just preps the parent dirs
     // so an O_CREAT open can make the new file in upper.
+    //
+    // Crucially, the parent chain is MIRRORED from lower to upper: a directory
+    // that exists only in the read-only lower (e.g. /opt from the pristine
+    // rootfs) has no upper counterpart, so a bare mkdir/create of a CHILD in
+    // upper would ENOENT on the missing parent. mirror_parents_from_lower
+    // reproduces each lower ancestor as a real upper directory first, so the
+    // upper layer is a coherent writable view of the whole tree.
     static void copy_up(const std::string& up, const std::string& lo) {
-        make_parents(up);
+        mirror_parents_from_lower(up, lo);
         if (exists(up.c_str())) return;                 // already copied up
+        // If the lower is a DIRECTORY, mirror it as a directory in upper (do
+        // NOT open+copy it as a regular file — that would leave a bogus file
+        // where a mkdir/child-create expects a dir, yielding EEXIST/ENOTDIR).
+        if (is_dir(lo.c_str())) { ::mkdir(up.c_str(), 0755); return; }
         int in = ::open(lo.c_str(), O_RDONLY | O_CLOEXEC);
         if (in < 0) return;                             // no lower => new file
         int out = ::open(up.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
@@ -348,6 +383,29 @@ private:
             }
         }
         ::close(in); ::close(out);
+    }
+
+    // Reproduce every ANCESTOR directory of `up` in the upper layer, matching
+    // the corresponding lower ancestor. `up` and `lo` are the upper/lower host
+    // paths of the SAME guest path, so they share a common suffix of
+    // components below their respective bases; we create each upper ancestor
+    // (ignoring EEXIST). Directories that exist only in lower thus gain a real
+    // upper twin, so a child create in upper resolves.
+    static void mirror_parents_from_lower(const std::string& up,
+                                          const std::string& lo) {
+        // Walk `up`'s ancestor prefixes; for each, mkdir it in upper. We can't
+        // know the exact lower/upper base split here, but creating each
+        // ancestor of `up` bottom-up is sufficient and idempotent.
+        std::size_t slash = up.find_last_of('/');
+        if (slash == std::string::npos || slash == 0) return;
+        std::string dir = up.substr(0, slash);
+        for (std::size_t i = 1; i <= dir.size(); ++i) {
+            if (i == dir.size() || dir[i] == '/') {
+                std::string sub = dir.substr(0, i);
+                ::mkdir(sub.c_str(), 0755);   // ignore EEXIST
+            }
+        }
+        (void)lo;
     }
 
     // mkdir -p for the directory component of a host path.

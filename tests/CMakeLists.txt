@@ -53,3 +53,7 @@ add_test(NAME run_stat_owner COMMAND test_run_stat_owner)
 add_executable(test_run_open_procfs test_run_open_procfs.cpp)
 target_link_libraries(test_run_open_procfs PRIVATE linuxity_core)
 add_test(NAME run_open_procfs COMMAND test_run_open_procfs)
+
+add_executable(test_run_mutate test_run_mutate.cpp)
+target_link_libraries(test_run_mutate PRIVATE linuxity_core)
+add_test(NAME run_mutate COMMAND test_run_mutate)

@@ -163,6 +163,18 @@ linuxity services their syscalls. Proofs of the model:
   post-redirect hook, before the task can read the buffer and race the write),
   so `ls -la` shows **`root root`** for every entry and a monitor's USER column
   reads `root` — the world is coherently owned by init, not the box's user.
+- **A package manager installs into the world, and the installed program
+  runs.** Alpine's real `apk` — reading its installed DB through the namespace,
+  extracting a `.apk`, writing files, `chmod`/`chown`ing them, running triggers,
+  updating the database — installs a package end to end (`OK: N packages`), and
+  the freshly-written binary then executes and walks the rootfs. This works
+  because the **whole mutating-path syscall family** (`mkdir`, `rmdir`,
+  `unlink`, `rename`, `link`, `symlink`, `chmod`, `chown`, `truncate`,
+  `utimensat`, `mknod`, and their `*at` forms) translates each guest path to
+  the copy-on-write **overlay upper** layer — never the host's own `/usr`,
+  `/etc` — with two-path ops (`rename`/`link`) rewriting *both* operands and
+  `chown`-to-root accepted as a vacuous no-op (the world is already root-owned,
+  the host process is unprivileged). The pristine lower rootfs is never touched.
 
 ### How the filesystem is virtualized
 
@@ -177,7 +189,13 @@ Every path-taking syscall (`openat`, `newfstatat`, `statx`, `access`,
   this is what carries a dynamically-linked distro binary to `main()`. A
   write-intent open (`O_WRONLY`/`O_RDWR`/`O_CREAT`/`O_TRUNC`) resolves to a
   copy-on-write **overlay upper** dir (copying the file up from the read-only
-  lower first), so the pristine rootfs is never mutated.
+  lower first), so the pristine rootfs is never mutated. The full **mutation
+  family** (`mkdir`/`rmdir`/`unlink`/`rename`/`link`/`symlink`/`chmod`/`chown`/
+  `truncate`/`utimensat`/`mknod` and their `*at` forms) redirects the same way:
+  each guest path resolves to the overlay upper layer, directories that exist
+  only in the read-only lower are mirrored up on first child-write, two-path
+  ops rewrite both operands, and a `symlink`'s literal target is preserved as a
+  guest path (resolved later through the namespace, not the host).
 - **virtual** (`/proc`, `/sys`, and future tmpfs, overlays): the bytes are
   synthesized and either written straight into guest memory (`read`/`stat`/
   `statx`) or materialized into a real fd the child can read *and* `mmap`
@@ -213,7 +231,8 @@ the host filesystem.
 Memory (`mmap`/`brk`/`mprotect`) stays forwarded so native libc reaches
 `main()`; identity, credentials, lifecycle, `uname`, **signal delivery**,
 **per-task pid/session identity**, **`/proc` symlinks**, and now the **whole
-file path** are virtualized. In place and proven by 13 test suites:
+file path — reads AND mutations** — are virtualized. In place and proven by
+15 test suites:
 
 - the type algebra, subsystem concept lattice, and authority boundary;
 - a real **VFS** (mount table, path resolution) with **tmpfs** and a

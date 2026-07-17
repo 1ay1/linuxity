@@ -43,6 +43,15 @@ enum class Sysno {
     rt_sigreturn, rt_sigpending, rt_sigsuspend, sigaltstack,
     // Session / process-group control.
     setpgid, getpgid, setsid, getsid, getpriority, setpriority,
+    // Namespace MUTATION: create/remove/rename/relink/chmod/chown paths.
+    // Every one names a guest path that must be translated to its overlay
+    // upper host path before the kernel touches the real filesystem.
+    mkdir, mkdirat, rmdir, unlink, unlinkat,
+    chmod, fchmod, fchmodat, chown, lchown, fchown, fchownat,
+    truncate, ftruncate, utimensat, futimesat, utimes, utime,
+    mknod, mknodat,
+    // Two-path mutations (both args are paths needing translation).
+    rename, renameat, renameat2, link, linkat, symlink, symlinkat,
 };
 
 // Decode an arch-specific raw syscall number into the canonical identity.
@@ -130,6 +139,34 @@ enum class Sysno {
                 case 141: return Sysno::setpriority;
                 case 332: return Sysno::statx;
                 case 439: return Sysno::faccessat2;
+                // -- namespace mutation (path args need translation) ------
+                case 83:  return Sysno::mkdir;
+                case 258: return Sysno::mkdirat;
+                case 84:  return Sysno::rmdir;
+                case 87:  return Sysno::unlink;
+                case 263: return Sysno::unlinkat;
+                case 90:  return Sysno::chmod;
+                case 91:  return Sysno::fchmod;
+                case 268: return Sysno::fchmodat;
+                case 92:  return Sysno::chown;
+                case 94:  return Sysno::lchown;
+                case 93:  return Sysno::fchown;
+                case 260: return Sysno::fchownat;
+                case 76:  return Sysno::truncate;
+                case 77:  return Sysno::ftruncate;
+                case 280: return Sysno::utimensat;
+                case 261: return Sysno::futimesat;
+                case 235: return Sysno::utimes;
+                case 132: return Sysno::utime;
+                case 133: return Sysno::mknod;
+                case 259: return Sysno::mknodat;
+                case 82:  return Sysno::rename;
+                case 264: return Sysno::renameat;
+                case 316: return Sysno::renameat2;
+                case 86:  return Sysno::link;
+                case 265: return Sysno::linkat;
+                case 88:  return Sysno::symlink;
+                case 266: return Sysno::symlinkat;
                 default:  return Sysno::unknown;
             }
         case Arch::aarch64:
@@ -199,6 +236,21 @@ enum class Sysno {
                 case 156: return Sysno::getsid;
                 case 141: return Sysno::getpriority;
                 case 140: return Sysno::setpriority;
+                // -- namespace mutation (aarch64 has only the *at forms) --
+                case 34:  return Sysno::mkdirat;
+                case 35:  return Sysno::unlinkat;   // AT_REMOVEDIR => rmdir
+                case 53:  return Sysno::fchmodat;
+                case 52:  return Sysno::fchmod;
+                case 54:  return Sysno::fchownat;
+                case 55:  return Sysno::fchown;
+                case 45:  return Sysno::truncate;
+                case 46:  return Sysno::ftruncate;
+                case 88:  return Sysno::utimensat;
+                case 33:  return Sysno::mknodat;
+                case 38:  return Sysno::renameat;
+                case 276: return Sysno::renameat2;
+                case 37:  return Sysno::linkat;
+                case 36:  return Sysno::symlinkat;
                 default:  return Sysno::unknown;
             }
     }

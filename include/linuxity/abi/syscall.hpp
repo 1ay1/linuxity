@@ -58,6 +58,21 @@ struct Outcome {
     int          path_arg{0};      // which arg register holds the char* path
     std::string  host_path;        // translated real host path to splice in
 
+    // A SECOND path arg to translate in the same call (rename/link/symlink,
+    // whose two operands are BOTH guest paths). When path_arg2 >= 0 the trap
+    // pokes host_path2 into that register too before forwarding. For symlink
+    // the FIRST operand is the link's literal text (a guest path stored as
+    // data, NOT resolved on the host) — only the destination is translated,
+    // so symlink sets path_arg2 to the destination and leaves path_arg = -1.
+    int          path_arg2{-1};
+    std::string  host_path2;
+
+    // Ensure the parent host directory of host_path exists before forwarding.
+    // A create into a freshly-materialized overlay upper dir would ENOENT if
+    // the intermediate dirs were never made; a package manager relies on
+    // `mkdir -p` semantics being implicit under the upper layer.
+    bool         make_parents{false};
+
     bool                inject{false};  // splice a host memfd, return its fd
     bool                inject_dir{false}; // the injected node is a directory
     std::vector<std::byte> content;     // bytes to back the injected fd
@@ -235,6 +250,62 @@ public:
             // -- fd-lifecycle bookkeeping: keep our guest fd->path table in
             //    sync so readlinkat/getdents on the fd recover its path.
             case Sysno::close:       return do_close(r);
+
+            // -- NAMESPACE MUTATION. Each names a guest path that must be
+            //    translated to its overlay UPPER host path (for_write=true)
+            //    before the kernel touches the real filesystem; otherwise the
+            //    raw guest path would hit the host's own /usr, /etc, .... This
+            //    is what lets a package manager install its whole world into
+            //    the rootfs. Single-path ops reuse the redirect machinery;
+            //    the create-class ones also request implicit parent mkdir so
+            //    a write into a fresh upper layer doesn't ENOENT.
+            //
+            //    path_arg picks the register: the *at forms carry a dirfd in
+            //    arg0 and the path in arg1; the legacy forms carry the path in
+            //    arg0. mkdir/mknod CREATE, so make_parents; rmdir/unlink
+            //    remove; chmod/chown/truncate/utimensat retarget metadata.
+            case Sysno::mkdir:      return path_mut(r, 0, false, Wi::parents_only);
+            case Sysno::mkdirat:    return path_mut(r, 1, true,  Wi::parents_only);
+            case Sysno::mknod:      return path_mut(r, 0, false, Wi::parents_only);
+            case Sysno::mknodat:    return path_mut(r, 1, true,  Wi::parents_only);
+            case Sysno::rmdir:      return path_mut(r, 0, false, Wi::remove);
+            case Sysno::unlink:     return path_mut(r, 0, false, Wi::remove);
+            case Sysno::unlinkat:   return path_mut(r, 1, true,  Wi::remove);
+            case Sysno::chmod:      return path_mut(r, 0, false, Wi::copy_leaf);
+            case Sysno::fchmodat:   return path_mut(r, 1, true,  Wi::copy_leaf);
+            // chown/chgrp: linuxity presents a ROOT-OWNED world (every stat is
+            // scrubbed to uid=gid=0), and the guest itself runs as uid 0. But
+            // the real host process is UNPRIVILEGED, so a forwarded chown to
+            // uid 0 would fail EPERM — breaking `apk add`, `tar -p`, `install`.
+            // Since ownership is already virtually root, chown is a vacuous
+            // no-op: accept it and report success without touching the host.
+            case Sysno::chown:
+            case Sysno::lchown:
+            case Sysno::fchown:
+            case Sysno::fchownat:   return val(0);
+            case Sysno::truncate:   return path_mut(r, 0, false, Wi::copy_leaf);
+            case Sysno::utimes:     return path_mut(r, 0, false, Wi::copy_leaf);
+            case Sysno::utime:      return path_mut(r, 0, false, Wi::copy_leaf);
+            case Sysno::utimensat:  return path_mut(r, 1, true,  Wi::copy_leaf);
+            case Sysno::futimesat:  return path_mut(r, 1, true,  Wi::copy_leaf);
+            // fchmod/ftruncate/fchdir act on an already-open fd (no path) —
+            // the fd is real, so just forward. (fchown is handled above as a
+            // vacuous no-op alongside the other chown forms.)
+            case Sysno::fchmod:
+            case Sysno::ftruncate:
+            case Sysno::fchdir:     return fwd();
+
+            // -- TWO-PATH mutations: both operands are guest paths. rename /
+            //    link translate both; symlink stores its first operand as the
+            //    link's literal text (guest-absolute, NOT resolved on the
+            //    host) and translates only the destination.
+            case Sysno::rename:     return path_mut2(r, 0, 1, false, false);
+            case Sysno::renameat:   return path_mut2(r, 1, 3, true,  true);
+            case Sysno::renameat2:  return path_mut2(r, 1, 3, true,  true);
+            case Sysno::link:       return path_mut2(r, 0, 1, false, false);
+            case Sysno::linkat:     return path_mut2(r, 1, 3, true,  true);
+            case Sysno::symlink:    return path_symlink(r, 0, 1, false);
+            case Sysno::symlinkat:  return path_symlink(r, 0, 2, true);
 
             // -- everything else: FORWARD to the real host kernel. -------
             // Memory (mmap/brk/mprotect) MUST run in the child so it gets
@@ -560,6 +631,94 @@ private:
     [[nodiscard]] Outcome do_close(const Regs& r) {
         k_.files().unbind_fd(static_cast<int>(r.arg[0]));
         return fwd();   // let the child actually close its real fd
+    }
+
+    // A single-path mutation (mkdir/rmdir/unlink/chmod/chown/truncate/...):
+    // translate the guest path at `path_arg` to its overlay UPPER host path
+    // and REDIRECT, with the WriteIntent selecting how the upper layer is
+    // prepared (create the leaf itself, copy an existing leaf up, or just
+    // resolve for removal). A virtual path (procfs/sysfs) is read-only —
+    // refuse with EROFS; an absent target yields its errno.
+    using Wi = kernel::FileNamespace::WriteIntent;
+    [[nodiscard]] Outcome path_mut(const Regs& r, int path_arg, bool at, Wi wi) {
+        std::string abs = resolve_arg(r, path_arg, at);
+        auto pc = k_.files().classify(abs, /*for_write=*/true, /*follow=*/false, wi);
+        if (pc.realm == kernel::Realm2::virtual_file)
+            return eno(Errno::erofs);
+        if (pc.host_path.empty()) return eno(pc.error);
+        Outcome o{};
+        o.redirect = true;
+        o.path_arg = path_arg;
+        o.host_path = std::move(pc.host_path);
+        // Only creates need their parent chain pre-built by the trap; the
+        // parents_only classify already mirrored them, so this is belt-and-
+        // suspenders for the deep-create case.
+        o.make_parents = (wi == Wi::parents_only);
+        return o;
+    }
+
+    // A two-path mutation (rename/link and their *at forms): BOTH operands are
+    // guest paths, so translate each to its overlay upper host path and hand
+    // the trap two rewrites. rename's *at forms carry (olddirfd, oldpath,
+    // newdirfd, newpath) => path args 1 and 3; the legacy forms carry
+    // (oldpath, newpath) => args 0 and 1. The source is resolved for REMOVAL
+    // (it must already exist), the destination CREATES its leaf.
+    [[nodiscard]] Outcome path_mut2(const Regs& r, int a1, int a2, bool at,
+                                    bool /*at2*/) {
+        std::string src = resolve_arg(r, a1, at);
+        std::string dst = resolve_second(r, a2, at);
+        auto ps = k_.files().classify(src, true, false, Wi::copy_leaf);
+        auto pd = k_.files().classify(dst, true, false, Wi::parents_only);
+        if (ps.realm == kernel::Realm2::virtual_file ||
+            pd.realm == kernel::Realm2::virtual_file)
+            return eno(Errno::erofs);
+        if (ps.host_path.empty() || pd.host_path.empty())
+            return eno(ps.host_path.empty() ? ps.error : pd.error);
+        Outcome o{};
+        o.redirect     = true;
+        o.path_arg     = a1;
+        o.host_path    = std::move(ps.host_path);
+        o.path_arg2    = a2;
+        o.host_path2   = std::move(pd.host_path);
+        o.make_parents = true;   // ensure the destination's parent exists
+        return o;
+    }
+
+    // symlink(target, linkpath) / symlinkat(target, newdirfd, linkpath):
+    // `target` is the link's literal CONTENTS — a guest-absolute string the
+    // guest will later resolve through OUR namespace — so it must NOT be
+    // rewritten to a host path. Only the linkpath (where the symlink lives)
+    // is translated to its overlay upper host path.
+    [[nodiscard]] Outcome path_symlink(const Regs& r, int /*target_arg*/,
+                                       int link_arg, bool at) {
+        std::string link = at ? resolve_second(r, link_arg, true)
+                              : k_.files().absolutize(
+                                    read_cstr(uaddr(r.arg[static_cast<std::size_t>(link_arg)])),
+                                    k_.files().cwd());
+        auto pc = k_.files().classify(link, true, false, Wi::parents_only);
+        if (pc.realm == kernel::Realm2::virtual_file)
+            return eno(Errno::erofs);
+        if (pc.host_path.empty()) return eno(pc.error);
+        Outcome o{};
+        o.redirect     = true;
+        o.path_arg     = link_arg;      // rewrite ONLY the linkpath
+        o.host_path    = std::move(pc.host_path);
+        o.make_parents = true;
+        return o;
+    }
+
+    // Resolve the SECOND path of an *at two-operand syscall. Its dirfd is the
+    // register just before the path (renameat: newdirfd=arg2,newpath=arg3;
+    // linkat: newdirfd=arg2,newpath=arg3; symlinkat: newdirfd=arg1,
+    // linkpath=arg2). For the legacy (non-at) forms there is no dirfd.
+    [[nodiscard]] std::string resolve_second(const Regs& r, int path_arg,
+                                             bool at) {
+        std::string raw =
+            read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)]));
+        std::string_view dir =
+            at ? dir_of(static_cast<std::int64_t>(r.arg[static_cast<std::size_t>(path_arg) - 1]))
+               : std::string_view{};
+        return k_.files().absolutize(raw, dir);
     }
 
     // getdents64(fd, buf, count): if fd names a VIRTUAL directory (procfs),
