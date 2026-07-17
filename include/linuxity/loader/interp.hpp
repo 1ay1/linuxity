@@ -60,4 +60,38 @@ namespace lx::loader {
     return {};   // static: no PT_INTERP
 }
 
+// A parsed `#!` script header: the interpreter path and its single optional
+// argument (the kernel passes at most one). Empty `interp` means "not a
+// shebang script".
+struct Shebang { std::string interp; std::string arg; };
+
+// Read the `#!interp [arg]` line of the file at `host_path`. Returns an empty
+// interp if the file doesn't start with "#!" (or is unreadable). Matches the
+// kernel's rule: everything after the interpreter up to the first whitespace
+// is the interpreter; the REMAINDER of the line (trimmed) is ONE argument.
+[[nodiscard]] inline Shebang read_shebang(const std::string& host_path) {
+    std::FILE* f = std::fopen(host_path.c_str(), "rb");
+    if (!f) return {};
+    struct Closer { std::FILE* f; ~Closer() { std::fclose(f); } } closer{f};
+    char line[256];
+    std::size_t n = std::fread(line, 1, sizeof line - 1, f);
+    if (n < 2 || line[0] != '#' || line[1] != '!') return {};
+    line[n] = '\0';
+    // Terminate at the newline.
+    for (std::size_t i = 0; i < n; ++i)
+        if (line[i] == '\n') { line[i] = '\0'; n = i; break; }
+    std::size_t i = 2;
+    while (i < n && (line[i] == ' ' || line[i] == '\t')) ++i;   // skip ws
+    std::size_t is = i;
+    while (i < n && line[i] != ' ' && line[i] != '\t') ++i;     // interp token
+    Shebang sh;
+    sh.interp.assign(line + is, i - is);
+    while (i < n && (line[i] == ' ' || line[i] == '\t')) ++i;   // skip ws
+    // The remainder (trimmed of trailing ws) is one argument.
+    std::size_t end = n;
+    while (end > i && (line[end - 1] == ' ' || line[end - 1] == '\t')) --end;
+    if (end > i) sh.arg.assign(line + i, end - i);
+    return sh;
+}
+
 } // namespace lx::loader

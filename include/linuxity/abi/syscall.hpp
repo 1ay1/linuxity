@@ -95,6 +95,12 @@ struct Outcome {
     bool         exec_interp{false};
     std::string  interp_host;      // real host path of the dynamic linker
     std::string  prog_guest;      // guest path of the program (new argv[0..1])
+    // Extra argv tokens inserted BETWEEN the interpreter (argv[0]) and the
+    // program. For a plain dynamic ELF this is empty. For a `#!` script it
+    // carries the shebang's optional argument (e.g. "-e" from `#!/bin/sh -e`)
+    // and, when the script's interpreter is ITSELF dynamic, the interpreter's
+    // own host path (so argv = ld.so, /bin/sh-host, [-e], script-guest, ...).
+    std::vector<std::string> interp_prefix;
 
     // POST-REDIRECT id scrub. Host-backed stat/lstat/newfstatat/statx are
     // REDIRECTED, so the host kernel fills the guest buffer with the HOST
@@ -605,6 +611,41 @@ private:
                 o.interp_host = ipc.realm == kernel::Realm2::host_backed
                                     ? std::move(ipc.host_path) : interp;
                 o.prog_guest  = abs;   // guest path; loader's openat redirects
+                return o;
+            }
+            // A `#!` script: the host kernel would launch the shebang
+            // interpreter with the HOST-translated script path, which OUR
+            // namespace then re-translates (double-rooting). So resolve the
+            // shebang ourselves and exec the interpreter with the script as a
+            // GUEST path. If the interpreter is itself dynamic, chain through
+            // its ld.so as well.
+            if (loader::Shebang sh = loader::read_shebang(pc.host_path);
+                !sh.interp.empty()) {
+                std::string si_abs = k_.files().absolutize(sh.interp);
+                auto sic = k_.files().classify(si_abs);
+                std::string si_host = sic.realm == kernel::Realm2::host_backed
+                                          ? sic.host_path : sh.interp;
+                Outcome o{};
+                o.exec_interp = true;
+                o.path_arg    = path_arg;
+                o.prog_guest  = abs;   // the script, as a guest path
+                // Is the shebang interpreter ITSELF dynamic? Then exec its
+                // ld.so, and pass the interpreter's host path as the first
+                // prefix token (ld.so <sh-host> [-e] <script-guest> ...).
+                std::string si_interp = loader::read_elf_interp(si_host);
+                if (!si_interp.empty()) {
+                    std::string ld_abs = k_.files().absolutize(si_interp);
+                    auto ldc = k_.files().classify(ld_abs);
+                    o.interp_host = ldc.realm == kernel::Realm2::host_backed
+                                        ? std::move(ldc.host_path) : si_interp;
+                    // ld.so opens its program argument through redirected
+                    // openat, so pass the interpreter's GUEST path (si_abs),
+                    // not its host path — else ld re-translates and double-roots.
+                    o.interp_prefix.push_back(std::move(si_abs));
+                } else {
+                    o.interp_host = std::move(si_host);   // static interpreter
+                }
+                if (!sh.arg.empty()) o.interp_prefix.push_back(std::move(sh.arg));
                 return o;
             }
             Outcome o{};

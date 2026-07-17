@@ -163,7 +163,7 @@ public:
                 if constexpr (requires {
                         trap_.exec_through_interp(0, std::string{}, std::string{}); }) {
                     (void)LX_TRY(trap_.exec_through_interp(
-                        o.path_arg, o.interp_host, o.prog_guest));
+                        o.path_arg, o.interp_host, o.prog_guest, o.interp_prefix));
                 } else {
                     (void)LX_TRY(trap_.forward());
                 }
