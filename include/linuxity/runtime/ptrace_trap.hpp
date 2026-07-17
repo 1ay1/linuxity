@@ -22,6 +22,7 @@
 
 #include "linuxity/abi/syscall.hpp"
 #include "linuxity/runtime/trap.hpp"
+#include "linuxity/runtime/seccomp_filter.hpp"
 
 #include <sys/ptrace.h>
 #include <sys/ioctl.h>
@@ -34,6 +35,7 @@
 #include <csignal>
 #include <cerrno>
 
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <string>
@@ -53,10 +55,27 @@ public:
           envp_{std::move(envp)}, root_{std::move(root)},
           pre_exec_{std::move(pre_exec)} {}
 
+    // Per-task state machine. Declared here (before the methods that take a
+    // Task&) so the public entry/exit helpers can name it.
+    enum class Action { none, set_ret };
+    struct Task {
+        bool in_call{false};   // currently between an ENTRY and its EXIT stop
+        Action action{Action::none};
+        std::int64_t ret{0};
+        int pending_sig{0};    // a signal held during a redirect, to re-inject
+        struct user_regs_struct regs{};
+    };
+
     [[nodiscard]] Status start(UAddr, UAddr) {
+        // A tiny pipe lets the child report whether the seccomp trap filter
+        // installed, so the parent knows to drive tasks with PTRACE_CONT (only
+        // filtered syscalls stop) versus PTRACE_SYSCALL (every syscall stops).
+        int seccomp_pipe[2] = {-1, -1};
+        (void)::pipe(seccomp_pipe);
         ::pid_t pid = ::fork();
         if (pid < 0) return err(Errno::eagain);
         if (pid == 0) {
+            if (seccomp_pipe[0] >= 0) ::close(seccomp_pipe[0]);
             if (!root_.empty()) {
                 if (::chroot(root_.c_str()) == 0) (void)::chdir("/");
             }
@@ -65,6 +84,19 @@ public:
             // resource cgroup and installs rlimit fallbacks. Runs pre-TRACEME
             // so enforcement is in effect the instant the guest's _start runs.
             if (pre_exec_) pre_exec_();
+            // Install the seccomp trap filter so ONLY the syscalls linuxity
+            // intercepts stop into the tracer; everything else runs natively.
+            // Report the outcome to the parent, then let the filter be
+            // inherited across the coming execve and every future fork. If
+            // seccomp is unavailable the parent falls back to PTRACE_SYSCALL,
+            // which is always correct (just slower). LINUXITY_NO_SECCOMP=1
+            // forces that fallback (for benchmarking / debugging the slow path).
+            char ok_byte = (!std::getenv("LINUXITY_NO_SECCOMP") &&
+                            install_trap_filter()) ? 1 : 0;
+            if (seccomp_pipe[1] >= 0) {
+                (void)!::write(seccomp_pipe[1], &ok_byte, 1);
+                ::close(seccomp_pipe[1]);
+            }
             ::ptrace(PTRACE_TRACEME, 0, nullptr, nullptr);
             std::vector<char*> cargv;
             for (auto& a : argv_) cargv.push_back(a.data());
@@ -77,13 +109,26 @@ public:
         }
         int st = 0;
         ::waitpid(pid, &st, 0);
-        ::ptrace(PTRACE_SETOPTIONS, pid, 0,
-                 PTRACE_O_EXITKILL | PTRACE_O_TRACESYSGOOD |
-                 PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK |
-                 PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC);
+        // Learn whether the child installed the seccomp filter.
+        if (seccomp_pipe[1] >= 0) ::close(seccomp_pipe[1]);
+        char ok_byte = 0;
+        if (seccomp_pipe[0] >= 0) {
+            (void)!::read(seccomp_pipe[0], &ok_byte, 1);
+            ::close(seccomp_pipe[0]);
+        }
+        seccomp_ = (ok_byte == 1);
+        int opts = PTRACE_O_EXITKILL | PTRACE_O_TRACESYSGOOD |
+                   PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK |
+                   PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC;
+        // With a filter, ask for PTRACE_EVENT_SECCOMP stops on the traced
+        // syscalls; without one, we rely on ordinary syscall-entry stops.
+        if (seccomp_) opts |= PTRACE_O_TRACESECCOMP;
+        ::ptrace(PTRACE_SETOPTIONS, pid, 0, opts);
         root_pid_ = pid;
         tasks_[pid];                       // create, at-entry state
-        ::ptrace(PTRACE_SYSCALL, pid, 0, 0);
+        // Filtered: run free until a seccomp/event stop. Unfiltered: stop at
+        // the next syscall entry.
+        resume_run(pid, 0);
         ++live_;
         return ok();
     }
@@ -138,7 +183,12 @@ public:
                     gppid_[gpid] = gppid;
                     proc_events_.push_back({ProcEvent::spawn, gpid, gppid, {}, {}});
                 }
-                ::ptrace(PTRACE_SYSCALL, w, 0, 0);
+                // If we're mid-servicing this task's clone/fork (in_call), it
+                // still owes us its EXIT stop so finalize_exit can translate
+                // the returned host pid to a guest pid. Step to that exit with
+                // PTRACE_SYSCALL rather than letting CONT run past it — else $!
+                // and jobs would show a host pid. Otherwise run free.
+                resume_after_event(w);
                 continue;
             }
             if (event == PTRACE_EVENT_EXEC) {
@@ -148,67 +198,109 @@ public:
                 proc_events_.push_back({ProcEvent::exec, gpid_of(w), 0,
                                         comm_of(w), cmdline_of(w)});
                 tasks_[w] = Task{};        // fresh image, back at-entry
-                ::ptrace(PTRACE_SYSCALL, w, 0, 0);
+                resume_run(w, 0);
                 continue;
+            }
+            // A seccomp-filter trap: the guest hit one of the syscalls we
+            // intercept. This IS the syscall-ENTRY stop under the fast path;
+            // service it exactly like an ordinary entry (the seccomp event
+            // fires BEFORE the syscall runs). Non-filtered syscalls never get
+            // here — they ran natively without stopping.
+            if (event == PTRACE_EVENT_SECCOMP) {
+                Task& t = tasks_[w];
+                struct user_regs_struct rr{};
+                ::ptrace(PTRACE_GETREGS, w, 0, &rr);
+                cur_ = w;
+                t.regs = rr;
+                t.in_call = true;
+                translate_entry_args(w, rr, t);
+                fill_frame(f, rr);
+                return ok(true);
             }
             // The initial SIGSTOP/ SIGTRAP of a freshly-attached child.
             if (sig == SIGSTOP || sig == SIGTRAP) {
                 tasks_.try_emplace(w);
-                ::ptrace(PTRACE_SYSCALL, w, 0, 0);
+                resume_run(w, 0);
                 continue;
             }
-            // A real syscall stop (TRACESYSGOOD => SIGTRAP|0x80).
+            // A real syscall stop (TRACESYSGOOD => SIGTRAP|0x80). Under the
+            // seccomp fast path this is ONLY an EXIT stop (from the one-shot
+            // PTRACE_SYSCALL a serviced entry issued); entries arrive as
+            // PTRACE_EVENT_SECCOMP above. Without seccomp it is BOTH the entry
+            // and the exit, distinguished by the -ENOSYS-primed RAX.
             if (sig == (SIGTRAP | 0x80)) {
                 Task& t = tasks_[w];
                 struct user_regs_struct rr{};
                 ::ptrace(PTRACE_GETREGS, w, 0, &rr);
-                // The kernel primes RAX to -ENOSYS at syscall-ENTRY and
-                // overwrites it with the result at EXIT. This is the robust,
-                // state-free way to tell the two stops apart (surviving
-                // fork/exec/attach without a fragile per-task toggle).
-                bool is_entry = (static_cast<long long>(rr.rax) == -38 /*ENOSYS*/)
-                                && !t.in_call;
+                bool is_entry = !seccomp_
+                    && (static_cast<long long>(rr.rax) == -38 /*ENOSYS*/)
+                    && !t.in_call;
                 if (is_entry) {
                     cur_ = w;
                     t.regs = rr;
                     t.in_call = true;
-                    // A forwarded wait4(pid, ...) carries a GUEST pid in arg0
-                    // (we handed the guest small pids from fork). The host
-                    // kernel only knows the real host tid, so a raw guest pid
-                    // would wait on nothing and return -1/ECHILD. Rewrite a
-                    // positive pid arg to its host tid before the kernel runs
-                    // the call; the reaped pid is translated back to the guest
-                    // pid at the exit stop (returns_pid). pid<=0 (any child /
-                    // process group / -pgid) passes through: our tree shares
-                    // the host's process-group membership natively.
-                    if (rr.orig_rax == 61 /*wait4*/) {
-                        auto gpid = static_cast<std::int32_t>(
-                            static_cast<long long>(rr.rdi));
-                        if (gpid > 0) {
-                            ::pid_t host = host_tid_of(gpid);
-                            if (host > 0) {
-                                struct user_regs_struct wr = rr;
-                                wr.rdi = static_cast<unsigned long long>(host);
-                                ::ptrace(PTRACE_SETREGS, w, 0, &wr);
-                                t.regs = wr;
-                            }
-                        }
-                    }
-                    f.regs.nr     = rr.orig_rax;
-                    f.regs.arg[0] = rr.rdi; f.regs.arg[1] = rr.rsi;
-                    f.regs.arg[2] = rr.rdx; f.regs.arg[3] = rr.r10;
-                    f.regs.arg[4] = rr.r8;  f.regs.arg[5] = rr.r9;
-                    f.pc          = rr.rip;
+                    translate_entry_args(w, rr, t);
+                    fill_frame(f, rr);
                     return ok(true);
                 }
-                // EXIT stop: finalize the action recorded at entry.
+                // EXIT stop: finalize the action recorded at entry, then let
+                // the task run FREE again (CONT) until its next filtered call.
                 finalize_exit(w, t);
-                ::ptrace(PTRACE_SYSCALL, w, 0, 0);
+                resume_run(w, 0);
                 continue;
             }
             // Any other signal: deliver it to the task.
-            ::ptrace(PTRACE_SYSCALL, w, 0, sig);
+            resume_run(w, sig);
         }
+    }
+
+    // Fill the arch-neutral TrapFrame from x86-64 registers at a syscall stop.
+    static void fill_frame(TrapFrame& f, const struct user_regs_struct& rr) {
+        f.regs.nr     = rr.orig_rax;
+        f.regs.arg[0] = rr.rdi; f.regs.arg[1] = rr.rsi;
+        f.regs.arg[2] = rr.rdx; f.regs.arg[3] = rr.r10;
+        f.regs.arg[4] = rr.r8;  f.regs.arg[5] = rr.r9;
+        f.pc          = rr.rip;
+    }
+
+    // At a syscall-ENTRY stop, translate any GUEST pid arguments to host tids
+    // before the kernel runs the (forwarded) call. Currently: wait4(pid,...).
+    // A forwarded wait4 carries a GUEST pid in arg0 (we hand the guest small
+    // pids from fork); the host kernel only knows the real host tid, so a raw
+    // guest pid would wait on nothing and return -1/ECHILD. Rewrite a positive
+    // pid to its host tid; the reaped pid is translated back at the exit stop
+    // (returns_pid). pid<=0 (any child / process group) passes through.
+    void translate_entry_args(::pid_t w, struct user_regs_struct& rr, Task& t) {
+        if (rr.orig_rax == 61 /*wait4*/) {
+            auto gpid = static_cast<std::int32_t>(static_cast<long long>(rr.rdi));
+            if (gpid > 0) {
+                ::pid_t host = host_tid_of(gpid);
+                if (host > 0) {
+                    struct user_regs_struct wr = rr;
+                    wr.rdi = static_cast<unsigned long long>(host);
+                    ::ptrace(PTRACE_SETREGS, w, 0, &wr);
+                    t.regs = wr;
+                    rr = wr;
+                }
+            }
+        }
+    }
+
+    // Resume a task to run FREE until its next stop of interest: CONT when a
+    // seccomp filter is active (only filtered syscalls stop), PTRACE_SYSCALL
+    // otherwise (every syscall entry/exit stops). `sig` is delivered on resume.
+    void resume_run(::pid_t w, int sig) {
+        ::ptrace(seccomp_ ? PTRACE_CONT : PTRACE_SYSCALL, w, 0, sig);
+    }
+
+    // Resume after a fork/exec EVENT stop. If the task is still inside a
+    // syscall WE are servicing (clone/fork/execve), it owes us its EXIT stop,
+    // so step to it with PTRACE_SYSCALL even under seccomp; otherwise run free.
+    void resume_after_event(::pid_t w) {
+        bool in_call = false;
+        if (auto it = tasks_.find(w); it != tasks_.end()) in_call = it->second.in_call;
+        if (seccomp_ && in_call) ::ptrace(PTRACE_SYSCALL, w, 0, 0);
+        else                     resume_run(w, 0);
     }
 
     // VIRTUALIZE: neutralize the syscall now; write `ret` into RAX at exit.
@@ -219,13 +311,21 @@ public:
         ::ptrace(PTRACE_SETREGS, cur_, 0, &r);
         t.action = Action::set_ret;
         t.ret = ret;
-        ::ptrace(PTRACE_SYSCALL, cur_, 0, 0);   // run to exit; don't block here
+        // A one-shot PTRACE_SYSCALL runs the (neutralized) call to its EXIT
+        // stop, where finalize_exit writes `ret` into RAX. This is correct
+        // under BOTH drive modes: from a seccomp-event entry stop or an
+        // ordinary syscall-entry stop, PTRACE_SYSCALL always halts at the
+        // matching exit. After finalize we return to the free-running CONT.
+        ::ptrace(PTRACE_SYSCALL, cur_, 0, 0);
         return ok();
     }
 
     // FORWARD: let the host kernel run this syscall in the task. We report the
     // result asynchronously as 0 (the loop doesn't need it for a plain
     // forward); the real value lands in the guest's RAX by the kernel itself.
+    // A one-shot PTRACE_SYSCALL steps to the EXIT stop so finalize_exit can
+    // translate a returned host pid (fork/wait) to a guest pid before the
+    // guest reads it; for non-pid forwards the exit stop is a cheap no-op.
     [[nodiscard]] Result<std::int64_t> forward() {
         Task& t = tasks_[cur_];
         t.action = Action::none;
@@ -369,7 +469,7 @@ public:
         // Forward: the kernel runs the (rewritten) execve; on success it
         // replaces the image and we get a PTRACE_EVENT_EXEC. Don't step here.
         t.action = Action::none;
-        ::ptrace(PTRACE_SYSCALL, cur_, 0, 0);
+        resume_run(cur_, 0);
         return ok(std::int64_t{0});
     }
 
@@ -554,15 +654,6 @@ public:
     }
 
 private:
-    enum class Action { none, set_ret };
-    struct Task {
-        bool in_call{false};   // currently between an ENTRY and its EXIT stop
-        Action action{Action::none};
-        std::int64_t ret{0};
-        int pending_sig{0};    // a signal held during a redirect, to re-inject
-        struct user_regs_struct regs{};
-    };
-
     // Resume `w` toward its next syscall stop, delivering any signal we held
     // back during a redirect step (so a deferred SIGALRM/SIGCHLD/... is not
     // lost, just sequenced AFTER the rewritten syscall completed).
@@ -572,7 +663,10 @@ private:
             sig = it->second.pending_sig;
             it->second.pending_sig = 0;
         }
-        ::ptrace(PTRACE_SYSCALL, w, 0, sig);
+        // We've consumed this task's exit stop; let it run FREE to its next
+        // filtered call (CONT under seccomp) rather than stopping at every
+        // subsequent syscall (PTRACE_SYSCALL), delivering any held signal.
+        resume_run(w, sig);
     }
 
     // At a task's syscall-EXIT stop, apply the action recorded at entry.
@@ -702,6 +796,7 @@ private:
     int exit_code_{0};
     int live_{0};
     bool exited_{false};
+    bool seccomp_{false};          // trap filter active -> drive with PTRACE_CONT
     std::unordered_map<::pid_t, Task> tasks_;
 };
 

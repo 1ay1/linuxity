@@ -74,6 +74,10 @@ add_executable(test_run_pid_namespace test_run_pid_namespace.cpp)
 target_link_libraries(test_run_pid_namespace PRIVATE linuxity_core)
 add_test(NAME run_pid_namespace COMMAND test_run_pid_namespace)
 
+add_executable(test_run_seccomp test_run_seccomp.cpp)
+target_link_libraries(test_run_seccomp PRIVATE linuxity_core)
+add_test(NAME run_seccomp COMMAND test_run_seccomp)
+
 add_executable(test_resources test_resources.cpp)
 target_link_libraries(test_resources PRIVATE linuxity_core)
 add_test(NAME resources COMMAND test_resources)
