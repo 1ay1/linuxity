@@ -26,8 +26,14 @@ static bool has_entry(const kernel::VirtualFile& d, std::string_view name) {
 }
 
 int main() {
+    // The single source of truth for this test's virtual machine: 4 CPUs at
+    // 2.4 GHz. /sys and /proc both read it, so they agree by construction.
+    kernel::MachineSpec mach;
+    mach.ncpu = 4;
+    mach.cpu_hz = 2'400'000'000;   // -> cpu_khz() == 2400000
+
     // ================= /sys synthesis (4-CPU virtual machine) ============
-    auto sysfs = vfs::make_sysfs(/*ncpu=*/4, /*khz=*/2400000);
+    auto sysfs = vfs::make_sysfs(mach);
 
     // Root and the top-level topology directories enumerate.
     {
@@ -93,7 +99,7 @@ int main() {
     child.cmdline = "sleep 10";
     procs.upsert(child);
 
-    auto procfs = vfs::make_procfs(procs, "6.6.0-linuxity", "linuxity", 4);
+    auto procfs = vfs::make_procfs(procs, mach);
 
     // /proc enumerates the live pids (1 = init, 7 = the child).
     {

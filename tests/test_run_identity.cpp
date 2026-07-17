@@ -43,8 +43,7 @@ static int run(const std::string& root, const std::string& prog) {
     host::PosixHost hw;
     kernel::Kernel<host::PosixHost> k{hw};
     k.files().mount_host("/", root);
-    k.files().mount_virtual("/proc",
-        vfs::make_procfs(k.procs(), "6.6.0-linuxity", "linuxity"));
+    k.files().mount_virtual("/proc", vfs::make_procfs(k.procs(), k.machine()));
     { kernel::ProcInfo init; init.pid = 1; init.cmdline = prog;
       k.procs().upsert(init); }
     std::string exec = root + prog;

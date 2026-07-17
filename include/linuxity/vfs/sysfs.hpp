@@ -26,6 +26,7 @@
 #pragma once
 
 #include "linuxity/kernel/file_namespace.hpp"
+#include "linuxity/kernel/machine.hpp"
 
 #include <string>
 #include <string_view>
@@ -61,14 +62,16 @@ inline long index_after(std::string_view s, std::string_view prefix) {
 
 } // namespace sysfs_detail
 
-// Build a /sys producer describing a virtual machine with `ncpu` logical CPUs.
-// The topology is one physical package, `ncpu` cores, no SMT — the simplest
-// coherent shape. `mhz` is the reported (fixed) core frequency in kHz base.
+// Build a /sys producer describing linuxity's virtual machine. It reads the
+// SAME MachineSpec (kernel/machine.hpp) as /proc and the syscalls, so the CPU
+// count, topology and reported frequency can never disagree between /sys and
+// /proc. One physical package, `ncpu` cores, no SMT.
 [[nodiscard]] inline kernel::FileNamespace::Producer
-make_sysfs(long ncpu = 4, long khz = 3000000) {
-    if (ncpu < 1) ncpu = 1;
-    return [ncpu, khz](std::string_view abs) -> Result<kernel::VirtualFile> {
+make_sysfs(const kernel::MachineSpec& mach) {
+    return [&mach](std::string_view abs) -> Result<kernel::VirtualFile> {
         using namespace sysfs_detail;
+        const long ncpu = mach.ncpu < 1 ? 1 : mach.ncpu;
+        const long khz  = mach.cpu_khz();
 
         auto D = [](std::initializer_list<VirtualDirent> e) {
             return ok(dir(std::vector<VirtualDirent>(e)));
@@ -76,7 +79,7 @@ make_sysfs(long ncpu = 4, long khz = 3000000) {
         auto T = [](std::string s) { return ok(text(std::move(s))); };
 
         // Helper: "0-3" style cpu range list for `ncpu`.
-        std::string cpu_range = ncpu == 1 ? "0" : "0-" + std::to_string(ncpu - 1);
+        std::string cpu_range = mach.cpu_range();
 
         // ================= /sys root =====================================
         if (abs == "/sys")

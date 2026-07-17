@@ -12,6 +12,7 @@
 #include "linuxity/host/host.hpp"
 #include "linuxity/kernel/authority.hpp"
 #include "linuxity/kernel/file_namespace.hpp"
+#include "linuxity/kernel/machine.hpp"
 #include "linuxity/kernel/process_table.hpp"
 #include "linuxity/kernel/subsystem.hpp"
 
@@ -42,16 +43,13 @@ public:
 
     [[nodiscard]] const Grants& grants() const noexcept { return grants_; }
 
-    // The virtual machine linuxity presents: logical CPUs and total RAM. These
-    // are the SAME facts /proc and /sys synthesize, surfaced here so the
-    // dispatcher can answer sysinfo(2) and sched_getaffinity(2) consistently
-    // (a monitor must see one coherent machine, not the host's).
-    struct MachineSpec {
-        long ncpu{1};
-        std::uint64_t mem_total_bytes{std::uint64_t{2048} << 20};  // 2 GiB
-    };
+    // The virtual machine linuxity presents: the SINGLE source of truth for
+    // ncpu/RAM/frequency/identity/uptime. Every /proc and /sys synthesizer
+    // and the sysinfo(2)/sched_getaffinity(2) handlers read THIS same struct
+    // by const-ref, so the guest always sees one coherent machine.
     [[nodiscard]] const MachineSpec& machine() const noexcept { return machine_; }
-    void set_machine(MachineSpec m) noexcept { machine_ = m; }
+    [[nodiscard]] MachineSpec& machine() noexcept { return machine_; }
+    void set_machine(MachineSpec m) noexcept { machine_ = std::move(m); machine_.normalize(); }
 
     // The filesystem namespace the guest lives in (mount table + cwd + fd
     // table). The syscall dispatcher routes every path syscall through here.

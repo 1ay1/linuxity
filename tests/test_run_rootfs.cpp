@@ -52,8 +52,7 @@ int main() {
     host::PosixHost hw;
     kernel::Kernel<host::PosixHost> k{hw};
     k.files().mount_host("/", root);
-    k.files().mount_virtual("/proc",
-        vfs::make_procfs(k.procs(), "6.6.0-linuxity", "linuxity"));
+    k.files().mount_virtual("/proc", vfs::make_procfs(k.procs(), k.machine()));
 
     // Translate the guest program path to its real host location under the
     // rootfs (the exec target is the one path the host kernel resolves).

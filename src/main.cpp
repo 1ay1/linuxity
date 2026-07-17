@@ -63,9 +63,19 @@ int main(int argc, char** argv) {
     long ncpu = ::sysconf(_SC_NPROCESSORS_ONLN);
     if (ncpu < 1) ncpu = 1;
 
-    // Tell the kernel the virtual machine's shape so sysinfo(2) and
-    // sched_getaffinity(2) match /proc and /sys (same ncpu, 2 GiB RAM).
-    k.set_machine({ncpu, std::uint64_t{2048} << 20});
+    // Configure the virtual machine ONCE. This MachineSpec is the single
+    // source of truth: /proc, /sys, and the sysinfo/sched_getaffinity syscalls
+    // all read this same instance (owned by the kernel), so they can never
+    // disagree. Native execution really runs on the host CPUs, so ncpu is the
+    // host's online count; everything else is linuxity's own identity.
+    {
+        kernel::MachineSpec spec;
+        spec.ncpu = ncpu;
+        spec.mem_total = std::uint64_t{2048} << 20;   // 2 GiB
+        spec.release = "6.6.0-linuxity";
+        spec.nodename = "linuxity";
+        k.set_machine(std::move(spec));
+    }
 
     // Seed the process table: pid 1 is our init (the traced root). Its
     // cmdline is the program we're about to run, so /proc/1/cmdline is real.
@@ -93,17 +103,15 @@ int main(int argc, char** argv) {
         std::string upper = "/tmp/linuxity-upper-" + std::to_string(::getpid());
         (void)::mkdir(upper.c_str(), 0755);
         k.files().mount_host("/", root, upper);
-        k.files().mount_virtual("/proc",
-            vfs::make_procfs(k.procs(), "6.6.0-linuxity", "linuxity", ncpu));
-        k.files().mount_virtual("/sys", vfs::make_sysfs(ncpu));
+        k.files().mount_virtual("/proc", vfs::make_procfs(k.procs(), k.machine()));
+        k.files().mount_virtual("/sys", vfs::make_sysfs(k.machine()));
     } else {
         // No rootfs: the guest lives in the real host tree (paths translate
         // 1:1), but /proc and /sys are STILL synthesized so uname/pid/mounts
         // and hardware topology report linuxity's world, not the host's.
         k.files().mount_host("/", "/");
-        k.files().mount_virtual("/proc",
-            vfs::make_procfs(k.procs(), "6.6.0-linuxity", "linuxity", ncpu));
-        k.files().mount_virtual("/sys", vfs::make_sysfs(ncpu));
+        k.files().mount_virtual("/proc", vfs::make_procfs(k.procs(), k.machine()));
+        k.files().mount_virtual("/sys", vfs::make_sysfs(k.machine()));
     }
 
     // The rootfs makes the translation unprivileged, so we no longer need to

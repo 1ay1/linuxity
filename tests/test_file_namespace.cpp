@@ -33,8 +33,8 @@ int main() {
     FN f;
     f.mount_host("/", "/tmp/lxroot");
     kernel::ProcessTable procs;
-    f.mount_virtual("/proc",
-        vfs::make_procfs(procs, "6.6.0-linuxity", "linuxity"));
+    static const kernel::MachineSpec mach;
+    f.mount_virtual("/proc", vfs::make_procfs(procs, mach));
 
     // A rootfs path translates to base + rel (host-backed realm).
     {

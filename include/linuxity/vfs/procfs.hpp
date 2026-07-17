@@ -15,9 +15,9 @@
 #pragma once
 
 #include "linuxity/kernel/file_namespace.hpp"
+#include "linuxity/kernel/machine.hpp"
 #include "linuxity/kernel/process_table.hpp"
 
-#include <chrono>
 #include <cstdio>
 #include <string>
 #include <string_view>
@@ -25,18 +25,6 @@
 namespace lx::vfs {
 
 namespace detail {
-
-// Seconds of "virtual uptime" elapsed since the producer was first built.
-// linuxity boots when the runtime starts; /proc/uptime, /proc/stat jiffies
-// and boot time all derive from this ONE monotonic origin so a monitor sees
-// a coherent, ADVANCING clock. A process monitor computes CPU% from the
-// DELTA of /proc/stat jiffies between two reads a second apart, so the
-// counters must move with real time or every core reads 0.0%.
-[[nodiscard]] inline double uptime_seconds() {
-    static const auto boot = std::chrono::steady_clock::now();
-    return std::chrono::duration<double>(
-               std::chrono::steady_clock::now() - boot).count();
-}
 
 inline kernel::VirtualFile text_file(std::string s) {
     kernel::VirtualFile vf;
@@ -67,17 +55,19 @@ inline std::pair<long, std::string> split_pid(std::string_view abs) {
 
 } // namespace detail
 
-// Build a /proc producer bound to linuxity's process table + identity. The
-// table is captured by reference; it is owned by the kernel and updated live
-// as the runtime traces the guest tree.
+// Build a /proc producer bound to linuxity's process table + machine spec.
+// The spec (kernel/machine.hpp) is the SINGLE source of truth for ncpu, RAM,
+// frequency, identity and uptime; /proc reads only from it, so it can never
+// drift from /sys or the sysinfo(2)/sched_getaffinity(2) syscalls. Both the
+// table and the spec are captured by reference (owned by the kernel).
 [[nodiscard]] inline kernel::FileNamespace::Producer
-make_procfs(const kernel::ProcessTable& procs, std::string release,
-            std::string nodename, long ncpu = 1) {
-    if (ncpu < 1) ncpu = 1;
-    return [&procs, release = std::move(release), nodename = std::move(nodename), ncpu]
-           (std::string_view abs) -> Result<kernel::VirtualFile> {
+make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) {
+    return [&procs, &mach](std::string_view abs) -> Result<kernel::VirtualFile> {
         using detail::text_file; using detail::dir_file;
-        const long nproc = static_cast<long>(procs.count());
+        const long  nproc   = static_cast<long>(procs.count());
+        const long  ncpu    = mach.ncpu < 1 ? 1 : mach.ncpu;
+        const auto& release = mach.release;
+        const auto& nodename= mach.nodename;
 
         // ---- /proc/self -> /proc/<pid 1> canonicalization ---------------
         std::string p{abs};
@@ -104,12 +94,14 @@ make_procfs(const kernel::ProcessTable& procs, std::string release,
         if (abs == "/proc/cmdline")
             return ok(text_file("BOOT_IMAGE=/boot/linuxity root=linuxity ro\n"));
         if (abs == "/proc/cpuinfo") {
+            char mhz[32];
+            std::snprintf(mhz, sizeof mhz, "%.3f", mach.cpu_mhz());
             std::string s;
             for (long c = 0; c < ncpu; ++c) {
                 s += "processor\t: " + std::to_string(c) + "\n";
                 s += "vendor_id\t: LinuxityVirtual\n"
-                     "cpu family\t: 6\nmodel\t\t: 1\nmodel name\t: linuxity native CPU\n"
-                     "cpu MHz\t\t: 3000.000\ncache size\t: 8192 KB\n";
+                     "cpu family\t: 6\nmodel\t\t: 1\nmodel name\t: linuxity native CPU\n";
+                s += "cpu MHz\t\t: " + std::string{mhz} + "\ncache size\t: 8192 KB\n";
                 s += "physical id\t: 0\nsiblings\t: " + std::to_string(ncpu) +
                      "\ncore id\t\t: " + std::to_string(c) +
                      "\ncpu cores\t: " + std::to_string(ncpu) + "\n";
@@ -119,14 +111,19 @@ make_procfs(const kernel::ProcessTable& procs, std::string release,
             return ok(text_file(std::move(s)));
         }
         if (abs == "/proc/meminfo") {
-            return ok(text_file(
-                "MemTotal:        2097152 kB\nMemFree:         1048576 kB\n"
-                "MemAvailable:    1572864 kB\nBuffers:           32768 kB\n"
-                "Cached:           524288 kB\nSwapCached:            0 kB\n"
-                "Active:           786432 kB\nInactive:         262144 kB\n"
-                "SwapTotal:             0 kB\nSwapFree:              0 kB\n"
-                "Dirty:                 0 kB\nWriteback:             0 kB\n"
-                "Shmem:             16384 kB\nSlab:              65536 kB\n"));
+            auto kb = [](std::uint64_t b){ return std::to_string(b >> 10); };
+            std::string s;
+            s += "MemTotal:        " + kb(mach.mem_total)     + " kB\n";
+            s += "MemFree:         " + kb(mach.mem_free())    + " kB\n";
+            s += "MemAvailable:    " + kb(mach.mem_available())+ " kB\n";
+            s += "Buffers:         " + kb(mach.mem_buffers()) + " kB\n";
+            s += "Cached:          " + kb(mach.mem_cached())  + " kB\n";
+            s += "SwapCached:            0 kB\n";
+            s += "SwapTotal:       " + kb(mach.swap_total)    + " kB\n";
+            s += "SwapFree:        " + kb(mach.swap_total)    + " kB\n";
+            s += "Dirty:                 0 kB\nWriteback:             0 kB\n"
+                 "Shmem:             16384 kB\nSlab:              65536 kB\n";
+            return ok(text_file(std::move(s)));
         }
         if (abs == "/proc/stat") {
             // System-wide CPU + process counters. htop/top/btop read this
@@ -136,7 +133,7 @@ make_procfs(const kernel::ProcessTable& procs, std::string release,
             // spends a small, gently per-core-varied slice busy and the rest
             // idle, so a monitor renders a live, plausible — not frozen — load.
             constexpr long kHz = 100;
-            const double up = detail::uptime_seconds();
+            const double up = mach.uptime_seconds();
             const long total = static_cast<long>(up * kHz);
             auto core_line = [&](long c) {
                 // A steady baseline load per core (2%..~14%), phase-shifted by
@@ -164,13 +161,13 @@ make_procfs(const kernel::ProcessTable& procs, std::string release,
                 s += "cpu" + std::to_string(c) + " " + core_line(c) + "\n";
             s += "intr " + std::to_string(total * 20) + "\n";
             s += "ctxt " + std::to_string(total * 8) + "\n";
-            s += "btime 1700000000\n";
+            s += "btime " + std::to_string(mach.boot_wall) + "\n";
             s += "processes " + std::to_string(nproc + 10) + "\n";
             s += "procs_running 1\nprocs_blocked 0\n";
             return ok(text_file(std::move(s)));
         }
         if (abs == "/proc/uptime") {
-            const double up = detail::uptime_seconds();
+            const double up = mach.uptime_seconds();
             // idle time = uptime * ncpu * (mostly idle); a plausible ratio.
             char buf[64];
             std::snprintf(buf, sizeof buf, "%.2f %.2f\n", up,
@@ -252,7 +249,7 @@ make_procfs(const kernel::ProcessTable& procs, std::string release,
                 // live per-process CPU% and a growing TIME+ column. A small
                 // fraction of elapsed jiffies is attributed to this task.
                 {
-                    long up_j = static_cast<long>(detail::uptime_seconds() * 100);
+                    long up_j = static_cast<long>(mach.uptime_seconds() * 100);
                     long ut = up_j / 20, st = up_j / 40;   // ~5% user, ~2.5% sys
                     s += std::to_string(ut) + " " + std::to_string(st) + " 0 0 ";
                 }

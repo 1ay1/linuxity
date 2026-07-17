@@ -14,6 +14,7 @@
 #include "linuxity/abi/sysno.hpp"
 #include "linuxity/abi/types.hpp"
 #include "linuxity/kernel/file_namespace.hpp"
+#include "linuxity/kernel/machine.hpp"
 #include "linuxity/kernel/process_table.hpp"
 #include "linuxity/kernel/subsystem.hpp"
 #include "linuxity/loader/interp.hpp"
@@ -643,16 +644,17 @@ private:
         return val(0);
     }
 
-    // The virtual machine's shape (ncpu, total RAM). Read from the kernel
-    // when it exposes machine() (the real Kernel does), else a 1-CPU/2-GiB
-    // default so the dispatcher works with a bare kernel in tests.
-    struct Machine { long ncpu; std::uint64_t mem_total; };
-    [[nodiscard]] Machine machine() {
+    // The virtual machine's canonical spec. The real Kernel owns ONE
+    // MachineSpec (kernel/machine.hpp) and every /proc & /sys synthesizer
+    // reads the same instance, so sysinfo/sched_getaffinity here agree with
+    // them by construction. A bare kernel (tests) falls back to the default
+    // spec, which is the same struct with its default field values.
+    [[nodiscard]] const kernel::MachineSpec& machine() {
         if constexpr (requires { k_.machine(); }) {
-            auto m = k_.machine();
-            return Machine{m.ncpu < 1 ? 1 : m.ncpu, m.mem_total_bytes};
+            return k_.machine();
         } else {
-            return Machine{1, std::uint64_t{2048} << 20};
+            static const kernel::MachineSpec fallback{};
+            return fallback;
         }
     }
 
@@ -670,13 +672,14 @@ private:
             std::uint32_t mem_unit;
             std::uint32_t _pad2;   // align to 8; kernel's _f[] is empty on 64-bit
         } si{};
-        auto m = machine();
-        si.uptime    = 1000;                         // seconds since boot
+        const auto& m = machine();
+        si.uptime    = static_cast<std::int64_t>(m.uptime_seconds());
         si.loads[0]  = si.loads[1] = si.loads[2] = 0;
         si.totalram  = m.mem_total;
-        si.freeram   = m.mem_total / 2;
-        si.bufferram = m.mem_total / 64;
-        si.totalswap = si.freeswap = 0;
+        si.freeram   = m.mem_free();
+        si.bufferram = m.mem_buffers();
+        si.totalswap = m.swap_total;
+        si.freeswap  = m.swap_total;
         si.procs     = static_cast<std::uint16_t>(k_.procs().count());
         si.mem_unit  = 1;                            // ram fields are bytes
         if (!mem_.copy_out(buf, {reinterpret_cast<const std::byte*>(&si), sizeof si}))
@@ -715,10 +718,11 @@ private:
             std::size_t i = 0; for (; s[i] && i < 64; ++i) dst[i] = s[i]; dst[i] = 0;
         };
         set(u.sysname,  "Linux");
-        set(u.nodename, "linuxity");
-        set(u.release,  "6.6.0-linuxity");
+        const auto& m = machine();
+        set(u.nodename, m.nodename.c_str());
+        set(u.release,  m.release.c_str());
         set(u.version,  "#1 linuxity portable Linux ABI");
-        set(u.machine,  arch_ == Arch::aarch64 ? "aarch64" : "x86_64");
+        set(u.machine,  m.machine_arch.c_str());
         set(u.domainname, "(none)");
         if (!mem_.copy_out(buf, {reinterpret_cast<const std::byte*>(&u), sizeof u}))
             return val(-static_cast<std::int64_t>(Errno::efault));
