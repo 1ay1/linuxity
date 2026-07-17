@@ -122,10 +122,14 @@ linuxity services their syscalls. Proofs of the model:
 - the guest can **write** (`/tmp`, `/run`, `/var`, …) and the writes land in a
   copy-on-write **overlay upper** layer — the on-disk rootfs stays **pristine**,
   never mutated by the guest.
-- **`htop` runs** — it reads linuxity's synthesized `/proc/stat`, `/proc/meminfo`,
-  `/proc/uptime`, `/proc/loadavg` and enumerates `/proc` (virtualized
-  `getdents64`) to render its full UI over linuxity's virtual system. `free`,
-  `uptime`, `ls /proc`, `ls /proc/1` all work the same way.
+- **`htop` and `top` run as real process monitors** — they read linuxity's
+  synthesized `/proc/stat`, `/proc/meminfo`, `/proc/uptime`, `/proc/loadavg`
+  and `/sys` (CPU topology, cpufreq, hwmon temperatures), enumerate `/proc`
+  and each `/proc/<pid>/task/<tid>` (virtualized `getdents64`), and render the
+  **live process tree**: run a shell that backgrounds `sleep`/`yes` and `htop`
+  shows every one with its real command line — `sh`, `sleep 10`, `yes`, `htop`
+  — because the trap feeds every fork/exec/exit into linuxity's process table.
+  `free`, `uptime`, `ls /proc`, `ls /proc/1` all work the same way.
 
 ### How the filesystem is virtualized
 
@@ -141,7 +145,7 @@ Every path-taking syscall (`openat`, `newfstatat`, `statx`, `access`,
   write-intent open (`O_WRONLY`/`O_RDWR`/`O_CREAT`/`O_TRUNC`) resolves to a
   copy-on-write **overlay upper** dir (copying the file up from the read-only
   lower first), so the pristine rootfs is never mutated.
-- **virtual** (`/proc`, and future `/sys`, tmpfs, overlays): the bytes are
+- **virtual** (`/proc`, `/sys`, and future tmpfs, overlays): the bytes are
   synthesized and either written straight into guest memory (`read`/`stat`/
   `statx`) or materialized into a real fd the child can read *and* `mmap`
   (**inject**). A virtual **directory** is backed by a real empty temp dir (so
@@ -150,9 +154,13 @@ Every path-taking syscall (`openat`, `newfstatat`, `statx`, `access`,
 
 `/proc` is comprehensive: `/proc/{stat,meminfo,cpuinfo,uptime,loadavg,version,
 cmdline,filesystems,mounts,sys/...}` plus the per-process tree
-`/proc/<pid>/{stat,statm,status,cmdline,comm,io,maps,...}`, all generated from
-linuxity's **process table** (pid 1 = init, uid 0, its own numbers) — which is
-why a process monitor shows linuxity's world, not the host's.
+`/proc/<pid>/{stat,statm,status,cmdline,comm,io,maps,task/<tid>/...}`, all
+generated from linuxity's **process table** (pid 1 = init, uid 0, its own
+numbers). `/sys` is synthesized too — CPU topology (`devices/system/cpu`,
+`cpufreq/policyN/scaling_cur_freq`), `hwmon` temperatures, one virtual block
+device, cgroup v2 stubs — so a hardware monitor discovers linuxity's virtual
+machine, not the box it runs on. That is why a process/hardware monitor shows
+linuxity's world.
 
 So the guest never sees the host tree: `--root` makes `/` the rootfs and
 `/proc` reports linuxity's world — all with zero privilege, no VM, no chroot.
@@ -182,6 +190,14 @@ path** are virtualized. In place and proven by 9 test suites:
   concept-based **trap** loop and a real **multi-process** `ptrace` backend
   that traces the entire forked/exec'd process tree.
 
-The road ahead: `/sys` synthesis, `futex`/`epoll` for threaded programs, and
-feeding the live ptrace tree into the process table so a monitor sees every
-guest task. The architecture is fixed and machine-checked.
+**The live process tree feeds `/proc`.** The `ptrace` backend observes every
+fork/vfork/exec/exit in the guest tree and emits neutral lifecycle events; the
+execution loop folds them into the kernel's process table (mapping host tids to
+linuxity's own tiny pid space, root = pid 1, real argv captured at `exec`). So
+`/proc` — and every monitor reading it — reflects linuxity's real, live
+processes, not the host's.
+
+The road ahead: `readlink` synthesis for `/proc/self/exe`, richer `futex`/
+`epoll` coverage for heavily-threaded programs, and reaching an interactive
+`/bin/sh` on a real Arch/Alpine rootfs. The architecture is fixed and
+machine-checked.

@@ -58,8 +58,9 @@ inline std::pair<long, std::string> split_pid(std::string_view abs) {
 // as the runtime traces the guest tree.
 [[nodiscard]] inline kernel::FileNamespace::Producer
 make_procfs(const kernel::ProcessTable& procs, std::string release,
-            std::string nodename) {
-    return [&procs, release = std::move(release), nodename = std::move(nodename)]
+            std::string nodename, long ncpu = 1) {
+    if (ncpu < 1) ncpu = 1;
+    return [&procs, release = std::move(release), nodename = std::move(nodename), ncpu]
            (std::string_view abs) -> Result<kernel::VirtualFile> {
         using detail::text_file; using detail::dir_file;
         const long nproc = static_cast<long>(procs.count());
@@ -90,12 +91,17 @@ make_procfs(const kernel::ProcessTable& procs, std::string release,
             return ok(text_file("BOOT_IMAGE=/boot/linuxity root=linuxity ro\n"));
         if (abs == "/proc/cpuinfo") {
             std::string s;
-            s += "processor\t: 0\nvendor_id\t: LinuxityVirtual\n"
-                 "cpu family\t: 6\nmodel\t\t: 1\nmodel name\t: linuxity native CPU\n"
-                 "cpu MHz\t\t: 3000.000\ncache size\t: 8192 KB\n"
-                 "physical id\t: 0\nsiblings\t: 1\ncore id\t\t: 0\ncpu cores\t: 1\n"
-                 "flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep\n"
-                 "bogomips\t: 6000.00\n\n";
+            for (long c = 0; c < ncpu; ++c) {
+                s += "processor\t: " + std::to_string(c) + "\n";
+                s += "vendor_id\t: LinuxityVirtual\n"
+                     "cpu family\t: 6\nmodel\t\t: 1\nmodel name\t: linuxity native CPU\n"
+                     "cpu MHz\t\t: 3000.000\ncache size\t: 8192 KB\n";
+                s += "physical id\t: 0\nsiblings\t: " + std::to_string(ncpu) +
+                     "\ncore id\t\t: " + std::to_string(c) +
+                     "\ncpu cores\t: " + std::to_string(ncpu) + "\n";
+                s += "flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep\n"
+                     "bogomips\t: 6000.00\n\n";
+            }
             return ok(text_file(std::move(s)));
         }
         if (abs == "/proc/meminfo") {
@@ -109,10 +115,17 @@ make_procfs(const kernel::ProcessTable& procs, std::string release,
                 "Shmem:             16384 kB\nSlab:              65536 kB\n"));
         }
         if (abs == "/proc/stat") {
-            // System-wide CPU + process counters. htop/top read this first.
+            // System-wide CPU + process counters. htop/top/btop read this
+            // first; the aggregate `cpu` line plus one `cpuN` per logical CPU.
             std::string s;
-            s += "cpu  1000 0 500 100000 200 0 50 0 0 0\n";
-            s += "cpu0 1000 0 500 100000 200 0 50 0 0 0\n";
+            s += "cpu  " + std::to_string(1000 * ncpu) + " 0 " +
+                 std::to_string(500 * ncpu) + " " +
+                 std::to_string(100000 * ncpu) + " " +
+                 std::to_string(200 * ncpu) + " 0 " +
+                 std::to_string(50 * ncpu) + " 0 0 0\n";
+            for (long c = 0; c < ncpu; ++c)
+                s += "cpu" + std::to_string(c) +
+                     " 1000 0 500 100000 200 0 50 0 0 0\n";
             s += "intr 0\nctxt 12345\n";
             s += "btime 1700000000\n";
             s += "processes " + std::to_string(nproc + 10) + "\n";
@@ -147,8 +160,32 @@ make_procfs(const kernel::ProcessTable& procs, std::string release,
                     {"stat",false},{"statm",false},{"status",false},
                     {"cmdline",false},{"comm",false},{"cwd",true},
                     {"exe",false},{"root",true},{"fd",true},{"maps",false},
-                    {"io",false},{"oom_score",false},
+                    {"io",false},{"oom_score",false},{"task",true},
                 }));
+
+            // ---- /proc/<pid>/task : the thread group -------------------
+            // We model one main thread whose tid == pid. htop/top enumerate
+            // processes THROUGH this directory, so it must exist and its
+            // per-thread files mirror the process's own.
+            if (tail == "task")
+                return ok(dir_file({{std::to_string(I.pid), true}}));
+            if (tail.starts_with("task/")) {
+                std::string_view rest = std::string_view{tail}.substr(5);
+                std::size_t slash = rest.find('/');
+                std::string_view tid = rest.substr(0, slash);
+                // Only the main thread (tid == pid) exists.
+                if (tid != std::to_string(I.pid))
+                    return err<kernel::VirtualFile>(Errno::enoent);
+                if (slash == std::string_view::npos)  // /proc/<pid>/task/<tid>
+                    return ok(dir_file({
+                        {"stat",false},{"statm",false},{"status",false},
+                        {"cmdline",false},{"comm",false},{"maps",false},
+                        {"io",false},{"children",false},
+                    }));
+                // Re-target the file lookup at the thread's own file, which is
+                // identical to the process's (single-thread model).
+                tail = std::string{rest.substr(slash + 1)};
+            }
 
             if (tail == "comm")   return ok(text_file(I.comm + "\n"));
             if (tail == "cmdline") {
@@ -202,6 +239,7 @@ make_procfs(const kernel::ProcessTable& procs, std::string release,
             if (tail == "io")
                 return ok(text_file("rchar: 0\nwchar: 0\nsyscr: 0\nsyscw: 0\n"
                                     "read_bytes: 0\nwrite_bytes: 0\n"));
+            if (tail == "children") return ok(text_file(""));
             if (tail == "oom_score") return ok(text_file("0\n"));
             if (tail == "maps")      return ok(text_file(""));
             if (tail == "fd")        return ok(dir_file({{"0",false},{"1",false},{"2",false}}));

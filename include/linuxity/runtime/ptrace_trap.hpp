@@ -33,7 +33,9 @@
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
+#include <fcntl.h>
 
 namespace lx::runtime {
 
@@ -87,6 +89,10 @@ public:
             if (WIFEXITED(st) || WIFSIGNALED(st)) {
                 int code = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
                 if (w == root_pid_) exit_code_ = code;
+                if (auto it = gpid_.find(w); it != gpid_.end()) {
+                    proc_events_.push_back({ProcEvent::reap, it->second, 0, {}, {}});
+                    gpid_.erase(it);
+                }
                 tasks_.erase(w);
                 if (--live_ <= 0) { exited_ = true; return ok(false); }
                 continue;
@@ -101,12 +107,28 @@ public:
                 event == PTRACE_EVENT_CLONE) {
                 unsigned long np = 0;
                 ::ptrace(PTRACE_GETEVENTMSG, w, 0, &np);
-                if (np && tasks_.emplace(static_cast<::pid_t>(np), Task{}).second)
+                auto child = static_cast<::pid_t>(np);
+                if (np && tasks_.emplace(child, Task{}).second)
                     ++live_;   // may already be counted if it stopped first
+                // A fork/vfork is a new PROCESS in the guest's world; a
+                // CLONE (thread) shares the tgid and is NOT a distinct pid to
+                // a process monitor. Record only real processes, and map the
+                // host tid to a small guest pid so /proc is a coherent, tiny
+                // pid space (root == pid 1) rather than leaking host pids.
+                if (np && event != PTRACE_EVENT_CLONE) {
+                    std::int32_t gpid = gpid_of(child);
+                    std::int32_t gppid = gpid_of(w);
+                    proc_events_.push_back({ProcEvent::spawn, gpid, gppid, {}, {}});
+                }
                 ::ptrace(PTRACE_SYSCALL, w, 0, 0);
                 continue;
             }
             if (event == PTRACE_EVENT_EXEC) {
+                // The image was replaced: the pid keeps its number but becomes
+                // a new program. Recover its new comm from /proc/<tid>/comm on
+                // the HOST (the child is mid-exec; this is the real name).
+                proc_events_.push_back({ProcEvent::exec, gpid_of(w), 0,
+                                        comm_of(w), cmdline_of(w)});
                 tasks_[w] = Task{};        // fresh image, back at-entry
                 ::ptrace(PTRACE_SYSCALL, w, 0, 0);
                 continue;
@@ -206,8 +228,68 @@ public:
         }
     }
 
+    // Read a task's current program name from the host's /proc/<tid>/comm.
+    // Used at PTRACE_EVENT_EXEC to learn the new image's name.
+    static std::string comm_of(::pid_t tid) {
+        std::string path = "/proc/" + std::to_string(tid) + "/comm";
+        int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return {};
+        char buf[256]; auto n = ::read(fd, buf, sizeof buf - 1); ::close(fd);
+        if (n <= 0) return {};
+        std::string s(buf, static_cast<std::size_t>(n));
+        if (!s.empty() && s.back() == '\n') s.pop_back();
+        return s;
+    }
+
+    // Read a task's full NUL-joined argv from the host's /proc/<tid>/cmdline
+    // at exec, so the process monitor shows the real command line.
+    static std::string cmdline_of(::pid_t tid) {
+        std::string path = "/proc/" + std::to_string(tid) + "/cmdline";
+        int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return {};
+        std::string s; char buf[512]; ssize_t n;
+        while ((n = ::read(fd, buf, sizeof buf)) > 0)
+            s.append(buf, static_cast<std::size_t>(n));
+        ::close(fd);
+        // Present argv as space-separated for the guest's cmdline field; the
+        // procfs synthesizer re-appends the trailing NUL it needs.
+        for (char& c : s) if (c == '\0') c = ' ';
+        while (!s.empty() && s.back() == ' ') s.pop_back();
+        return s;
+    }
+
+    // Map a host tid to a small, stable GUEST pid: the root task is pid 1,
+    // and each newly-seen process gets the next number. This keeps /proc in
+    // linuxity's own tiny pid space instead of exposing host pids.
+    std::int32_t gpid_of(::pid_t tid) {
+        if (tid == root_pid_) return 1;
+        auto [it, fresh] = gpid_.try_emplace(tid, 0);
+        if (fresh) it->second = next_gpid_++;
+        return it->second;
+    }
+
     [[nodiscard]] bool exited() const noexcept { return exited_; }
     [[nodiscard]] int exit_code() const noexcept { return exit_code_; }
+
+    // -- Live process tree -> ProcessTable bridge --------------------------
+    // The trap observes every fork/exec/exit in the guest tree. It records
+    // them as neutral events; the Cpu loop drains them each iteration and
+    // applies them to the kernel's ProcessTable, so a process monitor sees
+    // linuxity's real, live process list. The trap stays decoupled from the
+    // kernel: it only emits events, it never touches ProcessTable itself.
+    struct ProcEvent {
+        enum Kind { spawn, exec, reap } kind;
+        ::pid_t pid;          // the affected task's tid (== pid for a process)
+        ::pid_t ppid;         // parent (spawn only)
+        std::string comm;     // program name (exec only)
+        std::string cmdline;  // full argv, space-joined (exec only)
+    };
+    [[nodiscard]] std::vector<ProcEvent> drain_proc_events() {
+        return std::exchange(proc_events_, {});
+    }
+
+    // The current guest tid, so the loop can attribute a syscall to a pid.
+    [[nodiscard]] ::pid_t current_tid() const noexcept { return cur_; }
 
     // -- GuestMem: the CURRENT task's pages ARE the guest memory. -----------
     [[nodiscard]] Status copy_in(UAddr src, std::span<std::byte> dst) const {
@@ -256,6 +338,10 @@ private:
             if (WIFEXITED(st) || WIFSIGNALED(st)) {
                 int code = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
                 if (w == root_pid_) exit_code_ = code;
+                if (auto it = gpid_.find(w); it != gpid_.end()) {
+                    proc_events_.push_back({ProcEvent::reap, it->second, 0, {}, {}});
+                    gpid_.erase(it);
+                }
                 tasks_.erase(w);
                 if (--live_ <= 0) exited_ = true;
                 return false;
@@ -266,13 +352,21 @@ private:
                 event == PTRACE_EVENT_CLONE) {
                 unsigned long np = 0;
                 ::ptrace(PTRACE_GETEVENTMSG, w, 0, &np);
-                if (np && tasks_.emplace(static_cast<::pid_t>(np), Task{}).second)
+                auto child = static_cast<::pid_t>(np);
+                if (np && tasks_.emplace(child, Task{}).second)
                     ++live_;
+                if (np && event != PTRACE_EVENT_CLONE)
+                    proc_events_.push_back({ProcEvent::spawn, gpid_of(child),
+                                            gpid_of(w), {}, {}});
                 ::ptrace(PTRACE_SYSCALL, w, 0, 0);
                 continue;
             }
             if (event == PTRACE_EVENT_EXEC) {
                 // exec replaced the image; there is no ordinary syscall-exit.
+                // This is the exec we were redirecting: record the new image
+                // so the process monitor sees the program it became.
+                proc_events_.push_back({ProcEvent::exec, gpid_of(w), 0,
+                                        comm_of(w), cmdline_of(w)});
                 tasks_[w] = Task{};
                 return true;
             }
@@ -286,6 +380,9 @@ private:
     std::vector<std::string> argv_;
     std::vector<std::string> envp_;
     std::string root_;
+    std::vector<ProcEvent> proc_events_;
+    std::unordered_map<::pid_t, std::int32_t> gpid_;   // host tid -> guest pid
+    std::int32_t next_gpid_{2};                        // pid 1 = root/init
     ::pid_t cur_{-1};
     ::pid_t root_pid_{-1};
     int exit_code_{0};

@@ -11,6 +11,7 @@
 #include "linuxity/runtime/ptrace_trap.hpp"
 #include "linuxity/runtime/trap.hpp"
 #include "linuxity/vfs/procfs.hpp"
+#include "linuxity/vfs/sysfs.hpp"
 
 #include <sys/stat.h>
 #include <cstdio>
@@ -54,6 +55,13 @@ int main(int argc, char** argv) {
     host::PosixHost hw;
     kernel::Kernel<host::PosixHost> k{hw};
 
+    // The virtual machine exposes as many logical CPUs as the host has online
+    // (native execution means the guest genuinely runs on them). procfs and
+    // sysfs share this count so /proc/stat, /proc/cpuinfo and
+    // /sys/devices/system/cpu describe one coherent machine.
+    long ncpu = ::sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu < 1) ncpu = 1;
+
     // Seed the process table: pid 1 is our init (the traced root). Its
     // cmdline is the program we're about to run, so /proc/1/cmdline is real.
     {
@@ -81,14 +89,16 @@ int main(int argc, char** argv) {
         (void)::mkdir(upper.c_str(), 0755);
         k.files().mount_host("/", root, upper);
         k.files().mount_virtual("/proc",
-            vfs::make_procfs(k.procs(), "6.6.0-linuxity", "linuxity"));
+            vfs::make_procfs(k.procs(), "6.6.0-linuxity", "linuxity", ncpu));
+        k.files().mount_virtual("/sys", vfs::make_sysfs(ncpu));
     } else {
         // No rootfs: the guest lives in the real host tree (paths translate
-        // 1:1), but /proc is STILL synthesized so uname/pid/mounts report
-        // linuxity's world rather than the host's.
+        // 1:1), but /proc and /sys are STILL synthesized so uname/pid/mounts
+        // and hardware topology report linuxity's world, not the host's.
         k.files().mount_host("/", "/");
         k.files().mount_virtual("/proc",
-            vfs::make_procfs(k.procs(), "6.6.0-linuxity", "linuxity"));
+            vfs::make_procfs(k.procs(), "6.6.0-linuxity", "linuxity", ncpu));
+        k.files().mount_virtual("/sys", vfs::make_sysfs(ncpu));
     }
 
     // The rootfs makes the translation unprivileged, so we no longer need to

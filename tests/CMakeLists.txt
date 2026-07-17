@@ -26,6 +26,10 @@ add_executable(test_file_namespace test_file_namespace.cpp)
 target_link_libraries(test_file_namespace PRIVATE linuxity_core)
 add_test(NAME file_namespace COMMAND test_file_namespace)
 
+add_executable(test_sysfs_proctree test_sysfs_proctree.cpp)
+target_link_libraries(test_sysfs_proctree PRIVATE linuxity_core)
+add_test(NAME sysfs_proctree COMMAND test_sysfs_proctree)
+
 add_executable(test_run_rootfs test_run_rootfs.cpp)
 target_link_libraries(test_run_rootfs PRIVATE linuxity_core)
 add_test(NAME run_rootfs COMMAND test_run_rootfs)

@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 #include <unistd.h>
@@ -92,13 +93,14 @@ public:
         for (;;) {
             TrapFrame f;
             bool still_running = LX_TRY(trap_.next(f));
+            apply_proc_events();
             if (!still_running) { cleanup_temps(); return ok(trap_.exit_code()); }
 
             // The dispatcher classifies the trapped syscall: service it from
             // our subsystems, forward it to the host kernel, or exit.
             abi::Outcome o = sys.dispatch(f.regs);
             if (const char* t = std::getenv("LINUXITY_TRACE"); t && *t) {
-                std::fprintf(stderr, "[lx] nr=%llu -> %s%s%s%s ret=%lld %s\n",
+                std::fprintf(trace_out(t), "[lx] nr=%llu -> %s%s%s%s ret=%lld %s\n",
                     static_cast<unsigned long long>(f.regs.nr),
                     o.inject?"INJECT ":"", o.redirect?"REDIRECT ":"",
                     o.forward?"FORWARD ":"", o.exited?"EXIT ":"VIRT ",
@@ -138,6 +140,67 @@ public:
     }
 
 private:
+    // Fold the trap's observed fork/exec/exit events into the kernel's
+    // ProcessTable, so a process monitor (top/htop/ps) reading synthesized
+    // /proc sees linuxity's real, live process tree. Guarded on the trap
+    // actually exposing the bridge, so the loop stays generic over backends
+    // that don't (the concept only requires start/next/resume/forward/...).
+    void apply_proc_events() {
+        if constexpr (requires { trap_.drain_proc_events(); }) {
+            for (auto& e : trap_.drain_proc_events()) {
+                using EV = std::decay_t<decltype(e)>;
+                switch (e.kind) {
+                    case EV::spawn: {
+                        kernel::ProcInfo pi;
+                        pi.pid  = static_cast<std::int32_t>(e.pid);
+                        pi.ppid = static_cast<std::int32_t>(e.ppid);
+                        pi.comm = "(spawning)";
+                        pi.cmdline = "(spawning)";
+                        pi.state = 'R';
+                        pi.vsize_bytes = 4u << 20;   // plausible until first exec
+                        pi.rss_pages = 256;
+                        kernel_.procs().upsert(pi);
+                        break;
+                    }
+                    case EV::exec:
+                        if (auto* pi = kernel_.procs().find(
+                                static_cast<std::int32_t>(e.pid))) {
+                            kernel::ProcInfo np = *pi;
+                            if (!e.comm.empty()) {
+                                np.comm = e.comm;
+                                // Prefer the real argv captured at exec; fall
+                                // back to comm so there's always a name.
+                                np.cmdline = e.cmdline.empty() ? e.comm
+                                                               : e.cmdline;
+                            }
+                            np.state = 'R';
+                            kernel_.procs().upsert(np);
+                        }
+                        break;
+                    case EV::reap:
+                        // pid 1 (our init) is never removed: /proc must always
+                        // have a root even as the last guest thread winds down.
+                        if (e.pid != 1)
+                            kernel_.procs().remove(static_cast<std::int32_t>(e.pid));
+                        break;
+                }
+            }
+        }
+    }
+
+    // Where the LINUXITY_TRACE log goes. If the value looks like a path
+    // (contains '/'), append to that file (opened once); otherwise stderr.
+    // Routing to a file keeps the trace out of a guest TUI's pty stream.
+    static std::FILE* trace_out(const char* val) {
+        static std::FILE* f = [val] {
+            if (std::strchr(val, '/')) {
+                if (std::FILE* fp = std::fopen(val, "w")) return fp;
+            }
+            return stderr;
+        }();
+        return f;
+    }
+
     // Write bytes to a fresh host temp file, return its path ("" on failure).
     // Used to back an INJECT (virtual file) with a real, mmappable fd.
     static std::string materialize(const std::vector<std::byte>& bytes) {
