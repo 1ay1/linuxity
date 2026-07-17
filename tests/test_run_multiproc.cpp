@@ -37,7 +37,7 @@ static std::string run(const std::string& root, const std::string& prog) {
     kernel::Kernel<host::PosixHost> k{hw};
     k.files().mount_host("/", root);
     k.files().mount_virtual("/proc",
-        vfs::make_procfs(k.self().raw(), "6.6.0-linuxity", "linuxity"));
+        vfs::make_procfs(k.procs(), "6.6.0-linuxity", "linuxity"));
     std::string exec = root + prog;
     runtime::PtraceTrap trap{exec, {prog}, {}, {}};
     runtime::Cpu cpu{trap, k, trap, abi::Arch::x86_64};

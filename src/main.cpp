@@ -54,6 +54,20 @@ int main(int argc, char** argv) {
     host::PosixHost hw;
     kernel::Kernel<host::PosixHost> k{hw};
 
+    // Seed the process table: pid 1 is our init (the traced root). Its
+    // cmdline is the program we're about to run, so /proc/1/cmdline is real.
+    {
+        kernel::ProcInfo init;
+        init.pid = 1; init.ppid = 0;
+        init.comm = path.substr(path.find_last_of('/') + 1);
+        init.cmdline.clear();
+        for (std::size_t j = 0; j < gargv.size(); ++j) {
+            init.cmdline += gargv[j];
+            if (j + 1 < gargv.size()) init.cmdline.push_back(' ');
+        }
+        k.procs().upsert(init);
+    }
+
     // Build the guest's filesystem namespace. When --root is given, the
     // rootfs directory becomes the guest '/' via PATH TRANSLATION (no chroot,
     // no privilege): every guest path the program names is rewritten to the
@@ -67,14 +81,14 @@ int main(int argc, char** argv) {
         (void)::mkdir(upper.c_str(), 0755);
         k.files().mount_host("/", root, upper);
         k.files().mount_virtual("/proc",
-            vfs::make_procfs(k.self().raw(), "6.6.0-linuxity", "linuxity"));
+            vfs::make_procfs(k.procs(), "6.6.0-linuxity", "linuxity"));
     } else {
         // No rootfs: the guest lives in the real host tree (paths translate
         // 1:1), but /proc is STILL synthesized so uname/pid/mounts report
         // linuxity's world rather than the host's.
         k.files().mount_host("/", "/");
         k.files().mount_virtual("/proc",
-            vfs::make_procfs(k.self().raw(), "6.6.0-linuxity", "linuxity"));
+            vfs::make_procfs(k.procs(), "6.6.0-linuxity", "linuxity"));
     }
 
     // The rootfs makes the translation unprivileged, so we no longer need to

@@ -32,8 +32,9 @@ int main() {
     // -- Mount table + longest-prefix classification. ---------------------
     FN f;
     f.mount_host("/", "/tmp/lxroot");
+    kernel::ProcessTable procs;
     f.mount_virtual("/proc",
-        vfs::make_procfs(1, "6.6.0-linuxity", "linuxity"));
+        vfs::make_procfs(procs, "6.6.0-linuxity", "linuxity"));
 
     // A rootfs path translates to base + rel (host-backed realm).
     {
@@ -84,9 +85,50 @@ int main() {
         assert(s.find("rootfs / rootfs") != std::string::npos);
     }
     {
-        // An unknown /proc entry is a clean ENOENT, not a crash.
-        auto vf = f.produce("/proc/does-not-exist");
-        assert(!vf.has_value() && vf.error() == Errno::enoent);
+        // System-wide /proc/stat + /proc/meminfo (htop / free / top read these).
+        auto st = f.produce("/proc/stat");
+        assert(st.has_value());
+        std::string s = bytes_to_string(st->bytes);
+        assert(s.find("cpu ") != std::string::npos);
+        assert(s.find("btime ") != std::string::npos);
+
+        auto mi = f.produce("/proc/meminfo");
+        assert(mi.has_value());
+        assert(bytes_to_string(mi->bytes).find("MemTotal:") != std::string::npos);
+
+        auto ci = f.produce("/proc/cpuinfo");
+        assert(ci.has_value());
+        assert(bytes_to_string(ci->bytes).find("processor") != std::string::npos);
+    }
+    {
+        // /proc is an ENUMERABLE directory: it lists every pid + the
+        // well-known files (this backs getdents64 on /proc).
+        auto d = f.produce("/proc");
+        assert(d.has_value() && d->is_dir);
+        bool has_pid1 = false, has_stat = false, has_meminfo = false;
+        for (const auto& e : d->entries) {
+            if (e.name == "1") has_pid1 = true;
+            if (e.name == "stat") has_stat = true;
+            if (e.name == "meminfo") has_meminfo = true;
+        }
+        assert(has_pid1 && has_stat && has_meminfo);
+    }
+    {
+        // The per-process /proc/<pid> directory enumerates its files.
+        auto d = f.produce("/proc/1");
+        assert(d.has_value() && d->is_dir);
+        bool has_stat = false, has_status = false, has_cmdline = false;
+        for (const auto& e : d->entries) {
+            if (e.name == "stat") has_stat = true;
+            if (e.name == "status") has_status = true;
+            if (e.name == "cmdline") has_cmdline = true;
+        }
+        assert(has_stat && has_status && has_cmdline);
+
+        auto stat1 = f.produce("/proc/1/stat");
+        assert(stat1.has_value());
+        // /proc/1/stat starts with "1 (comm) R ..."
+        assert(bytes_to_string(stat1->bytes).starts_with("1 ("));
     }
 
     // -- Guest fd table binds a real fd back to its guest path. -----------
@@ -94,6 +136,16 @@ int main() {
     assert(f.path_of_fd(7) == "/etc/hosts");
     f.unbind_fd(7);
     assert(f.path_of_fd(7).empty());
+
+    // -- Virtual-directory fd stream (backs getdents64). ------------------
+    f.bind_dir(9, {{"a", false}, {"b", true}});
+    assert(f.is_virtual_dir_fd(9));
+    {
+        auto* ds = f.dir_stream(9);
+        assert(ds && ds->entries.size() == 2 && ds->pos == 0);
+    }
+    f.unbind_fd(9);
+    assert(!f.is_virtual_dir_fd(9));
 
     // -- Overlay (copy-up upper over read-only lower). --------------------
     {

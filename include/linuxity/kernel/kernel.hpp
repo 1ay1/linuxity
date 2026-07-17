@@ -12,6 +12,7 @@
 #include "linuxity/host/host.hpp"
 #include "linuxity/kernel/authority.hpp"
 #include "linuxity/kernel/file_namespace.hpp"
+#include "linuxity/kernel/process_table.hpp"
 #include "linuxity/kernel/subsystem.hpp"
 
 #include <unordered_map>
@@ -45,6 +46,11 @@ public:
     // table). The syscall dispatcher routes every path syscall through here.
     [[nodiscard]] FileNamespace& files() noexcept { return files_; }
     [[nodiscard]] const FileNamespace& files() const noexcept { return files_; }
+
+    // The virtual process table /proc is synthesized from. The runtime keeps
+    // it in sync as it traces the guest tree.
+    [[nodiscard]] ProcessTable& procs() noexcept { return procs_; }
+    [[nodiscard]] const ProcessTable& procs() const noexcept { return procs_; }
 
     // -- Process subsystem --------------------------------------------------
     [[nodiscard]] Pid self() const noexcept { return self_; }
@@ -129,6 +135,7 @@ private:
     IdSpace<Pid> pids_{1};
     Pid self_{};
     FileNamespace files_{};
+    ProcessTable procs_{};
     std::unordered_map<UAddr, std::size_t> maps_;
 };
 

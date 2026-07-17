@@ -92,7 +92,7 @@ public:
         for (;;) {
             TrapFrame f;
             bool still_running = LX_TRY(trap_.next(f));
-            if (!still_running) return ok(trap_.exit_code());
+            if (!still_running) { cleanup_temps(); return ok(trap_.exit_code()); }
 
             // The dispatcher classifies the trapped syscall: service it from
             // our subsystems, forward it to the host kernel, or exit.
@@ -108,14 +108,17 @@ public:
             if (o.exited) return ok(o.exit_code);
 
             if (o.inject) {
-                // A purely virtual file: materialize its bytes into a real
-                // host temp file, then redirect the open at it so the child
-                // gets a real, mmappable fd. The temp file is unlinked once
-                // opened (the fd keeps it alive), so nothing leaks into the
-                // guest's namespace.
-                std::string tmp = materialize(o.content);
+                // A purely virtual node: back it with a real host temp — a
+                // temp FILE (with the synthesized bytes) for a file, or an
+                // empty temp DIRECTORY for a virtual dir so O_DIRECTORY opens
+                // succeed and getdents64 (virtualized) can enumerate it. The
+                // open runs ASYNCHRONOUSLY in the child (event-driven trap),
+                // so we must NOT unlink here — the child hasn't opened it yet;
+                // temps are cleaned up at the end of the run.
+                std::string tmp = o.inject_dir ? materialize_dir()
+                                               : materialize(o.content);
                 auto fd = LX_TRY(trap_.redirect(o.path_arg ? o.path_arg : 1, tmp));
-                if (!tmp.empty()) std::remove(tmp.c_str());
+                if (!tmp.empty()) temps_.push_back(std::move(tmp));
                 sys.note_opened_fd(fd);
             } else if (o.redirect) {
                 // Host-backed path: rewrite the arg to the real host path and
@@ -151,10 +154,25 @@ private:
         return std::string{tmpl};
     }
 
+    // Create a fresh empty host temp DIRECTORY, return its path. Backs a
+    // virtual directory so the child's O_DIRECTORY open succeeds; the actual
+    // entries are served by the virtualized getdents64.
+    static std::string materialize_dir() {
+        char tmpl[] = "/tmp/linuxity-vdir-XXXXXX";
+        return ::mkdtemp(tmpl) ? std::string{tmpl} : std::string{};
+    }
+
+    // Unlink every INJECT temp created during the run (files and dirs).
+    void cleanup_temps() {
+        for (const auto& t : temps_) { std::remove(t.c_str()); ::rmdir(t.c_str()); }
+        temps_.clear();
+    }
+
     T& trap_;
     K& kernel_;
     M& mem_;
     abi::Arch arch_;
+    std::vector<std::string> temps_;
 };
 
 } // namespace lx::runtime

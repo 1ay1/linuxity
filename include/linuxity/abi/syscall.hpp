@@ -56,6 +56,7 @@ struct Outcome {
     std::string  host_path;        // translated real host path to splice in
 
     bool                inject{false};  // splice a host memfd, return its fd
+    bool                inject_dir{false}; // the injected node is a directory
     std::vector<std::byte> content;     // bytes to back the injected fd
 };
 
@@ -124,12 +125,13 @@ public:
             case Sysno::access:      return path_at(r, 0, false);
             case Sysno::chdir:       return do_chdir(r);
             case Sysno::newfstatat:  return path_stat(r, 1, true);
-            case Sysno::statx:       return path_at(r, 1, true);
+            case Sysno::statx:       return path_statx(r);
             case Sysno::faccessat:
             case Sysno::faccessat2:  return path_at(r, 1, true);
             case Sysno::readlink:    return path_at(r, 0, false);
             case Sysno::readlinkat:  return path_at(r, 1, true);
             case Sysno::getcwd:      return do_getcwd(r);
+            case Sysno::getdents64:  return do_getdents64(r);
 
             // -- execve/execveat: translate the program path to its real
             //    host location under the rootfs, then let the kernel exec it.
@@ -220,8 +222,14 @@ private:
             if (!vf) return eno(vf.error());
             Outcome o{};
             o.inject  = true;
-            o.content = std::move(vf->bytes);
+            o.content = std::move(vf->bytes);   // empty for a dir
             pending_open_ = abs;
+            // A virtual DIRECTORY: stash its entries so getdents64 on the
+            // resulting fd enumerates them (the backing temp node is a real
+            // empty directory so O_DIRECTORY opens succeed).
+            pending_dir_ = vf->is_dir;
+            o.inject_dir = vf->is_dir;
+            pending_entries_ = std::move(vf->entries);
             return o;
         }
         return eno(pc.error);
@@ -248,7 +256,25 @@ private:
         return eno(pc.error);
     }
 
-    // access/statx/readlink[at]/faccessat: host-backed -> redirect; virtual
+    // statx(dirfd, path, flags, mask, buf): host-backed -> redirect; virtual
+    // -> synthesize a `struct statx` into the guest buffer (arg[4]).
+    [[nodiscard]] Outcome path_statx(const Regs& r) {
+        std::string abs = resolve_arg(r, 1, true);
+        auto pc = k_.files().classify(abs);
+        if (pc.realm == kernel::Realm2::host_backed) {
+            Outcome o{};
+            o.redirect = true; o.path_arg = 1; o.host_path = std::move(pc.host_path);
+            return o;
+        }
+        if (pc.realm == kernel::Realm2::virtual_file) {
+            auto vf = k_.files().produce(abs);
+            if (!vf) return eno(vf.error());
+            return write_statx(uaddr(r.arg[4]), vf->is_dir, vf->bytes.size());
+        }
+        return eno(pc.error);
+    }
+
+    // access/readlink[at]/faccessat: host-backed -> redirect; virtual
     // paths that exist -> success (0); absent -> error.
     [[nodiscard]] Outcome path_at(const Regs& r, int path_arg, bool at) {
         std::string abs = resolve_arg(r, path_arg, at);
@@ -303,6 +329,83 @@ private:
         return fwd();   // let the child actually close its real fd
     }
 
+    // getdents64(fd, buf, count): if fd names a VIRTUAL directory (procfs),
+    // synthesize the linux_dirent64 stream into the guest buffer ourselves.
+    // Otherwise forward — host-backed dirs enumerate natively on the real fd.
+    // Returns bytes written; 0 at end-of-directory (the getdents contract).
+    [[nodiscard]] Outcome do_getdents64(const Regs& r) {
+        int fd = static_cast<int>(r.arg[0]);
+        auto* ds = k_.files().dir_stream(fd);
+        if (!ds) return fwd();               // real (host-backed) directory
+
+        const std::size_t cap = static_cast<std::size_t>(r.arg[2]);
+        std::vector<std::byte> out;
+        out.reserve(cap < 4096 ? cap : 4096);
+
+        // struct linux_dirent64 { u64 d_ino; s64 d_off; u16 d_reclen;
+        //                         u8 d_type; char d_name[]; } — 8-aligned.
+        constexpr std::uint8_t kDtDir = 4, kDtReg = 8;
+        while (ds->pos < ds->entries.size()) {
+            const auto& e = ds->entries[ds->pos];
+            std::size_t namelen = e.name.size() + 1;                 // incl NUL
+            std::size_t reclen  = (19 + namelen + 7) & ~std::size_t{7};
+            if (out.size() + reclen > cap) break;                   // buffer full
+            std::size_t base = out.size();
+            out.resize(base + reclen, std::byte{0});
+            auto put64 = [&](std::size_t off, std::uint64_t v) {
+                for (int i = 0; i < 8; ++i)
+                    out[base + off + static_cast<std::size_t>(i)] =
+                        static_cast<std::byte>((v >> (8 * i)) & 0xff);
+            };
+            put64(0, ds->pos + 1);                                  // d_ino
+            put64(8, static_cast<std::uint64_t>(ds->pos + 1));      // d_off
+            out[base + 16] = static_cast<std::byte>(reclen & 0xff); // d_reclen lo
+            out[base + 17] = static_cast<std::byte>((reclen >> 8) & 0xff);
+            out[base + 18] = static_cast<std::byte>(e.is_dir ? kDtDir : kDtReg);
+            for (std::size_t i = 0; i < e.name.size(); ++i)
+                out[base + 19 + i] = static_cast<std::byte>(e.name[i]);
+            ++ds->pos;
+        }
+        if (out.empty()) {
+            // Either end-of-directory (return 0) or the caller's buffer is too
+            // small for even one entry (EINVAL, per getdents(2)).
+            if (ds->pos < ds->entries.size()) return eno(Errno::einval);
+            return val(0);
+        }
+        if (!mem_.copy_out(uaddr(r.arg[1]), out)) return eno(Errno::efault);
+        return val(static_cast<std::int64_t>(out.size()));
+    }
+
+    // Synthesize a `struct statx` (the flat, versioned stat the kernel fills
+    // for statx(2)) for a virtual node into the guest buffer.
+    [[nodiscard]] Outcome write_statx(UAddr buf, bool is_dir, std::uint64_t size) {
+        struct Statx {
+            std::uint32_t stx_mask, stx_blksize;
+            std::uint64_t stx_attributes;
+            std::uint32_t stx_nlink, stx_uid, stx_gid;
+            std::uint16_t stx_mode; std::uint16_t __spare0[1];
+            std::uint64_t stx_ino, stx_size, stx_blocks, stx_attributes_mask;
+            struct { std::int64_t tv_sec; std::uint32_t tv_nsec; std::int32_t __pad; }
+                stx_atime, stx_btime, stx_ctime, stx_mtime;
+            std::uint32_t stx_rdev_major, stx_rdev_minor, stx_dev_major, stx_dev_minor;
+            std::uint64_t stx_mnt_id, __spare2;
+            std::uint64_t __spare3[12];
+        } sx{};
+        constexpr std::uint32_t kBasicStats = 0x7ff;  // STATX_BASIC_STATS
+        constexpr std::uint16_t kIfDir = 0040000, kIfReg = 0100000;
+        sx.stx_mask    = kBasicStats;
+        sx.stx_blksize = 4096;
+        sx.stx_nlink   = 1;
+        sx.stx_mode    = static_cast<std::uint16_t>(is_dir ? kIfDir | 0555u
+                                                           : kIfReg | 0444u);
+        sx.stx_ino     = 1;
+        sx.stx_size    = size;
+        sx.stx_blocks  = (size + 511) / 512;
+        if (!mem_.copy_out(buf, {reinterpret_cast<const std::byte*>(&sx), sizeof sx}))
+            return eno(Errno::efault);
+        return val(0);
+    }
+
     // Synthesize a `struct stat` (x86-64 layout) for a virtual file into the
     // guest buffer. Only the fields programs read are populated.
     [[nodiscard]] Outcome write_statbuf(UAddr buf, bool is_dir, std::uint64_t size) {
@@ -350,13 +453,21 @@ private:
     M& mem_;
     Arch arch_;
     std::string pending_open_;   // guest path awaiting fd assignment by trap
+    bool pending_dir_{false};    // the pending open is a virtual directory
+    std::vector<kernel::VirtualDirent> pending_entries_;
 public:
     // The trap calls this after a redirect/inject syscall returns a real fd,
-    // so the namespace can bind the guest path to that fd (readlinkat etc.).
+    // so the namespace can bind the guest path to that fd (readlinkat etc.),
+    // and — for a virtual directory — the entries getdents64 will enumerate.
     void note_opened_fd(std::int64_t fd) {
-        if (fd >= 0 && !pending_open_.empty())
+        if (fd >= 0 && !pending_open_.empty()) {
             k_.files().bind_fd(static_cast<int>(fd), pending_open_);
+            if (pending_dir_)
+                k_.files().bind_dir(static_cast<int>(fd), std::move(pending_entries_));
+        }
         pending_open_.clear();
+        pending_dir_ = false;
+        pending_entries_.clear();
     }
 };
 

@@ -172,12 +172,11 @@ public:
     }
 
     // REDIRECT: rewrite the char* path arg to the translated host path (in the
-    // task's stack scratch), then forward. The kernel's result (e.g. a real
-    // fd) lands in RAX by itself. We can't observe it synchronously, so we
-    // best-effort return 0; fd->path binding for redirects that need it is
-    // handled by re-reading RAX would require an exit hook — for the common
-    // case (ld.so mmaping libs) the fd is used immediately and doesn't need
-    // our path table, so 0 is fine.
+    // task's stack scratch), then run the syscall to its EXIT stop and return
+    // the kernel's real result (e.g. the fd for openat). This is SYNCHRONOUS:
+    // path syscalls (open/stat/exec) never block on a sibling task, so
+    // stepping to their exit can't deadlock the tree — and we need the real fd
+    // to bind virtual-directory streams and readlinkat paths.
     [[nodiscard]] Result<std::int64_t> redirect(int path_arg,
                                                 const std::string& host_path) {
         Task& t = tasks_[cur_];
@@ -188,9 +187,14 @@ public:
         if (!copy_out(uaddr(scratch), bytes)) return err<std::int64_t>(Errno::efault);
         set_arg(r, path_arg, scratch);
         ::ptrace(PTRACE_SETREGS, cur_, 0, &r);
-        t.action = Action::none;
+        if (!step_to_exit(cur_)) return ok(std::int64_t{-1});   // task exited
+        struct user_regs_struct rr{};
+        ::ptrace(PTRACE_GETREGS, cur_, 0, &rr);
+        std::int64_t ret = static_cast<std::int64_t>(rr.rax);
+        tasks_[cur_].in_call = false;
+        // Resume the task toward its next syscall (we consumed its exit stop).
         ::ptrace(PTRACE_SYSCALL, cur_, 0, 0);
-        return ok(std::int64_t{0});
+        return ok(ret);
     }
 
     static void set_arg(struct user_regs_struct& r, int n, std::uint64_t v) {
@@ -238,6 +242,44 @@ private:
         }
         t.action = Action::none;
         t.in_call = false;
+    }
+
+    // Step ONE task from its syscall-ENTRY stop to its syscall-EXIT stop,
+    // transparently passing any PTRACE_EVENT (fork/exec) stops. Used by the
+    // SYNCHRONOUS redirect(); safe because path syscalls never block on a
+    // sibling. Returns false if the task exited during the syscall.
+    bool step_to_exit(::pid_t w) {
+        ::ptrace(PTRACE_SYSCALL, w, 0, 0);
+        for (;;) {
+            int st = 0;
+            if (::waitpid(w, &st, __WALL) < 0) return false;
+            if (WIFEXITED(st) || WIFSIGNALED(st)) {
+                int code = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
+                if (w == root_pid_) exit_code_ = code;
+                tasks_.erase(w);
+                if (--live_ <= 0) exited_ = true;
+                return false;
+            }
+            if (!WIFSTOPPED(st)) return false;
+            int event = st >> 16;
+            if (event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK ||
+                event == PTRACE_EVENT_CLONE) {
+                unsigned long np = 0;
+                ::ptrace(PTRACE_GETEVENTMSG, w, 0, &np);
+                if (np && tasks_.emplace(static_cast<::pid_t>(np), Task{}).second)
+                    ++live_;
+                ::ptrace(PTRACE_SYSCALL, w, 0, 0);
+                continue;
+            }
+            if (event == PTRACE_EVENT_EXEC) {
+                // exec replaced the image; there is no ordinary syscall-exit.
+                tasks_[w] = Task{};
+                return true;
+            }
+            if (WSTOPSIG(st) == (SIGTRAP | 0x80)) return true;   // the exit stop
+            ::ptrace(PTRACE_SYSCALL, w, 0,
+                     WSTOPSIG(st) == SIGTRAP ? 0 : WSTOPSIG(st));
+        }
     }
 
     std::string path_;

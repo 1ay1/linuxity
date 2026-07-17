@@ -48,10 +48,14 @@ struct PathClass {
     Errno       error{Errno::enoent};  // meaningful when realm == absent
 };
 
-// A synthesized virtual file: a producer of bytes for a virtual path.
+// A synthesized virtual file: a producer of bytes for a virtual path. If
+// `is_dir`, `entries` names its children (for getdents enumeration) and
+// `bytes` is ignored.
+struct VirtualDirent { std::string name; bool is_dir{false}; };
 struct VirtualFile {
     std::vector<std::byte> bytes;
     bool is_dir{false};
+    std::vector<VirtualDirent> entries;   // populated when is_dir
 };
 
 // The filesystem namespace. Backends register two kinds of mounts:
@@ -147,10 +151,26 @@ public:
     // getdents, and fd-relative openat can recover the path. The fd number is
     // the REAL host fd the child holds (redirect/inject both yield real fds).
     void bind_fd(int fd, std::string abs) { fd_paths_[fd] = std::move(abs); }
-    void unbind_fd(int fd) { fd_paths_.erase(fd); }
+    void unbind_fd(int fd) { fd_paths_.erase(fd); dir_streams_.erase(fd); }
     [[nodiscard]] std::string_view path_of_fd(int fd) const {
         auto it = fd_paths_.find(fd);
         return it == fd_paths_.end() ? std::string_view{} : std::string_view{it->second};
+    }
+
+    // -- Virtual directory streams -----------------------------------------
+    // When the guest opens a VIRTUAL directory (procfs/sysfs), we bind its
+    // synthesized entries to the fd so getdents64 can enumerate them (the
+    // real backing fd is an empty temp file; enumeration is fully virtual).
+    struct DirStream { std::vector<VirtualDirent> entries; std::size_t pos{0}; };
+    void bind_dir(int fd, std::vector<VirtualDirent> entries) {
+        dir_streams_[fd] = DirStream{std::move(entries), 0};
+    }
+    [[nodiscard]] bool is_virtual_dir_fd(int fd) const {
+        return dir_streams_.count(fd) != 0;
+    }
+    [[nodiscard]] DirStream* dir_stream(int fd) {
+        auto it = dir_streams_.find(fd);
+        return it == dir_streams_.end() ? nullptr : &it->second;
     }
 
     // Normalize an absolute path: collapse "//", resolve "." and "..", drop a
@@ -254,6 +274,7 @@ private:
     std::vector<Mount> mounts_;
     std::string cwd_{"/"};
     std::unordered_map<int, std::string> fd_paths_;
+    std::unordered_map<int, DirStream> dir_streams_;
 };
 
 } // namespace lx::kernel

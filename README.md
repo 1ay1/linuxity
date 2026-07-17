@@ -122,6 +122,10 @@ linuxity services their syscalls. Proofs of the model:
 - the guest can **write** (`/tmp`, `/run`, `/var`, …) and the writes land in a
   copy-on-write **overlay upper** layer — the on-disk rootfs stays **pristine**,
   never mutated by the guest.
+- **`htop` runs** — it reads linuxity's synthesized `/proc/stat`, `/proc/meminfo`,
+  `/proc/uptime`, `/proc/loadavg` and enumerates `/proc` (virtualized
+  `getdents64`) to render its full UI over linuxity's virtual system. `free`,
+  `uptime`, `ls /proc`, `ls /proc/1` all work the same way.
 
 ### How the filesystem is virtualized
 
@@ -138,8 +142,17 @@ Every path-taking syscall (`openat`, `newfstatat`, `statx`, `access`,
   copy-on-write **overlay upper** dir (copying the file up from the read-only
   lower first), so the pristine rootfs is never mutated.
 - **virtual** (`/proc`, and future `/sys`, tmpfs, overlays): the bytes are
-  synthesized and either written straight into guest memory (`read`/`stat`) or
-  materialized into a real fd the child can read *and* `mmap` (**inject**).
+  synthesized and either written straight into guest memory (`read`/`stat`/
+  `statx`) or materialized into a real fd the child can read *and* `mmap`
+  (**inject**). A virtual **directory** is backed by a real empty temp dir (so
+  `O_DIRECTORY` opens succeed) and its `getdents64` is fully virtualized — the
+  entries are synthesized from linuxity's state.
+
+`/proc` is comprehensive: `/proc/{stat,meminfo,cpuinfo,uptime,loadavg,version,
+cmdline,filesystems,mounts,sys/...}` plus the per-process tree
+`/proc/<pid>/{stat,statm,status,cmdline,comm,io,maps,...}`, all generated from
+linuxity's **process table** (pid 1 = init, uid 0, its own numbers) — which is
+why a process monitor shows linuxity's world, not the host's.
 
 So the guest never sees the host tree: `--root` makes `/` the rootfs and
 `/proc` reports linuxity's world — all with zero privilege, no VM, no chroot.
@@ -169,6 +182,6 @@ path** are virtualized. In place and proven by 9 test suites:
   concept-based **trap** loop and a real **multi-process** `ptrace` backend
   that traces the entire forked/exec'd process tree.
 
-The road ahead: `getdents64` synthesis for virtual dirs (so `ls /proc` works),
-`futex`/`epoll` for threaded programs, then a full interactive shell from a
-pristine distro rootfs. The architecture is fixed and machine-checked.
+The road ahead: `/sys` synthesis, `futex`/`epoll` for threaded programs, and
+feeding the live ptrace tree into the process table so a monitor sees every
+guest task. The architecture is fixed and machine-checked.
