@@ -123,9 +123,10 @@ public:
                 // temps are cleaned up at the end of the run.
                 std::string tmp = o.inject_dir ? materialize_dir()
                                                : materialize(o.content);
-                auto fd = LX_TRY(trap_.redirect(o.path_arg, tmp));
+                auto fdr = trap_.redirect(o.path_arg, tmp);
+                if (!fdr) { LX_TRY(recover_syscall(fdr.error())); continue; }
                 if (!tmp.empty()) temps_.push_back(std::move(tmp));
-                sys.note_opened_fd(fd);
+                sys.note_opened_fd(*fdr);
             } else if (o.redirect) {
                 // Host-backed path: rewrite the arg to the real host path and
                 // let the kernel run it in the child (real fd for mmap). A
@@ -142,11 +143,12 @@ public:
                     make_host_parents(o.host_path);
                     if (o.path_arg2 >= 0) make_host_parents(o.host_path2);
                 }
-                auto ret = LX_TRY(trap_.redirect(
+                auto retr = trap_.redirect(
                     o.path_arg, o.host_path,
                     [&](std::int64_t rc) { if (rc == 0) sys.scrub_ids(o); },
-                    o.path_arg2, o.host_path2));
-                sys.note_opened_fd(ret);
+                    o.path_arg2, o.host_path2);
+                if (!retr) { LX_TRY(recover_syscall(retr.error())); continue; }
+                sys.note_opened_fd(*retr);
             } else if (o.signal) {
                 // The guest signalled a GUEST pid. Deliver the real signal to
                 // that task's host tid (guarded so backends without the
@@ -164,14 +166,17 @@ public:
                 // replaced on success and observed as an EXEC event.
                 if constexpr (requires {
                         trap_.exec_through_interp(0, std::string{}, std::string{}); }) {
-                    (void)LX_TRY(trap_.exec_through_interp(
-                        o.path_arg, o.interp_host, o.prog_guest, o.interp_prefix));
+                    auto er = trap_.exec_through_interp(
+                        o.path_arg, o.interp_host, o.prog_guest, o.interp_prefix);
+                    if (!er) { LX_TRY(recover_syscall(er.error())); continue; }
                 } else {
-                    (void)LX_TRY(trap_.forward());
+                    auto fr = trap_.forward();
+                    if (!fr) { LX_TRY(recover_syscall(fr.error())); continue; }
                 }
             } else if (o.forward) {
                 // Let the host kernel run it IN the guest (mmap/brk/...).
-                (void)LX_TRY(trap_.forward());
+                auto fr = trap_.forward();
+                if (!fr) { LX_TRY(recover_syscall(fr.error())); continue; }
             } else {
                 // Virtualize: hand the guest our answer, no real syscall.
                 LX_TRY(trap_.resume(o.ret));
@@ -182,6 +187,29 @@ public:
     }
 
 private:
+    // A trap primitive (redirect/inject/forward/exec_interp) failed while
+    // servicing ONE guest syscall. Crucially this is NOT a reason to tear
+    // down the whole runtime — it usually means the guest task raced us
+    // (a short-lived helper forked by gpg/dirmngr dying mid-poke yields
+    // EFAULT/ESRCH from process_vm_* or PTRACE_POKEDATA). The correct guest
+    // semantics is to complete THAT syscall with -errno and keep running the
+    // rest of the tree. So we resume the still-stopped task with the errno as
+    // its return value. Only a failure to even resume the task (the tracer
+    // itself is desynced) is genuinely fatal and propagates out of run().
+    //
+    // ESRCH specifically means the task is already gone; there is nothing to
+    // resume and next() will observe its reap on the following iteration, so
+    // we simply swallow it and loop.
+    [[nodiscard]] Status recover_syscall(Errno e) {
+        if (const char* t = std::getenv("LINUXITY_TRACE"); t && *t)
+            std::fprintf(trace_out(t),
+                "[lx] trap op failed errno=%d -> recovered (inject to guest)\n",
+                int(e));
+        if (e == Errno::esrch) return ok();
+        LX_TRY(trap_.resume(-static_cast<std::int64_t>(e)));
+        return ok();
+    }
+
     // Fold the trap's observed fork/exec/exit events into the kernel's
     // ProcessTable, so a process monitor (top/htop/ps) reading synthesized
     // /proc sees linuxity's real, live process tree. Guarded on the trap
