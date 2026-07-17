@@ -112,6 +112,23 @@ coherent tiny pid namespace (which proot does NOT have — proot leaks host pids
    (statfs(/proc)=tmpfs, openat2 reads the ROOTFS marker, no host leak), plus
    real-rootfs `df -T /` -> rootfs and `stat -f /proc` -> tmpfs.
 
+   Second wave (the remaining audit gaps, all coherently serviced): file
+   watchers `inotify_add_watch`/`fanotify_mark` translate the watched path to
+   the overlay (build tools / `inotifywait` watch the ROOTFS, not the host);
+   the file-handle API `name_to_handle_at`/`open_by_handle_at` is REFUSED with
+   ENOTSUP (the handle encodes host inode identity — glibc/nfs/tar fall back to
+   path ops); the new mount API `fsopen`/`fsconfig`/`fsmount`/`move_mount`/
+   `open_tree`/`mount_setattr` and mount-info `statmount`/`listmount` return
+   ENOSYS (callers fall back to classic mount(2) + our virtualized
+   /proc/self/mountinfo); classic `mount`/`umount2` are accepted as satisfied
+   no-ops (the pseudo-filesystems already exist virtually, so init scripts /
+   containers that mount /proc proceed instead of aborting on EPERM); and the
+   privileged sysadmin ops `pivot_root`/`swapon`/`swapoff`/`acct` EPERM,
+   `quotactl`/`ustat` ENOSYS — never a raw host-scoped forward. All wired into
+   the seccomp filter and the aarch64 decode table. Regression: the extended
+   test_run_untranslated (inotify path-translated, name_to_handle_at ENOTSUP,
+   mount no-op'd), plus real-rootfs `mount -t proc none /proc` -> rc=0.
+
 ## Order of attack
 
 1. seccomp-BPF acceleration (perf — unlocks heavy workloads). ✓ DONE
@@ -120,3 +137,5 @@ coherent tiny pid namespace (which proot does NOT have — proot leaks host pids
 4. single-read file-header inspection + foreign-arch refusal (termux-exec). ✓ DONE
 5. host-resolv.conf DNS provisioning (proot-distro). ✓ DONE
 6. path-carrying syscall coverage: statfs/openat2/xattr/chroot + seccomp lock-step. ✓ DONE
+7. remaining gaps: inotify/fanotify path xlate, handle-API/new-mount-API refusal,
+   mount no-op, sysadmin-op refusal + seccomp lock-step. ✓ DONE

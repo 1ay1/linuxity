@@ -51,6 +51,35 @@ enum class Sysno {
     setxattr, lsetxattr, fsetxattr,
     listxattr, llistxattr, flistxattr,
     removexattr, lremovexattr, fremovexattr,
+    // A file watcher's path registration: inotify_add_watch names a guest
+    // path (arg1) that must be translated to the overlay so build tools /
+    // `inotifywait` watch the ROOTFS tree, not the host's. inotify_init[1]
+    // and inotify_rm_watch carry no path and forward.
+    inotify_add_watch,
+    // fanotify_mark(fanotify_fd, flags, mask, dirfd, path): path in arg4
+    // (needs CAP_SYS_ADMIN and will EPERM unprivileged, but translate the
+    // path anyway so a privileged host can't be tricked into marking a host
+    // path through an untranslated guest string).
+    fanotify_mark,
+    // File-handle API (name_to_handle_at / open_by_handle_at): the handle
+    // encodes HOST filesystem inode identity, so round-tripping it would leak
+    // host-fs structure into the guest. We REFUSE with ENOTSUP; glibc, nfs,
+    // and tar's handle fast-paths fall back to path-based operations.
+    name_to_handle_at, open_by_handle_at,
+    // The new mount API (fsopen/fsconfig/fsmount/move_mount/open_tree/
+    // mount_setattr) and the mount-info API (statmount/listmount). All are
+    // privileged and describe/mutate the HOST mount namespace; linuxity owns a
+    // synthesized mount table (surfaced via /proc/self/mountinfo). We refuse
+    // these with ENOSYS so callers fall back to classic mount(2) + the
+    // procfs mount views, which we already serve.
+    fsopen, fsconfig, fsmount, move_mount, open_tree, mount_setattr,
+    statmount, listmount,
+    // Privileged system-administration ops with no coherent guest meaning:
+    // pivot_root swaps the root mount, swapon/swapoff manage host swap, acct
+    // toggles host process accounting, quotactl touches host quotas, ustat
+    // reports a host device's fs stats. Refuse cleanly (EPERM/ENOSYS) rather
+    // than forward a raw host-scoped operation.
+    pivot_root, swapon, swapoff, acct, quotactl, ustat,
     // Namespace / mount ops we own.
     mount, umount2, getpgrp, getppid, sysinfo, sched_getaffinity,
     // Time (virtualized to linuxity's own boot epoch + monotonic clock).
@@ -187,6 +216,24 @@ enum class Sysno {
                 case 197: return Sysno::removexattr;
                 case 198: return Sysno::lremovexattr;
                 case 199: return Sysno::fremovexattr;
+                case 254: return Sysno::inotify_add_watch;
+                case 301: return Sysno::fanotify_mark;
+                case 303: return Sysno::name_to_handle_at;
+                case 304: return Sysno::open_by_handle_at;
+                case 430: return Sysno::fsopen;
+                case 431: return Sysno::fsconfig;
+                case 432: return Sysno::fsmount;
+                case 429: return Sysno::move_mount;
+                case 428: return Sysno::open_tree;
+                case 442: return Sysno::mount_setattr;
+                case 457: return Sysno::statmount;
+                case 458: return Sysno::listmount;
+                case 155: return Sysno::pivot_root;
+                case 167: return Sysno::swapon;
+                case 168: return Sysno::swapoff;
+                case 163: return Sysno::acct;
+                case 179: return Sysno::quotactl;
+                case 136: return Sysno::ustat;
                 // -- namespace mutation (path args need translation) ------
                 case 83:  return Sysno::mkdir;
                 case 258: return Sysno::mkdirat;
@@ -291,6 +338,23 @@ enum class Sysno {
                 case 14:  return Sysno::removexattr;
                 case 15:  return Sysno::lremovexattr;
                 case 16:  return Sysno::fremovexattr;
+                case 27:  return Sysno::inotify_add_watch;
+                case 263: return Sysno::fanotify_mark;
+                case 264: return Sysno::name_to_handle_at;
+                case 265: return Sysno::open_by_handle_at;
+                case 430: return Sysno::fsopen;
+                case 431: return Sysno::fsconfig;
+                case 432: return Sysno::fsmount;
+                case 429: return Sysno::move_mount;
+                case 428: return Sysno::open_tree;
+                case 442: return Sysno::mount_setattr;
+                case 457: return Sysno::statmount;
+                case 458: return Sysno::listmount;
+                case 41:  return Sysno::pivot_root;
+                case 224: return Sysno::swapon;
+                case 225: return Sysno::swapoff;
+                case 89:  return Sysno::acct;
+                case 60:  return Sysno::quotactl;
                 case 23:  return Sysno::dup;
                 case 24:  return Sysno::dup3;
                 case 25:  return Sysno::fcntl;

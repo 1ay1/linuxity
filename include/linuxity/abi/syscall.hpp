@@ -290,6 +290,70 @@ public:
             case Sysno::flistxattr:   case Sysno::fremovexattr:
                 return fwd();
 
+            // -- inotify_add_watch(fd, path, mask): translate the guest path
+            //    (arg1) and REDIRECT so a file watcher registers against the
+            //    ROOTFS tree, not the host's. inotify_init[1]/inotify_rm_watch
+            //    carry no path and fall through to forward.
+            case Sysno::inotify_add_watch:
+                return path_watch(r, /*path_arg=*/1);
+            // -- fanotify_mark(fanotify_fd, flags, mask, dirfd, path): the
+            //    path is arg4 with dirfd arg3. Translate it so even a
+            //    privileged host acts on the rootfs path, never the raw guest
+            //    string against the host tree. (fanotify itself needs
+            //    CAP_SYS_ADMIN and will EPERM unprivileged — that's fine.)
+            case Sysno::fanotify_mark:
+                return path_watch(r, /*path_arg=*/4, /*at=*/true);
+
+            // -- file-handle API: name_to_handle_at / open_by_handle_at. The
+            //    handle encodes HOST-filesystem inode identity; round-tripping
+            //    it would leak host-fs structure into the guest and can't be
+            //    made coherent with the overlay. Refuse with ENOTSUP — glibc,
+            //    nfs-utils, and tar's handle fast-paths fall back to path ops.
+            case Sysno::name_to_handle_at:
+            case Sysno::open_by_handle_at:
+                return eno(Errno::enotsup);
+
+            // -- the new mount API (fsopen/fsconfig/fsmount/move_mount/
+            //    open_tree/mount_setattr) and mount-info API (statmount/
+            //    listmount). All are privileged and describe/mutate the HOST
+            //    mount namespace. linuxity owns a synthesized mount table
+            //    surfaced through /proc/self/mountinfo (already virtualized),
+            //    so refuse these with ENOSYS: util-linux/systemd fall back to
+            //    classic mount(2) + the procfs mount views we serve.
+            case Sysno::fsopen:        case Sysno::fsconfig:
+            case Sysno::fsmount:       case Sysno::move_mount:
+            case Sysno::open_tree:     case Sysno::mount_setattr:
+            case Sysno::statmount:     case Sysno::listmount:
+                return eno(Errno::enosys);
+
+            // -- classic mount/umount: an unprivileged guest cannot really
+            //    (u)mount, and the well-known pseudo-filesystems (proc, sysfs,
+            //    devtmpfs, tmpfs on /tmp,/run,/dev/shm) already EXIST as
+            //    virtual/host mounts in our namespace. So accept them as
+            //    satisfied no-ops: init scripts and containers that mount
+            //    /proc etc. proceed instead of aborting on EPERM. A real
+            //    block-device mount has no backing here — still accepted
+            //    vacuously (the guest sees its target directory unchanged).
+            case Sysno::mount:
+            case Sysno::umount2:
+                return val(0);
+
+            // -- privileged system-administration ops with no coherent guest
+            //    meaning. pivot_root swaps the root mount; swapon/swapoff
+            //    manage HOST swap; acct toggles HOST process accounting;
+            //    quotactl touches HOST quotas; ustat reports a HOST device's
+            //    fs stats. Never forward a raw host-scoped operation — refuse
+            //    cleanly the way the real kernel would for an unprivileged or
+            //    unsupported caller.
+            case Sysno::pivot_root:
+            case Sysno::swapon:
+            case Sysno::swapoff:
+            case Sysno::acct:
+                return eno(Errno::eperm);
+            case Sysno::quotactl:
+            case Sysno::ustat:
+                return eno(Errno::enosys);
+
             // -- execve/execveat: translate the program path to its real
             //    host location under the rootfs, then let the kernel exec it.
             //    argv/envp are consumed from the OLD image before the new one
@@ -617,6 +681,34 @@ private:
             return o;
         }
         if (pc.realm == kernel::Realm2::virtual_file) return val(0);
+        return eno(pc.error);
+    }
+
+    // inotify_add_watch(fd, path, mask) / fanotify_mark(fd, flags, mask,
+    // dirfd, path): translate the WATCHED guest path to its overlay host path
+    // and REDIRECT, so a file watcher registers against the ROOTFS tree, not
+    // the host's. The path lives at `path_arg` (1 for inotify, 4 for
+    // fanotify); fanotify's `at` form takes its dirfd from the register just
+    // before the path. A virtual (procfs/sysfs) target has no inode a real
+    // inotify fd can watch — refuse with ENOENT so the watcher skips it
+    // rather than the raw guest path leaking to the host.
+    [[nodiscard]] Outcome path_watch(const Regs& r, int path_arg,
+                                     bool at = false) {
+        std::string raw =
+            read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)]));
+        std::string_view dir =
+            at ? dir_of(static_cast<std::int64_t>(
+                     r.arg[static_cast<std::size_t>(path_arg) - 1]))
+               : std::string_view{};
+        std::string abs = k_.files().absolutize(raw, dir);
+        auto pc = k_.files().classify(abs);
+        if (pc.realm == kernel::Realm2::host_backed) {
+            Outcome o{};
+            o.redirect = true; o.path_arg = path_arg;
+            o.host_path = std::move(pc.host_path);
+            return o;
+        }
+        if (pc.realm == kernel::Realm2::virtual_file) return eno(Errno::enoent);
         return eno(pc.error);
     }
 

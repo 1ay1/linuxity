@@ -10,6 +10,10 @@
 //   * openat2("/etc/marker") -> opens the ROOTFS marker (contents "rootfs"),
 //                          proving the modern openat replacement honors the
 //                          namespace instead of opening the host's /etc.
+//   * inotify_add_watch("/etc/marker") -> succeeds against the ROOTFS inode
+//                          (path translated to the overlay, not the host).
+//   * name_to_handle_at    -> ENOTSUP (refused; would leak host inode identity).
+//   * mount(...)           -> accepted as a satisfied no-op (returns 0).
 //
 // Skips gracefully off Linux/x86-64, without gcc/static glibc, or w/o ptrace.
 #include "linuxity/host/posix_host.hpp"
@@ -33,6 +37,9 @@ static const char* kSrc =
     "#include <unistd.h>\n"
     "#include <string.h>\n"
     "#include <linux/openat2.h>\n"
+    "#include <sys/inotify.h>\n"
+    "#include <sys/mount.h>\n"
+    "#include <errno.h>\n"
     "#include <sys/syscall.h>\n"
     "int main(void){\n"
     "  struct statfs sf;\n"
@@ -49,6 +56,24 @@ static const char* kSrc =
     "  if (n < 6) return 6;\n"
     "  buf[n] = 0;\n"
     "  if (strncmp(buf, \"rootfs\", 6) != 0) return 8;  /* host leak! */\n"
+    "  /* inotify: adding a watch on the rootfs marker must translate the\n"
+    "     path to the overlay and SUCCEED (>=0 watch descriptor). */\n"
+    "  int ifd = inotify_init1(0);\n"
+    "  if (ifd >= 0) {\n"
+    "    int wd = inotify_add_watch(ifd, \"/etc/marker\", IN_MODIFY);\n"
+    "    if (wd < 0) return 9;\n"
+    "  }\n"
+    "  /* name_to_handle_at must be refused (ENOTSUP), not leak a host handle. */\n"
+    "  {\n"
+    "    struct { struct file_handle h; char buf[128]; } fh;\n"
+    "    fh.h.handle_bytes = 128; int mnt;\n"
+    "    long rc = syscall(SYS_name_to_handle_at, AT_FDCWD, \"/etc/marker\",\n"
+    "                      &fh.h, &mnt, 0);\n"
+    "    if (rc == 0) return 10;              /* should NOT succeed */\n"
+    "    if (errno != EOPNOTSUPP) return 11;  /* must be ENOTSUP */\n"
+    "  }\n"
+    "  /* mount must be accepted as a satisfied no-op (returns 0). */\n"
+    "  if (mount(\"none\", \"/proc\", \"proc\", 0, 0) != 0) return 12;\n"
     "  return 7;\n}\n";
 
 int main() {
@@ -87,12 +112,17 @@ int main() {
     switch (*r) {
         case 7:
             std::puts("run_untranslated: statfs(/proc)=tmpfs, statfs(/etc) ok, "
-                      "openat2(/etc/marker) read the ROOTFS (no host leak), exit=7");
+                      "openat2 read the ROOTFS, inotify path-translated, "
+                      "name_to_handle_at refused, mount no-op'd, exit=7");
             return 0;
         case 3: std::puts("run_untranslated: FAIL statfs(/proc) leaked host fs magic"); return 1;
         case 4: std::puts("run_untranslated: FAIL statfs(/etc) did not redirect"); return 1;
         case 5: std::puts("run_untranslated: FAIL openat2 could not open rootfs marker"); return 1;
         case 8: std::puts("run_untranslated: FAIL openat2 read the HOST /etc, not the rootfs"); return 1;
+        case 9: std::puts("run_untranslated: FAIL inotify_add_watch did not translate the path"); return 1;
+        case 10: std::puts("run_untranslated: FAIL name_to_handle_at succeeded (host leak)"); return 1;
+        case 11: std::puts("run_untranslated: FAIL name_to_handle_at wrong errno (not ENOTSUP)"); return 1;
+        case 12: std::puts("run_untranslated: FAIL mount not accepted as no-op"); return 1;
         default:
             std::printf("run_untranslated: FAIL exit=%d (expected 7)\n", *r);
             return 1;

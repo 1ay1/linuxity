@@ -120,7 +120,22 @@ inline constexpr int kTrappedX86_64[] = {
     // -- landlock (accepted no-op; the namespace already confines) ---------
     444, 445, 446,               // landlock_create_ruleset/add_rule/restrict_self
     // -- mount ops we own --------------------------------------------------
-    165, 166,                    // mount/umount2
+    165, 166,                    // mount/umount2 (accepted no-op)
+    // -- file watchers: translate the watched path to the overlay ----------
+    254,                         // inotify_add_watch
+    301,                         // fanotify_mark
+    // -- file-handle API: refused (leaks host inode identity) --------------
+    303, 304,                    // name_to_handle_at/open_by_handle_at
+    // -- new mount + mount-info API: refused (privileged, host-scoped) ------
+    430, 431, 432,               // fsopen/fsconfig/fsmount
+    429, 428, 442,               // move_mount/open_tree/mount_setattr
+    457, 458,                    // statmount/listmount
+    // -- privileged sysadmin ops: refused cleanly (never host-scoped raw) ---
+    155,                         // pivot_root
+    167, 168,                    // swapon/swapoff
+    163,                         // acct
+    179,                         // quotactl
+    136,                         // ustat
 };
 
 // Install the seccomp trap filter in the CURRENT process (called in the child
