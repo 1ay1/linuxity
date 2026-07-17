@@ -254,7 +254,39 @@ int main(int argc, char** argv) {
     // inside the rootfs — no chroot, no privilege. argv[0] stays the guest
     // program name so the process sees itself correctly.
     std::vector<std::string> child_argv = gargv;
-    if (std::string interp = loader::read_elf_interp(exec_path); !interp.empty()) {
+    // A `#!` script named directly on the command line: the host kernel would
+    // launch its interpreter with the HOST-translated script path, which our
+    // namespace re-translates (double-rooting). Resolve the shebang ourselves
+    // and exec the interpreter with the script as a GUEST path (its own openat
+    // redirects into the rootfs). If the interpreter is dynamic, chain its
+    // ld.so too. This mirrors path_exec's in-guest handling for the FIRST hop.
+    if (loader::Shebang sh = loader::read_shebang(exec_path); !sh.interp.empty()) {
+        std::string si_abs = k.files().absolutize(sh.interp);
+        auto sic = k.files().classify(si_abs);
+        std::string si_host = sic.realm == kernel::Realm2::host_backed
+                                  ? sic.host_path : sh.interp;
+        std::string script_guest = k.files().absolutize(path);
+        child_argv.clear();
+        std::string si_interp = loader::read_elf_interp(si_host);
+        if (!si_interp.empty()) {
+            // Dynamic interpreter: exec its ld.so, then the interpreter (guest
+            // path), then the shebang arg, then the script (guest path).
+            std::string ld_abs = k.files().absolutize(si_interp);
+            auto ldc = k.files().classify(ld_abs);
+            std::string ld_host = ldc.realm == kernel::Realm2::host_backed
+                                      ? ldc.host_path : si_interp;
+            child_argv.push_back(ld_host);
+            child_argv.push_back(si_abs);           // interpreter, guest path
+            exec_path = ld_host;
+        } else {
+            child_argv.push_back(si_host);          // static interpreter
+            exec_path = si_host;
+        }
+        if (!sh.arg.empty()) child_argv.push_back(sh.arg);
+        child_argv.push_back(script_guest);         // the script, guest path
+        for (std::size_t j = 1; j < gargv.size(); ++j)
+            child_argv.push_back(gargv[j]);
+    } else if (std::string interp = loader::read_elf_interp(exec_path); !interp.empty()) {
         std::string interp_abs = k.files().absolutize(interp);
         auto ipc = k.files().classify(interp_abs);
         std::string interp_host = interp;

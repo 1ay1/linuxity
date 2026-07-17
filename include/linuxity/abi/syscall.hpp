@@ -313,6 +313,37 @@ public:
             case Sysno::symlink:    return path_symlink(r, 0, 1, false);
             case Sysno::symlinkat:  return path_symlink(r, 0, 2, true);
 
+            // -- PRIVILEGE DROPS. linuxity presents a root-owned world and the
+            //    guest runs as our single unprivileged host process. A real
+            //    setuid/setgid to a non-root user (pacman's 'alpm', apk's
+            //    build user) would EPERM on the host and abort the program.
+            //    Ownership is already virtually root and there is only ONE
+            //    identity to be, so accept every privilege change vacuously:
+            //    the guest believes it dropped to the sandbox user; the host
+            //    process is untouched. Subsequent geteuid/getuid still report
+            //    0 (the guest's coherent root world).
+            case Sysno::setuid:     case Sysno::setgid:
+            case Sysno::setreuid:   case Sysno::setregid:
+            case Sysno::setresuid:  case Sysno::setresgid:
+            case Sysno::setfsuid:   case Sysno::setfsgid:
+            case Sysno::setgroups:  return val(0);
+
+            // -- LANDLOCK (pacman 7's download sandbox). We cannot apply an
+            //    LSM ruleset to a ptraced tree, but linuxity's own namespace
+            //    already confines the guest to the rootfs. Accept the sandbox
+            //    calls as satisfied no-ops so pacman proceeds instead of
+            //    treating the failure as fatal. create_ruleset returns a
+            //    plausible ruleset fd number (a small positive int); add_rule
+            //    and restrict_self return success.
+            case Sysno::landlock_create_ruleset:
+                // If the guest is only querying the ABI version (flags has
+                // LANDLOCK_CREATE_RULESET_VERSION == 1 and attr==NULL), report
+                // a supported version; otherwise hand back a dummy ruleset fd.
+                return val((r.arg[2] & 1u) ? 1 : 3);
+            case Sysno::landlock_add_rule:
+            case Sysno::landlock_restrict_self:
+                return val(0);
+
             // -- everything else: FORWARD to the real host kernel. -------
             // Memory (mmap/brk/mprotect) MUST run in the child so it gets
             // real pages in its own address space; file I/O, arch_prctl,

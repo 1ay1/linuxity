@@ -52,6 +52,20 @@ enum class Sysno {
     mknod, mknodat,
     // Two-path mutations (both args are paths needing translation).
     rename, renameat, renameat2, link, linkat, symlink, symlinkat,
+    // Privilege drops. linuxity presents a ROOT-OWNED world and the guest
+    // runs as our unprivileged host process, so a real setuid to a non-root
+    // user (pacman's 'alpm', apk's build user) EPERMs. We accept them
+    // vacuously: the guest believes it dropped privilege; the host process is
+    // unchanged (already the only identity we have).
+    setuid, setgid, setreuid, setregid, setresuid, setresgid,
+    setfsuid, setfsgid, setgroups,
+    // Landlock (pacman 7's download sandbox). We can't apply an LSM ruleset
+    // through ptrace, but linuxity's namespace already confines the guest, so
+    // we ACCEPT the sandbox calls as satisfied no-ops rather than let pacman
+    // treat the failure as fatal.
+    landlock_create_ruleset, landlock_add_rule, landlock_restrict_self,
+    // Miscellany the guest may probe; forwarded or benign by default.
+    prctl,
 };
 
 // Decode an arch-specific raw syscall number into the canonical identity.
@@ -167,6 +181,21 @@ enum class Sysno {
                 case 265: return Sysno::linkat;
                 case 88:  return Sysno::symlink;
                 case 266: return Sysno::symlinkat;
+                // -- privilege drops (vacuous in a root-owned world) ------
+                case 105: return Sysno::setuid;
+                case 106: return Sysno::setgid;
+                case 113: return Sysno::setreuid;
+                case 114: return Sysno::setregid;
+                case 117: return Sysno::setresuid;
+                case 119: return Sysno::setresgid;
+                case 122: return Sysno::setfsuid;
+                case 123: return Sysno::setfsgid;
+                case 116: return Sysno::setgroups;
+                case 157: return Sysno::prctl;
+                // -- Landlock (accepted no-op; namespace already confines) --
+                case 444: return Sysno::landlock_create_ruleset;
+                case 445: return Sysno::landlock_add_rule;
+                case 446: return Sysno::landlock_restrict_self;
                 default:  return Sysno::unknown;
             }
         case Arch::aarch64:
