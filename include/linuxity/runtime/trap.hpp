@@ -126,8 +126,13 @@ public:
                 sys.note_opened_fd(fd);
             } else if (o.redirect) {
                 // Host-backed path: rewrite the arg to the real host path and
-                // let the kernel run it in the child (real fd for mmap).
-                auto ret = LX_TRY(trap_.redirect(o.path_arg, o.host_path));
+                // let the kernel run it in the child (real fd for mmap). A
+                // host-backed stat leaves the HOST file's owner in the guest
+                // buffer; scrub it to root in the SAME stopped window, before
+                // the task resumes and could read the buffer (racing us).
+                auto ret = LX_TRY(trap_.redirect(
+                    o.path_arg, o.host_path,
+                    [&](std::int64_t rc) { if (rc == 0) sys.scrub_ids(o); }));
                 sys.note_opened_fd(ret);
             } else if (o.signal) {
                 // The guest signalled a GUEST pid. Deliver the real signal to

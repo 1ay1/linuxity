@@ -34,6 +34,7 @@
 #include <cerrno>
 
 #include <cstring>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -204,7 +205,9 @@ public:
     // stepping to their exit can't deadlock the tree — and we need the real fd
     // to bind virtual-directory streams and readlinkat paths.
     [[nodiscard]] Result<std::int64_t> redirect(int path_arg,
-                                                const std::string& host_path) {
+                                                const std::string& host_path,
+                                                std::function<void(std::int64_t)>
+                                                    post_exit = {}) {
         Task& t = tasks_[cur_];
         struct user_regs_struct r = t.regs;
         // Park the translated path in the child's own stack, just below the
@@ -228,6 +231,11 @@ public:
         ::ptrace(PTRACE_GETREGS, cur_, 0, &rr);
         std::int64_t ret = static_cast<std::int64_t>(rr.rax);
         tasks_[cur_].in_call = false;
+        // Run the caller's post-exit patch WHILE the task is still stopped at
+        // its syscall-exit (e.g. scrub a stat buffer the kernel just filled).
+        // This must precede the resume below: once the task runs it may read
+        // the buffer, so writing after resuming would race the child.
+        if (post_exit) post_exit(ret);
         // Resume the task toward its next syscall (we consumed its exit stop).
         ::ptrace(PTRACE_SYSCALL, cur_, 0, 0);
         return ok(ret);

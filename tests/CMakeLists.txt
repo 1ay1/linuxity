@@ -45,3 +45,7 @@ add_test(NAME run_signal COMMAND test_run_signal)
 add_executable(test_run_identity test_run_identity.cpp)
 target_link_libraries(test_run_identity PRIVATE linuxity_core)
 add_test(NAME run_identity COMMAND test_run_identity)
+
+add_executable(test_run_stat_owner test_run_stat_owner.cpp)
+target_link_libraries(test_run_stat_owner PRIVATE linuxity_core)
+add_test(NAME run_stat_owner COMMAND test_run_stat_owner)

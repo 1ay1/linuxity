@@ -80,6 +80,16 @@ struct Outcome {
     bool         exec_interp{false};
     std::string  interp_host;      // real host path of the dynamic linker
     std::string  prog_guest;      // guest path of the program (new argv[0..1])
+
+    // POST-REDIRECT id scrub. Host-backed stat/lstat/newfstatat/statx are
+    // REDIRECTED, so the host kernel fills the guest buffer with the HOST
+    // file's uid/gid (whatever user unpacked the rootfs). linuxity presents a
+    // root-owned world, so after the redirect returns 0 we read the buffer
+    // back and rewrite the owner fields to 0. scrub_stat names the buffer
+    // address and which layout to patch.
+    enum class ScrubKind : std::uint8_t { none, stat, statx };
+    ScrubKind    scrub{ScrubKind::none};
+    UAddr        scrub_buf{};
 };
 
 // A guest-memory accessor the dispatcher uses to copy_in/copy_out. Modeled as
@@ -356,6 +366,11 @@ private:
         if (pc.realm == kernel::Realm2::host_backed) {
             Outcome o{};
             o.redirect = true; o.path_arg = path_arg; o.host_path = std::move(pc.host_path);
+            // The host kernel will fill the statbuf with the host file's
+            // owner; scrub it to root afterwards. statbuf is arg[1] for
+            // stat/lstat, arg[2] for newfstatat.
+            o.scrub = Outcome::ScrubKind::stat;
+            o.scrub_buf = at ? uaddr(r.arg[2]) : uaddr(r.arg[1]);
             return o;
         }
         // Virtual stat: forward is impossible, so synthesize a stat64 buffer.
@@ -377,6 +392,8 @@ private:
         if (pc.realm == kernel::Realm2::host_backed) {
             Outcome o{};
             o.redirect = true; o.path_arg = 1; o.host_path = std::move(pc.host_path);
+            o.scrub = Outcome::ScrubKind::statx;
+            o.scrub_buf = uaddr(r.arg[4]);
             return o;
         }
         if (pc.realm == kernel::Realm2::virtual_file) {
@@ -748,6 +765,22 @@ public:
         pending_open_.clear();
         pending_dir_ = false;
         pending_entries_.clear();
+    }
+
+    // After a host-backed stat/statx REDIRECT returns success, the guest
+    // buffer holds the HOST file's uid/gid. linuxity presents a root-owned
+    // world, so rewrite the owner fields to 0 in place. The field offsets are
+    // the SAME layouts write_statbuf/write_statx synthesize, so there is one
+    // definition of where uid/gid live. No-op unless o.scrub is set.
+    void scrub_ids(const Outcome& o) {
+        if (o.scrub == Outcome::ScrubKind::none) return;
+        // struct stat (x86-64): st_uid at byte 28, st_gid at byte 32 (both
+        // u32, contiguous). struct statx: stx_uid at 20, stx_gid at 24 (both
+        // u32, contiguous). Zeroing 8 bytes from the uid offset clears both
+        // owner fields without touching neighbours (st_gid's pad / stx_mode).
+        const std::size_t uid_off = o.scrub == Outcome::ScrubKind::stat ? 28 : 20;
+        std::array<std::byte, 8> zero{};   // clears uid AND the adjacent gid
+        (void)mem_.copy_out(uaddr(value(o.scrub_buf) + uid_off), zero);
     }
 };
 
