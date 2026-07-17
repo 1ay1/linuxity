@@ -10,6 +10,7 @@
 #pragma once
 
 #include "linuxity/host/host.hpp"
+#include "linuxity/kernel/authority.hpp"
 #include "linuxity/kernel/subsystem.hpp"
 
 #include <unordered_map>
@@ -30,9 +31,14 @@ private:
 template <host::Host H>
 class Kernel {
 public:
-    explicit Kernel(H& host) : host_{host} {
+    // The Grants describe what the layer BELOW the line offers. Default is
+    // the iOS sandbox: a complete virtual world, zero delegated authority.
+    explicit Kernel(H& host, Grants grants = ios_sandbox())
+        : host_{host}, grants_{grants} {
         self_ = pids_.allocate(); // pid 1: our "init"
     }
+
+    [[nodiscard]] const Grants& grants() const noexcept { return grants_; }
 
     // -- Process subsystem --------------------------------------------------
     [[nodiscard]] Pid self() const noexcept { return self_; }
@@ -83,8 +89,37 @@ public:
 
     [[nodiscard]] Result<UAddr> brk(UAddr a) { return ok(a); }
 
+    // -- Authority-gated operations ----------------------------------------
+    // These live at the line. Each names the Cap it needs and resolves it
+    // through grants_.require() — the SINGLE place unbacked authority
+    // becomes an errno. No scattered EPERM/ENOSYS.
+
+    // mount(2). A tmpfs/procfs mount is Virtual (we own the fs). Mounting a
+    // real device is HostDelegated — and will EPERM on an iOS sandbox.
+    [[nodiscard]] Status mount(std::string_view fstype) {
+        Cap need = (fstype == "tmpfs" || fstype == "proc" || fstype == "sysfs")
+                       ? Cap::VfsNamespace       // our virtual world
+                       : Cap::MountRealDevice;   // needs the host to expose it
+        LX_TRY(grants_.require(need));
+        // ... on success, update our virtual mount table here ...
+        return ok();
+    }
+
+    // init_module(2). Nowhere to load it. Structurally absent ⇒ ENOSYS.
+    [[nodiscard]] Status init_module() {
+        LX_TRY(grants_.require(Cap::LoadKernelModule));
+        return ok(); // unreachable on any real host
+    }
+
+    // uname(2). Pure information about our virtual Linux ⇒ always Virtual.
+    [[nodiscard]] Status uname() {
+        LX_TRY(grants_.require(Cap::Uname));
+        return ok();
+    }
+
 private:
     H& host_;
+    Grants grants_{};
     IdSpace<Pid> pids_{1};
     Pid self_{};
     std::unordered_map<UAddr, std::size_t> maps_;

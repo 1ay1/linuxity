@@ -54,5 +54,28 @@ int main() {
     std::int64_t rc = sys.dispatch(bad);
     std::printf("guest syscall(999999) -> %lld (-ENOSYS=%d)\n",
                 static_cast<long long>(rc), -int(Errno::enosys));
+
+    // -- The authority boundary in action ---------------------------------
+    // The SAME kernel code, two different host grant sets. What's above the
+    // line (uname, tmpfs mount) always works; what needs authority below the
+    // line (mount a real device, load a module) depends on the host.
+    auto show = [](const char* label, kernel::Kernel<host::PosixHost>& kk) {
+        auto rep = [&](const char* op, lx::Status s) {
+            std::printf("  %-22s -> %s\n", op,
+                        s ? "ok"
+                          : (s.error() == Errno::eperm ? "EPERM"
+                             : s.error() == Errno::enosys ? "ENOSYS" : "err"));
+        };
+        std::printf("[%s]\n", label);
+        rep("uname()",            kk.uname());
+        rep("mount tmpfs /tmp",   kk.mount("tmpfs"));
+        rep("mount ext4 /dev/sda", kk.mount("ext4"));
+        rep("init_module()",      kk.init_module());
+    };
+
+    kernel::Kernel<host::PosixHost> ios{hw, kernel::ios_sandbox()};
+    kernel::Kernel<host::PosixHost> priv{hw, kernel::privileged_linux()};
+    show("iOS app sandbox", ios);
+    show("privileged Linux host", priv);
     return 0;
 }
