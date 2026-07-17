@@ -98,6 +98,10 @@ add_executable(test_run_untranslated test_run_untranslated.cpp)
 target_link_libraries(test_run_untranslated PRIVATE linuxity_core)
 add_test(NAME run_untranslated COMMAND test_run_untranslated)
 
+add_executable(test_run_empty_path test_run_empty_path.cpp)
+target_link_libraries(test_run_empty_path PRIVATE linuxity_core)
+add_test(NAME run_empty_path COMMAND test_run_empty_path)
+
 add_executable(test_resources test_resources.cpp)
 target_link_libraries(test_resources PRIVATE linuxity_core)
 add_test(NAME resources COMMAND test_resources)

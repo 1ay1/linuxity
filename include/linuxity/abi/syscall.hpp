@@ -515,21 +515,55 @@ private:
     }
 
     // Read a NUL-terminated C string from guest memory (bounded).
+    //
+    // process_vm_readv reads a WHOLE iovec or nothing: if a 64-byte chunk
+    // straddles the end of a mapped page into an unmapped one, the entire
+    // chunk read faults (EFAULT) even though the string's bytes before the
+    // page boundary are perfectly valid. A dynamic loader routinely places a
+    // library path right up against a page end, so a naive chunked read loses
+    // the path and yields "" — which then classifies as "/" and REDIRECTS the
+    // open to the overlay ROOT (a directory), so the loader's read/mmap gets
+    // EISDIR ("cannot read file data"). To avoid that, on a chunk fault we
+    // fall back to reading up to the next page boundary, then byte-by-byte,
+    // so we always recover the maximal valid prefix up to the NUL.
     [[nodiscard]] std::string read_cstr(UAddr a) {
         std::string s;
-        std::array<std::byte, 64> chunk{};
+        const std::uint64_t base = value(a);
         std::uint64_t off = 0;
+        constexpr std::uint64_t kPage = 4096;
         for (;;) {
-            if (!mem_.copy_in(uaddr(value(a) + off), chunk)) break;
-            for (std::byte b : chunk) {
-                char c = static_cast<char>(b);
+            // How many bytes remain until the next page boundary from here;
+            // never read across it in one process_vm_readv (that's the read
+            // that can spuriously fault on a valid string).
+            std::uint64_t to_page = kPage - ((base + off) & (kPage - 1));
+            std::size_t want = static_cast<std::size_t>(to_page < 64 ? to_page : 64);
+            std::array<std::byte, 64> chunk{};
+            std::span<std::byte> dst{chunk.data(), want};
+            if (mem_.copy_in(uaddr(base + off), dst)) {
+                for (std::size_t i = 0; i < want; ++i) {
+                    char c = static_cast<char>(chunk[i]);
+                    if (c == '\0') return s;
+                    s.push_back(c);
+                    if (s.size() > 4096) return s;
+                }
+                off += want;
+                continue;
+            }
+            // Even the page-bounded read faulted. Recover byte-by-byte so a
+            // valid prefix isn't lost to one unreadable trailing byte.
+            bool progressed = false;
+            for (std::size_t i = 0; i < want; ++i) {
+                std::array<std::byte, 1> one{};
+                if (!mem_.copy_in(uaddr(base + off + i), one)) return s;
+                progressed = true;
+                char c = static_cast<char>(one[0]);
                 if (c == '\0') return s;
                 s.push_back(c);
                 if (s.size() > 4096) return s;
             }
-            off += chunk.size();
+            if (!progressed) return s;
+            off += want;
         }
-        return s;
     }
 
     // The path bound to a guest dirfd, or empty for AT_FDCWD (-100).
@@ -577,6 +611,19 @@ private:
     // overlay upper layer on write intent and REDIRECTs or INJECTs.
     [[nodiscard]] Outcome path_open_flags(const Regs& r, int path_arg, bool at,
                                           std::uint64_t flags) {
+        // An empty path string is NOT the root directory. openat(dirfd,"",...)
+        // without AT_EMPTY_PATH is ENOENT per the kernel; resolving "" to "/"
+        // (and then REDIRECTing to the overlay root, a directory) is wrong and
+        // faults the loader (glibc probes openat("") during library search).
+        // AT_EMPTY_PATH (0x1000) would mean "operate on dirfd itself" — we
+        // don't service that here, so forward it to the host unchanged.
+        constexpr std::uint64_t kAtEmptyPath = 0x1000;
+        {
+            std::string raw0 =
+                read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)]));
+            if (raw0.empty())
+                return (flags & kAtEmptyPath) ? fwd() : eno(Errno::enoent);
+        }
         std::string abs = resolve_arg(r, path_arg, at);
         // Write intent (O_WRONLY / O_RDWR / O_CREAT / O_TRUNC) selects the
         // overlay upper layer.
@@ -683,6 +730,9 @@ private:
     // access/readlink[at]/faccessat: host-backed -> redirect; virtual
     // paths that exist -> success (0); absent -> error.
     [[nodiscard]] Outcome path_at(const Regs& r, int path_arg, bool at) {
+        std::string raw0 =
+            read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)]));
+        if (raw0.empty()) return at ? fwd() : eno(Errno::enoent);
         std::string abs = resolve_arg(r, path_arg, at);
         auto pc = k_.files().classify(abs);
         if (pc.realm == kernel::Realm2::host_backed) {
@@ -727,6 +777,13 @@ private:
     // self/fd/N) are SYNTHESIZED here, since a monitor / dynamic loader /
     // language runtime routinely reads /proc/self/exe to find its own binary.
     [[nodiscard]] Outcome do_readlink(const Regs& r, int path_arg, bool at) {
+        // An empty path is ENOENT (readlink(2)); don't resolve "" to "/" and
+        // redirect to the overlay root (a directory) — that faults the caller.
+        // (readlinkat with AT_EMPTY_PATH would read the dirfd's own link; we
+        // don't service that, so forward it.)
+        std::string raw0 =
+            read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)]));
+        if (raw0.empty()) return at ? fwd() : eno(Errno::enoent);
         std::string abs = resolve_arg(r, path_arg, at);
         // The buffer + size follow the path arg: readlink(path,buf,sz) ->
         // arg1/arg2; readlinkat(dirfd,path,buf,sz) -> arg2/arg3.
@@ -787,6 +844,26 @@ private:
                     if (tail == "exe")  return exe_of(pid);
                     if (tail == "cwd")  return std::string{k_.files().cwd()};
                     if (tail == "root") return "/";
+                    // /proc/<pid>/fd/N -> the GUEST-namespace path the fd was
+                    // opened as. Without this the readlink falls to the host
+                    // procfs redirect and leaks the real host fd target — for
+                    // an overlay-upper file that is /tmp/linuxity-upper-XXXX,
+                    // a path that does NOT exist in the guest namespace. gpg
+                    // /gpg-agent readlink their own fds to locate their socket
+                    // dir; the leaked host path then faults the runtime.
+                    // Only OUR own tree's fds are known here (one guest tree);
+                    // an unknown fd (e.g. inherited stdio 0/1/2 -> the real
+                    // tty) returns "" and correctly falls back to the host
+                    // redirect so /dev/stdout still reaches fd 1.
+                    constexpr std::string_view kFd = "fd/";
+                    if (tail.rfind(kFd, 0) == 0 && pid == id.pid) {
+                        std::int32_t fd = atoi_safe(tail.substr(kFd.size()));
+                        if (fd >= 0) {
+                            std::string_view gp =
+                                k_.files().path_of_fd(fd);
+                            if (!gp.empty()) return std::string{gp};
+                        }
+                    }
                 }
             }
         }
