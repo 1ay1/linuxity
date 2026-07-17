@@ -25,7 +25,7 @@ enum class Sysno {
     unknown,
     read, write, open, openat, close,
     mmap, munmap, mprotect, brk,
-    getpid, gettid, clone, fork, execve, wait4, kill, exit, exit_group,
+    getpid, gettid, clone, fork, vfork, execve, execveat, wait4, kill, exit, exit_group,
     uname, arch_prctl, set_tid_address, ioctl, writev, readv,
     rt_sigaction, rt_sigprocmask, getuid, geteuid, getgid, getegid,
     // File metadata & directory path family (virtualized through the VFS).
@@ -57,6 +57,8 @@ enum class Sysno {
                 case 56:  return Sysno::clone;
                 case 57:  return Sysno::fork;
                 case 59:  return Sysno::execve;
+                case 322: return Sysno::execveat;
+                case 58:  return Sysno::vfork;
                 case 60:  return Sysno::exit;
                 case 61:  return Sysno::wait4;
                 case 62:  return Sysno::kill;
@@ -116,6 +118,7 @@ enum class Sysno {
                 case 178: return Sysno::gettid;
                 case 220: return Sysno::clone;
                 case 221: return Sysno::execve;
+                case 281: return Sysno::execveat;
                 case 93:  return Sysno::exit;
                 case 94:  return Sysno::exit_group;
                 case 260: return Sysno::wait4;

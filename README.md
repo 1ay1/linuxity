@@ -116,6 +116,9 @@ linuxity services their syscalls. Proofs of the model:
   **linuxity's** mount table — `/proc` is fully **synthesized**, not the host's.
 - `--root <rootfs> /bin/cat /etc/os-release` reads the **rootfs** file, not
   the host's — and needs **no privilege and no chroot**.
+- `--root <rootfs> /bin/sh -c '/bin/cat /etc/os-release | /bin/head -1'` runs a
+  **shell that forks and execs coreutils**, and every child stays inside the
+  rootfs — the whole process tree lives in linuxity's world, no host escape.
 
 ### How the filesystem is virtualized
 
@@ -135,9 +138,19 @@ Every path-taking syscall (`openat`, `newfstatat`, `statx`, `access`,
 So the guest never sees the host tree: `--root` makes `/` the rootfs and
 `/proc` reports linuxity's world — all with zero privilege, no VM, no chroot.
 
+**The trap traces the whole process tree.** A real shell forks and execs
+children and blocks in `wait4()`/`read()` on them, so the `ptrace` backend is
+multi-process and event-driven: it traces every descendant
+(`PTRACE_O_TRACEFORK|VFORK|CLONE|EXEC`), waits on any task, and never blocks on
+one while another can run — so a parent's blocking `wait4` doesn't deadlock its
+child. Each task's syscall entry/exit is told apart robustly by the kernel's
+`rax == -ENOSYS` entry priming. A forked `cat` in a pipeline therefore lives in
+exactly the same virtual namespace as its parent shell; it never escapes to
+the host filesystem.
+
 Memory (`mmap`/`brk`/`mprotect`) stays forwarded so native libc reaches
 `main()`; identity, credentials, lifecycle, `uname`, and now the **whole file
-path** are virtualized. In place and proven by 8 test suites:
+path** are virtualized. In place and proven by 9 test suites:
 
 - the type algebra, subsystem concept lattice, and authority boundary;
 - a real **VFS** (mount table, path resolution) with **tmpfs** and a
@@ -147,8 +160,10 @@ path** are virtualized. In place and proven by 8 test suites:
   **address space**, plus SysV AMD64 **stack/auxv** init;
 - an arch-neutral **syscall dispatcher** (per-arch tables → canonical `Sysno`)
   with a **virtualize / forward / redirect / inject** classifier, driven by a
-  concept-based **trap** loop and a real `ptrace` backend.
+  concept-based **trap** loop and a real **multi-process** `ptrace` backend
+  that traces the entire forked/exec'd process tree.
 
 The road ahead: a writable overlay (tmpfs upper over the rootfs), `getdents64`
-synthesis for virtual dirs, then `clone`/`futex`/`epoll` and a shell from a
-pristine distro rootfs. The architecture is fixed and machine-checked.
+synthesis for virtual dirs, `futex`/`epoll` for threaded programs, then a full
+interactive shell from a pristine distro rootfs. The architecture is fixed and
+machine-checked.

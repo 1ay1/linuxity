@@ -98,11 +98,12 @@ public:
             // our subsystems, forward it to the host kernel, or exit.
             abi::Outcome o = sys.dispatch(f.regs);
             if (const char* t = std::getenv("LINUXITY_TRACE"); t && *t) {
-                std::fprintf(stderr, "[lx] nr=%llu -> %s%s%s%s ret=%lld\n",
+                std::fprintf(stderr, "[lx] nr=%llu -> %s%s%s%s ret=%lld %s\n",
                     static_cast<unsigned long long>(f.regs.nr),
                     o.inject?"INJECT ":"", o.redirect?"REDIRECT ":"",
                     o.forward?"FORWARD ":"", o.exited?"EXIT ":"VIRT ",
-                    static_cast<long long>(o.ret));
+                    static_cast<long long>(o.ret),
+                    o.redirect?o.host_path.c_str():"");
             }
             if (o.exited) return ok(o.exit_code);
 
@@ -118,8 +119,7 @@ public:
                 sys.note_opened_fd(fd);
             } else if (o.redirect) {
                 // Host-backed path: rewrite the arg to the real host path and
-                // let the kernel run it in the child (real fd for mmap). The
-                // kernel's result already sits in the guest return register.
+                // let the kernel run it in the child (real fd for mmap).
                 auto ret = LX_TRY(trap_.redirect(o.path_arg, o.host_path));
                 sys.note_opened_fd(ret);
             } else if (o.forward) {
@@ -129,7 +129,8 @@ public:
                 // Virtualize: hand the guest our answer, no real syscall.
                 LX_TRY(trap_.resume(o.ret));
             }
-            if (trap_.exited()) return ok(trap_.exit_code());
+            // The trap continues the task asynchronously; whole-tree exit is
+            // reported by next() returning false, so we just loop.
         }
     }
 

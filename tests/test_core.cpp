@@ -72,9 +72,11 @@ int main() {
     abi::Regs r; r.nr = 39; // x86-64 getpid
     assert(sys.dispatch(r).ret == 42);
 
+    // exit/exit_group are FORWARDED: the task actually terminates in the
+    // kernel and the trap reaps it (multi-process: only the root's exit ends
+    // the whole run), so the dispatcher reports forward, not a virtual exit.
     abi::Regs e; e.nr = 60; e.arg[0] = 7; // x86-64 exit(7)
-    auto o = sys.dispatch(e);
-    assert(o.exited && o.exit_code == 7);
+    assert(sys.dispatch(e).forward);
 
     // An unrecognized/real syscall is FORWARDED to the host kernel (the
     // dispatcher only virtualizes identity/lifecycle; everything else runs

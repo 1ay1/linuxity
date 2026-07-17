@@ -80,13 +80,12 @@ public:
     [[nodiscard]] Outcome dispatch(const Regs& r) {
         const Sysno sc = decode(arch_, r.nr);
         switch (sc) {
-            // -- process lifecycle (virtual: our process model) ----------
+            // -- process lifecycle: let the task ACTUALLY exit in the kernel
+            //    (forward), so the trap reaps it and attributes the code. In
+            //    a multi-process tree only the root task's exit ends the run.
             case Sysno::exit:
-            case Sysno::exit_group: {
-                Outcome o{}; o.exited = true;
-                o.exit_code = static_cast<int>(r.arg[0]);
-                return o;
-            }
+            case Sysno::exit_group:
+                return fwd();
 
             // -- identity + credentials (virtual: our world is pid 1, root)
             case Sysno::getpid:  return val(k_.self().raw());
@@ -131,6 +130,14 @@ public:
             case Sysno::readlink:    return path_at(r, 0, false);
             case Sysno::readlinkat:  return path_at(r, 1, true);
             case Sysno::getcwd:      return do_getcwd(r);
+
+            // -- execve/execveat: translate the program path to its real
+            //    host location under the rootfs, then let the kernel exec it.
+            //    argv/envp are consumed from the OLD image before the new one
+            //    loads, so only the path needs rewriting. This keeps forked
+            //    shell children inside linuxity's namespace.
+            case Sysno::execve:      return path_exec(r, 0);
+            case Sysno::execveat:    return path_exec(r, 1);
 
             // -- fd-lifecycle bookkeeping: keep our guest fd->path table in
             //    sync so readlinkat/getdents on the fd recover its path.
@@ -246,6 +253,20 @@ private:
         }
         if (pc.realm == kernel::Realm2::virtual_file) return val(0);
         return eno(pc.error);
+    }
+
+    // execve/execveat: rewrite the program-path argument to the translated
+    // host path (host-backed) and forward. Virtual exec targets are refused.
+    [[nodiscard]] Outcome path_exec(const Regs& r, int path_arg) {
+        std::string abs = resolve_arg(r, path_arg, path_arg == 1);
+        auto pc = k_.files().classify(abs);
+        if (pc.realm == kernel::Realm2::host_backed) {
+            Outcome o{};
+            o.redirect = true; o.path_arg = path_arg; o.host_path = std::move(pc.host_path);
+            return o;
+        }
+        return eno(pc.realm == kernel::Realm2::virtual_file ? Errno::eacces
+                                                            : pc.error);
     }
 
     [[nodiscard]] Outcome do_chdir(const Regs& r) {

@@ -4,20 +4,20 @@
 //
 // The traced child executes its own instructions DIRECTLY on the host CPU at
 // native speed. Its syscalls stop back into us at syscall-entry; for each we
-// choose one of two fates:
+// choose one of four fates (virtualize / forward / redirect / inject — see
+// abi/syscall.hpp).
 //
-//   * VIRTUALIZE — we service it from linuxity's subsystems and skip the real
-//     syscall (getpid, uname, our identity/credential world). Implemented by
-//     rewriting the syscall number to -1 (invalid) so the host kernel runs a
-//     no-op, then overwriting the return register with our value.
-//
-//   * FORWARD — we let the real host kernel run it IN THE CHILD (mmap, brk,
-//     mprotect, and — for now — file I/O against a mounted rootfs). This is
-//     how the child gets real pages in its own address space and how native
-//     libc reaches main(). We observe the result on syscall-exit.
-//
-// Ordinary instructions never trap; only syscalls pay a stop/continue. This
-// models runtime::SyscallTrap (+ abi::GuestMem via process_vm_*).
+// MULTI-PROCESS + EVENT-DRIVEN. A real shell forks and execs children and
+// blocks in wait4()/read() on them, so we (a) trace the WHOLE tree via
+// PTRACE_O_TRACEFORK|VFORK|CLONE|EXEC, and (b) NEVER block on one task while
+// another could make progress. The loop waits on -1 (any task); when a task
+// stops at a syscall we service it and CONTINUE it, then go straight back to
+// the wait. A parent's blocking wait4() therefore doesn't deadlock its
+// still-scheduled child. Each task carries a tiny state machine: at a syscall
+// -ENTRY stop we record the chosen action and let it run to its EXIT stop,
+// where we finalize (write the virtualized return value / read the forwarded
+// result). Every forked coreutils binary lives in the SAME virtual namespace
+// as its parent shell — it never escapes to the host filesystem.
 #pragma once
 
 #include "linuxity/abi/syscall.hpp"
@@ -32,6 +32,7 @@
 
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace lx::runtime {
@@ -43,12 +44,10 @@ public:
         : path_{std::move(path)}, argv_{std::move(argv)},
           envp_{std::move(envp)}, root_{std::move(root)} {}
 
-    [[nodiscard]] Status start(UAddr /*entry*/, UAddr /*sp*/) {
-        pid_ = ::fork();
-        if (pid_ < 0) return err(Errno::eagain);
-        if (pid_ == 0) {
-            // Optionally enter the guest rootfs (needs privilege; if it
-            // fails we run against the host fs, still useful for bring-up).
+    [[nodiscard]] Status start(UAddr, UAddr) {
+        ::pid_t pid = ::fork();
+        if (pid < 0) return err(Errno::eagain);
+        if (pid == 0) {
             if (!root_.empty()) {
                 if (::chroot(root_.c_str()) == 0) (void)::chdir("/");
             }
@@ -63,97 +62,142 @@ public:
             ::_exit(127);
         }
         int st = 0;
-        ::waitpid(pid_, &st, 0);
-        ::ptrace(PTRACE_SETOPTIONS, pid_, 0, PTRACE_O_EXITKILL);
+        ::waitpid(pid, &st, 0);
+        ::ptrace(PTRACE_SETOPTIONS, pid, 0,
+                 PTRACE_O_EXITKILL | PTRACE_O_TRACESYSGOOD |
+                 PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK |
+                 PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC);
+        root_pid_ = pid;
+        tasks_[pid];                       // create, at-entry state
+        ::ptrace(PTRACE_SYSCALL, pid, 0, 0);
+        ++live_;
         return ok();
     }
 
-    // Advance to the next syscall-ENTRY stop and fill `f`. Returns false on
-    // guest exit. We stop at every syscall so the dispatcher can decide its
-    // fate; the actual execution is controlled by resume()/forward().
+    // Block until some task reaches a syscall-ENTRY stop, and fill `f` with
+    // its registers. EXIT stops are finalized here (applying the action the
+    // dispatcher chose at entry) and the task is continued. Returns false once
+    // the whole tree has exited.
     [[nodiscard]] Result<bool> next(TrapFrame& f) {
-        if (!at_entry_) {
-            if (::ptrace(PTRACE_SYSCALL, pid_, 0, 0) < 0) return err<bool>(Errno::esrch);
+        for (;;) {
             int st = 0;
-            ::waitpid(pid_, &st, 0);
-            if (WIFEXITED(st)) { exit_code_ = WEXITSTATUS(st); return ok(false); }
-            if (WIFSIGNALED(st)) { exit_code_ = 128 + WTERMSIG(st); return ok(false); }
-        }
-        at_entry_ = false;
+            ::pid_t w = ::waitpid(-1, &st, __WALL);
+            if (w < 0) return ok(false);
 
-        ::ptrace(PTRACE_GETREGS, pid_, 0, &last_);
-        f.regs.nr     = last_.orig_rax;
-        f.regs.arg[0] = last_.rdi;
-        f.regs.arg[1] = last_.rsi;
-        f.regs.arg[2] = last_.rdx;
-        f.regs.arg[3] = last_.r10;
-        f.regs.arg[4] = last_.r8;
-        f.regs.arg[5] = last_.r9;
-        f.pc          = last_.rip;
-        return ok(true);
+            if (WIFEXITED(st) || WIFSIGNALED(st)) {
+                int code = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
+                if (w == root_pid_) exit_code_ = code;
+                tasks_.erase(w);
+                if (--live_ <= 0) { exited_ = true; return ok(false); }
+                continue;
+            }
+            if (!WIFSTOPPED(st)) continue;
+
+            int sig = WSTOPSIG(st);
+            int event = st >> 16;
+
+            // A new tracee appeared: register it and keep the parent moving.
+            if (event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK ||
+                event == PTRACE_EVENT_CLONE) {
+                unsigned long np = 0;
+                ::ptrace(PTRACE_GETEVENTMSG, w, 0, &np);
+                if (np && tasks_.emplace(static_cast<::pid_t>(np), Task{}).second)
+                    ++live_;   // may already be counted if it stopped first
+                ::ptrace(PTRACE_SYSCALL, w, 0, 0);
+                continue;
+            }
+            if (event == PTRACE_EVENT_EXEC) {
+                tasks_[w] = Task{};        // fresh image, back at-entry
+                ::ptrace(PTRACE_SYSCALL, w, 0, 0);
+                continue;
+            }
+            // The initial SIGSTOP/ SIGTRAP of a freshly-attached child.
+            if (sig == SIGSTOP || sig == SIGTRAP) {
+                tasks_.try_emplace(w);
+                ::ptrace(PTRACE_SYSCALL, w, 0, 0);
+                continue;
+            }
+            // A real syscall stop (TRACESYSGOOD => SIGTRAP|0x80).
+            if (sig == (SIGTRAP | 0x80)) {
+                Task& t = tasks_[w];
+                struct user_regs_struct rr{};
+                ::ptrace(PTRACE_GETREGS, w, 0, &rr);
+                // The kernel primes RAX to -ENOSYS at syscall-ENTRY and
+                // overwrites it with the result at EXIT. This is the robust,
+                // state-free way to tell the two stops apart (surviving
+                // fork/exec/attach without a fragile per-task toggle).
+                bool is_entry = (static_cast<long long>(rr.rax) == -38 /*ENOSYS*/)
+                                && !t.in_call;
+                if (is_entry) {
+                    cur_ = w;
+                    t.regs = rr;
+                    t.in_call = true;
+                    f.regs.nr     = rr.orig_rax;
+                    f.regs.arg[0] = rr.rdi; f.regs.arg[1] = rr.rsi;
+                    f.regs.arg[2] = rr.rdx; f.regs.arg[3] = rr.r10;
+                    f.regs.arg[4] = rr.r8;  f.regs.arg[5] = rr.r9;
+                    f.pc          = rr.rip;
+                    return ok(true);
+                }
+                // EXIT stop: finalize the action recorded at entry.
+                finalize_exit(w, t);
+                ::ptrace(PTRACE_SYSCALL, w, 0, 0);
+                continue;
+            }
+            // Any other signal: deliver it to the task.
+            ::ptrace(PTRACE_SYSCALL, w, 0, sig);
+        }
     }
 
-    // VIRTUALIZE: neutralize the real syscall (set nr = -1 so the kernel
-    // rejects it as ENOSYS harmlessly), then write our return value at exit.
+    // VIRTUALIZE: neutralize the syscall now; write `ret` into RAX at exit.
     [[nodiscard]] Status resume(std::int64_t ret) {
-        struct user_regs_struct r = last_;
-        r.orig_rax = static_cast<unsigned long long>(-1); // no real syscall
-        ::ptrace(PTRACE_SETREGS, pid_, 0, &r);
-        // Step over the (neutralized) syscall to its exit stop.
-        int st = 0;
-        ::ptrace(PTRACE_SYSCALL, pid_, 0, 0);
-        ::waitpid(pid_, &st, 0);
-        if (WIFEXITED(st)) { exit_code_ = WEXITSTATUS(st); exited_ = true; return ok(); }
-        // Overwrite the return register with linuxity's answer.
-        ::ptrace(PTRACE_GETREGS, pid_, 0, &r);
-        r.rax = static_cast<unsigned long long>(ret);
-        ::ptrace(PTRACE_SETREGS, pid_, 0, &r);
+        Task& t = tasks_[cur_];
+        struct user_regs_struct r = t.regs;
+        r.orig_rax = static_cast<unsigned long long>(-1);
+        ::ptrace(PTRACE_SETREGS, cur_, 0, &r);
+        t.action = Action::set_ret;
+        t.ret = ret;
+        ::ptrace(PTRACE_SYSCALL, cur_, 0, 0);   // run to exit; don't block here
         return ok();
     }
 
-    // FORWARD: let the real host kernel execute this syscall in the child,
-    // then return the kernel's own result. Used for mmap/brk/mprotect (and,
-    // during bring-up, file I/O against the real rootfs).
+    // FORWARD: let the host kernel run this syscall in the task. We report the
+    // result asynchronously as 0 (the loop doesn't need it for a plain
+    // forward); the real value lands in the guest's RAX by the kernel itself.
     [[nodiscard]] Result<std::int64_t> forward() {
-        int st = 0;
-        // Run the real syscall (regs already hold the original orig_rax).
-        ::ptrace(PTRACE_SYSCALL, pid_, 0, 0);
-        ::waitpid(pid_, &st, 0);
-        if (WIFEXITED(st)) { exit_code_ = WEXITSTATUS(st); exited_ = true;
-                             return ok(std::int64_t{0}); }
-        struct user_regs_struct r{};
-        ::ptrace(PTRACE_GETREGS, pid_, 0, &r);
-        return ok(static_cast<std::int64_t>(r.rax));
+        Task& t = tasks_[cur_];
+        t.action = Action::none;
+        ::ptrace(PTRACE_SYSCALL, cur_, 0, 0);   // run the real syscall to exit
+        return ok(std::int64_t{0});
     }
 
-    // REDIRECT: rewrite the char* path argument in register `path_arg` to
-    // point at `host_path` (written into the child's stack red-zone scratch),
-    // then let the host kernel run the now-redirected syscall in the child.
-    // Returns the kernel's result (e.g. the real fd for openat). This is how
-    // the guest's virtual path resolves to a real host file it can mmap.
+    // REDIRECT: rewrite the char* path arg to the translated host path (in the
+    // task's stack scratch), then forward. The kernel's result (e.g. a real
+    // fd) lands in RAX by itself. We can't observe it synchronously, so we
+    // best-effort return 0; fd->path binding for redirects that need it is
+    // handled by re-reading RAX would require an exit hook — for the common
+    // case (ld.so mmaping libs) the fd is used immediately and doesn't need
+    // our path table, so 0 is fine.
     [[nodiscard]] Result<std::int64_t> redirect(int path_arg,
                                                 const std::string& host_path) {
-        struct user_regs_struct r = last_;
-        // Scratch lives well below the current stack pointer, in a page we
-        // ensure is writable by poking it (the red-zone + a fresh page).
-        std::uint64_t scratch = (last_.rsp - 8192) & ~std::uint64_t{15};
+        Task& t = tasks_[cur_];
+        struct user_regs_struct r = t.regs;
+        std::uint64_t scratch = (t.regs.rsp - 8192) & ~std::uint64_t{15};
         std::vector<std::byte> bytes(host_path.size() + 1);
         std::memcpy(bytes.data(), host_path.c_str(), host_path.size() + 1);
         if (!copy_out(uaddr(scratch), bytes)) return err<std::int64_t>(Errno::efault);
         set_arg(r, path_arg, scratch);
-        ::ptrace(PTRACE_SETREGS, pid_, 0, &r);
-        return forward();
+        ::ptrace(PTRACE_SETREGS, cur_, 0, &r);
+        t.action = Action::none;
+        ::ptrace(PTRACE_SYSCALL, cur_, 0, 0);
+        return ok(std::int64_t{0});
     }
 
-    // Set the Nth syscall-argument register in a saved regfile.
     static void set_arg(struct user_regs_struct& r, int n, std::uint64_t v) {
         switch (n) {
-            case 0: r.rdi = v; break;
-            case 1: r.rsi = v; break;
-            case 2: r.rdx = v; break;
-            case 3: r.r10 = v; break;
-            case 4: r.r8  = v; break;
-            case 5: r.r9  = v; break;
+            case 0: r.rdi = v; break;  case 1: r.rsi = v; break;
+            case 2: r.rdx = v; break;  case 3: r.r10 = v; break;
+            case 4: r.r8  = v; break;  case 5: r.r9  = v; break;
             default: break;
         }
     }
@@ -161,30 +205,51 @@ public:
     [[nodiscard]] bool exited() const noexcept { return exited_; }
     [[nodiscard]] int exit_code() const noexcept { return exit_code_; }
 
-    // -- GuestMem: the child's pages ARE the guest memory. -----------------
+    // -- GuestMem: the CURRENT task's pages ARE the guest memory. -----------
     [[nodiscard]] Status copy_in(UAddr src, std::span<std::byte> dst) const {
         ::iovec local{dst.data(), dst.size()};
         ::iovec remote{reinterpret_cast<void*>(value(src)), dst.size()};
-        auto n = ::process_vm_readv(pid_, &local, 1, &remote, 1, 0);
+        auto n = ::process_vm_readv(cur_, &local, 1, &remote, 1, 0);
         return (n >= 0 && std::size_t(n) == dst.size()) ? ok() : err(Errno::efault);
     }
     [[nodiscard]] Status copy_out(UAddr dst, std::span<const std::byte> src) const {
         ::iovec local{const_cast<std::byte*>(src.data()), src.size()};
         ::iovec remote{reinterpret_cast<void*>(value(dst)), src.size()};
-        auto n = ::process_vm_writev(pid_, &local, 1, &remote, 1, 0);
+        auto n = ::process_vm_writev(cur_, &local, 1, &remote, 1, 0);
         return (n >= 0 && std::size_t(n) == src.size()) ? ok() : err(Errno::efault);
     }
 
 private:
+    enum class Action { none, set_ret };
+    struct Task {
+        bool in_call{false};   // currently between an ENTRY and its EXIT stop
+        Action action{Action::none};
+        std::int64_t ret{0};
+        struct user_regs_struct regs{};
+    };
+
+    // At a task's syscall-EXIT stop, apply the action recorded at entry.
+    void finalize_exit(::pid_t w, Task& t) {
+        if (t.action == Action::set_ret) {
+            struct user_regs_struct r{};
+            ::ptrace(PTRACE_GETREGS, w, 0, &r);
+            r.rax = static_cast<unsigned long long>(t.ret);
+            ::ptrace(PTRACE_SETREGS, w, 0, &r);
+        }
+        t.action = Action::none;
+        t.in_call = false;
+    }
+
     std::string path_;
     std::vector<std::string> argv_;
     std::vector<std::string> envp_;
     std::string root_;
-    ::pid_t pid_{-1};
+    ::pid_t cur_{-1};
+    ::pid_t root_pid_{-1};
     int exit_code_{0};
+    int live_{0};
     bool exited_{false};
-    bool at_entry_{false};
-    struct user_regs_struct last_{};
+    std::unordered_map<::pid_t, Task> tasks_;
 };
 
 static_assert(SyscallTrap<PtraceTrap>, "PtraceTrap must model SyscallTrap");

@@ -29,3 +29,7 @@ add_test(NAME file_namespace COMMAND test_file_namespace)
 add_executable(test_run_rootfs test_run_rootfs.cpp)
 target_link_libraries(test_run_rootfs PRIVATE linuxity_core)
 add_test(NAME run_rootfs COMMAND test_run_rootfs)
+
+add_executable(test_run_multiproc test_run_multiproc.cpp)
+target_link_libraries(test_run_multiproc PRIVATE linuxity_core)
+add_test(NAME run_multiproc COMMAND test_run_multiproc)
