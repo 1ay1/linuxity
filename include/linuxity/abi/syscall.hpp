@@ -117,6 +117,20 @@ struct Outcome {
     // metadata store up by this key to overlay the guest-intended mode/uid/gid
     // onto the host inode the redirect just filled. Empty for non-stat scrubs.
     std::string  scrub_guest_path;
+
+    // AF_UNIX bind/connect path translation. The guest is NOT chroot'd when
+    // linuxity runs unprivileged (chroot(2) needs CAP_SYS_CHROOT), so an
+    // absolute sun_path forwarded raw lands on the HOST filesystem — leaking
+    // e.g. /etc/pacman.d/gnupg/S.gpg-agent onto the host and colliding with
+    // stale host sockets ("Address already in use" / stat "Bad address").
+    // sock_rewrite pokes the translated overlay host path into the sockaddr's
+    // sun_path (at sock_path_addr) and sets the socklen register to
+    // sock_new_len before forwarding, so both peers (bind + connect) resolve
+    // to the same in-overlay node. host_path carries the translated path.
+    bool         sock_rewrite{false};
+    UAddr        sock_path_addr{};   // guest addr of sockaddr_un.sun_path
+    int          sock_len_arg{2};    // which arg register holds socklen
+    std::uint64_t sock_new_len{0};   // new socklen value (family + path + NUL)
 };
 
 // A guest-memory accessor the dispatcher uses to copy_in/copy_out. Modeled as
@@ -1094,7 +1108,19 @@ private:
     // presents the full guest-intended mode regardless of what the host kept.
     // The mode argument follows the path: chmod(path,mode) -> arg1;
     // fchmodat(dirfd,path,mode,flags) -> arg2.
-    [[nodiscard]] Outcome do_chmod(const Regs& r, int path_arg, bool at, Wi wi) {
+    //
+    // Like do_chown, this RECORDS the guest-intended mode in the shadow meta
+    // store and reports success WITHOUT forwarding the real chmod. Forwarding
+    // was both redundant and failure-prone: linuxity already overlays the
+    // recorded mode onto every future stat/statx via scrub_ids (so the guest
+    // sees exactly what it set, including setuid/sticky/0000 bits the
+    // unprivileged host would silently drop), AND the forwarded host chmod
+    // frequently returned EPERM — gpg-agent's `chmod 0700` on its freshly
+    // created private-keys-v1.d aborted with "can't set permissions ...:
+    // Operation not permitted" purely because the real host chmod on the
+    // overlay-upper node failed. Recording-only makes the mode authoritative
+    // and coherent regardless of host privilege.
+    [[nodiscard]] Outcome do_chmod(const Regs& r, int path_arg, bool at, Wi /*wi*/) {
         std::string abs = resolve_arg(r, path_arg, at);
         std::uint32_t mode = static_cast<std::uint32_t>(
             r.arg[static_cast<std::size_t>(path_arg) + 1]);
@@ -1102,17 +1128,19 @@ private:
         if (pc.realm == kernel::Realm2::virtual_file) return eno(Errno::erofs);
         if (pc.realm == kernel::Realm2::absent)       return eno(pc.error);
         k_.files().meta().set_mode(abs, mode);
-        return path_mut(r, path_arg, at, wi);
+        return val(0);
     }
 
-    // fchmod(fd, mode): recover the fd's bound guest path, record the mode,
-    // then forward so the host applies what it can on the real fd.
+    // fchmod(fd, mode): recover the fd's bound guest path, record the mode in
+    // the shadow store, and report success WITHOUT forwarding — same rationale
+    // as do_chmod (the recorded mode is authoritative via scrub_ids, and a
+    // forwarded host fchmod on an unprivileged process can EPERM/drop bits).
     [[nodiscard]] Outcome do_fchmod(const Regs& r) {
         std::string_view gp = k_.files().path_of_fd(static_cast<int>(r.arg[0]));
         if (!gp.empty())
             k_.files().meta().set_mode(std::string{gp},
                                        static_cast<std::uint32_t>(r.arg[1]));
-        return fwd();
+        return val(0);
     }
 
     // chown/lchown/fchownat: RECORD the guest-intended owner in the shadow
@@ -1196,7 +1224,7 @@ private:
         constexpr std::uint16_t kAfUnix = 1;
         const std::uint64_t addr = r.arg[1];
         const std::size_t   len  = static_cast<std::size_t>(r.arg[2]);
-        if (!for_bind || addr == 0 || len < 3) return fwd();
+        if (addr == 0 || len < 3) return fwd();
         if (get_u16(addr) != kAfUnix) return fwd();
 
         const std::size_t path_bytes = std::min<std::size_t>(len - 2, 108);
@@ -1208,12 +1236,54 @@ private:
                                          path_bytes));
         if (guest_path.empty() || guest_path.front() != '/') return fwd();
 
-        // Copy the parent dir chain up into the writable overlay layer so the
-        // bind can create the socket node there; the guest's own (chroot'd)
-        // absolute path resolves onto that same upper directory.
-        (void)k_.files().classify(guest_path, /*for_write=*/true,
-                                  /*follow=*/false, Wi::parents_only);
-        return fwd();
+        // Translate the AF_UNIX filesystem path into the SAME host path a file
+        // open of guest_path would resolve to. The guest is NOT chroot'd when
+        // linuxity runs unprivileged (chroot(2) needs CAP_SYS_CHROOT), so a
+        // raw-forwarded absolute sun_path binds/connects against the HOST
+        // filesystem — leaking the socket onto the host and colliding with
+        // stale host sockets ("Address already in use", stat "Bad address").
+        // Redirecting the path keeps the socket inside the overlay, and
+        // because BOTH bind and connect run through here they resolve to the
+        // identical node, so the two peers meet.
+        //
+        // For a bind we want the WRITABLE upper layer (create the node there)
+        // and materialize its parent chain; for a connect we want wherever the
+        // socket currently lives. classify(for_write=for_bind) yields that.
+        auto pc = k_.files().classify(guest_path, /*for_write=*/for_bind,
+                                      /*follow=*/false,
+                                      for_bind ? Wi::parents_only : Wi::copy_leaf);
+        if (pc.realm == kernel::Realm2::virtual_file || pc.host_path.empty())
+            return fwd();
+        std::string host_path = std::move(pc.host_path);
+
+        // The translated host path must fit in sun_path (108 bytes incl. NUL).
+        // The overlay prefix (/tmp/linuxity-upper-<pid>) is short so real
+        // socket paths fit; a pathological overflow falls back to a raw
+        // forward rather than truncating (truncation is worse).
+        if (host_path.size() + 1 > 108) return fwd();
+
+        if (for_bind) {
+            // Pre-unlink any stale socket at the translated path so the
+            // forwarded bind never hits EADDRINUSE. Cover both layers.
+            auto rd = k_.files().classify(guest_path, /*for_write=*/false,
+                                          /*follow=*/false);
+            (void)::unlink(host_path.c_str());
+            if (!rd.host_path.empty() && rd.host_path != host_path)
+                (void)::unlink(rd.host_path.c_str());
+        }
+
+        // Emit a socket-path rewrite: the trap pokes host_path into the
+        // guest's sun_path and sets the socklen register, then forwards the
+        // (now overlay-targeted) bind/connect to the kernel.
+        Outcome o{};
+        o.sock_rewrite   = true;
+        o.forward        = true;
+        o.host_path      = std::move(host_path);
+        o.sock_path_addr = uaddr(addr + 2);
+        o.sock_len_arg   = 2;
+        // sizeof(sa_family_t) == 2, then the path bytes and its NUL.
+        o.sock_new_len   = 2 + o.host_path.size() + 1;
+        return o;
     }
 
     [[nodiscard]] Outcome path_symlink(const Regs& r, int /*target_arg*/,
