@@ -344,6 +344,7 @@ private:
             if (!vf) return eno(vf.error());
             Outcome o{};
             o.inject  = true;
+            o.path_arg = path_arg;              // which reg holds the char* path
             o.content = std::move(vf->bytes);   // empty for a dir
             pending_open_ = abs;
             // A virtual DIRECTORY: stash its entries so getdents64 on the

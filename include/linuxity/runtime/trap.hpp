@@ -121,7 +121,7 @@ public:
                 // temps are cleaned up at the end of the run.
                 std::string tmp = o.inject_dir ? materialize_dir()
                                                : materialize(o.content);
-                auto fd = LX_TRY(trap_.redirect(o.path_arg ? o.path_arg : 1, tmp));
+                auto fd = LX_TRY(trap_.redirect(o.path_arg, tmp));
                 if (!tmp.empty()) temps_.push_back(std::move(tmp));
                 sys.note_opened_fd(fd);
             } else if (o.redirect) {

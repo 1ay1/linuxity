@@ -210,19 +210,21 @@ public:
                                                     post_exit = {}) {
         Task& t = tasks_[cur_];
         struct user_regs_struct r = t.regs;
-        // Park the translated path in the child's own stack, just below the
-        // current stack pointer. The SysV red zone (128B) plus a small margin
-        // keeps us clear of live frames, and staying within a few hundred
-        // bytes of rsp guarantees the target lies in an already-mapped stack
-        // page (rsp-8KB could fall past the mapped stack of a freshly-exec'd
-        // task, where process_vm_writev faults with EFAULT). Path arguments
-        // are short, so a modest scratch window is ample.
+        // Park the translated path in the child's own stack, below the red
+        // zone. The child is stopped at its syscall-ENTRY; on resume the
+        // kernel copies this pathname from userspace via copy_from_user.
+        //
+        // The path MUST be written with PTRACE_POKEDATA, not process_vm_writev:
+        // a cross-process vm write to a STOPPED tracee is not guaranteed
+        // coherent with the very next in-kernel copy_from_user of the same
+        // pages — empirically the syscall then reads a stale/partial path and
+        // fails with a scattered ENOTDIR/EINVAL/EACCES/EPERM (flaky, masked by
+        // any added latency). PTRACE_POKEDATA goes through the ptrace access
+        // path, which IS ordered against the tracee's own memory accesses.
         std::size_t need = host_path.size() + 1;
         std::uint64_t scratch =
             (t.regs.rsp - 256 - need) & ~std::uint64_t{15};
-        std::vector<std::byte> bytes(need);
-        std::memcpy(bytes.data(), host_path.c_str(), need);
-        if (!copy_out(uaddr(scratch), bytes))
+        if (!poke_bytes(scratch, host_path))
             return err<std::int64_t>(Errno::efault);
         set_arg(r, path_arg, scratch);
         ::ptrace(PTRACE_SETREGS, cur_, 0, &r);
@@ -236,8 +238,9 @@ public:
         // This must precede the resume below: once the task runs it may read
         // the buffer, so writing after resuming would race the child.
         if (post_exit) post_exit(ret);
-        // Resume the task toward its next syscall (we consumed its exit stop).
-        ::ptrace(PTRACE_SYSCALL, cur_, 0, 0);
+        // Resume the task toward its next syscall (we consumed its exit stop),
+        // delivering any signal held during the step.
+        resume_task(cur_);
         return ok(ret);
     }
 
@@ -457,14 +460,55 @@ public:
         return (n >= 0 && std::size_t(n) == src.size()) ? ok() : err(Errno::efault);
     }
 
+    // Write a NUL-terminated string into the CURRENT task at `at` using
+    // PTRACE_POKEDATA (word-granular). Unlike process_vm_writev, ptrace pokes
+    // are ordered against the tracee's own subsequent copy_from_user, so a
+    // path spliced here is reliably seen by the syscall we then step. Reads
+    // the existing word first to preserve bytes past the string's NUL within
+    // the final partial word. Returns false on any poke failure.
+    [[nodiscard]] bool poke_bytes(std::uint64_t at, const std::string& s) const {
+        const std::size_t n = s.size() + 1;             // include the NUL
+        std::size_t off = 0;
+        while (off < n) {
+            errno = 0;
+            long word = ::ptrace(PTRACE_PEEKDATA, cur_,
+                                 reinterpret_cast<void*>(at + off), nullptr);
+            if (word == -1 && errno != 0) return false;
+            auto* wb = reinterpret_cast<unsigned char*>(&word);
+            for (std::size_t i = 0; i < sizeof(long) && off + i < n; ++i)
+                wb[i] = (off + i < s.size())
+                            ? static_cast<unsigned char>(s[off + i])
+                            : 0;                        // the terminating NUL
+            if (::ptrace(PTRACE_POKEDATA, cur_,
+                         reinterpret_cast<void*>(at + off),
+                         reinterpret_cast<void*>(word)) != 0)
+                return false;
+            off += sizeof(long);
+        }
+        return true;
+    }
+
 private:
     enum class Action { none, set_ret };
     struct Task {
         bool in_call{false};   // currently between an ENTRY and its EXIT stop
         Action action{Action::none};
         std::int64_t ret{0};
+        int pending_sig{0};    // a signal held during a redirect, to re-inject
         struct user_regs_struct regs{};
     };
+
+    // Resume `w` toward its next syscall stop, delivering any signal we held
+    // back during a redirect step (so a deferred SIGALRM/SIGCHLD/... is not
+    // lost, just sequenced AFTER the rewritten syscall completed).
+    void resume_task(::pid_t w) {
+        int sig = 0;
+        if (auto it = tasks_.find(w); it != tasks_.end()) {
+            sig = it->second.pending_sig;
+            it->second.pending_sig = 0;
+        }
+        ::ptrace(PTRACE_SYSCALL, w, 0, sig);
+    }
 
     // At a task's syscall-EXIT stop, apply the action recorded at entry.
     void finalize_exit(::pid_t w, Task& t) {
@@ -484,6 +528,7 @@ private:
     // sibling. Returns false if the task exited during the syscall.
     bool step_to_exit(::pid_t w) {
         ::ptrace(PTRACE_SYSCALL, w, 0, 0);
+        int held_sig = 0;   // a signal that arrived mid-syscall, re-injected after
         for (;;) {
             int st = 0;
             if (::waitpid(w, &st, __WALL) < 0) return false;
@@ -524,9 +569,23 @@ private:
                 tasks_[w] = Task{};
                 return true;
             }
-            if (WSTOPSIG(st) == (SIGTRAP | 0x80)) return true;   // the exit stop
-            ::ptrace(PTRACE_SYSCALL, w, 0,
-                     WSTOPSIG(st) == SIGTRAP ? 0 : WSTOPSIG(st));
+            if (WSTOPSIG(st) == (SIGTRAP | 0x80)) {
+                // The syscall-exit stop we were after. If a real signal was
+                // held back during the syscall, re-inject it now so the task
+                // still receives it — but on the NEXT resume, after we've read
+                // the result and (for a redirect) any post_exit patch has run.
+                if (held_sig) tasks_[w].pending_sig = held_sig;
+                return true;
+            }
+            // A real signal arrived while we were stepping the rewritten path
+            // syscall to its exit. Delivering it HERE runs the guest's handler
+            // mid-redirect, which reorders the handler's own syscalls ahead of
+            // the result we're about to read. So HOLD the signal: resume with
+            // 0 and re-inject it once the syscall has exited (via pending_sig).
+            // SIGTRAP (a trap, not a real signal) is swallowed as before.
+            int sig = WSTOPSIG(st);
+            if (sig != SIGTRAP && sig != (SIGTRAP | 0x80)) held_sig = sig;
+            ::ptrace(PTRACE_SYSCALL, w, 0, 0);
         }
     }
 
