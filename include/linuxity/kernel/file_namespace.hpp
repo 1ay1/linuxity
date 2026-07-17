@@ -26,6 +26,7 @@
 #include "linuxity/abi/types.hpp"
 
 #include <sys/stat.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -155,6 +156,31 @@ public:
         return m->producer(abs);
     }
 
+    // The UNION listing of a host-backed directory across an overlay: entries
+    // from the read-only lower merged with the writable upper (upper wins on
+    // name collision). Returns entries only when `abs` names a real directory
+    // in at least one layer; empty optional means "not an overlay dir" (the
+    // caller should just forward getdents to the single real fd). This is what
+    // makes `ls /` show the rootfs even though the upper layer starts empty.
+    [[nodiscard]] std::vector<VirtualDirent>
+    overlay_dir_union(std::string_view abs) const {
+        const Mount* m = deepest(abs);
+        std::vector<VirtualDirent> out;
+        if (!m || m->producer || m->upper.empty()) return out;  // not overlaid
+        std::string_view rel = abs;
+        rel.remove_prefix(m->prefix == "/" ? 0 : m->prefix.size());
+        while (!rel.empty() && rel.front() == '/') rel.remove_prefix(1);
+        std::string lo = join_host(m->host_base, rel);
+        std::string up = join_host(m->upper, rel);
+        if (!is_dir(lo.c_str()) && !is_dir(up.c_str())) return out;
+        std::unordered_map<std::string, bool> seen;   // name -> is_dir
+        merge_dir(up, seen);   // upper first (wins)
+        merge_dir(lo, seen);
+        out.reserve(seen.size());
+        for (auto& [name, isdir] : seen) out.push_back({name, isdir});
+        return out;
+    }
+
     // -- Guest fd table ----------------------------------------------------
     // Records the guest path bound to a real (forwarded) fd, so readlinkat,
     // getdents, and fd-relative openat can recover the path. The fd number is
@@ -274,6 +300,30 @@ private:
     static bool exists(const char* path) {
         struct ::stat st{};
         return ::lstat(path, &st) == 0;
+    }
+
+    static bool is_dir(const char* path) {
+        struct ::stat st{};
+        return ::stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+    }
+
+    // Read a real host directory's entries into `seen` (name -> is_dir),
+    // skipping "."/".." and not overwriting a name already present (so the
+    // caller can merge upper before lower and have upper win).
+    static void merge_dir(const std::string& host_dir,
+                          std::unordered_map<std::string, bool>& seen) {
+        ::DIR* d = ::opendir(host_dir.c_str());
+        if (!d) return;
+        while (::dirent* e = ::readdir(d)) {
+            std::string name = e->d_name;
+            if (name == "." || name == "..") continue;
+            if (seen.count(name)) continue;
+            bool isdir = e->d_type == DT_DIR;
+            if (e->d_type == DT_UNKNOWN)
+                isdir = is_dir((host_dir + "/" + name).c_str());
+            seen.emplace(std::move(name), isdir);
+        }
+        ::closedir(d);
     }
 
     // Ensure `up` exists in the upper layer, copying its bytes up from the

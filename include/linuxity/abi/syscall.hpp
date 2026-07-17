@@ -314,6 +314,18 @@ private:
             o.forward   = false;
             // Remember the guest path for this fd after the trap assigns it.
             pending_open_ = abs;
+            // If this opens a directory that is overlaid (writable upper over
+            // the read-only rootfs lower), enumerate the UNION of both layers
+            // and serve THAT from getdents64 on the resulting fd — otherwise a
+            // freshly-created (empty) upper would hide the whole rootfs, and
+            // `ls /` would show nothing. Non-overlay dirs enumerate natively.
+            if (!for_write) {
+                auto merged = k_.files().overlay_dir_union(abs);
+                if (!merged.empty()) {
+                    pending_dir_ = true;
+                    pending_entries_ = std::move(merged);
+                }
+            }
             return o;
         }
         if (pc.realm == kernel::Realm2::virtual_file) {
