@@ -42,6 +42,17 @@ public:
 
     [[nodiscard]] const Grants& grants() const noexcept { return grants_; }
 
+    // The virtual machine linuxity presents: logical CPUs and total RAM. These
+    // are the SAME facts /proc and /sys synthesize, surfaced here so the
+    // dispatcher can answer sysinfo(2) and sched_getaffinity(2) consistently
+    // (a monitor must see one coherent machine, not the host's).
+    struct MachineSpec {
+        long ncpu{1};
+        std::uint64_t mem_total_bytes{std::uint64_t{2048} << 20};  // 2 GiB
+    };
+    [[nodiscard]] const MachineSpec& machine() const noexcept { return machine_; }
+    void set_machine(MachineSpec m) noexcept { machine_ = m; }
+
     // The filesystem namespace the guest lives in (mount table + cwd + fd
     // table). The syscall dispatcher routes every path syscall through here.
     [[nodiscard]] FileNamespace& files() noexcept { return files_; }
@@ -132,6 +143,7 @@ public:
 private:
     H& host_;
     Grants grants_{};
+    MachineSpec machine_{};
     IdSpace<Pid> pids_{1};
     Pid self_{};
     FileNamespace files_{};

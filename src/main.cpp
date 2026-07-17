@@ -62,6 +62,10 @@ int main(int argc, char** argv) {
     long ncpu = ::sysconf(_SC_NPROCESSORS_ONLN);
     if (ncpu < 1) ncpu = 1;
 
+    // Tell the kernel the virtual machine's shape so sysinfo(2) and
+    // sched_getaffinity(2) match /proc and /sys (same ncpu, 2 GiB RAM).
+    k.set_machine({ncpu, std::uint64_t{2048} << 20});
+
     // Seed the process table: pid 1 is our init (the traced root). Its
     // cmdline is the program we're about to run, so /proc/1/cmdline is real.
     {

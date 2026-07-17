@@ -172,6 +172,17 @@ public:
             case Sysno::getpriority: return val(0);       // nice 0
             case Sysno::setpriority: return val(0);
 
+            // -- sysinfo(2): report linuxity's virtual machine (total/free RAM,
+            //    process count, a plausible uptime), not the host's numbers.
+            case Sysno::sysinfo:
+                return do_sysinfo(uaddr(r.arg[0]));
+
+            // -- sched_getaffinity(pid, cpusetsize, mask): the guest may run
+            //    on N CPUs; report a mask with our ncpu bits set so a runtime
+            //    sizes its thread pool to linuxity's machine, not the host.
+            case Sysno::sched_getaffinity:
+                return do_sched_getaffinity(r);
+
             // -- the filesystem namespace (virtual: the guest's whole tree
             //    is linuxity's; host-backed paths get translated + forwarded,
             //    virtual paths get synthesized). This is what makes --root a
@@ -588,6 +599,68 @@ private:
         if (!mem_.copy_out(buf, {reinterpret_cast<const std::byte*>(&st), sizeof st}))
             return eno(Errno::efault);
         return val(0);
+    }
+
+    // The virtual machine's shape (ncpu, total RAM). Read from the kernel
+    // when it exposes machine() (the real Kernel does), else a 1-CPU/2-GiB
+    // default so the dispatcher works with a bare kernel in tests.
+    struct Machine { long ncpu; std::uint64_t mem_total; };
+    [[nodiscard]] Machine machine() {
+        if constexpr (requires { k_.machine(); }) {
+            auto m = k_.machine();
+            return Machine{m.ncpu < 1 ? 1 : m.ncpu, m.mem_total_bytes};
+        } else {
+            return Machine{1, std::uint64_t{2048} << 20};
+        }
+    }
+
+    // sysinfo(2): fill `struct sysinfo` for linuxity's virtual machine. The
+    // layout is the x86-64 kernel ABI (mem_unit == 1, so *ram fields are in
+    // bytes). Only the fields tools read are populated meaningfully.
+    [[nodiscard]] Outcome do_sysinfo(UAddr buf) {
+        struct Sysinfo {
+            std::int64_t uptime;
+            std::uint64_t loads[3];
+            std::uint64_t totalram, freeram, sharedram, bufferram;
+            std::uint64_t totalswap, freeswap;
+            std::uint16_t procs; std::uint16_t pad;
+            std::uint64_t totalhigh, freehigh;
+            std::uint32_t mem_unit;
+            std::uint32_t _pad2;   // align to 8; kernel's _f[] is empty on 64-bit
+        } si{};
+        auto m = machine();
+        si.uptime    = 1000;                         // seconds since boot
+        si.loads[0]  = si.loads[1] = si.loads[2] = 0;
+        si.totalram  = m.mem_total;
+        si.freeram   = m.mem_total / 2;
+        si.bufferram = m.mem_total / 64;
+        si.totalswap = si.freeswap = 0;
+        si.procs     = static_cast<std::uint16_t>(k_.procs().count());
+        si.mem_unit  = 1;                            // ram fields are bytes
+        if (!mem_.copy_out(buf, {reinterpret_cast<const std::byte*>(&si), sizeof si}))
+            return eno(Errno::efault);
+        return val(0);
+    }
+
+    // sched_getaffinity(pid, cpusetsize, mask): write a cpu_set with the low
+    // `ncpu` bits set into the guest mask, and return the number of bytes
+    // used (the kernel returns the size of the affinity mask it wrote).
+    [[nodiscard]] Outcome do_sched_getaffinity(const Regs& r) {
+        std::size_t cap = static_cast<std::size_t>(r.arg[1]);
+        UAddr mask = uaddr(r.arg[2]);
+        long ncpu = machine().ncpu;
+        std::size_t bytes = ((static_cast<std::size_t>(ncpu) + 63) / 64) * 8;
+        if (bytes < 8) bytes = 8;
+        if (cap < bytes) bytes = cap;           // honor the caller's buffer
+        if (bytes == 0) return eno(Errno::einval);
+        std::vector<std::byte> buf(bytes, std::byte{0});
+        for (long c = 0; c < ncpu; ++c) {
+            std::size_t byte = static_cast<std::size_t>(c) / 8;
+            if (byte >= bytes) break;
+            buf[byte] |= static_cast<std::byte>(1u << (static_cast<unsigned>(c) & 7u));
+        }
+        if (!mem_.copy_out(mask, buf)) return eno(Errno::efault);
+        return val(static_cast<std::int64_t>(bytes));
     }
 
     // struct utsname: 6 fixed-size NUL-terminated char[65] fields. We
