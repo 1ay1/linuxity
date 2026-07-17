@@ -56,6 +56,28 @@ void reserve_low_fds() {
     }
 }
 
+// A rootfs's /etc/resolv.conf carries a usable nameserver line?
+// A freshly extracted rootfs frequently ships resolv.conf as empty, absent,
+// or a dangling symlink (Debian minbase points it at systemd-resolved's
+// runtime stub), so DNS — and thus `pacman -Sy`, `apt update`, `curl` — breaks
+// out of the box. Returns true iff the file exists and contains a non-comment
+// `nameserver` directive.
+[[nodiscard]] bool rootfs_has_usable_dns(const std::string& host_resolv) {
+    std::FILE* f = std::fopen(host_resolv.c_str(), "r");
+    if (!f) return false;
+    char line[512];
+    bool ok = false;
+    while (std::fgets(line, sizeof line, f)) {
+        const char* p = line;
+        while (*p == ' ' || *p == '\t') ++p;
+        if (*p == '#' || *p == ';') continue;
+        if (std::strncmp(p, "nameserver", 10) == 0 &&
+            (p[10] == ' ' || p[10] == '\t')) { ok = true; break; }
+    }
+    std::fclose(f);
+    return ok;
+}
+
 // If a real cgroup bound was requested but linuxity's OWN cgroup has no
 // delegated controllers (the common unprivileged case), we can't create a
 // child cgroup with live limit files. systemd, which owns the user session
@@ -297,6 +319,26 @@ int main(int argc, char** argv) {
                      norm.c_str(), host_dir.c_str());
     }
 
+    // Guarantee working DNS in a real rootfs (the proot-distro lesson, done
+    // the modern way). proot-distro OVERWRITES the rootfs's /etc/resolv.conf on
+    // disk with hardcoded 8.8.8.8; linuxity instead, only when the rootfs's own
+    // resolv.conf has no usable nameserver, BINDS the HOST's live
+    // /etc/resolv.conf over the guest path — so DNS tracks whatever the host
+    // actually uses (VPN, split-horizon, corporate resolver) and the pristine
+    // rootfs is never mutated. A single-FILE bind rides the same mount_host as
+    // --bind. Opt out with LINUXITY_NO_DNS=1. Skipped without --root (the guest
+    // already shares the host's real /etc).
+    if (!root.empty() && !std::getenv("LINUXITY_NO_DNS")) {
+        auto pc = k.files().classify("/etc/resolv.conf");
+        bool guest_ok = pc.realm == kernel::Realm2::host_backed &&
+                        rootfs_has_usable_dns(pc.host_path);
+        if (!guest_ok && rootfs_has_usable_dns("/etc/resolv.conf")) {
+            k.files().mount_host("/etc/resolv.conf", "/etc/resolv.conf");
+            std::fprintf(stderr,
+                "linuxity: bind /etc/resolv.conf -> host (rootfs had no DNS)\n");
+        }
+    }
+
     // The rootfs makes the translation unprivileged, so we no longer need to
     // chroot the child. The one path the host kernel resolves itself is the
     // exec target, so translate it up front: the child execs the REAL host
@@ -306,6 +348,20 @@ int main(int argc, char** argv) {
         std::string abs = k.files().absolutize(path);
         auto pc = k.files().classify(abs);
         if (pc.realm == kernel::Realm2::host_backed) exec_path = pc.host_path;
+    }
+
+    // Fail fast on a foreign-ISA program named on the command line (e.g. an
+    // aarch64 rootfs's /bin/sh on an x86-64 host). linuxity runs guest code
+    // natively on the host CPU — there is no cross-emulator — so a foreign
+    // binary would only die in a cryptic loader crash. Diagnose it up front,
+    // pointing at the ISA mismatch (this is termux's isNonNativeElf, surfaced
+    // as an actionable error rather than routed to qemu).
+    if (loader::read_elf_machine(exec_path) == loader::ForeignArch::foreign) {
+        std::fprintf(stderr,
+            "linuxity: '%s' is a foreign-architecture binary — linuxity runs "
+            "guest code natively on this host's CPU and has no cross-emulator. "
+            "Use a rootfs built for this machine's ISA.\n", path.c_str());
+        return 1;
     }
 
     // A dynamically-linked guest names its interpreter (ld-linux / ld-musl) in

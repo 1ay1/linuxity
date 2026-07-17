@@ -18,6 +18,10 @@ add_executable(test_loader test_loader.cpp)
 target_link_libraries(test_loader PRIVATE linuxity_core)
 add_test(NAME loader COMMAND test_loader)
 
+add_executable(test_interp test_interp.cpp)
+target_link_libraries(test_interp PRIVATE linuxity_core)
+add_test(NAME interp COMMAND test_interp)
+
 add_executable(test_run_native test_run_native.cpp)
 target_link_libraries(test_run_native PRIVATE linuxity_core)
 add_test(NAME run_native COMMAND test_run_native)
@@ -85,6 +89,10 @@ add_test(NAME run_meta COMMAND test_run_meta)
 add_executable(test_run_bind test_run_bind.cpp)
 target_link_libraries(test_run_bind PRIVATE linuxity_core)
 add_test(NAME run_bind COMMAND test_run_bind)
+
+add_executable(test_run_foreign_exec test_run_foreign_exec.cpp)
+target_link_libraries(test_run_foreign_exec PRIVATE linuxity_core)
+add_test(NAME run_foreign_exec COMMAND test_run_foreign_exec)
 
 add_executable(test_resources test_resources.cpp)
 target_link_libraries(test_resources PRIVATE linuxity_core)

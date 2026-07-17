@@ -11,7 +11,8 @@ the host CPU and the runtime IS the kernel-substitute. Not a VM, not emulation.*
 |---------|-------|--------------------------|
 | **proot** (termux's `proot-distro` engine) | ptrace + native execution; syscalls trapped and their path/id args rewritten | **Same model as linuxity.** Proven running full Arch/Debian/Ubuntu unprivileged. The direct roadmap source. |
 | **ish** | x86→host instruction emulation in a JIT (a real usermode CPU) | The OPPOSITE philosophy — emulation. Validates that linuxity's native path is faster; nothing to copy, only to out-perform. |
-| **termux-exec** | `LD_PRELOAD` shim that rewrites `execve`/shebang paths in userspace | linuxity does the same rewriting IN the trap (kernel-substitute), which is cleaner: no preload, works for static binaries, can't be bypassed. |
+| **termux-exec** | `LD_PRELOAD` shim that rewrites `execve`/shebang paths in userspace | linuxity does the same rewriting IN the trap (kernel-substitute), which is cleaner: no preload, works for static binaries, can't be bypassed. Its `inspectFileHeader` (ONE read → static/dynamic/foreign ELF or shebang, with foreign-ISA detection) is worth mirroring — **DONE** (loader/interp.hpp `inspect_file_header` + `read_elf_machine`). |
+| **proot-distro** | termux's distro manager: bootstraps a rootfs then launches proot with the right binds + DNS/hosts seeding | The launch-hygiene layer. Its DNS-seeding (a fresh rootfs has no working resolv.conf) is the one load-bearing UX bit — **DONE** the modern way: linuxity binds the HOST's live resolv.conf when the rootfs's is unusable, never mutating the rootfs (proot-distro hardcodes 8.8.8.8 to disk). |
 
 Conclusion: **proot is the north star.** It has already solved, at scale, every
 problem linuxity is working through. We adopt its *techniques* but keep linuxity's
@@ -70,13 +71,26 @@ coherent tiny pid namespace (which proot does NOT have — proot leaks host pids
    read + write-back on the real Arch shell. Regression: tests/test_run_bind.cpp.
 
 5. **shebang + ldso rewriting** (`execve/shebang.c`, `ldso.c`) — DONE in linuxity
-   (path_exec + exec_through_interp).
+   (path_exec + exec_through_interp). termux-exec's `inspectFileHeader` refinement
+   is now folded in: loader/interp.hpp `inspect_file_header()` classifies a
+   program in ONE read (static / dynamic / foreign ELF / shebang-with-arg /
+   non-exec), and `read_elf_machine()` gives the exec path a cheap foreign-ISA
+   guard. A wrong-arch binary (aarch64 on x86-64) is REFUSED cleanly — ENOEXEC
+   from the in-guest path, a clear CLI diagnostic from `main`, instead of a
+   cryptic loader crash. Regression: tests/test_interp.cpp, run_foreign_exec.
 
-6. **ioctl / tty job control** — proot only traps ioctl on Android. linuxity
+6. **DNS / launch hygiene** (proot-distro `helpers/rootfs.py`) — DONE, modernized.
+   A freshly extracted rootfs often ships no usable `/etc/resolv.conf`, breaking
+   `pacman -Sy`/`apt update`. proot-distro overwrites it with hardcoded 8.8.8.8;
+   linuxity instead binds the HOST's LIVE resolv.conf over the guest path only
+   when the rootfs's own has no nameserver — DNS tracks the host (VPN/corporate
+   resolver) and the pristine rootfs is never mutated. Opt out: LINUXITY_NO_DNS=1.
+
+7. **ioctl / tty job control** — proot only traps ioctl on Android. linuxity
    virtualizes the tty job-control ioctls (TIOCGPGRP/TIOCSPGRP/TIOCGSID) so a
    guest shell owns its tty and doesn't spin. DONE.
 
-7. **pid namespace coherence** — proot LEAKS host pids (its `$!` shows host pids;
+8. **pid namespace coherence** — proot LEAKS host pids (its `$!` shows host pids;
    documented behavior). linuxity translates fork/clone/wait4 pids both ways so
    the guest lives in one tiny pid space (root == 1). **linuxity is already ahead
    of proot here.**
@@ -86,3 +100,5 @@ coherent tiny pid namespace (which proot does NOT have — proot leaks host pids
 1. seccomp-BPF acceleration (perf — unlocks heavy workloads). ✓ DONE
 2. shadow perms db for fake_id0-grade chmod/chown round-tripping (correctness). ✓ DONE
 3. `--bind` flag over FileNamespace (ergonomics). ✓ DONE
+4. single-read file-header inspection + foreign-arch refusal (termux-exec). ✓ DONE
+5. host-resolv.conf DNS provisioning (proot-distro). ✓ DONE

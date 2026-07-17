@@ -652,6 +652,17 @@ private:
         std::string abs = resolve_arg(r, path_arg, path_arg == 1);
         auto pc = k_.files().classify(abs);
         if (pc.realm == kernel::Realm2::host_backed) {
+            // termux-exec's inspectFileHeader lesson: a FOREIGN-arch ELF (an
+            // aarch64 binary on an x86-64 host, say) cannot run natively —
+            // linuxity executes guest code directly on the host CPU, there is
+            // no cross-emulator. If we let the host kernel exec it, the guest
+            // dies in a cryptic SIGSEGV/SIGILL deep in the loader. Catch it
+            // here and fail with a clean ENOEXEC, exactly what the kernel
+            // returns for an unrunnable binary format. (termux routes this to
+            // qemu; linuxity's scope is native-speed same-ISA execution.)
+            if (loader::read_elf_machine(pc.host_path) ==
+                    loader::ForeignArch::foreign)
+                return eno(Errno::enoexec);
             // A dynamically-linked program names its interpreter in PT_INTERP;
             // the host kernel would resolve that against the host root and
             // fail. If this binary has an interp, exec the interpreter instead
