@@ -66,6 +66,10 @@ add_executable(test_run_shebang test_run_shebang.cpp)
 target_link_libraries(test_run_shebang PRIVATE linuxity_core)
 add_test(NAME run_shebang COMMAND test_run_shebang)
 
+add_executable(test_run_tty_jobcontrol test_run_tty_jobcontrol.cpp)
+target_link_libraries(test_run_tty_jobcontrol PRIVATE linuxity_core)
+add_test(NAME run_tty_jobcontrol COMMAND test_run_tty_jobcontrol)
+
 add_executable(test_resources test_resources.cpp)
 target_link_libraries(test_resources PRIVATE linuxity_core)
 add_test(NAME resources COMMAND test_resources)

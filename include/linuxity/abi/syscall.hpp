@@ -21,6 +21,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <span>
 #include <string>
 #include <vector>
@@ -344,10 +345,25 @@ public:
             case Sysno::landlock_restrict_self:
                 return val(0);
 
+            // -- ioctl: MOST requests act on a real host fd (TCGETS, winsize,
+            //    FIONREAD, ...) and must forward. But the JOB-CONTROL group
+            //    of tty ioctls read/write PIDs, and the host tty's foreground
+            //    process group is our host child's pgid — a number that has
+            //    NOTHING to do with the guest's flat pid space. A guest shell
+            //    (busybox ash, bash) compares TIOCGPGRP against its own
+            //    getpgrp(): when the host answer doesn't match, it believes it
+            //    is a BACKGROUND job, tries to seize the terminal, and spins
+            //    forever (ioctl/getpgid/kill in a tight loop pinning a core).
+            //    Virtualize these so the guest's session leader owns its tty:
+            //    report the caller's own pgrp as the foreground group and
+            //    accept TIOCSPGRP as a satisfied no-op.
+            case Sysno::ioctl:
+                return do_ioctl(r);
+
             // -- everything else: FORWARD to the real host kernel. -------
             // Memory (mmap/brk/mprotect) MUST run in the child so it gets
             // real pages in its own address space; file I/O, arch_prctl,
-            // ioctl, clock, random, etc. likewise need real host action.
+            // clock, random, etc. likewise need real host action.
             // This is what carries native libc all the way to main().
             default:
                 return fwd();
@@ -965,6 +981,38 @@ private:
         }
         if (!mem_.copy_out(mask, buf)) return eno(Errno::efault);
         return val(static_cast<std::int64_t>(bytes));
+    }
+
+    // ioctl(fd, request, argp): virtualize ONLY the tty job-control requests
+    // whose payload is a PID (which would otherwise leak the host's pgrp into
+    // the guest's flat pid space and make a guest shell spin trying to seize
+    // its terminal). Everything else forwards to the real host fd.
+    [[nodiscard]] Outcome do_ioctl(const Regs& r) {
+        constexpr std::uint64_t kTIOCGPGRP = 0x540F;  // get fg process group
+        constexpr std::uint64_t kTIOCSPGRP = 0x5410;  // set fg process group
+        constexpr std::uint64_t kTIOCGSID  = 0x5429;  // get session id
+        const std::uint64_t request = r.arg[1];
+        switch (request) {
+            // Report the caller's OWN pgrp as the terminal's foreground group
+            // (and its own sid as the session): the guest session leader owns
+            // its controlling tty, so the shell settles at the prompt instead
+            // of looping to acquire it. argp is a pid_t* out-parameter.
+            case kTIOCGPGRP:
+            case kTIOCGSID: {
+                std::int32_t pgrp = ids().pid;
+                std::array<std::byte, sizeof pgrp> buf{};
+                std::memcpy(buf.data(), &pgrp, sizeof pgrp);
+                if (!mem_.copy_out(uaddr(r.arg[2]), buf))
+                    return eno(Errno::efault);
+                return val(0);
+            }
+            // Accept a foreground-group change vacuously: the guest believes
+            // it grabbed the terminal; our single host process is untouched.
+            case kTIOCSPGRP:
+                return val(0);
+            default:
+                return fwd();   // real host tty/device ioctl
+        }
     }
 
     // struct utsname: 6 fixed-size NUL-terminated char[65] fields. We
