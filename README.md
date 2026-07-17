@@ -192,17 +192,25 @@ linuxity services their syscalls. Proofs of the model:
   cleanly. Cross-mount **symlinks** resolve too: `/etc/mtab -> /proc/self/mounts`
   crosses from the rootfs into the virtual `/proc`, and following it lands in
   the virtual realm instead of fabricating a nonexistent host path.
-- **Arch's `pacman` installs a package end to end.** On a real Arch/glibc
-  bootstrap rootfs, glibc `bash` and `pacman` run, and
-  `pacman -U <pkg>.pkg.tar.zst --noconfirm` installs a package (exit 0): the
-  binary lands in the overlay, the package DB entry is written, and the
-  post-transaction **systemd hook** (a `#!/bin/sh` scriptlet) runs. pacman 7's
-  download sandbox is satisfied too — the privilege drop to the `alpm` user is
-  accepted vacuously and the **Landlock** ruleset calls are accepted no-ops
-  (linuxity's namespace already confines the guest). Networked `-Sy` connects
-  out (DNS, TLS, HTTP all forwarded to the host kernel) and downloads the repo
-  databases; committing a fully-networked `-S` across the multi-threaded
-  download workers is the current frontier.
+- **Arch's `pacman` installs a package from the network, end to end.** On a
+  real Arch/glibc bootstrap rootfs, glibc `bash` and `pacman` run, and
+  `pacman -Sy <pkg> --noconfirm` **downloads the repo databases, resolves
+  dependencies, downloads the package, and installs it**: the binary lands in
+  the overlay, the package DB entry is written, and the post-transaction
+  **systemd hook** (a `#!/bin/sh` scriptlet) runs. Networking is fully native —
+  DNS, TLS, and HTTP are forwarded to the host kernel, identical to bare metal.
+  Two subtleties fell along the way: (1) pacman's **multi-threaded libcurl**
+  download workers create a short-lived wakeup `eventfd` and open the data file
+  nearly at once; in a bare `0,1,2`-only guest both raced for fd `3`, so a
+  sibling thread's 8-byte wakeup landed in `core.db` and corrupted it — fixed
+  by reserving the low descriptors in the child (mirroring a shell-launched
+  process that inherits open fds). (2) `pacman -U <pkg>.pkg.tar.zst` installs a
+  local package the same way. pacman 7's download **sandbox** (`DownloadUser`,
+  Landlock, seccomp) is accepted vacuously — setuid/Landlock are no-ops because
+  linuxity's namespace already confines the guest — but the sandbox's forked
+  download child relays completion to the parent over a pipe whose commit step
+  is the remaining frontier; with the standard in-process download path it all
+  works.
 
 ### How the filesystem is virtualized
 
