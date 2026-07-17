@@ -1223,18 +1223,14 @@ private:
     // rewritten to a host path. Only the linkpath (where the symlink lives)
     // is translated to its overlay upper host path.
     // bind/connect(fd, const sockaddr* addr, socklen_t len): for an AF_UNIX
-    // socket the filesystem path lives in `addr->sun_path`. The guest runs
-    // chroot'd into the rootfs, so an ABSOLUTE guest sun_path already resolves
-    // to the correct file WITHOUT translation — and translating it to the
-    // longer overlay-upper host path would overflow the guest's declared
-    // socklen (the kernel reads only `len` bytes and would truncate the path).
-    // So we forward unchanged. We keep the syscall TRAPPED (rather than not
-    // filtering it) for two reasons: (1) it documents the AF_UNIX path
-    // semantics in one place, and (2) if a future overlay design needs the
-    // socket node copied up, this is the single hook to do it. The one thing
-    // we DO here is materialize the parent directory chain in the overlay
-    // upper for a bind, so a socket whose parent dir only exists in the lower
-    // layer still gets a writable home.
+    // socket the filesystem path lives in `addr->sun_path`. linuxity runs the
+    // guest UNPRIVILEGED, so chroot(2) is unavailable and the guest is NOT
+    // confined by the kernel — path confinement is done by TRANSLATION. A raw
+    // absolute sun_path forwarded to bind/connect would therefore resolve on
+    // the HOST filesystem, leaking the socket outside the sandbox. So we
+    // translate the sun_path into the overlay (below) for BOTH bind and
+    // connect, keeping the socket inside the guest's world and letting the two
+    // peers meet at the same node.
     [[nodiscard]] Outcome do_sockaddr_un(const Regs& r, bool for_bind) {
         constexpr std::uint16_t kAfUnix = 1;
         const std::uint64_t addr = r.arg[1];
