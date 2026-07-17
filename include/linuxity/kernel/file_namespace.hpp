@@ -30,6 +30,7 @@
 #include <unistd.h>
 
 #include <cstdint>
+#include <algorithm>
 #include <functional>
 #include <string>
 #include <string_view>
@@ -109,7 +110,8 @@ public:
     // mutated. Existence is NOT checked for reads — the forwarded host syscall
     // reports ENOENT itself.
     [[nodiscard]] PathClass classify(std::string_view abs,
-                                     bool for_write = false) const {
+                                     bool for_write = false,
+                                     bool follow = true) const {
         const Mount* m = deepest(abs);
         if (!m) return PathClass{Realm2::absent, {}, Errno::enoent};
         if (m->producer) {
@@ -132,10 +134,17 @@ public:
                 return PathClass{Realm2::host_backed, std::move(up), Errno::enoent};
             }
             if (exists(up.c_str()))
-                return PathClass{Realm2::host_backed, std::move(up), Errno::enoent};
-            return PathClass{Realm2::host_backed, std::move(lo), Errno::enoent};
+                return PathClass{Realm2::host_backed,
+                                 follow ? reroot_symlink(*m, std::move(up))
+                                        : std::move(up), Errno::enoent};
+            return PathClass{Realm2::host_backed,
+                             follow ? reroot_symlink(*m, std::move(lo))
+                                    : std::move(lo), Errno::enoent};
         }
-        return PathClass{Realm2::host_backed, join_host(m->host_base, rel),
+        std::string full = join_host(m->host_base, rel);
+        return PathClass{Realm2::host_backed,
+                         follow ? reroot_symlink(*m, std::move(full))
+                                : std::move(full),
                          Errno::enoent};
     }
 
@@ -214,6 +223,52 @@ private:
         std::string p{base};
         if (!rel.empty()) { p += '/'; p += rel; }
         return p;
+    }
+
+    // Follow rootfs symlinks WITHIN the guest world. A rootfs is full of
+    // absolute symlinks (Alpine's /bin/sh -> /bin/busybox, /lib -> /usr/lib):
+    // their targets are GUEST-absolute, so the host kernel would resolve them
+    // against the HOST root and miss. Here we chase the chain ourselves,
+    // re-rooting every absolute target under the mount base (upper first, then
+    // lower), so the final host path lands inside the rootfs. Relative links
+    // resolve against the link's own directory, also within the rootfs.
+    // Bounded to avoid loops; returns the original path if not a symlink.
+    std::string reroot_symlink(const Mount& m, std::string host) const {
+        for (int hops = 0; hops < 40; ++hops) {
+            char buf[4096];
+            ::ssize_t n = ::readlink(host.c_str(), buf, sizeof buf - 1);
+            if (n < 0) return host;                 // not a symlink (or gone)
+            buf[n] = '\0';
+            std::string target{buf};
+            std::string guest_abs;
+            if (!target.empty() && target.front() == '/') {
+                guest_abs = normalize(target);       // absolute: re-root it
+            } else {
+                // relative: resolve against the link's guest directory. Map
+                // the host path back to a guest path via the mount base.
+                std::string_view base = m.upper.empty() ? std::string_view{m.host_base}
+                    : (host.rfind(m.upper, 0) == 0 ? std::string_view{m.upper}
+                                                   : std::string_view{m.host_base});
+                std::string_view relhost = host;
+                relhost.remove_prefix(base.size());
+                std::string guest_link = m.prefix == "/" ? std::string{relhost}
+                                       : m.prefix + std::string{relhost};
+                auto slash = guest_link.find_last_of('/');
+                std::string dir = slash == std::string::npos ? "/"
+                                    : guest_link.substr(0, slash);
+                guest_abs = normalize(dir + "/" + target);
+            }
+            // Re-root the guest-absolute target under this mount (upper|lower).
+            std::string_view rel = guest_abs;
+            if (m.prefix != "/") rel.remove_prefix(
+                std::min(rel.size(), m.prefix.size()));
+            while (!rel.empty() && rel.front() == '/') rel.remove_prefix(1);
+            std::string up = m.upper.empty() ? std::string{}
+                                             : join_host(m.upper, rel);
+            std::string lo = join_host(m.host_base, rel);
+            host = (!up.empty() && exists(up.c_str())) ? up : lo;
+        }
+        return host;
     }
 
     static bool exists(const char* path) {

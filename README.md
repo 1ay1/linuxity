@@ -148,6 +148,14 @@ linuxity services their syscalls. Proofs of the model:
 - **Shell pipelines work.** `echo a b | wc -w`, `... | tr ... | wc -l`, loops,
   `awk`, backgrounded jobs — the whole forked pipeline stays in linuxity's
   namespace and its members signal, wait on, and enumerate each other correctly.
+- **A real distro runs.** Point `--root` at an extracted **Alpine** (musl)
+  rootfs and `/bin/sh`, `/bin/ls`, `/bin/cat`, `busybox` and friends all run:
+  dynamically-linked PIE binaries load through their **translated PT_INTERP**
+  (the musl/glibc dynamic linker), absolute rootfs **symlinks** (`/bin/sh ->
+  /bin/busybox`) re-root inside the rootfs, and nested `execve`s of dynamic
+  programs are rewritten the same way — so a shell spawns real coreutils.
+  `uname -a` reports linuxity, `cat /etc/alpine-release` reads the real distro
+  file, `id` is root, a pipeline of 82 busybox applets counts correctly.
 
 ### How the filesystem is virtualized
 
@@ -216,7 +224,6 @@ linuxity's own tiny pid space, root = pid 1, real argv captured at `exec`). So
 `/proc` — and every monitor reading it — reflects linuxity's real, live
 processes, not the host's.
 
-The road ahead: `readlink` synthesis for `/proc/self/exe`, richer `futex`/
-`epoll` coverage for heavily-threaded programs, and reaching an interactive
-`/bin/sh` on a real Arch/Alpine rootfs. The architecture is fixed and
-machine-checked.
+The road ahead: overlay directory-read UNION (getdents merge of lower+upper),
+live advancing `/proc` CPU counters, and richer `futex`/`epoll` coverage for
+heavily-threaded programs. The architecture is fixed and machine-checked.

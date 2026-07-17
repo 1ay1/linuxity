@@ -191,6 +191,44 @@ int main() {
         std::system(("rm -rf " + lower + " " + upper).c_str());
     }
 
+    // -- Rootfs symlink re-rooting. A distro is full of ABSOLUTE symlinks
+    //    whose targets must resolve INSIDE the rootfs, not the host root.
+    {
+        std::string base = "/tmp/lx_fns_slroot";
+        std::system(("rm -rf " + base +
+                     " && mkdir -p " + base + "/bin " + base + "/usr/bin").c_str());
+        // /bin/real is the actual file; /bin/sh -> /bin/real (absolute, guest);
+        // /bin/link2 -> real (relative). And /usr/bin/env -> /bin/real.
+        { std::FILE* rf = std::fopen((base + "/bin/real").c_str(), "w");
+          std::fputs("X\n", rf); std::fclose(rf); }
+        std::system(("ln -sf /bin/real " + base + "/bin/sh").c_str());
+        std::system(("ln -sf real "      + base + "/bin/link2").c_str());
+        std::system(("ln -sf /bin/real " + base + "/usr/bin/env").c_str());
+
+        FN sf;
+        sf.mount_host("/", base);
+        // follow=true (default): the symlink resolves to the real host file.
+        {
+            auto pc = sf.classify("/bin/sh");
+            assert(pc.realm == Realm2::host_backed);
+            assert(pc.host_path == base + "/bin/real");   // re-rooted, not /bin/real
+        }
+        {
+            auto pc = sf.classify("/bin/link2");           // relative symlink
+            assert(pc.host_path == base + "/bin/real");
+        }
+        {
+            auto pc = sf.classify("/usr/bin/env");         // absolute, cross-dir
+            assert(pc.host_path == base + "/bin/real");
+        }
+        // follow=false (lstat/readlink): the LINK path is kept, not the target.
+        {
+            auto pc = sf.classify("/bin/sh", /*for_write=*/false, /*follow=*/false);
+            assert(pc.host_path == base + "/bin/sh");
+        }
+        std::system(("rm -rf " + base).c_str());
+    }
+
     std::puts("file_namespace: mount table, normalization, realm "
               "classification, synthesized /proc, and copy-up overlay correct");
     return 0;

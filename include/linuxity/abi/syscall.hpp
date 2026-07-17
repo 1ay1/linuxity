@@ -16,6 +16,7 @@
 #include "linuxity/kernel/file_namespace.hpp"
 #include "linuxity/kernel/process_table.hpp"
 #include "linuxity/kernel/subsystem.hpp"
+#include "linuxity/loader/interp.hpp"
 
 #include <array>
 #include <cstdint>
@@ -68,6 +69,16 @@ struct Outcome {
     bool         signal{false};
     std::int32_t sig_pid{0};       // target GUEST pid (0 => current task)
     std::int32_t sig_num{0};       // signal number to deliver
+
+    // EXEC_INTERP - the guest execve'd a DYNAMIC binary. The host kernel would
+    // resolve its PT_INTERP against the host root and fail, so we rewrite the
+    // exec into `interp_host <prog_guest> <orig-argv...>`: the child execs the
+    // real interpreter, which then opens the program + its libraries through
+    // redirected syscalls inside the rootfs. path_arg names the execve's path
+    // register; the trap rebuilds argv in the child before forwarding.
+    bool         exec_interp{false};
+    std::string  interp_host;      // real host path of the dynamic linker
+    std::string  prog_guest;      // guest path of the program (new argv[0..1])
 };
 
 // A guest-memory accessor the dispatcher uses to copy_in/copy_out. Modeled as
@@ -189,8 +200,8 @@ public:
             //    real, unprivileged Linux world.
             case Sysno::open:        return path_open(r, 0, /*at=*/false);
             case Sysno::openat:      return path_open(r, 1, /*at=*/true);
-            case Sysno::stat:        return path_stat(r, 0, false);
-            case Sysno::lstat:       return path_stat(r, 0, false);
+            case Sysno::stat:        return path_stat(r, 0, false, true);
+            case Sysno::lstat:       return path_stat(r, 0, false, false);
             case Sysno::access:      return path_at(r, 0, false);
             case Sysno::chdir:       return do_chdir(r);
             case Sysno::newfstatat:  return path_stat(r, 1, true);
@@ -325,9 +336,10 @@ private:
 
     // stat/lstat/newfstatat: redirect host-backed to the real path; for
     // virtual files synthesize a stat buffer into guest memory ourselves.
-    [[nodiscard]] Outcome path_stat(const Regs& r, int path_arg, bool at) {
+    [[nodiscard]] Outcome path_stat(const Regs& r, int path_arg, bool at,
+                                    bool follow = true) {
         std::string abs = resolve_arg(r, path_arg, at);
-        auto pc = k_.files().classify(abs);
+        auto pc = k_.files().classify(abs, /*for_write=*/false, follow);
         if (pc.realm == kernel::Realm2::host_backed) {
             Outcome o{};
             o.redirect = true; o.path_arg = path_arg; o.host_path = std::move(pc.host_path);
@@ -391,7 +403,7 @@ private:
         if (std::string tgt = proc_symlink_target(abs); !tgt.empty())
             return write_link(buf, cap, tgt);
 
-        auto pc = k_.files().classify(abs);
+        auto pc = k_.files().classify(abs, /*for_write=*/false, /*follow=*/false);
         if (pc.realm == kernel::Realm2::host_backed) {
             Outcome o{};
             o.redirect = true; o.path_arg = path_arg;
@@ -466,8 +478,26 @@ private:
         std::string abs = resolve_arg(r, path_arg, path_arg == 1);
         auto pc = k_.files().classify(abs);
         if (pc.realm == kernel::Realm2::host_backed) {
+            // A dynamically-linked program names its interpreter in PT_INTERP;
+            // the host kernel would resolve that against the host root and
+            // fail. If this binary has an interp, exec the interpreter instead
+            // (with the program as argv[1]) so the loader opens the program +
+            // its libraries through redirected syscalls inside the rootfs.
+            std::string interp = loader::read_elf_interp(pc.host_path);
+            if (!interp.empty()) {
+                std::string interp_abs = k_.files().absolutize(interp);
+                auto ipc = k_.files().classify(interp_abs);
+                Outcome o{};
+                o.exec_interp = true;
+                o.path_arg    = path_arg;
+                o.interp_host = ipc.realm == kernel::Realm2::host_backed
+                                    ? std::move(ipc.host_path) : interp;
+                o.prog_guest  = abs;   // guest path; loader's openat redirects
+                return o;
+            }
             Outcome o{};
-            o.redirect = true; o.path_arg = path_arg; o.host_path = std::move(pc.host_path);
+            o.redirect = true; o.path_arg = path_arg;
+            o.host_path = std::move(pc.host_path);
             return o;
         }
         return eno(pc.realm == kernel::Realm2::virtual_file ? Errno::eacces

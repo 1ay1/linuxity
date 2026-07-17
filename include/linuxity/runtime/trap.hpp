@@ -100,10 +100,11 @@ public:
             // our subsystems, forward it to the host kernel, or exit.
             abi::Outcome o = sys.dispatch(f.regs);
             if (const char* t = std::getenv("LINUXITY_TRACE"); t && *t) {
-                std::fprintf(trace_out(t), "[lx] nr=%llu -> %s%s%s%s%s ret=%lld %s\n",
+                std::fprintf(trace_out(t), "[lx] nr=%llu -> %s%s%s%s%s%s ret=%lld %s\n",
                     static_cast<unsigned long long>(f.regs.nr),
                     o.inject?"INJECT ":"", o.redirect?"REDIRECT ":"",
                     o.signal?"SIGNAL ":"",
+                    o.exec_interp?"EXECINT ":"",
                     o.forward?"FORWARD ":"", o.exited?"EXIT ":"VIRT ",
                     static_cast<long long>(o.ret),
                     o.redirect?o.host_path.c_str():"");
@@ -138,6 +139,18 @@ public:
                 if constexpr (requires { trap_.deliver_signal(0, 0); })
                     ret = trap_.deliver_signal(o.sig_pid, o.sig_num);
                 LX_TRY(trap_.resume(ret));
+            } else if (o.exec_interp) {
+                // A dynamic guest execve: rewrite it to run through the real
+                // interpreter (guarded so backends without the bridge just
+                // forward the original, which fails cleanly). The image is
+                // replaced on success and observed as an EXEC event.
+                if constexpr (requires {
+                        trap_.exec_through_interp(0, std::string{}, std::string{}); }) {
+                    (void)LX_TRY(trap_.exec_through_interp(
+                        o.path_arg, o.interp_host, o.prog_guest));
+                } else {
+                    (void)LX_TRY(trap_.forward());
+                }
             } else if (o.forward) {
                 // Let the host kernel run it IN the guest (mmap/brk/...).
                 (void)LX_TRY(trap_.forward());

@@ -233,6 +233,84 @@ public:
         return ok(ret);
     }
 
+    // EXEC_INTERP: the guest execve'd a dynamic binary. Rewrite the call in
+    // place into `interp_host <prog_guest> <orig argv[1..]>` so the child
+    // execs the real dynamic linker (which then opens the program and its
+    // libraries through redirected syscalls), then FORWARD it to the kernel.
+    //
+    // We build the new argument vector in the child's own stack, below rsp:
+    //   [ interp_host\0 ][ prog_guest\0 ][ ptr array: &interp,&prog,
+    //     orig_argv[1], orig_argv[2], ..., NULL ]
+    // The original argv[1..] pointers still address valid guest strings, so we
+    // reuse them; only argv[0] is replaced by prog_guest. path_arg is the
+    // execve path register (0 for execve, 1 for execveat); argv follows it.
+    [[nodiscard]] Result<std::int64_t> exec_through_interp(
+            int path_arg, const std::string& interp_host,
+            const std::string& prog_guest) {
+        Task& t = tasks_[cur_];
+        struct user_regs_struct r = t.regs;
+        int argv_reg = path_arg + 1;
+        std::uint64_t argv_ptr = reg_arg(r, argv_reg);
+
+        // Read the original argv pointer array (stop at NULL, bounded).
+        std::vector<std::uint64_t> orig;
+        for (std::size_t i = 0; i < 1024; ++i) {
+            std::uint64_t p = 0;
+            std::array<std::byte, 8> b{};
+            if (!copy_in(uaddr(argv_ptr + i * 8), b)) break;
+            std::memcpy(&p, b.data(), 8);
+            if (p == 0) break;
+            orig.push_back(p);
+        }
+
+        // Lay strings then the pointer array into a scratch block below rsp.
+        // Total size: two strings + a pointer array of (2 + (orig-1) + 1).
+        std::size_t narg = 2 + (orig.empty() ? 0 : orig.size() - 1);
+        std::size_t arr_bytes = (narg + 1) * 8;
+        std::size_t block = interp_host.size() + 1 + prog_guest.size() + 1
+                          + arr_bytes + 64;
+        std::uint64_t base = (t.regs.rsp - 512 - block) & ~std::uint64_t{15};
+
+        std::uint64_t p_interp = base;
+        if (!write_cstr(p_interp, interp_host)) return err<std::int64_t>(Errno::efault);
+        std::uint64_t p_prog = p_interp + interp_host.size() + 1;
+        if (!write_cstr(p_prog, prog_guest)) return err<std::int64_t>(Errno::efault);
+
+        std::uint64_t arr = (p_prog + prog_guest.size() + 1 + 15) & ~std::uint64_t{15};
+        std::vector<std::uint64_t> ptrs;
+        ptrs.push_back(p_interp);   // argv[0] = interpreter
+        ptrs.push_back(p_prog);     // argv[1] = program (guest path)
+        for (std::size_t i = 1; i < orig.size(); ++i)
+            ptrs.push_back(orig[i]); // original argv[1..]
+        ptrs.push_back(0);          // NULL terminator
+        std::vector<std::byte> arrbytes(ptrs.size() * 8);
+        std::memcpy(arrbytes.data(), ptrs.data(), arrbytes.size());
+        if (!copy_out(uaddr(arr), arrbytes)) return err<std::int64_t>(Errno::efault);
+
+        set_arg(r, path_arg, p_interp);   // exec the interpreter
+        set_arg(r, argv_reg, arr);        // with the rebuilt argv
+        ::ptrace(PTRACE_SETREGS, cur_, 0, &r);
+        // Forward: the kernel runs the (rewritten) execve; on success it
+        // replaces the image and we get a PTRACE_EVENT_EXEC. Don't step here.
+        t.action = Action::none;
+        ::ptrace(PTRACE_SYSCALL, cur_, 0, 0);
+        return ok(std::int64_t{0});
+    }
+
+    static std::uint64_t reg_arg(const struct user_regs_struct& r, int n) {
+        switch (n) {
+            case 0: return r.rdi; case 1: return r.rsi; case 2: return r.rdx;
+            case 3: return r.r10; case 4: return r.r8;  case 5: return r.r9;
+            default: return 0;
+        }
+    }
+
+    [[nodiscard]] bool write_cstr(std::uint64_t at, const std::string& s) {
+        std::vector<std::byte> b(s.size() + 1);
+        std::memcpy(b.data(), s.c_str(), s.size() + 1);
+        return static_cast<bool>(copy_out(uaddr(at), b));
+    }
+
     static void set_arg(struct user_regs_struct& r, int n, std::uint64_t v) {
         switch (n) {
             case 0: r.rdi = v; break;  case 1: r.rsi = v; break;
