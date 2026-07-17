@@ -97,6 +97,7 @@ inline constexpr int kTrappedX86_64[] = {
     133, 259,                    // mknod/mknodat
     84, 87, 263,                 // rmdir/unlink/unlinkat
     90, 268,                     // chmod/fchmodat
+    91,                          // fchmod        (records mode; then fwd)
     92, 94, 93, 260,             // chown/lchown/fchown/fchownat
     76,                          // truncate
     235, 132, 280, 261,          // utimes/utime/utimensat/futimesat

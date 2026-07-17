@@ -24,6 +24,7 @@
 
 #include "linuxity/abi/result.hpp"
 #include "linuxity/abi/types.hpp"
+#include "linuxity/kernel/meta_store.hpp"
 
 #include <sys/stat.h>
 #include <dirent.h>
@@ -96,9 +97,22 @@ public:
         if (prefix.size() > 1 && prefix.back() == '/') prefix.pop_back();
         if (!host_base.empty() && host_base.back() == '/') host_base.pop_back();
         if (!upper.empty() && upper.back() == '/') upper.pop_back();
+        // The shadow metadata journal lives in the ROOT mount's upper layer,
+        // so uid/mode overlays for the whole guest tree share one store that
+        // persists across runs. Attach the first time a rooted overlay mounts.
+        if (prefix == "/" && !upper.empty() && !meta_attached_) {
+            meta_.attach(upper);
+            meta_attached_ = true;
+        }
         mounts_.push_back(Mount{std::move(prefix), std::move(host_base),
                                 std::move(upper), {}});
     }
+
+    // The shadow permission/ownership store (per-path mode/uid/gid overlay).
+    // The dispatcher records guest chmod/chown here and overlays it back onto
+    // host stat results, so a uid-0 world round-trips coherently.
+    [[nodiscard]] MetaStore& meta() noexcept { return meta_; }
+    [[nodiscard]] const MetaStore& meta() const noexcept { return meta_; }
 
     // Mount a virtual producer at an absolute guest prefix ("/proc", "/sys").
     void mount_virtual(std::string prefix, Producer prod) {
@@ -227,6 +241,9 @@ public:
         std::unordered_map<std::string, bool> seen;   // name -> is_dir
         merge_dir(up, seen);   // upper first (wins)
         merge_dir(lo, seen);
+        // The shadow-metadata journal is an implementation file in the upper
+        // layer, not part of the guest tree — never let it show up in a listing.
+        seen.erase(std::string{MetaStore::journal_leaf()});
         out.reserve(seen.size());
         for (auto& [name, isdir] : seen) out.push_back({name, isdir});
         return out;
@@ -482,6 +499,8 @@ private:
     std::string cwd_{"/"};
     std::unordered_map<int, std::string> fd_paths_;
     std::unordered_map<int, DirStream> dir_streams_;
+    MetaStore meta_{};
+    bool meta_attached_{false};
 };
 
 } // namespace lx::kernel

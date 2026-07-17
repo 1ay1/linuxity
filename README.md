@@ -337,3 +337,41 @@ guest is just another host process.
 The road ahead: overlay directory-read UNION (getdents merge of lower+upper),
 live advancing `/proc` CPU counters, and richer `futex`/`epoll` coverage for
 heavily-threaded programs. The architecture is fixed and machine-checked.
+
+## A coherent uid-0 world (fake root, done right)
+
+The host process is **unprivileged**, but the guest believes it is root — and
+that belief has to survive a `stat`. Two holes the host filesystem can't back:
+ownership (`chown 1000:1000 f` can't really change owner) and privileged mode
+bits (`chmod 4755 f` — the host may drop the setuid bit). linuxity closes them
+with a **shadow metadata store** (`kernel/meta_store.hpp`): chmod/chown/fchmod/
+fchown RECORD the guest-intended `(mode, uid, gid)`, and every stat/lstat/statx/
+newfstatat OVERLAYS them back onto the host inode result. So:
+
+```
+linuxity --root /arch /usr/bin/bash -c \
+  'touch /tmp/z; chmod 4755 /tmp/z; chown 1000:1000 /tmp/z; stat -c "%a %u:%g" /tmp/z'
+# -> 4755 1000:1000
+```
+
+round-trips exactly — setuid bit and non-root owner intact — even though the
+real inode never changed owner and the host would have dropped the setuid bit.
+Where proot scatters a `.proot-meta-file.<name>` **sidecar** beside every
+touched file (polluting the guest tree), linuxity keeps ONE consolidated
+`.linuxity-meta` journal in the overlay upper layer: never guest-visible,
+persists and replays across runs, with tombstones so unlink/rename stay exact.
+
+## Binding host directories in
+
+`--bind host[:guest]` exposes a real host directory inside the guest tree at
+`guest` (default: the same path) — proot's `-b`, bubblewrap's `--bind`, but
+riding linuxity's path-translation namespace (no privilege, no real `mount(2)`):
+
+```
+linuxity --root /arch --bind ~/project:/work /usr/bin/bash
+# /work in the guest IS ~/project on the host; writes land on the real files.
+```
+
+Binds register after the rootfs, so a deeper or explicit bind wins by
+longest-prefix and can even shadow a rootfs directory. It's a thin wrapper over
+the same `FileNamespace::mount_host` the `--root` overlay already uses.

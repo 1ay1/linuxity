@@ -44,11 +44,18 @@ coherent tiny pid namespace (which proot does NOT have — proot leaks host pids
 2. **fake_id0** — proot's most complete "fake root": a coherent uid-0 world where
    chmod/chown/access/setuid/capset/stat all agree, backed by a shadow
    ownership/mode db so a package manager's `install -o root -g root -m 4755`
-   round-trips. linuxity already presents a root-owned world (stat scrubbed to
-   uid/gid 0, chown a no-op, privilege drops accepted), which covers apk/pacman
-   today. Gap vs proot: no shadow perms db, so `stat` after a guest `chmod 0755`
-   reports the host mode, not the guest-intended mode. Track a per-path
-   mode/owner overlay if a package's post-install verification needs it.
+   round-trips. **DONE — and better than proot.** linuxity's `MetaStore`
+   (kernel/meta_store.hpp) keeps a per-path (mode,uid,gid) overlay: chmod/chown/
+   fchmod/fchown RECORD the guest-intended values, and stat/lstat/statx/
+   newfstatat OVERLAY them onto the host inode result. Ownership round-trips
+   even though the host process is unprivileged; setuid/sticky/0000 modes
+   round-trip even when the host drops them. Where proot scatters a
+   `.proot-meta-file.<name>` SIDECAR beside every touched file (polluting the
+   guest tree, needing filter-everywhere), linuxity keeps ONE consolidated
+   `.linuxity-meta` journal in the overlay upper layer — never guest-visible,
+   persists+replays across runs, with tombstones so unlink/rename stay accurate.
+   Verified: real Arch bash `chmod 4755 f; chown 1000:1000 f; stat f` →
+   `4755 1000:1000`. Regression: tests/test_run_meta.cpp.
 
 3. **link2symlink** — emulate hardlinks as symlinks on filesystems (or overlays)
    that can't hardlink. linuxity's overlay upper is a normal fs so `link(2)`
@@ -56,8 +63,11 @@ coherent tiny pid namespace (which proot does NOT have — proot leaks host pids
 
 4. **bindings / mounts** (`path/binding.c`) — proot's `-b host:guest` bind model.
    linuxity's `mount_host` / `mount_virtual` already generalizes this; the
-   `--root` overlay is the common case. A future `--bind host:guest` flag would
-   be a thin wrapper over the existing FileNamespace.
+   `--root` overlay is the common case. **DONE:** `--bind host[:guest]` (main.cpp)
+   is a thin wrapper over FileNamespace::mount_host, registered after the rootfs
+   so a deeper/explicit bind wins by longest-prefix and can even shadow a rootfs
+   dir. Writes land on the real host files (a true bind, no overlay). Verified
+   read + write-back on the real Arch shell. Regression: tests/test_run_bind.cpp.
 
 5. **shebang + ldso rewriting** (`execve/shebang.c`, `ldso.c`) — DONE in linuxity
    (path_exec + exec_through_interp).
@@ -74,5 +84,5 @@ coherent tiny pid namespace (which proot does NOT have — proot leaks host pids
 ## Order of attack
 
 1. seccomp-BPF acceleration (perf — unlocks heavy workloads). ✓ DONE
-2. shadow perms db for fake_id0-grade chmod/chown round-tripping (correctness).
-3. `--bind` flag over FileNamespace (ergonomics).
+2. shadow perms db for fake_id0-grade chmod/chown round-tripping (correctness). ✓ DONE
+3. `--bind` flag over FileNamespace (ergonomics). ✓ DONE

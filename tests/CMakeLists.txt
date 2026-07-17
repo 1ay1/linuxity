@@ -78,6 +78,14 @@ add_executable(test_run_seccomp test_run_seccomp.cpp)
 target_link_libraries(test_run_seccomp PRIVATE linuxity_core)
 add_test(NAME run_seccomp COMMAND test_run_seccomp)
 
+add_executable(test_run_meta test_run_meta.cpp)
+target_link_libraries(test_run_meta PRIVATE linuxity_core)
+add_test(NAME run_meta COMMAND test_run_meta)
+
+add_executable(test_run_bind test_run_bind.cpp)
+target_link_libraries(test_run_bind PRIVATE linuxity_core)
+add_test(NAME run_bind COMMAND test_run_bind)
+
 add_executable(test_resources test_resources.cpp)
 target_link_libraries(test_resources PRIVATE linuxity_core)
 add_test(NAME resources COMMAND test_resources)

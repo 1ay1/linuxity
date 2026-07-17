@@ -22,6 +22,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -112,6 +113,10 @@ struct Outcome {
     enum class ScrubKind : std::uint8_t { none, stat, statx };
     ScrubKind    scrub{ScrubKind::none};
     UAddr        scrub_buf{};
+    // The normalized GUEST path being stat'd. scrub_ids looks the shadow
+    // metadata store up by this key to overlay the guest-intended mode/uid/gid
+    // onto the host inode the redirect just filled. Empty for non-stat scrubs.
+    std::string  scrub_guest_path;
 };
 
 // A guest-memory accessor the dispatcher uses to copy_in/copy_out. Modeled as
@@ -278,27 +283,29 @@ public:
             case Sysno::rmdir:      return path_mut(r, 0, false, Wi::remove);
             case Sysno::unlink:     return path_mut(r, 0, false, Wi::remove);
             case Sysno::unlinkat:   return path_mut(r, 1, true,  Wi::remove);
-            case Sysno::chmod:      return path_mut(r, 0, false, Wi::copy_leaf);
-            case Sysno::fchmodat:   return path_mut(r, 1, true,  Wi::copy_leaf);
-            // chown/chgrp: linuxity presents a ROOT-OWNED world (every stat is
-            // scrubbed to uid=gid=0), and the guest itself runs as uid 0. But
-            // the real host process is UNPRIVILEGED, so a forwarded chown to
-            // uid 0 would fail EPERM — breaking `apk add`, `tar -p`, `install`.
-            // Since ownership is already virtually root, chown is a vacuous
-            // no-op: accept it and report success without touching the host.
-            case Sysno::chown:
-            case Sysno::lchown:
-            case Sysno::fchown:
-            case Sysno::fchownat:   return val(0);
+            case Sysno::chmod:      return do_chmod(r, 0, false, Wi::copy_leaf);
+            case Sysno::fchmodat:   return do_chmod(r, 1, true,  Wi::copy_leaf);
+            // chown/lchown/fchown/fchownat: linuxity presents a ROOT-OWNED
+            // world and the guest runs as our single UNPRIVILEGED host process,
+            // so a forwarded chown (even to uid 0) EPERMs and breaks `tar -p`,
+            // `install -o`, `useradd`. Instead we RECORD the guest-intended
+            // owner in the shadow metadata store and report success: a later
+            // stat overlays the recorded uid/gid, so ownership round-trips
+            // coherently (fake_id0-grade) without touching the real inode.
+            case Sysno::chown:      return do_chown(r, 0, 1, 2, false);
+            case Sysno::lchown:     return do_chown(r, 0, 1, 2, false);
+            case Sysno::fchownat:   return do_chown(r, 1, 2, 3, true);
+            case Sysno::fchown:     return do_fchown(r);
             case Sysno::truncate:   return path_mut(r, 0, false, Wi::copy_leaf);
             case Sysno::utimes:     return path_mut(r, 0, false, Wi::copy_leaf);
             case Sysno::utime:      return path_mut(r, 0, false, Wi::copy_leaf);
             case Sysno::utimensat:  return path_mut(r, 1, true,  Wi::copy_leaf);
             case Sysno::futimesat:  return path_mut(r, 1, true,  Wi::copy_leaf);
-            // fchmod/ftruncate/fchdir act on an already-open fd (no path) —
-            // the fd is real, so just forward. (fchown is handled above as a
-            // vacuous no-op alongside the other chown forms.)
-            case Sysno::fchmod:
+            // fchmod acts on an already-open fd: record the guest-intended
+            // mode against the fd's bound path in the shadow store, then
+            // forward (the host applies what bits it can). ftruncate/fchdir
+            // carry no metadata, so just forward.
+            case Sysno::fchmod:     return do_fchmod(r);
             case Sysno::ftruncate:
             case Sysno::fchdir:     return fwd();
 
@@ -306,11 +313,11 @@ public:
             //    link translate both; symlink stores its first operand as the
             //    link's literal text (guest-absolute, NOT resolved on the
             //    host) and translates only the destination.
-            case Sysno::rename:     return path_mut2(r, 0, 1, false, false);
-            case Sysno::renameat:   return path_mut2(r, 1, 3, true,  true);
-            case Sysno::renameat2:  return path_mut2(r, 1, 3, true,  true);
-            case Sysno::link:       return path_mut2(r, 0, 1, false, false);
-            case Sysno::linkat:     return path_mut2(r, 1, 3, true,  true);
+            case Sysno::rename:     return path_mut2(r, 0, 1, false, false, true);
+            case Sysno::renameat:   return path_mut2(r, 1, 3, true,  true, true);
+            case Sysno::renameat2:  return path_mut2(r, 1, 3, true,  true, true);
+            case Sysno::link:       return path_mut2(r, 0, 1, false, false, false);
+            case Sysno::linkat:     return path_mut2(r, 1, 3, true,  true, false);
             case Sysno::symlink:    return path_symlink(r, 0, 1, false);
             case Sysno::symlinkat:  return path_symlink(r, 0, 2, true);
 
@@ -499,6 +506,7 @@ private:
             // stat/lstat, arg[2] for newfstatat.
             o.scrub = Outcome::ScrubKind::stat;
             o.scrub_buf = at ? uaddr(r.arg[2]) : uaddr(r.arg[1]);
+            o.scrub_guest_path = abs;
             return o;
         }
         // Virtual stat: forward is impossible, so synthesize a stat64 buffer.
@@ -523,6 +531,7 @@ private:
             o.redirect = true; o.path_arg = 1; o.host_path = std::move(pc.host_path);
             o.scrub = Outcome::ScrubKind::statx;
             o.scrub_buf = uaddr(r.arg[4]);
+            o.scrub_guest_path = abs;
             return o;
         }
         if (pc.realm == kernel::Realm2::virtual_file) {
@@ -744,6 +753,9 @@ private:
         if (pc.realm == kernel::Realm2::virtual_file)
             return eno(Errno::erofs);
         if (pc.host_path.empty()) return eno(pc.error);
+        // A removal drops any shadow record so a fresh file created at the same
+        // path later starts from the host defaults, not a stale owner/mode.
+        if (wi == Wi::remove) k_.files().meta().forget(abs);
         Outcome o{};
         o.redirect = true;
         o.path_arg = path_arg;
@@ -755,6 +767,62 @@ private:
         return o;
     }
 
+    // chmod/fchmodat: RECORD the guest-intended permission bits in the shadow
+    // store keyed by guest path, THEN still redirect the syscall to the host
+    // (so bits the unprivileged host CAN apply take real effect on the inode,
+    // e.g. the executable bit that a real exec needs). The stat overlay later
+    // presents the full guest-intended mode regardless of what the host kept.
+    // The mode argument follows the path: chmod(path,mode) -> arg1;
+    // fchmodat(dirfd,path,mode,flags) -> arg2.
+    [[nodiscard]] Outcome do_chmod(const Regs& r, int path_arg, bool at, Wi wi) {
+        std::string abs = resolve_arg(r, path_arg, at);
+        std::uint32_t mode = static_cast<std::uint32_t>(
+            r.arg[static_cast<std::size_t>(path_arg) + 1]);
+        auto pc = k_.files().classify(abs, /*for_write=*/false, /*follow=*/false);
+        if (pc.realm == kernel::Realm2::virtual_file) return eno(Errno::erofs);
+        if (pc.realm == kernel::Realm2::absent)       return eno(pc.error);
+        k_.files().meta().set_mode(abs, mode);
+        return path_mut(r, path_arg, at, wi);
+    }
+
+    // fchmod(fd, mode): recover the fd's bound guest path, record the mode,
+    // then forward so the host applies what it can on the real fd.
+    [[nodiscard]] Outcome do_fchmod(const Regs& r) {
+        std::string_view gp = k_.files().path_of_fd(static_cast<int>(r.arg[0]));
+        if (!gp.empty())
+            k_.files().meta().set_mode(std::string{gp},
+                                       static_cast<std::uint32_t>(r.arg[1]));
+        return fwd();
+    }
+
+    // chown/lchown/fchownat: RECORD the guest-intended owner in the shadow
+    // store and report success WITHOUT touching the host inode (an unprivileged
+    // host process cannot chown). A later stat overlays the recorded uid/gid.
+    // owner/group args are the two registers after the path (or dirfd+path):
+    // chown(path,uid,gid)=>1,2; fchownat(dirfd,path,uid,gid,flags)=>2,3. A
+    // component of (uid_t)-1 means "leave unchanged" per chown(2).
+    [[nodiscard]] Outcome do_chown(const Regs& r, int path_arg, int uid_arg,
+                                   int gid_arg, bool at) {
+        std::string abs = resolve_arg(r, path_arg, at);
+        auto pc = k_.files().classify(abs, /*for_write=*/false, /*follow=*/false);
+        if (pc.realm == kernel::Realm2::virtual_file) return eno(Errno::erofs);
+        if (pc.realm == kernel::Realm2::absent)       return eno(pc.error);
+        k_.files().meta().set_owner(
+            abs, static_cast<std::uint32_t>(r.arg[static_cast<std::size_t>(uid_arg)]),
+            static_cast<std::uint32_t>(r.arg[static_cast<std::size_t>(gid_arg)]));
+        return val(0);
+    }
+
+    // fchown(fd, uid, gid): same as do_chown but the target is an open fd.
+    [[nodiscard]] Outcome do_fchown(const Regs& r) {
+        std::string_view gp = k_.files().path_of_fd(static_cast<int>(r.arg[0]));
+        if (!gp.empty())
+            k_.files().meta().set_owner(std::string{gp},
+                                        static_cast<std::uint32_t>(r.arg[1]),
+                                        static_cast<std::uint32_t>(r.arg[2]));
+        return val(0);
+    }
+
     // A two-path mutation (rename/link and their *at forms): BOTH operands are
     // guest paths, so translate each to its overlay upper host path and hand
     // the trap two rewrites. rename's *at forms carry (olddirfd, oldpath,
@@ -762,7 +830,7 @@ private:
     // (oldpath, newpath) => args 0 and 1. The source is resolved for REMOVAL
     // (it must already exist), the destination CREATES its leaf.
     [[nodiscard]] Outcome path_mut2(const Regs& r, int a1, int a2, bool at,
-                                    bool /*at2*/) {
+                                    bool /*at2*/, bool move_meta = false) {
         std::string src = resolve_arg(r, a1, at);
         std::string dst = resolve_second(r, a2, at);
         auto ps = k_.files().classify(src, true, false, Wi::copy_leaf);
@@ -772,6 +840,10 @@ private:
             return eno(Errno::erofs);
         if (ps.host_path.empty() || pd.host_path.empty())
             return eno(ps.host_path.empty() ? ps.error : pd.error);
+        // rename carries the shadow metadata with the file (a hardlink/link
+        // does NOT: both names share the inode, so the original keeps its own
+        // record). Do the in-store move BEFORE the redirect returns.
+        if (move_meta) k_.files().meta().rename(src, dst);
         Outcome o{};
         o.redirect     = true;
         o.path_arg     = a1;
@@ -1063,19 +1135,81 @@ public:
     }
 
     // After a host-backed stat/statx REDIRECT returns success, the guest
-    // buffer holds the HOST file's uid/gid. linuxity presents a root-owned
-    // world, so rewrite the owner fields to 0 in place. The field offsets are
-    // the SAME layouts write_statbuf/write_statx synthesize, so there is one
-    // definition of where uid/gid live. No-op unless o.scrub is set.
+    // buffer holds the HOST inode's mode/uid/gid. linuxity presents a root-
+    // owned world AND honors the guest's own chmod/chown history, so we OVERLAY
+    // the shadow metadata store on top of the host result in place:
+    //
+    //   * uid/gid default to 0 (root world), OR to the guest-intended owner if
+    //     the guest chown'd this path (fake_id0-grade coherent ownership).
+    //   * mode keeps the host inode's FILE-TYPE bits (S_IFMT) but takes the
+    //     guest-intended permission+special bits (07777) when the guest chmod'd
+    //     it — so setuid/sticky/0000 round-trip even when the unprivileged host
+    //     silently dropped them.
+    //
+    // The field offsets match the layouts write_statbuf/write_statx synthesize,
+    // so there is one definition of where mode/uid/gid live. No-op unless
+    // o.scrub is set. Reads the current bytes back via copy_in so the host's
+    // real file-type and any bits we keep are preserved.
     void scrub_ids(const Outcome& o) {
         if (o.scrub == Outcome::ScrubKind::none) return;
-        // struct stat (x86-64): st_uid at byte 28, st_gid at byte 32 (both
-        // u32, contiguous). struct statx: stx_uid at 20, stx_gid at 24 (both
-        // u32, contiguous). Zeroing 8 bytes from the uid offset clears both
-        // owner fields without touching neighbours (st_gid's pad / stx_mode).
-        const std::size_t uid_off = o.scrub == Outcome::ScrubKind::stat ? 28 : 20;
-        std::array<std::byte, 8> zero{};   // clears uid AND the adjacent gid
-        (void)mem_.copy_out(uaddr(value(o.scrub_buf) + uid_off), zero);
+        const bool is_statx = o.scrub == Outcome::ScrubKind::statx;
+        // struct stat  (x86-64): st_mode u32 @24, st_uid u32 @28, st_gid @32.
+        // struct statx        : stx_mode u16 @28, stx_uid u32 @20, stx_gid @24.
+        const std::size_t mode_off = is_statx ? 28 : 24;
+        const std::size_t uid_off  = is_statx ? 20 : 28;
+        const std::size_t gid_off  = is_statx ? 24 : 32;
+        const std::uint64_t base = value(o.scrub_buf);
+
+        // The shadow record for this guest path, if the guest ever chmod/chown'd
+        // it. Default (no record) => root-owned, host mode untouched.
+        std::optional<kernel::MetaRecord> rec;
+        if (!o.scrub_guest_path.empty())
+            rec = k_.files().meta().lookup(o.scrub_guest_path);
+
+        // --- uid/gid: default root (0,0); honor recorded owner if present ---
+        std::uint32_t uid = 0, gid = 0;
+        if (rec) {
+            if (rec->have & kernel::MetaRecord::kUid) uid = rec->uid;
+            if (rec->have & kernel::MetaRecord::kGid) gid = rec->gid;
+        }
+        put_u32(base + uid_off, uid);
+        put_u32(base + gid_off, gid);
+
+        // --- mode: overlay the guest-intended permission bits when recorded ---
+        if (rec && (rec->have & kernel::MetaRecord::kMode)) {
+            if (is_statx) {
+                std::uint16_t host_mode = get_u16(base + mode_off);
+                std::uint16_t eff = static_cast<std::uint16_t>(
+                    kernel::MetaStore::effective_mode(host_mode, *rec));
+                put_u16(base + mode_off, eff);
+            } else {
+                std::uint32_t host_mode = get_u32(base + mode_off);
+                put_u32(base + mode_off,
+                        kernel::MetaStore::effective_mode(host_mode, *rec));
+            }
+        }
+    }
+
+    // Small typed guest-memory pokes/peeks for the scrub overlay.
+    void put_u32(std::uint64_t addr, std::uint32_t v) {
+        std::array<std::byte, 4> b{};
+        std::memcpy(b.data(), &v, 4);
+        (void)mem_.copy_out(uaddr(addr), b);
+    }
+    void put_u16(std::uint64_t addr, std::uint16_t v) {
+        std::array<std::byte, 2> b{};
+        std::memcpy(b.data(), &v, 2);
+        (void)mem_.copy_out(uaddr(addr), b);
+    }
+    [[nodiscard]] std::uint32_t get_u32(std::uint64_t addr) {
+        std::array<std::byte, 4> b{};
+        if (!mem_.copy_in(uaddr(addr), b)) return 0;
+        std::uint32_t v = 0; std::memcpy(&v, b.data(), 4); return v;
+    }
+    [[nodiscard]] std::uint16_t get_u16(std::uint64_t addr) {
+        std::array<std::byte, 2> b{};
+        if (!mem_.copy_in(uaddr(addr), b)) return 0;
+        std::uint16_t v = 0; std::memcpy(&v, b.data(), 2); return v;
     }
 };
 
