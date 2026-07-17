@@ -18,6 +18,7 @@
 #include "linuxity/vfs/sysfs.hpp"
 
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -28,6 +29,32 @@
 extern char** environ;
 
 namespace {
+
+// Occupy the low file-descriptor slots (3..8) with harmless /dev/null handles
+// in the freshly forked child, BEFORE it execs the guest. This makes the
+// guest's dynamic fd numbering start above the reserved range — mirroring a
+// process launched from a real login session that inherits several open fds
+// (the terminal, the journal, a dbus socket, ...). It is load-bearing for
+// multi-threaded downloaders: pacman's libcurl workers create a short-lived
+// wakeup fd and open the data file nearly simultaneously; when both compete
+// for the SAME lowest-free descriptor (fd 3 in a bare 0,1,2-only process), a
+// sibling thread's 8-byte wakeup write lands in the data file and corrupts it
+// (observed: core.db gains 32 stray bytes). Holding the low slots open keeps
+// the two on distinct descriptors, exactly as on a normal host. The handles
+// survive execve (no CLOEXEC) so they still occupy the slots while the guest
+// and its forked workers run; /dev/null makes any stray access a no-op.
+void reserve_low_fds() {
+    for (int want = 3; want <= 8; ++want) {
+        int fd = ::open("/dev/null", O_RDWR);
+        if (fd < 0) break;
+        if (fd > want) { ::close(fd); }   // slot already taken; leave it be
+        else if (fd < want) {
+            // Shouldn't happen (we open in ascending order), but never leak.
+            ::close(fd);
+        }
+        // fd == want: keep it open, occupying the slot.
+    }
+}
 
 // If a real cgroup bound was requested but linuxity's OWN cgroup has no
 // delegated controllers (the common unprivileged case), we can't create a
@@ -305,7 +332,28 @@ int main(int argc, char** argv) {
         exec_path = interp_host;             // exec the interpreter itself
     }
     runtime::PtraceTrap trap{exec_path, child_argv, genvp, {},
-                             [&governor]() { governor.join_child(); }};
+                             [&governor]() {
+                                 governor.join_child();
+                                 // Occupy a handful of low file descriptors so
+                                 // the guest's dynamic fd allocation starts
+                                 // above them — exactly like a normal process
+                                 // launched from a shell/login session that
+                                 // inherits several open fds. Without this the
+                                 // guest allocates from fd 3, and a program
+                                 // that races a short-lived control fd (e.g.
+                                 // curl_multi's wakeup eventfd in pacman's
+                                 // download workers) against a data file can
+                                 // see BOTH land on the same low number and
+                                 // corrupt the file. Point the reservations at
+                                 // /dev/null so they are harmless and let them
+                                 // survive execve (NOT CLOEXEC) so they still
+                                 // occupy the low slots once the guest program
+                                 // and its forked download workers are running
+                                 // — which is precisely when the collision would
+                                 // otherwise occur. Inheriting a few open fds is
+                                 // exactly what a shell-launched process sees.
+                                 reserve_low_fds();
+                             }};
 
     // PtraceTrap is BOTH the trap backend and the guest-memory accessor
     // (it shares the child's real pages via process_vm_readv/writev).
