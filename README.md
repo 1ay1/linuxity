@@ -252,6 +252,52 @@ linuxity's own tiny pid space, root = pid 1, real argv captured at `exec`). So
 `/proc` — and every monitor reading it — reflects linuxity's real, live
 processes, not the host's.
 
+### Bounding the guest: two numbers, kept equal
+
+linuxity is an ABI translator, not a hypervisor, so it never *partitions*
+hardware — the guest runs native and draws memory/CPU straight from the host's
+global pool via **forwarded** `mmap`/`brk`. But because the guest is a real
+host process tree, it is **cgroup-able like any other process**, so "how much
+it gets" becomes a policy the host kernel enforces:
+
+```
+linuxity --root /alpine --memory 512M --cpus 2 --pids 256 /sbin/apk add ...
+```
+
+There are **two** numbers a program cares about, and linuxity keeps them equal:
+
+- **Belief** — what the guest *reads* (`sysinfo`, `/proc/meminfo`,
+  `/proc/cpuinfo`, `sched_getaffinity`), so it sizes its caches and thread
+  pools sensibly. This comes from the `MachineSpec`.
+- **Enforced reality** — what the host kernel actually *lets* it consume.
+
+A single `ResourceSpec` drives BOTH: it (a) writes the host-side bound and (b)
+**derives** the `MachineSpec` the guest sees (`--memory 512M` → `MemTotal:
+524288 kB`; `--cpus 2` → `nproc` = 2). So a program that sizes a cache to "half
+of RAM" fits inside `memory.max` instead of being OOM-killed — belief == the
+number you asked to be bounded to, by construction.
+
+Enforcement is **best-effort with graceful fallback** (the Docker-rootless /
+Termux discipline):
+
+1. **cgroup v2** — a `payload` cgroup under linuxity's own delegated subtree
+   gets `memory.max` / `cpu.max` / `pids.max` / `cpuset.cpus`. When the
+   session's controllers aren't yet delegated (the common unprivileged case),
+   linuxity **re-execs itself through `systemd-run --user --scope`** to obtain
+   a delegated scope, then moves itself into a `supervisor` leaf so it can
+   enable the controllers (cgroup v2's "no internal processes" rule). This is
+   the precise, kernel-enforced bound.
+2. **`setrlimit`** — where no cgroup can be created, `RLIMIT_AS` bounds address
+   space as a coarse memory ceiling. (`--pids` is deliberately NOT mapped to
+   `RLIMIT_NPROC`, which counts the whole login session, not just the guest
+   tree.)
+
+Proven: a guest touching 800 MB under `--memory 256M` is stopped by the host
+kernel at ~240 MB (uncapped, the same binary reaches 800 MB); `--pids 32`
+stops a fork bomb at 32 tasks; `apk add` installs a package unbounded AND under
+a 400 MB cap. The default (no flags) is fully unbounded native speed — the
+guest is just another host process.
+
 The road ahead: overlay directory-read UNION (getdents merge of lower+upper),
 live advancing `/proc` CPU counters, and richer `futex`/`epoll` coverage for
 heavily-threaded programs. The architecture is fixed and machine-checked.

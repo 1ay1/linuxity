@@ -57,3 +57,7 @@ add_test(NAME run_open_procfs COMMAND test_run_open_procfs)
 add_executable(test_run_mutate test_run_mutate.cpp)
 target_link_libraries(test_run_mutate PRIVATE linuxity_core)
 add_test(NAME run_mutate COMMAND test_run_mutate)
+
+add_executable(test_resources test_resources.cpp)
+target_link_libraries(test_resources PRIVATE linuxity_core)
+add_test(NAME resources COMMAND test_resources)

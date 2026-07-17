@@ -8,41 +8,144 @@
 // our kernel.
 #include "linuxity/host/posix_host.hpp"
 #include "linuxity/kernel/kernel.hpp"
+#include "linuxity/kernel/resources.hpp"
 #include "linuxity/loader/interp.hpp"
 #include "linuxity/runtime/ptrace_trap.hpp"
+#include "linuxity/runtime/resource_governor.hpp"
 #include "linuxity/runtime/trap.hpp"
 #include "linuxity/vfs/procfs.hpp"
 #include "linuxity/vfs/sysfs.hpp"
 
 #include <sys/stat.h>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 #include <unistd.h>
 
 extern char** environ;
 
+namespace {
+
+// If a real cgroup bound was requested but linuxity's OWN cgroup has no
+// delegated controllers (the common unprivileged case), we can't create a
+// child cgroup with live limit files. systemd, which owns the user session
+// hierarchy, CAN carve out a properly-delegated scope for us. So re-exec the
+// whole linuxity invocation inside `systemd-run --user --scope`: the guest
+// then launches under a delegated scope where ResourceGovernor's direct-cgroup
+// path works precisely. An env marker breaks the recursion, and if systemd-run
+// is absent we simply proceed (the governor falls back to setrlimit).
+void maybe_reexec_delegated(int argc, char** argv, bool want_cgroup) {
+    if (!want_cgroup) return;
+    if (std::getenv("LINUXITY_DELEGATED")) return;   // already re-exec'd
+    // Probe: does our own cgroup already delegate cpu+memory? If so, the
+    // governor can create a child directly — no need to involve systemd.
+    if (std::FILE* f = std::fopen("/proc/self/cgroup", "r")) {
+        char line[4096]; std::string rel;
+        while (std::fgets(line, sizeof line, f)) {
+            if (std::strncmp(line, "0::", 3) == 0) {
+                rel = line + 3;
+                if (!rel.empty() && rel.back() == '\n') rel.pop_back();
+            }
+        }
+        std::fclose(f);
+        std::string sc = "/sys/fs/cgroup" + (rel == "/" ? std::string{} : rel) +
+                         "/cgroup.subtree_control";
+        if (std::FILE* s = std::fopen(sc.c_str(), "r")) {
+            char ctl[256] = {0}; (void)!std::fgets(ctl, sizeof ctl, s);
+            std::fclose(s);
+            if (std::strstr(ctl, "memory") || std::strstr(ctl, "cpu"))
+                return;   // already delegated, direct path will work
+        }
+    }
+    // Need systemd-run to carve a delegated scope. Absent => proceed to rlimit.
+    if (::access("/usr/bin/systemd-run", X_OK) != 0 &&
+        ::access("/bin/systemd-run", X_OK) != 0)
+        return;
+
+    std::vector<char*> a;
+    a.push_back(const_cast<char*>("systemd-run"));
+    a.push_back(const_cast<char*>("--user"));
+    a.push_back(const_cast<char*>("--scope"));
+    a.push_back(const_cast<char*>("-q"));
+    // Delegate the controllers into the new scope so OUR child cgroup can set
+    // limits; --pty would forward the tty, but linuxity's guest inherits our
+    // stdio directly, so a plain scope suffices.
+    a.push_back(const_cast<char*>("-p"));
+    a.push_back(const_cast<char*>("Delegate=yes"));
+    a.push_back(const_cast<char*>("--"));
+    for (int j = 0; j < argc; ++j) a.push_back(argv[j]);
+    a.push_back(nullptr);
+    ::setenv("LINUXITY_DELEGATED", "1", 1);
+    ::execvp("systemd-run", a.data());
+    // execvp only returns on failure; fall through to run un-delegated.
+    ::unsetenv("LINUXITY_DELEGATED");
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
     using namespace lx;
 
-    // Optional: `--root <dir>` chroots the guest into an extracted rootfs
-    // before running the program (the 'install any distro' entry point).
+    // Parse leading flags: `--root <dir>` mounts a rootfs; the resource flags
+    // (`--cpus N`, `--memory SZ`, `--memory-swap SZ`, `--pids N`, `--cpuset
+    // LIST`) BOUND the guest tree via the host kernel (cgroup v2 / rlimit) and
+    // DERIVE the machine the guest believes it has, so belief == enforced
+    // reality. Flags may appear in any order before the program.
     std::string root;
+    kernel::ResourceSpec res;
     int i = 1;
-    if (i + 1 < argc && std::string(argv[i]) == "--root") {
-        root = argv[i + 1];
-        i += 2;
+    auto need = [&](const char* what) -> const char* {
+        if (i + 1 >= argc) {
+            std::fprintf(stderr, "linuxity: %s needs an argument\n", what);
+            std::exit(2);
+        }
+        return argv[++i];
+    };
+    for (; i < argc; ++i) {
+        std::string f = argv[i];
+        if (f == "--root") { root = need("--root"); }
+        else if (f == "--cpus")        { res.cpus = std::atof(need("--cpus")); }
+        else if (f == "--memory" || f == "-m") {
+            if (auto b = kernel::parse_bytes(need("--memory"))) res.mem_max = *b;
+            else { std::fprintf(stderr, "linuxity: bad --memory size\n"); return 2; }
+        }
+        else if (f == "--memory-swap") {
+            if (auto b = kernel::parse_bytes(need("--memory-swap"))) res.swap_and_mem_max = *b;
+            else { std::fprintf(stderr, "linuxity: bad --memory-swap size\n"); return 2; }
+        }
+        else if (f == "--pids")   { res.pids_max = std::strtoull(need("--pids"), nullptr, 10); }
+        else if (f == "--cpuset") { res.cpuset = need("--cpuset"); }
+        else break;   // first non-flag: the program
     }
 
     if (i >= argc) {
         std::fprintf(stderr,
-            "usage: %s [--root <rootfs-dir>] <program> [args...]\n"
+            "usage: %s [OPTIONS] <program> [args...]\n"
             "  Runs a native Linux binary; its syscalls are serviced by the\n"
             "  linuxity runtime (native speed, no VM, no emulation).\n"
-            "  --root mounts an extracted distro rootfs as the guest '/'.\n",
+            "\n"
+            "  --root <dir>        mount an extracted distro rootfs as guest '/'\n"
+            "  --cpus <N>          bound CPU to N cores' worth (e.g. 1.5)\n"
+            "  --memory <SZ>       hard memory ceiling (e.g. 512M, 2G)\n"
+            "  --memory-swap <SZ>  combined memory+swap ceiling\n"
+            "  --pids <N>          max tasks in the guest tree (fork-bomb guard)\n"
+            "  --cpuset <LIST>     pin to CPUs (e.g. 0-1, 0,2,4)\n"
+            "\n"
+            "  The resource bounds are enforced by the HOST kernel (cgroup v2,\n"
+            "  or setrlimit where a cgroup can't be created unprivileged) and\n"
+            "  the guest's /proc, /sys and sysinfo are derived to MATCH them.\n",
             argv[0]);
         return 2;
     }
+
+    // If a hard bound was asked for, try to run under a delegated cgroup scope
+    // (via systemd-run) so the enforcement is precise. This re-execs the whole
+    // process; on return we are either delegated or proceeding with fallback.
+    maybe_reexec_delegated(argc, argv, res.mem_max.has_value() ||
+                                       res.cpus.has_value() ||
+                                       res.pids_max.has_value());
 
     std::string path = argv[i];
     std::vector<std::string> gargv;
@@ -74,8 +177,21 @@ int main(int argc, char** argv) {
         spec.mem_total = std::uint64_t{2048} << 20;   // 2 GiB
         spec.release = "6.6.0-linuxity";
         spec.nodename = "linuxity";
+        // Fold the enforced resource policy INTO the advertised machine, so a
+        // program that sizes its caches to "half of RAM" or starts "one worker
+        // per CPU" shapes itself to the bound it will actually be held to —
+        // belief == enforced reality (kernel/resources.hpp::advertise).
+        spec = res.advertise(std::move(spec));
         k.set_machine(std::move(spec));
     }
+
+    // Establish the host-side enforcement for the guest tree. The governor
+    // creates a cgroup v2 subtree (when the controllers are delegated — e.g.
+    // after the systemd-run re-exec above) or installs rlimit fallbacks; the
+    // child adopts it via the pre-exec hook so every descendant inherits it.
+    runtime::ResourceGovernor governor{res};
+    if (std::string how = governor.describe(); !how.empty())
+        std::fprintf(stderr, "linuxity: %s\n", how.c_str());
 
     // Seed the process table: pid 1 is our init (the traced root). Its
     // cmdline is the program we're about to run, so /proc/1/cmdline is real.
@@ -153,7 +269,8 @@ int main(int argc, char** argv) {
             child_argv.push_back(gargv[j]);  // the guest program's args
         exec_path = interp_host;             // exec the interpreter itself
     }
-    runtime::PtraceTrap trap{exec_path, child_argv, genvp, {}};
+    runtime::PtraceTrap trap{exec_path, child_argv, genvp, {},
+                             [&governor]() { governor.join_child(); }};
 
     // PtraceTrap is BOTH the trap backend and the guest-memory accessor
     // (it shares the child's real pages via process_vm_readv/writev).

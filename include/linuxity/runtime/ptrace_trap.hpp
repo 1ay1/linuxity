@@ -46,9 +46,11 @@ namespace lx::runtime {
 class PtraceTrap {
 public:
     PtraceTrap(std::string path, std::vector<std::string> argv,
-               std::vector<std::string> envp = {}, std::string root = {})
+               std::vector<std::string> envp = {}, std::string root = {},
+               std::function<void()> pre_exec = {})
         : path_{std::move(path)}, argv_{std::move(argv)},
-          envp_{std::move(envp)}, root_{std::move(root)} {}
+          envp_{std::move(envp)}, root_{std::move(root)},
+          pre_exec_{std::move(pre_exec)} {}
 
     [[nodiscard]] Status start(UAddr, UAddr) {
         ::pid_t pid = ::fork();
@@ -57,6 +59,11 @@ public:
             if (!root_.empty()) {
                 if (::chroot(root_.c_str()) == 0) (void)::chdir("/");
             }
+            // Bound this task (and, by inheritance, every descendant) BEFORE
+            // it starts running: the child writes its own pid into the
+            // resource cgroup and installs rlimit fallbacks. Runs pre-TRACEME
+            // so enforcement is in effect the instant the guest's _start runs.
+            if (pre_exec_) pre_exec_();
             ::ptrace(PTRACE_TRACEME, 0, nullptr, nullptr);
             std::vector<char*> cargv;
             for (auto& a : argv_) cargv.push_back(a.data());
@@ -607,6 +614,7 @@ private:
     std::vector<std::string> argv_;
     std::vector<std::string> envp_;
     std::string root_;
+    std::function<void()> pre_exec_;   // child hook (post-fork, pre-execve)
     std::vector<ProcEvent> proc_events_;
     std::unordered_map<::pid_t, std::int32_t> gpid_;   // host tid -> guest pid
     std::unordered_map<std::int32_t, std::int32_t> gppid_; // guest pid -> ppid
