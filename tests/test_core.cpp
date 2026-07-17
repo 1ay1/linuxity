@@ -34,6 +34,11 @@ struct MockKernel {
     kernel::FileNamespace fns{};
     kernel::FileNamespace& files() noexcept { return fns; }
 
+    // The virtual process table /proc (and readlink /proc/self/exe) reads.
+    kernel::ProcessTable ptab{};
+    kernel::ProcessTable& procs() noexcept { return ptab; }
+    const kernel::ProcessTable& procs() const noexcept { return ptab; }
+
     // Memory
     Result<UAddr> mmap(UAddr, std::size_t) { return ok(uaddr(0x1000)); }
     Status munmap(UAddr, std::size_t) { return ok(); }

@@ -14,6 +14,7 @@
 #include "linuxity/abi/sysno.hpp"
 #include "linuxity/abi/types.hpp"
 #include "linuxity/kernel/file_namespace.hpp"
+#include "linuxity/kernel/process_table.hpp"
 #include "linuxity/kernel/subsystem.hpp"
 
 #include <array>
@@ -114,20 +115,37 @@ public:
                 return sig(static_cast<std::int32_t>(r.arg[1]),
                            static_cast<std::int32_t>(r.arg[2]));
 
-            // -- identity + credentials (virtual: our world is pid 1, root)
-            case Sysno::getpid:  return val(k_.self().raw());
-            case Sysno::gettid:  return val(k_.self().raw());
+            // -- identity + credentials. Each task answers with ITS OWN
+            //    guest pid/tid/ppid (from the trap's live task map) so every
+            //    process sees a coherent identity, not a fixed "pid 1". A
+            //    backend without the identity bridge falls back to init.
+            case Sysno::getpid:  return val(ids().pid);
+            case Sysno::gettid:  return val(ids().tid);
+            case Sysno::getppid: return val(ids().ppid);
             case Sysno::getuid:  case Sysno::geteuid:
             case Sysno::getgid:  case Sysno::getegid:
                 return val(0);
 
             // -- benign process-init syscalls libc issues early ----------
-            // Serviced trivially so _start proceeds; they carry no host
-            // resource we need to allocate.
+            // set_tid_address carries no host resource; serve it trivially so
+            // _start proceeds (return a plausible tid).
             case Sysno::set_tid_address:
+                return val(ids().tid);
+
+            // -- signal state MUST reach the real host task. rt_sigaction
+            //    installs the guest's handler/disposition and
+            //    rt_sigprocmask sets its blocked mask; if we faked success
+            //    the host task would have NO handler and our delivered
+            //    signal would kill it instead of running the guest's handler.
+            //    Forward them so the traced task's real sigaction table and
+            //    blocked mask match what the guest asked for.
             case Sysno::rt_sigaction:
             case Sysno::rt_sigprocmask:
-                return val(0);
+            case Sysno::rt_sigpending:
+            case Sysno::rt_sigsuspend:
+            case Sysno::rt_sigreturn:
+            case Sysno::sigaltstack:
+                return fwd();
 
             // -- uname (virtual: report LINUXITY's identity, not the host)
             // The guest must believe it runs on linuxity, so we synthesize
@@ -136,9 +154,23 @@ public:
             case Sysno::uname:
                 return do_uname(uaddr(r.arg[0]));
 
-            // -- getppid: our init has no parent; getpgrp: our group is 1.
-            case Sysno::getppid: return val(0);
-            case Sysno::getpgrp: return val(k_.self().raw());
+            // -- getpgrp: our process group is the caller's own pid.
+            case Sysno::getpgrp: return val(ids().pid);
+
+            // -- process groups & sessions. These read/write PIDs, so
+            //    forwarding would leak host pgids/sids into linuxity's world.
+            //    We model a flat namespace: a task's group and session are
+            //    its own pid (or the argument for get*id of another task).
+            case Sysno::getpgid:
+                return val(r.arg[0] ? static_cast<std::int64_t>(r.arg[0])
+                                    : ids().pid);
+            case Sysno::getsid:
+                return val(r.arg[0] ? static_cast<std::int64_t>(r.arg[0])
+                                    : ids().pid);
+            case Sysno::setpgid:  return val(0);   // accepted, flat model
+            case Sysno::setsid:   return val(ids().pid);  // new session == pid
+            case Sysno::getpriority: return val(0);       // nice 0
+            case Sysno::setpriority: return val(0);
 
             // -- the filesystem namespace (virtual: the guest's whole tree
             //    is linuxity's; host-backed paths get translated + forwarded,
@@ -154,8 +186,8 @@ public:
             case Sysno::statx:       return path_statx(r);
             case Sysno::faccessat:
             case Sysno::faccessat2:  return path_at(r, 1, true);
-            case Sysno::readlink:    return path_at(r, 0, false);
-            case Sysno::readlinkat:  return path_at(r, 1, true);
+            case Sysno::readlink:    return do_readlink(r, 0, false);
+            case Sysno::readlinkat:  return do_readlink(r, 1, true);
             case Sysno::getcwd:      return do_getcwd(r);
             case Sysno::getdents64:  return do_getdents64(r);
 
@@ -189,6 +221,21 @@ private:
         return o;
     }
     static Outcome eno(Errno e) { return val(-static_cast<std::int64_t>(e)); }
+
+    // The trapped task's guest identity. When the memory backend also exposes
+    // the live task map (the ptrace trap does), report that task's real
+    // pid/tid/ppid; otherwise fall back to init (pid 1, ppid 0) so the
+    // dispatcher stays usable with a bare GuestMem in tests.
+    struct Ids { std::int32_t pid, tid, ppid; };
+    [[nodiscard]] Ids ids() {
+        if constexpr (requires { mem_.current_ids(); }) {
+            auto t = mem_.current_ids();
+            return Ids{t.pid, t.tid, t.ppid};
+        } else {
+            return Ids{static_cast<std::int32_t>(k_.self().raw()), 
+                       static_cast<std::int32_t>(k_.self().raw()), 0};
+        }
+    }
 
     // Read a NUL-terminated C string from guest memory (bounded).
     [[nodiscard]] std::string read_cstr(UAddr a) {
@@ -316,6 +363,90 @@ private:
         }
         if (pc.realm == kernel::Realm2::virtual_file) return val(0);
         return eno(pc.error);
+    }
+
+    // readlink[at]: host-backed symlinks redirect to the real path; the
+    // virtual /proc symlinks (self/exe, <pid>/exe, self/cwd, self/root,
+    // self/fd/N) are SYNTHESIZED here, since a monitor / dynamic loader /
+    // language runtime routinely reads /proc/self/exe to find its own binary.
+    [[nodiscard]] Outcome do_readlink(const Regs& r, int path_arg, bool at) {
+        std::string abs = resolve_arg(r, path_arg, at);
+        // The buffer + size follow the path arg: readlink(path,buf,sz) ->
+        // arg1/arg2; readlinkat(dirfd,path,buf,sz) -> arg2/arg3.
+        std::size_t bi = static_cast<std::size_t>(path_arg) + 1;
+        UAddr buf = uaddr(r.arg[bi]);
+        std::size_t cap = static_cast<std::size_t>(r.arg[bi + 1]);
+
+        if (std::string tgt = proc_symlink_target(abs); !tgt.empty())
+            return write_link(buf, cap, tgt);
+
+        auto pc = k_.files().classify(abs);
+        if (pc.realm == kernel::Realm2::host_backed) {
+            Outcome o{};
+            o.redirect = true; o.path_arg = path_arg;
+            o.host_path = std::move(pc.host_path);
+            return o;
+        }
+        if (pc.realm == kernel::Realm2::virtual_file)
+            return eno(Errno::einval);   // a virtual file is not a symlink
+        return eno(pc.error);
+    }
+
+    // The target of a synthesized /proc symlink, or "" if `abs` is not one.
+    // self/<pid> both resolve against the CURRENT task (linuxity runs one
+    // guest tree; the monitor asks about its own members).
+    [[nodiscard]] std::string proc_symlink_target(const std::string& abs) {
+        auto id = ids();
+        auto exe_of = [&](std::int32_t pid) -> std::string {
+            if (const auto* pi = k_.procs().find(pid)) {
+                // cmdline is space-joined argv; the first token is argv[0].
+                std::string c = pi->cmdline;
+                auto sp = c.find(' ');
+                std::string a0 = sp == std::string::npos ? c : c.substr(0, sp);
+                // Only an ABSOLUTE argv[0] is a valid exe link target; a bare
+                // name ("linuxity", "bash") or the spawn placeholder is not,
+                // so we leave the link to the host-backed /proc (redirect).
+                if (!a0.empty() && a0[0] == '/' && a0 != "(spawning)") return a0;
+            }
+            return {};
+        };
+        // /proc/self/exe  and  /proc/<pid>/exe
+        if (abs == "/proc/self/exe") return exe_of(id.pid);
+        constexpr std::string_view kProc = "/proc/";
+        if (abs.rfind(kProc, 0) == 0) {
+            std::string rest = abs.substr(kProc.size());
+            auto slash = rest.find('/');
+            if (slash != std::string::npos) {
+                std::string who = rest.substr(0, slash);
+                std::string tail = rest.substr(slash + 1);
+                std::int32_t pid = (who == "self" || who == "thread-self")
+                                       ? id.pid : atoi_safe(who);
+                if (pid > 0) {
+                    if (tail == "exe")  return exe_of(pid);
+                    if (tail == "cwd")  return std::string{k_.files().cwd()};
+                    if (tail == "root") return "/";
+                }
+            }
+        }
+        return {};
+    }
+
+    static std::int32_t atoi_safe(const std::string& s) {
+        std::int32_t v = 0;
+        for (char c : s) { if (c < '0' || c > '9') return -1; v = v * 10 + (c - '0'); }
+        return s.empty() ? -1 : v;
+    }
+
+    // Write a readlink target (NOT NUL-terminated, per readlink(2)) into the
+    // guest buffer, truncated to `cap`; returns the number of bytes written.
+    [[nodiscard]] Outcome write_link(UAddr buf, std::size_t cap,
+                                     const std::string& tgt) {
+        std::size_t n = tgt.size() < cap ? tgt.size() : cap;
+        std::vector<std::byte> bytes(n);
+        for (std::size_t i = 0; i < n; ++i)
+            bytes[i] = static_cast<std::byte>(tgt[i]);
+        if (n && !mem_.copy_out(buf, bytes)) return eno(Errno::efault);
+        return val(static_cast<std::int64_t>(n));
     }
 
     // execve/execveat: rewrite the program-path argument to the translated

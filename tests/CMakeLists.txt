@@ -41,3 +41,7 @@ add_test(NAME run_multiproc COMMAND test_run_multiproc)
 add_executable(test_run_signal test_run_signal.cpp)
 target_link_libraries(test_run_signal PRIVATE linuxity_core)
 add_test(NAME run_signal COMMAND test_run_signal)
+
+add_executable(test_run_identity test_run_identity.cpp)
+target_link_libraries(test_run_identity PRIVATE linuxity_core)
+add_test(NAME run_identity COMMAND test_run_identity)

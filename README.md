@@ -135,7 +135,19 @@ linuxity services their syscalls. Proofs of the model:
   signal an unrelated host task). The runtime translates the target to the
   traced task's real host tid and delivers the signal there — a shell can
   background `sleep 30 &` then `kill`/`kill -9` it, `kill -0` probes liveness,
-  and an unknown pid returns `ESRCH`.
+  and an unknown pid returns `ESRCH`. Signal **dispositions and masks**
+  (`rt_sigaction`/`rt_sigprocmask`) are forwarded to the real task, so a guest
+  `SIGTERM` handler actually **runs** instead of the process being killed.
+- **Every task has a coherent identity.** `getpid`/`gettid`/`getppid`/
+  `getpgid`/`getsid`/`setsid` answer from the trap's live task map, so a forked
+  child sees its *own* pid with its parent's pid — not a fixed “pid 1”. init is
+  pid 1 with ppid 0.
+- **`/proc/self/exe` (and `<pid>/exe`, `cwd`, `root`) are synthesized** against
+  linuxity's namespace, so a dynamic loader or runtime that finds its own
+  binary reads the guest path (`/bin/foo`), never the host path.
+- **Shell pipelines work.** `echo a b | wc -w`, `... | tr ... | wc -l`, loops,
+  `awk`, backgrounded jobs — the whole forked pipeline stays in linuxity's
+  namespace and its members signal, wait on, and enumerate each other correctly.
 
 ### How the filesystem is virtualized
 
@@ -182,9 +194,9 @@ exactly the same virtual namespace as its parent shell; it never escapes to
 the host filesystem.
 
 Memory (`mmap`/`brk`/`mprotect`) stays forwarded so native libc reaches
-`main()`; identity, credentials, lifecycle, `uname`, **signal delivery**, and
-now the **whole file path** are virtualized. In place and proven by 11 test
-suites:
+`main()`; identity, credentials, lifecycle, `uname`, **signal delivery**,
+**per-task pid/session identity**, **`/proc` symlinks**, and now the **whole
+file path** are virtualized. In place and proven by 12 test suites:
 
 - the type algebra, subsystem concept lattice, and authority boundary;
 - a real **VFS** (mount table, path resolution) with **tmpfs** and a

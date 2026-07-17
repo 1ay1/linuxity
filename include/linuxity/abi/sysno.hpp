@@ -35,6 +35,14 @@ enum class Sysno {
     access, faccessat, faccessat2, dup, dup2, dup3, fcntl,
     // Namespace / mount ops we own.
     mount, umount2, getpgrp, getppid, sysinfo, sched_getaffinity,
+    // Time (virtualized to linuxity's own boot epoch + monotonic clock).
+    clock_gettime, gettimeofday, time, clock_getres, times,
+    // Resource limits & usage.
+    getrlimit, setrlimit, prlimit64, getrusage,
+    // Signal state (per-task mask + disposition table).
+    rt_sigreturn, rt_sigpending, rt_sigsuspend, sigaltstack,
+    // Session / process-group control.
+    setpgid, getpgid, setsid, getsid, getpriority, setpriority,
 };
 
 // Decode an arch-specific raw syscall number into the canonical identity.
@@ -101,6 +109,25 @@ enum class Sysno {
                 case 269: return Sysno::faccessat;
                 case 292: return Sysno::dup3;
                 case 204: return Sysno::sched_getaffinity;
+                case 228: return Sysno::clock_gettime;
+                case 229: return Sysno::clock_getres;
+                case 96:  return Sysno::gettimeofday;
+                case 201: return Sysno::time;
+                case 100: return Sysno::times;
+                case 97:  return Sysno::getrlimit;
+                case 160: return Sysno::setrlimit;
+                case 302: return Sysno::prlimit64;
+                case 98:  return Sysno::getrusage;
+                case 15:  return Sysno::rt_sigreturn;
+                case 127: return Sysno::rt_sigpending;
+                case 130: return Sysno::rt_sigsuspend;
+                case 131: return Sysno::sigaltstack;
+                case 109: return Sysno::setpgid;
+                case 121: return Sysno::getpgid;
+                case 112: return Sysno::setsid;
+                case 124: return Sysno::getsid;
+                case 140: return Sysno::getpriority;
+                case 141: return Sysno::setpriority;
                 case 332: return Sysno::statx;
                 case 439: return Sysno::faccessat2;
                 default:  return Sysno::unknown;
@@ -156,6 +183,22 @@ enum class Sysno {
                 case 179: return Sysno::sysinfo;
                 case 173: return Sysno::getppid;
                 case 123: return Sysno::sched_getaffinity;
+                case 113: return Sysno::clock_gettime;
+                case 114: return Sysno::clock_getres;
+                case 169: return Sysno::gettimeofday;
+                case 153: return Sysno::times;
+                case 261: return Sysno::prlimit64;
+                case 165: return Sysno::getrusage;
+                case 139: return Sysno::rt_sigreturn;
+                case 136: return Sysno::rt_sigpending;
+                case 133: return Sysno::rt_sigsuspend;
+                case 132: return Sysno::sigaltstack;
+                case 154: return Sysno::setpgid;
+                case 155: return Sysno::getpgid;
+                case 157: return Sysno::setsid;
+                case 156: return Sysno::getsid;
+                case 141: return Sysno::getpriority;
+                case 140: return Sysno::setpriority;
                 default:  return Sysno::unknown;
             }
     }

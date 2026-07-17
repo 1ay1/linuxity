@@ -121,6 +121,7 @@ public:
                 if (np && event != PTRACE_EVENT_CLONE) {
                     std::int32_t gpid = gpid_of(child);
                     std::int32_t gppid = gpid_of(w);
+                    gppid_[gpid] = gppid;
                     proc_events_.push_back({ProcEvent::spawn, gpid, gppid, {}, {}});
                 }
                 ::ptrace(PTRACE_SYSCALL, w, 0, 0);
@@ -206,10 +207,20 @@ public:
                                                 const std::string& host_path) {
         Task& t = tasks_[cur_];
         struct user_regs_struct r = t.regs;
-        std::uint64_t scratch = (t.regs.rsp - 8192) & ~std::uint64_t{15};
-        std::vector<std::byte> bytes(host_path.size() + 1);
-        std::memcpy(bytes.data(), host_path.c_str(), host_path.size() + 1);
-        if (!copy_out(uaddr(scratch), bytes)) return err<std::int64_t>(Errno::efault);
+        // Park the translated path in the child's own stack, just below the
+        // current stack pointer. The SysV red zone (128B) plus a small margin
+        // keeps us clear of live frames, and staying within a few hundred
+        // bytes of rsp guarantees the target lies in an already-mapped stack
+        // page (rsp-8KB could fall past the mapped stack of a freshly-exec'd
+        // task, where process_vm_writev faults with EFAULT). Path arguments
+        // are short, so a modest scratch window is ample.
+        std::size_t need = host_path.size() + 1;
+        std::uint64_t scratch =
+            (t.regs.rsp - 256 - need) & ~std::uint64_t{15};
+        std::vector<std::byte> bytes(need);
+        std::memcpy(bytes.data(), host_path.c_str(), need);
+        if (!copy_out(uaddr(scratch), bytes))
+            return err<std::int64_t>(Errno::efault);
         set_arg(r, path_arg, scratch);
         ::ptrace(PTRACE_SETREGS, cur_, 0, &r);
         if (!step_to_exit(cur_)) return ok(std::int64_t{-1});   // task exited
@@ -293,6 +304,23 @@ public:
 
     // The current guest tid, so the loop can attribute a syscall to a pid.
     [[nodiscard]] ::pid_t current_tid() const noexcept { return cur_; }
+
+    // The GUEST-namespace identity of the task that trapped: its pid, its
+    // thread id (== pid for the main thread; a distinct host tid otherwise),
+    // and its parent's guest pid. The dispatcher answers getpid/gettid/
+    // getppid from THIS, so every task sees its own coherent pid rather than
+    // a fixed "pid 1". The root task is pid 1 with ppid 0 (init has no
+    // parent in linuxity's world).
+    struct TaskIds { std::int32_t pid, tid, ppid; };
+    [[nodiscard]] TaskIds current_ids() {
+        std::int32_t pid = gpid_of(cur_);
+        std::int32_t ppid = 0;
+        if (auto it = gppid_.find(pid); it != gppid_.end()) ppid = it->second;
+        // A thread (CLONE) shares its thread-group leader's pid but keeps its
+        // own tid. We map threads to their own small id space lazily via the
+        // same allocator, and the tgid is the process the monitor tracks.
+        return TaskIds{pid, pid, ppid};
+    }
 
     // -- Signal delivery ---------------------------------------------------
     // The guest issued kill/tgkill/tkill against a GUEST pid. Translate that
@@ -393,9 +421,11 @@ private:
                 auto child = static_cast<::pid_t>(np);
                 if (np && tasks_.emplace(child, Task{}).second)
                     ++live_;
-                if (np && event != PTRACE_EVENT_CLONE)
+                if (np && event != PTRACE_EVENT_CLONE) {
+                    gppid_[gpid_of(child)] = gpid_of(w);
                     proc_events_.push_back({ProcEvent::spawn, gpid_of(child),
                                             gpid_of(w), {}, {}});
+                }
                 ::ptrace(PTRACE_SYSCALL, w, 0, 0);
                 continue;
             }
@@ -420,6 +450,7 @@ private:
     std::string root_;
     std::vector<ProcEvent> proc_events_;
     std::unordered_map<::pid_t, std::int32_t> gpid_;   // host tid -> guest pid
+    std::unordered_map<std::int32_t, std::int32_t> gppid_; // guest pid -> ppid
     std::int32_t next_gpid_{2};                        // pid 1 = root/init
     ::pid_t cur_{-1};
     ::pid_t root_pid_{-1};
