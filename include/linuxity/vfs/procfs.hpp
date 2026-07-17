@@ -17,12 +17,26 @@
 #include "linuxity/kernel/file_namespace.hpp"
 #include "linuxity/kernel/process_table.hpp"
 
+#include <chrono>
+#include <cstdio>
 #include <string>
 #include <string_view>
 
 namespace lx::vfs {
 
 namespace detail {
+
+// Seconds of "virtual uptime" elapsed since the producer was first built.
+// linuxity boots when the runtime starts; /proc/uptime, /proc/stat jiffies
+// and boot time all derive from this ONE monotonic origin so a monitor sees
+// a coherent, ADVANCING clock. A process monitor computes CPU% from the
+// DELTA of /proc/stat jiffies between two reads a second apart, so the
+// counters must move with real time or every core reads 0.0%.
+[[nodiscard]] inline double uptime_seconds() {
+    static const auto boot = std::chrono::steady_clock::now();
+    return std::chrono::duration<double>(
+               std::chrono::steady_clock::now() - boot).count();
+}
 
 inline kernel::VirtualFile text_file(std::string s) {
     kernel::VirtualFile vf;
@@ -116,23 +130,53 @@ make_procfs(const kernel::ProcessTable& procs, std::string release,
         }
         if (abs == "/proc/stat") {
             // System-wide CPU + process counters. htop/top/btop read this
-            // first; the aggregate `cpu` line plus one `cpuN` per logical CPU.
+            // first, then AGAIN a second later, and compute each core's CPU%
+            // from the delta. So the jiffies must ADVANCE with real time:
+            // derive them from linuxity's virtual uptime (HZ = 100). Each core
+            // spends a small, gently per-core-varied slice busy and the rest
+            // idle, so a monitor renders a live, plausible — not frozen — load.
+            constexpr long kHz = 100;
+            const double up = detail::uptime_seconds();
+            const long total = static_cast<long>(up * kHz);
+            auto core_line = [&](long c) {
+                // A steady baseline load per core (2%..~14%), phase-shifted by
+                // core index so the gauges differ; the rest is idle.
+                long busy_pct = 2 + (c * 3) % 12;
+                long busy = total * busy_pct / 100;
+                long user = busy * 2 / 3, sys = busy - user;
+                long idle = total - busy;
+                if (idle < 0) idle = 0;
+                return std::to_string(user) + " 0 " + std::to_string(sys) + " " +
+                       std::to_string(idle) + " 0 0 0 0 0 0";
+            };
+            // Aggregate = sum across cores.
+            long auser = 0, asys = 0, aidle = 0;
+            for (long c = 0; c < ncpu; ++c) {
+                long busy_pct = 2 + (c * 3) % 12;
+                long busy = total * busy_pct / 100;
+                auser += busy * 2 / 3; asys += busy - busy * 2 / 3;
+                aidle += total - busy;
+            }
             std::string s;
-            s += "cpu  " + std::to_string(1000 * ncpu) + " 0 " +
-                 std::to_string(500 * ncpu) + " " +
-                 std::to_string(100000 * ncpu) + " " +
-                 std::to_string(200 * ncpu) + " 0 " +
-                 std::to_string(50 * ncpu) + " 0 0 0\n";
+            s += "cpu  " + std::to_string(auser) + " 0 " + std::to_string(asys) +
+                 " " + std::to_string(aidle) + " 0 0 0 0 0 0\n";
             for (long c = 0; c < ncpu; ++c)
-                s += "cpu" + std::to_string(c) +
-                     " 1000 0 500 100000 200 0 50 0 0 0\n";
-            s += "intr 0\nctxt 12345\n";
+                s += "cpu" + std::to_string(c) + " " + core_line(c) + "\n";
+            s += "intr " + std::to_string(total * 20) + "\n";
+            s += "ctxt " + std::to_string(total * 8) + "\n";
             s += "btime 1700000000\n";
             s += "processes " + std::to_string(nproc + 10) + "\n";
             s += "procs_running 1\nprocs_blocked 0\n";
             return ok(text_file(std::move(s)));
         }
-        if (abs == "/proc/uptime")   return ok(text_file("1000.00 990.00\n"));
+        if (abs == "/proc/uptime") {
+            const double up = detail::uptime_seconds();
+            // idle time = uptime * ncpu * (mostly idle); a plausible ratio.
+            char buf[64];
+            std::snprintf(buf, sizeof buf, "%.2f %.2f\n", up,
+                          up * static_cast<double>(ncpu) * 0.9);
+            return ok(text_file(std::string{buf}));
+        }
         if (abs == "/proc/loadavg")
             return ok(text_file("0.00 0.01 0.05 1/" + std::to_string(nproc) + " 1\n"));
         if (abs == "/proc/filesystems")
@@ -204,10 +248,17 @@ make_procfs(const kernel::ProcessTable& procs, std::string release,
                 s += "0 -1 ";                           // tty_nr, tpgid
                 s += "4194304 ";                        // flags
                 s += "0 0 0 0 ";                        // minflt cminflt majflt cmajflt
-                s += "100 20 0 0 ";                     // utime stime cutime cstime
+                // utime/stime advance with virtual uptime so a monitor shows a
+                // live per-process CPU% and a growing TIME+ column. A small
+                // fraction of elapsed jiffies is attributed to this task.
+                {
+                    long up_j = static_cast<long>(detail::uptime_seconds() * 100);
+                    long ut = up_j / 20, st = up_j / 40;   // ~5% user, ~2.5% sys
+                    s += std::to_string(ut) + " " + std::to_string(st) + " 0 0 ";
+                }
                 s += "20 0 ";                           // priority nice
                 s += "1 0 ";                            // num_threads itrealvalue
-                s += "1000 ";                           // starttime
+                s += "100 ";                            // starttime (jiffies)
                 s += std::to_string(I.vsize_bytes) + " ";           // vsize
                 s += std::to_string(I.rss_pages) + " ";             // rss (pages)
                 s += "18446744073709551615 ";           // rsslim
