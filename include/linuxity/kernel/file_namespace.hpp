@@ -344,7 +344,14 @@ public:
                     ++it;
             }
         }
-        out.reserve(seen.size());
+        // A directory listing MUST begin with "." and ".." (both directories):
+        // the getdents(2) contract guarantees them, and tools that count or
+        // recurse over entries (find, du, cmake/make's progress counter) break
+        // without them. merge_dir deliberately drops the host layers' own
+        // "."/"..", so we synthesize exactly one pair here for the merged view.
+        out.reserve(seen.size() + 2);
+        out.push_back({".",  DType::dir});
+        out.push_back({"..", DType::dir});
         for (auto& [name, type] : seen) out.push_back({name, type});
         return out;
     }
