@@ -156,7 +156,21 @@ public:
                 // fork. A dead child's identity must outlive it until reaped;
                 // guest pids are tiny ints, so retaining them is cheap.
                 tasks_.erase(w);
-                if (--live_ <= 0) { exited_ = true; return ok(false); }
+                --live_;
+                // The ROOT task is the guest's init/session leader. When it
+                // exits the foreground session is over and control returns to
+                // whoever launched linuxity -- exactly as a controlling
+                // terminal returns to the parent shell when the session leader
+                // dies. A DAEMON the guest detached (gpg-agent/dirmngr: double
+                // fork + setsid) is still alive and, worse, typically inherited
+                // our stdout/stderr, so it neither exits on its own nor lets
+                // its pipe EOF: waiting for live_==0 would hang the runtime
+                // forever. On a real host such a daemon survives reparented to
+                // init; here linuxity OWNS the tree, so the faithful behaviour
+                // is to reap the session and let PTRACE_O_EXITKILL take the
+                // orphans down with us. Tear the tree down and return.
+                if (w == root_pid_) { reap_tree(); exited_ = true; return ok(false); }
+                if (live_ <= 0) { exited_ = true; return ok(false); }
                 continue;
             }
             if (!WIFSTOPPED(st)) continue;
@@ -217,9 +231,18 @@ public:
                 fill_frame(f, rr);
                 return ok(true);
             }
-            // The initial SIGSTOP/ SIGTRAP of a freshly-attached child.
+            // The initial SIGSTOP/ SIGTRAP of a freshly-attached child. This
+            // may arrive BEFORE the parent's PTRACE_EVENT_FORK stop (the kernel
+            // does not order the two), so this can be the FIRST time we see the
+            // task. If so it must be counted in live_ here -- otherwise the
+            // fork-event's `emplace(...).second` guard finds the task already
+            // present, skips its ++live_, and the child is tracked but NEVER
+            // counted. When it later exits, --live_ then undercounts the tree
+            // and can drive live_ to 0 while real tasks remain, tearing the
+            // whole runtime down mid-run (observed: gpg-agent's fast-exiting
+            // double-fork intermediary killing the parent shell prematurely).
             if (sig == SIGSTOP || sig == SIGTRAP) {
-                tasks_.try_emplace(w);
+                if (tasks_.try_emplace(w).second) ++live_;
                 resume_run(w, 0);
                 continue;
             }
@@ -756,6 +779,34 @@ public:
     }
 
 private:
+    // Bring the whole traced tree down after the root/session leader exited.
+    // Any surviving task is a detached daemon (gpg-agent/dirmngr etc.) that the
+    // guest orphaned; it will not exit on its own and may hold our stdout open.
+    // PTRACE_O_EXITKILL already guarantees these die when we detach/exit, but a
+    // task stopped under ptrace must be KILLed explicitly to make progress, and
+    // we drain its exit so no zombie is left parented to us. Best-effort: a
+    // task may already be gone (ESRCH) between the snapshot and the kill.
+    void reap_tree() {
+        std::vector<::pid_t> victims;
+        victims.reserve(tasks_.size());
+        for (const auto& [tid, _] : tasks_) victims.push_back(tid);
+        for (::pid_t tid : victims) ::ptrace(PTRACE_KILL, tid, 0, 0);
+        for (::pid_t tid : victims) ::kill(tid, SIGKILL);
+        // Drain exit notifications so we don't leave zombies. A stopped tracee
+        // needs a resume for the SIGKILL to take effect, then reports WIFSIGNALED.
+        for (::pid_t tid : victims) {
+            for (;;) {
+                int st = 0;
+                ::pid_t r = ::waitpid(tid, &st, __WALL);
+                if (r <= 0) break;
+                if (WIFEXITED(st) || WIFSIGNALED(st)) break;
+                ::ptrace(PTRACE_CONT, tid, 0, SIGKILL);
+            }
+        }
+        tasks_.clear();
+        live_ = 0;
+    }
+
     // Resume `w` toward its next syscall stop, delivering any signal we held
     // back during a redirect step (so a deferred SIGALRM/SIGCHLD/... is not
     // lost, just sequenced AFTER the rewritten syscall completed).

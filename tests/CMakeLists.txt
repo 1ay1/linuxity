@@ -70,6 +70,10 @@ add_executable(test_run_socket test_run_socket.cpp)
 target_link_libraries(test_run_socket PRIVATE linuxity_core)
 add_test(NAME run_socket COMMAND test_run_socket)
 
+add_executable(test_run_daemon test_run_daemon.cpp)
+target_link_libraries(test_run_daemon PRIVATE linuxity_core)
+add_test(NAME run_daemon COMMAND test_run_daemon)
+
 add_executable(test_run_shebang test_run_shebang.cpp)
 target_link_libraries(test_run_shebang PRIVATE linuxity_core)
 add_test(NAME run_shebang COMMAND test_run_shebang)
