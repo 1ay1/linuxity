@@ -1155,6 +1155,20 @@ private:
                                                 k_.files().cwd());
         auto pc = k_.files().classify(abs);
         if (pc.realm == kernel::Realm2::absent) return eno(pc.error);
+        // chdir is fully virtualized (we track cwd and never forward), so we
+        // MUST verify the target actually exists as a directory ourselves.
+        // classify() on a read never returns `absent` for a path under the
+        // rootfs mount -- it points host_backed at the lower layer and lets a
+        // FORWARDED syscall report ENOENT. But chdir doesn't forward, so
+        // without this check it would report SUCCESS for a nonexistent dir.
+        // That broke `git init <newdir>`: git does chdir(dir); if it ENOENTs,
+        // mkdir(dir) then retry -- our false-success made git skip the mkdir,
+        // never create the work tree, and die "Cannot access work tree".
+        if (pc.realm == kernel::Realm2::host_backed) {
+            struct ::stat st{};
+            if (::stat(pc.host_path.c_str(), &st) != 0) return eno(Errno::enoent);
+            if (!S_ISDIR(st.st_mode))                   return eno(Errno::enotdir);
+        }
         k_.files().set_cwd(abs);
         return val(0);
     }
@@ -1189,6 +1203,14 @@ private:
                                                 k_.files().cwd());
         auto pc = k_.files().classify(abs);
         if (pc.realm == kernel::Realm2::absent) return eno(pc.error);
+        // Same non-forwarding hazard as do_chdir: verify the target really
+        // exists as a directory so a bogus chroot ENOENTs like the real call
+        // instead of falsely succeeding.
+        if (pc.realm == kernel::Realm2::host_backed) {
+            struct ::stat st{};
+            if (::stat(pc.host_path.c_str(), &st) != 0) return eno(Errno::enoent);
+            if (!S_ISDIR(st.st_mode))                   return eno(Errno::enotdir);
+        }
         return val(0);
     }
 
