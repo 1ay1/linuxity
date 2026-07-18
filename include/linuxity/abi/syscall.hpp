@@ -676,10 +676,27 @@ private:
         std::string abs = resolve_arg(r, path_arg, at);
         // Write intent (O_WRONLY / O_RDWR / O_CREAT / O_TRUNC) selects the
         // overlay upper layer.
-        constexpr std::uint64_t kWrOnly = 1, kRdWr = 2, kCreat = 0100, kTrunc = 01000;
+        constexpr std::uint64_t kWrOnly = 1, kRdWr = 2, kCreat = 0100,
+                                kTrunc = 01000, kExcl = 0200;
         bool for_write = (flags & 3) == kWrOnly || (flags & 3) == kRdWr ||
                          (flags & kCreat) || (flags & kTrunc);
-        auto pc = k_.files().classify(abs, for_write);
+        // WriteIntent for the overlay copy-up decision. copy_leaf (the
+        // default) copies the read-only lower file UP into the writable upper
+        // before returning, so an in-place edit (O_WRONLY without O_TRUNC)
+        // sees the existing bytes. But for a create that discards the old
+        // contents — O_CREAT|O_EXCL (must fail if it exists) or O_TRUNC
+        // (truncate to zero) — copying the leaf up is WRONG: it materializes
+        // the file in the upper, so the child's O_EXCL open then finds it and
+        // fails EEXIST (libarchive/libalpm extraction hit exactly this on
+        // EVERY overwrite, warning "Can't create <path>"). Use parents_only
+        // there: mirror the parent chain, leave the leaf absent, let the
+        // syscall create it fresh in the upper (which also clears any
+        // whiteout). A lower-only file thus reads as replaced, not duplicated.
+        Wi open_wi = Wi::copy_leaf;
+        if (for_write &&
+            (((flags & kCreat) && (flags & kExcl)) || (flags & kTrunc)))
+            open_wi = Wi::parents_only;
+        auto pc = k_.files().classify(abs, for_write, /*follow=*/true, open_wi);
         if (pc.realm == kernel::Realm2::host_backed) {
             Outcome o{};
             o.redirect  = true;

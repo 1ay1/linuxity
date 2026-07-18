@@ -81,6 +81,20 @@ static const char* kSrc =
     "  close(xf);\n"
     "  if (chmod(\"/base/cwd/script\", 0755) != 0) return 27;\n"
     "  if (access(\"/base/cwd/script\", X_OK) != 0) return 28;\n"
+    // OVERWRITE a lower-only file with O_CREAT|O_EXCL (the libarchive /
+    // pacman extraction pattern): it existed only in the read-only lower, and
+    // an exclusive create MUST succeed by materializing a fresh file in the
+    // upper. A copy-up-then-O_EXCL would resurrect the leaf in the upper and
+    // fail EEXIST ("Can't create <path>" on every package overwrite).
+    "  if (access(\"/excl_lower\", F_OK) != 0) return 29;\n"
+    "  int ef = open(\"/excl_lower\", O_WRONLY|O_CREAT|O_EXCL, 0644);\n"
+    "  if (ef < 0) return 30;\n"
+    "  if (write(ef, \"new\\n\", 4) != 4) return 31;\n"
+    "  close(ef);\n"
+    "  char eb[8]; int erf = open(\"/excl_lower\", O_RDONLY);\n"
+    "  if (erf < 0) return 32;\n"
+    "  if (read(erf, eb, 4) != 4 || memcmp(eb, \"new\\n\", 4) != 0) return 33;\n"
+    "  close(erf);\n"
     "  return 42;\n}\n";
 
 int main() {
@@ -92,7 +106,8 @@ int main() {
     const std::string upper = "/tmp/lx_mutate_upper";
     std::system(("rm -rf " + root + " " + upper +
                  " && mkdir -p " + root + "/bin " + root + "/base " + upper +
-                 " && printf lower > " + root + "/lower_only").c_str());
+                 " && printf lower > " + root + "/lower_only" +
+                 " && printf old > " + root + "/excl_lower").c_str());
 
     { std::FILE* f = std::fopen("/tmp/lx_mutate_src.c", "w");
       if (!f) { std::puts("run_mutate: skipped (no /tmp)"); return 0; }
@@ -128,6 +143,16 @@ int main() {
         return ::stat(p.c_str(), &st) == 0 && (st.st_mode & 0111) != 0;
     };
     bool chmod_exec = is_exec(upper + "/base/cwd/script");
+    // O_CREAT|O_EXCL overwrite of a lower-only file must have materialized the
+    // NEW contents in the upper (and the pristine lower must be untouched).
+    auto read1 = [](const std::string& p) -> std::string {
+        std::FILE* f = std::fopen(p.c_str(), "r");
+        if (!f) return {};
+        char b[64]; std::size_t n = std::fread(b, 1, sizeof b, f);
+        std::fclose(f); return std::string(b, n);
+    };
+    bool excl_upper_new = read1(upper + "/excl_lower") == "new\n";
+    bool excl_lower_old = read1(root  + "/excl_lower") == "old";
 
     std::system(("rm -rf " + root + " " + upper).c_str());
     std::remove("/tmp/lx_mutate_src.c");
@@ -159,6 +184,12 @@ int main() {
     if (!chmod_exec) {
         std::puts("run_mutate: FAIL chmod 0755 did not set +x on the host inode "
                   "(scriptlet execve would EACCES)");
+        return 1;
+    }
+    if (!excl_upper_new || !excl_lower_old) {
+        std::puts("run_mutate: FAIL O_CREAT|O_EXCL overwrite of a lower-only "
+                  "file did not materialize fresh contents in the upper "
+                  "(copy-up-then-O_EXCL would EEXIST: 'Can't create <path>')");
         return 1;
     }
     std::puts("run_mutate: mkdir/write/chmod/chown/rename/symlink/unlink all "
