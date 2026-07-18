@@ -67,6 +67,19 @@ namespace lx::vfs {
             return ok(std::move(vf));
         }
 
+        // /dev/fd/N (bash process substitution `<(...)` opens /dev/fd/63):
+        // /dev/fd is a symlink to /proc/self/fd, but a path WITH a trailing
+        // component (/dev/fd/63) arrives here whole rather than being resolved
+        // through the symlink. Redirect the descriptor path straight to the
+        // guest's real host fd via /proc/self/fd/N.
+        if (abs.starts_with("/dev/fd/")) {
+            kernel::VirtualFile vf;
+            vf.redirect_host =
+                std::string{"/proc/self/fd/"} +
+                std::string{abs.substr(std::string_view{"/dev/fd/"}.size())};
+            return ok(std::move(vf));
+        }
+
         std::string_view leaf = abs;
         leaf.remove_prefix(std::string_view{"/dev/"}.size());
 

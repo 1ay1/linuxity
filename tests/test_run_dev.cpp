@@ -50,6 +50,22 @@ static const char* kSrc =
     "  if (out < 0) return 11;\n"
     "  if (write(out, \"K\", 1) != 1) return 12;\n"         // marker to fd 1
     "  close(out);\n"
+    // /dev/fd/N must resolve to the guest's own fd N (bash `<(...)` opens
+    // /dev/fd/63). Open a pipe, then read it back through /dev/fd/<readfd>.
+    "  int pf[2]; if (pipe(pf) != 0) return 13;\n"
+    "  if (write(pf[1], \"Q\", 1) != 1) return 14;\n"
+    "  char devfd[32]; \n"
+    "  int m=0; const char* pre=\"/dev/fd/\";\n"
+    "  for (const char* s=pre; *s; ++s) devfd[m++]=*s;\n"
+    "  int v=pf[0]; char tmp[16]; int t=0;\n"
+    "  if (v==0) tmp[t++]='0'; else while(v){tmp[t++]='0'+v%10; v/=10;}\n"
+    "  while(t) devfd[m++]=tmp[--t];\n"
+    "  devfd[m]=0;\n"
+    "  int df = open(devfd, O_RDONLY);\n"
+    "  if (df < 0) return 15;\n"
+    "  char q; if (read(df, &q, 1) != 1) return 16;\n"
+    "  if (q != 'Q') return 17;\n"                          // /dev/fd/N echoes
+    "  close(df); close(pf[0]); close(pf[1]);\n"
     "  return 42;\n}\n";
 
 int main() {
@@ -99,8 +115,9 @@ int main() {
                     "misbehaved)\n", *r);
         return 1;
     }
-    std::puts("run_dev: /dev/{null,zero,urandom,stdin,stdout} all behave — "
-              "sink/zeros/entropy, piped stdin echoes, stdout reaches fd 1, exit=42");
+    std::puts("run_dev: /dev/{null,zero,urandom,stdin,stdout,fd/N} all behave — "
+              "sink/zeros/entropy, piped stdin echoes, stdout reaches fd 1, "
+              "/dev/fd/N resolves to the guest fd, exit=42");
     return 0;
 #endif
 }
