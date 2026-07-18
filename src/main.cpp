@@ -144,6 +144,12 @@ int main(int argc, char** argv) {
     // DERIVE the machine the guest believes it has, so belief == enforced
     // reality. Flags may appear in any order before the program.
     std::string root;
+    // --persist <dir>: a DURABLE upper overlay layer. Without it the writable
+    // upper is a fresh /tmp/linuxity-upper-<pid> torn down each run, so a
+    // `pacman -S pkg` install evaporates when the process exits. Point
+    // --persist at a directory and every write (installed packages, the pacman
+    // local DB, config) survives across runs — a real, mutable machine.
+    std::string persist;
     kernel::ResourceSpec res;
     // --bind host[:guest] mounts a real host directory into the guest tree at
     // `guest` (default: same path). Thin wrapper over FileNamespace::mount_host
@@ -161,6 +167,7 @@ int main(int argc, char** argv) {
     for (; i < argc; ++i) {
         std::string f = argv[i];
         if (f == "--root") { root = need("--root"); }
+        else if (f == "--persist" || f == "--upper") { persist = need("--persist"); }
         else if (f == "--cpus")        { res.cpus = std::atof(need("--cpus")); }
         else if (f == "--memory" || f == "-m") {
             if (auto b = kernel::parse_bytes(need("--memory"))) res.mem_max = *b;
@@ -199,6 +206,8 @@ int main(int argc, char** argv) {
             "  linuxity runtime (native speed, no VM, no emulation).\n"
             "\n"
             "  --root <dir>        mount an extracted distro rootfs as guest '/'\n"
+            "  --persist <dir>     durable overlay upper: installs/writes survive\n"
+            "                      across runs (default: ephemeral per-run)\n"
             "  --cpus <N>          bound CPU to N cores' worth (e.g. 1.5)\n"
             "  --memory <SZ>       hard memory ceiling (e.g. 512M, 2G)\n"
             "  --memory-swap <SZ>  combined memory+swap ceiling\n"
@@ -310,11 +319,29 @@ int main(int argc, char** argv) {
     // real host path underneath the rootfs before the syscall runs. /proc is
     // synthesized to report linuxity's own identity, not the host's.
     if (!root.empty()) {
-        // Stack a writable, per-run overlay over the read-only rootfs so the
-        // guest can write (to /tmp, /run, /var, ...) WITHOUT mutating the
-        // pristine rootfs on disk — copy-up happens on first write.
-        std::string upper = "/tmp/linuxity-upper-" + std::to_string(::getpid());
-        (void)::mkdir(upper.c_str(), 0755);
+        // Stack a writable overlay over the read-only rootfs so the guest can
+        // write WITHOUT mutating the pristine rootfs; copy-up happens on first
+        // write. With --persist the upper is a caller-named DURABLE directory
+        // (installs/DB/config survive across runs — a real machine); without
+        // it, a fresh per-run /tmp dir that's implicitly discarded on exit.
+        std::string upper = persist.empty()
+            ? "/tmp/linuxity-upper-" + std::to_string(::getpid())
+            : persist;
+        if (!persist.empty()) {
+            // Create the persistent tree (and its parents) if new; existing
+            // contents are reused as-is so prior installs are visible.
+            std::string acc;
+            for (std::size_t p = 1; p <= upper.size(); ++p) {
+                if (p == upper.size() || upper[p] == '/') {
+                    acc = upper.substr(0, p);
+                    if (acc != "/") (void)::mkdir(acc.c_str(), 0755);
+                }
+            }
+            std::fprintf(stderr, "linuxity: persistent overlay upper at %s\n",
+                         upper.c_str());
+        } else {
+            (void)::mkdir(upper.c_str(), 0755);
+        }
         k.files().mount_host("/", root, upper);
         k.files().mount_virtual("/proc", vfs::make_procfs(k.procs(), k.machine()));
         k.files().mount_virtual("/sys", vfs::make_sysfs(k.machine()));
