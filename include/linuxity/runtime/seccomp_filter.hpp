@@ -58,13 +58,16 @@ inline constexpr int kTrappedX86_64[] = {
     102, 104, 107, 108,          // getuid/getgid/geteuid/getegid
     118, 120,                    // getresuid/getresgid (bash/sudo $UID at init)
     56, 57, 58,                  // clone/fork/vfork      (pid translated)
-    // execve(59)/execveat(322) are NOT filtered. Trapping execve is what makes
-    // the bootstrap fragile: the child must run execve after installing the
-    // filter but before the tracer can arm TRACESECCOMP, and a trapped execve
-    // ENOSYS-fails there, aborting the launch. linuxity's guest binaries are
-    // launched by the real ld.so (opened through the trapped openat, which IS
-    // filtered and path-translated), so native execve is correct; the process
-    // monitor still sees each exec via PTRACE_EVENT_EXEC.
+    59, 322,                     // execve/execveat
+    // A NATIVE guest execve resolves its target against the child's ROOT.
+    // Unprivileged, chroot(2) fails, so that root is the HOST tree: a native
+    // execve then runs the HOST's binary (namespace escape), and a #!-script
+    // or static binary present only in the rootfs fails outright. Trapping
+    // execve routes every exec through path_exec, which translates the target
+    // into the overlay and rewrites dynamic/#! execs through the in-rootfs
+    // interpreter. The bootstrap hazard (first exec trapping before the tracer
+    // arms TRACESECCOMP) is handled in start(): the child tgkill-SIGSTOPs
+    // itself after TRACEME so the parent arms options first.
     61,                          // wait4                 (pid translated both ways)
     62,                          // kill                  (signal to guest pid)
     // tgkill(234)/tkill(200) are intentionally NOT filtered: glibc's raise()

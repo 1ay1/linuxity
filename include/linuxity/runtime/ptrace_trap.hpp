@@ -98,6 +98,16 @@ public:
                 ::close(seccomp_pipe[1]);
             }
             ::ptrace(PTRACE_TRACEME, 0, nullptr, nullptr);
+            // Stop here so the parent can arm PTRACE_O_TRACESECCOMP before the
+            // first (now TRACE-filtered) execve runs; otherwise that exec
+            // traps with no tracer listening and ENOSYS-aborts (_exit 127).
+            // Stop via tkill(gettid, SIGSTOP): tkill(200)/gettid(186) are
+            // unfiltered, whereas kill(2) AND getpid(2) are BOTH in the trap
+            // list -- calling either here (no tracer armed yet) ENOSYS-fails,
+            // so a raise()/tgkill(getpid,...) would silently not stop us and
+            // the execve would run un-arm'd and abort.
+            ::syscall(SYS_tkill,
+                      static_cast<int>(::syscall(SYS_gettid)), SIGSTOP);
             std::vector<char*> cargv;
             for (auto& a : argv_) cargv.push_back(a.data());
             cargv.push_back(nullptr);
@@ -117,17 +127,16 @@ public:
             ::close(seccomp_pipe[0]);
         }
         seccomp_ = (ok_byte == 1);
+        // The child is stopped at the tkill-SIGSTOP it raised after TRACEME.
+        // Arm options now (so the coming execve traps as PTRACE_EVENT_SECCOMP),
+        // then resume it past the stop into its bootstrap execve.
         int opts = PTRACE_O_EXITKILL | PTRACE_O_TRACESYSGOOD |
                    PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK |
                    PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC;
-        // With a filter, ask for PTRACE_EVENT_SECCOMP stops on the traced
-        // syscalls; without one, we rely on ordinary syscall-entry stops.
         if (seccomp_) opts |= PTRACE_O_TRACESECCOMP;
         ::ptrace(PTRACE_SETOPTIONS, pid, 0, opts);
         root_pid_ = pid;
         tasks_[pid];                       // create, at-entry state
-        // Filtered: run free until a seccomp/event stop. Unfiltered: stop at
-        // the next syscall entry.
         resume_run(pid, 0);
         ++live_;
         return ok();
@@ -207,8 +216,10 @@ public:
             }
             if (event == PTRACE_EVENT_EXEC) {
                 // The image was replaced: the pid keeps its number but becomes
-                // a new program. Recover its new comm from /proc/<tid>/comm on
-                // the HOST (the child is mid-exec; this is the real name).
+                // a new program. The ROOT's FIRST exec is the bootstrap of
+                // path_ (a host path) -- mark it done so later guest execs are
+                // dispatched through path_exec.
+                if (w == root_pid_) booted_root_ = true;
                 proc_events_.push_back({ProcEvent::exec, gpid_of(w), 0,
                                         comm_of(w), cmdline_of(w)});
                 tasks_[w] = Task{};        // fresh image, back at-entry
@@ -221,9 +232,28 @@ public:
             // fires BEFORE the syscall runs). Non-filtered syscalls never get
             // here — they ran natively without stopping.
             if (event == PTRACE_EVENT_SECCOMP) {
-                Task& t = tasks_[w];
                 struct user_regs_struct rr{};
                 ::ptrace(PTRACE_GETREGS, w, 0, &rr);
+                // The ROOT's bootstrap execve targets path_, already a resolved
+                // HOST path; path_exec expects a GUEST path and would
+                // mis-resolve it. Run that one exec natively; every guest exec
+                // after the image is live goes through the dispatcher.
+                std::uint64_t sysno = rr.orig_rax;
+                if (!booted_root_ && w == root_pid_ &&
+                    (sysno == 59 || sysno == 322)) {
+                    // Let this bootstrap execve run NATIVELY. At a
+                    // PTRACE_EVENT_SECCOMP stop the kernel has parked rax at
+                    // -ENOSYS as the "skip unless the tracer re-arms it"
+                    // sentinel; a bare PTRACE_CONT would return that ENOSYS and
+                    // the exec would _exit(127). Re-write the entry registers
+                    // (orig_rax = the exec nr) so the syscall is re-armed, then
+                    // resume -- the exec proceeds and its PTRACE_EVENT_EXEC
+                    // sets booted_root_.
+                    ::ptrace(PTRACE_SETREGS, w, 0, &rr);
+                    resume_run(w, 0);
+                    continue;
+                }
+                Task& t = tasks_[w];
                 cur_ = w;
                 t.regs = rr;
                 t.in_call = true;
@@ -259,6 +289,19 @@ public:
                     && (static_cast<long long>(rr.rax) == -38 /*ENOSYS*/)
                     && !t.in_call;
                 if (is_entry) {
+                    // Same bootstrap exemption as the seccomp path, for the
+                    // PTRACE_SYSCALL fallback (LINUXITY_NO_SECCOMP): the ROOT's
+                    // first execve targets path_ (a resolved HOST path), which
+                    // path_exec would mis-resolve as a guest path. Forward it
+                    // natively; its PTRACE_EVENT_EXEC sets booted_root_ and
+                    // every later guest exec is dispatched normally.
+                    std::uint64_t sysno = rr.orig_rax;
+                    if (!booted_root_ && w == root_pid_ &&
+                        (sysno == 59 || sysno == 322)) {
+                        t.in_call = true;
+                        ::ptrace(PTRACE_SYSCALL, w, 0, 0);   // run exec to exit
+                        continue;
+                    }
                     cur_ = w;
                     t.regs = rr;
                     t.in_call = true;
@@ -946,6 +989,7 @@ private:
     std::int32_t next_gpid_{2};                        // pid 1 = root/init
     ::pid_t cur_{-1};
     ::pid_t root_pid_{-1};
+    bool booted_root_{false};      // root's bootstrap execve(path_) has completed
     int exit_code_{0};
     int live_{0};
     bool exited_{false};
