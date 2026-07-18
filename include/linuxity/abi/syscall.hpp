@@ -22,6 +22,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <sys/stat.h>
 #include <optional>
 #include <span>
 #include <string>
@@ -316,9 +317,24 @@ public:
             case Sysno::removexattr:  return path_xattr(r, /*for_write=*/true);
             case Sysno::lsetxattr:
             case Sysno::lremovexattr: return path_xattr(r, /*for_write=*/true, /*follow=*/false);
-            case Sysno::fgetxattr:    case Sysno::fsetxattr:
-            case Sysno::flistxattr:   case Sysno::fremovexattr:
+            case Sysno::fgetxattr:    case Sysno::flistxattr:
                 return fwd();
+            // fsetxattr/fremovexattr act on an already-open fd (this is what
+            // libarchive/pacman actually use to restore a package's xattrs).
+            // A privileged namespace (security.*/system.*/trusted.*) can never
+            // be applied by our unprivileged host -> the forwarded call EPERMs
+            // and libarchive warns "Cannot restore extended attributes:
+            // security.capability". Fake success (name = arg1), same policy as
+            // the path variants above; other namespaces still forward.
+            case Sysno::fsetxattr:
+            case Sysno::fremovexattr: {
+                std::string name = read_cstr(uaddr(r.arg[1]));
+                if (name.rfind("security.", 0) == 0 ||
+                    name.rfind("system.",   0) == 0 ||
+                    name.rfind("trusted.",  0) == 0)
+                    return val(0);
+                return fwd();
+            }
 
             // -- inotify_add_watch(fd, path, mask): translate the guest path
             //    (arg1) and REDIRECT so a file watcher registers against the
@@ -1183,6 +1199,30 @@ private:
     [[nodiscard]] Outcome path_xattr(const Regs& r, bool for_write,
                                      bool follow = true) {
         std::string abs = resolve_arg(r, 0, /*at=*/false);
+        // A WRITE (set/remove) whose attribute lives in a PRIVILEGED xattr
+        // namespace can never be applied by our unprivileged host process:
+        //   * security.*  -- LSM/capabilities. security.capability is the file
+        //                    capability set libarchive restores from a pacman
+        //                    package; the host setxattr EPERMs -> "Cannot
+        //                    restore extended attributes: security.capability".
+        //   * system.*    -- ACLs / kernel-managed attrs, privileged outside
+        //                    of specific fs support.
+        //   * trusted.*   -- requires CAP_SYS_ADMIN.
+        // linuxity runs the guest as fake-root and does not ENFORCE file
+        // capabilities, so faking success is coherent -- the same policy as
+        // do_chmod/do_chown, which record privileged metadata and report 0
+        // rather than forward a doomed host call. Accept the write vacuously
+        // instead of forwarding a setxattr that can only fail; this silences
+        // the extraction warning. (get/list on these still fall through and
+        // read whatever the host actually stored.) name = arg1 for both
+        // setxattr(path,name,...) and removexattr(path,name).
+        if (for_write) {
+            std::string name = read_cstr(uaddr(r.arg[1]));
+            if (name.rfind("security.", 0) == 0 ||
+                name.rfind("system.",   0) == 0 ||
+                name.rfind("trusted.",  0) == 0)
+                return val(0);
+        }
         auto pc = for_write
             ? k_.files().classify(abs, /*for_write=*/true, follow, Wi::copy_leaf)
             : k_.files().classify(abs, /*for_write=*/false, follow);
@@ -1287,7 +1327,14 @@ private:
         {
             auto wc = k_.files().classify(abs, /*for_write=*/true,
                                           /*follow=*/false, Wi::copy_leaf);
-            if (!wc.host_path.empty())
+            // Skip a symlink: chmod on a symlink either follows it (wrong
+            // target) or, with AT_SYMLINK_NOFOLLOW as libarchive passes,
+            // returns EOPNOTSUPP on Linux -> "Can't set permissions to 0777"
+            // when a package ships a .so symlink. A symlink's own mode is
+            // fixed at 0777 and ignored by the kernel, so there is nothing to
+            // apply; the shadow store still presents the intended mode at stat
+            // time. Only chmod a REGULAR file/dir we own in the upper.
+            if (!wc.host_path.empty() && !is_symlink(wc.host_path.c_str()))
                 (void)::chmod(wc.host_path.c_str(), mode & 07777);
         }
         return val(0);
@@ -1846,6 +1893,13 @@ public:
         std::array<std::byte, 2> b{};
         if (!mem_.copy_in(uaddr(addr), b)) return 0;
         std::uint16_t v = 0; std::memcpy(&v, b.data(), 2); return v;
+    }
+
+    // True iff `path` is a symbolic link (lstat, no follow). Used to skip a
+    // pointless/failing host chmod on a symlink the guest is "chmod"ing.
+    static bool is_symlink(const char* path) {
+        struct ::stat st{};
+        return ::lstat(path, &st) == 0 && S_ISLNK(st.st_mode);
     }
 };
 
