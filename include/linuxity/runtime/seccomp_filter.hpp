@@ -109,6 +109,14 @@ inline constexpr int kTrappedX86_64[] = {
     // teardown) and linuxity only uses it for fd->path bookkeeping, which is
     // non-essential (readlink recovers paths lazily). Trapping it would also
     // fire during bootstrap before TRACESECCOMP is set. Left native.
+    // dup/dup2/dup3/fcntl(F_DUPFD*) ARE trapped: a dup'd fd must inherit the
+    // original's fd->path and virtual-dir bindings, or an *at call relative to
+    // the new fd resolves against the wrong directory. coreutils `rm -rf`
+    // opens a dir, dups the fd (fts's fd cache), then unlinkat(dupfd, name) --
+    // without mirroring, `name` resolves against cwd, the unlink misses
+    // (ENOENT), and the parent rmdir fails "Directory not empty".
+    32, 33, 292,                 // dup/dup2/dup3
+    72,                          // fcntl (only F_DUPFD/F_DUPFD_CLOEXEC acted on)
     // -- namespace MUTATION (create/remove/rename/relink/perm) -------------
     83, 258,                     // mkdir/mkdirat
     133, 259,                    // mknod/mknodat

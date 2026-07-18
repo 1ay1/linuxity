@@ -362,6 +362,20 @@ public:
     // the REAL host fd the child holds (redirect/inject both yield real fds).
     void bind_fd(int fd, std::string abs) { fd_paths_[fd] = std::move(abs); }
     void unbind_fd(int fd) { fd_paths_.erase(fd); dir_streams_.erase(fd); }
+    // Copy the path binding AND (if any) the virtual-directory stream from
+    // `from` onto `to`. Used after a dup/dup2/dup3/fcntl(F_DUPFD): the new fd
+    // aliases the same open description, so an *at call or getdents on it must
+    // resolve the SAME path/entries. The dir stream is duplicated with a fresh
+    // read position (the dup'd fd shares the file offset in the real kernel,
+    // but our virtual enumeration is independent and each fd enumerates from
+    // the start). No-op if `from` has no binding.
+    void mirror_fd(int from, int to) {
+        if (from == to) return;
+        if (auto it = fd_paths_.find(from); it != fd_paths_.end())
+            fd_paths_[to] = it->second;
+        if (auto it = dir_streams_.find(from); it != dir_streams_.end())
+            dir_streams_[to] = DirStream{it->second.entries, 0};
+    }
     [[nodiscard]] std::string_view path_of_fd(int fd) const {
         auto it = fd_paths_.find(fd);
         return it == fd_paths_.end() ? std::string_view{} : std::string_view{it->second};

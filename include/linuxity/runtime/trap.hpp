@@ -194,9 +194,24 @@ public:
                     if (!fr) { LX_TRY(recover_syscall(fr.error())); continue; }
                 }
             } else if (o.forward) {
-                // Let the host kernel run it IN the guest (mmap/brk/...).
-                auto fr = trap_.forward();
-                if (!fr) { LX_TRY(recover_syscall(fr.error())); continue; }
+                // A dup/dup2/dup3/fcntl(F_DUPFD*): step SYNCHRONOUSLY so we can
+                // read the real new fd and mirror the source fd's path /
+                // virtual-dir binding onto it (an *at call or getdents on the
+                // dup must resolve the same path/entries). dup2/dup3 first
+                // close their explicit target, so drop its stale binding.
+                if (o.dup_from >= 0) {
+                    int from = o.dup_from, closed = o.dup_close;
+                    auto fr = trap_.forward_sync([&](std::int64_t ret) {
+                        if (ret < 0) return;
+                        if (closed >= 0 && closed != from) sys.on_fd_closed(closed);
+                        sys.on_fd_dup(from, static_cast<int>(ret));
+                    });
+                    if (!fr) { LX_TRY(recover_syscall(fr.error())); continue; }
+                } else {
+                    // Let the host kernel run it IN the guest (mmap/brk/...).
+                    auto fr = trap_.forward();
+                    if (!fr) { LX_TRY(recover_syscall(fr.error())); continue; }
+                }
             } else {
                 // Virtualize: hand the guest our answer, no real syscall.
                 LX_TRY(trap_.resume(o.ret));

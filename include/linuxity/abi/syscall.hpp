@@ -138,6 +138,18 @@ struct Outcome {
     UAddr        sock_path_addr{};   // guest addr of sockaddr_un.sun_path
     int          sock_len_arg{2};    // which arg register holds socklen
     std::uint64_t sock_new_len{0};   // new socklen value (family + path + NUL)
+
+    // DUP fd-binding mirror. dup/dup2/dup3/fcntl(F_DUPFD*) create a NEW fd that
+    // aliases an existing one; the new fd must inherit the source fd's
+    // fd->path and virtual-dir bindings, or an *at call relative to the new fd
+    // resolves against the wrong directory (breaks `rm -rf` via coreutils fts,
+    // which dups its dir fd then unlinkat's entries relative to the dup).
+    // These are FORWARDED (the host does the real dup); when dup_from >= 0 the
+    // run loop mirrors bindings from dup_from onto the forwarded return fd.
+    // dup2/dup3 also close their explicit target first, so dup_close names an
+    // fd whose stale binding must be dropped before the mirror.
+    int          dup_from{-1};
+    int          dup_close{-1};
 };
 
 // A guest-memory accessor the dispatcher uses to copy_in/copy_out. Modeled as
@@ -428,6 +440,14 @@ public:
             // -- fd-lifecycle bookkeeping: keep our guest fd->path table in
             //    sync so readlinkat/getdents on the fd recover its path.
             case Sysno::close:       return do_close(r);
+
+            // -- fd DUPLICATION: forward the real dup, then mirror the source
+            //    fd's path / virtual-dir binding onto the new fd so *at calls
+            //    relative to the dup resolve correctly (fixes rm -rf's fts).
+            case Sysno::dup:         return do_dup(r);
+            case Sysno::dup2:        return do_dup2(r);
+            case Sysno::dup3:        return do_dup2(r);
+            case Sysno::fcntl:       return do_fcntl(r);
 
             // -- NAMESPACE MUTATION. Each names a guest path that must be
             //    translated to its overlay UPPER host path (for_write=true)
@@ -1294,6 +1314,39 @@ private:
         return fwd();   // let the child actually close its real fd
     }
 
+    // dup(oldfd): forward, then mirror oldfd's bindings onto the new fd (the
+    // forwarded return value). do_dup only knows oldfd here; the run loop
+    // reads the result and calls files().mirror_fd(dup_from, retfd).
+    [[nodiscard]] Outcome do_dup(const Regs& r) {
+        Outcome o{};
+        o.forward  = true;
+        o.dup_from = static_cast<int>(r.arg[0]);
+        return o;
+    }
+
+    // dup2(oldfd,newfd) / dup3(oldfd,newfd,flags): the new fd number is fixed
+    // (arg1). It implicitly closes newfd first, so drop newfd's stale binding,
+    // then forward and mirror oldfd -> newfd (== the return value on success).
+    [[nodiscard]] Outcome do_dup2(const Regs& r) {
+        Outcome o{};
+        o.forward   = true;
+        o.dup_from  = static_cast<int>(r.arg[0]);
+        o.dup_close = static_cast<int>(r.arg[1]);
+        return o;
+    }
+
+    // fcntl(fd,cmd,arg): only F_DUPFD(0)/F_DUPFD_CLOEXEC(1030) create a new fd
+    // that must inherit fd's bindings; every other cmd (locks, flags, ...) is
+    // a plain forward with no fd->path consequence.
+    [[nodiscard]] Outcome do_fcntl(const Regs& r) {
+        constexpr std::uint64_t kFDupFd = 0, kFDupFdCloexec = 1030;
+        Outcome o{};
+        o.forward = true;
+        if (r.arg[1] == kFDupFd || r.arg[1] == kFDupFdCloexec)
+            o.dup_from = static_cast<int>(r.arg[0]);
+        return o;
+    }
+
     // A single-path mutation (mkdir/rmdir/unlink/chmod/chown/truncate/...):
     // translate the guest path at `path_arg` to its overlay UPPER host path
     // and REDIRECT, with the WriteIntent selecting how the upper layer is
@@ -1860,6 +1913,13 @@ public:
         pending_dir_ = false;
         pending_entries_.clear();
     }
+
+    // Called by the run loop after a forwarded dup/dup2/dup3/fcntl(F_DUPFD*)
+    // succeeds: mirror the source fd's path/dir binding onto the new fd so an
+    // *at call or getdents on the dup resolves the same path/entries.
+    void on_fd_dup(int from, int to) { k_.files().mirror_fd(from, to); }
+    // Called when a dup2/dup3 target fd is implicitly closed before the dup.
+    void on_fd_closed(int fd) { k_.files().unbind_fd(fd); }
 
     // After a host-backed stat/statx REDIRECT returns success, the guest
     // buffer holds the HOST inode's mode/uid/gid. linuxity presents a root-

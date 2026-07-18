@@ -95,6 +95,22 @@ static const char* kSrc =
     "  if (erf < 0) return 32;\n"
     "  if (read(erf, eb, 4) != 4 || memcmp(eb, \"new\\n\", 4) != 0) return 33;\n"
     "  close(erf);\n"
+    // DUP fd-binding: open a dir, create a file in it, then dup the DIR fd
+    // (fcntl F_DUPFD, as coreutils fts does) and unlinkat the file THROUGH the
+    // dup. The relative name resolves against the dup's dir only if the dup
+    // inherited the source fd's path binding — without it the unlink misses
+    // (ENOENT) and a following rmdir sees the dir non-empty (the `rm -rf` bug).
+    "  if (mkdir(\"/base/dupdir\", 0755) != 0) return 34;\n"
+    "  int df = open(\"/base/dupdir/victim\", O_WRONLY|O_CREAT|O_TRUNC, 0644);\n"
+    "  if (df < 0) return 35; close(df);\n"
+    "  int dd = open(\"/base/dupdir\", O_RDONLY|O_DIRECTORY);\n"
+    "  if (dd < 0) return 36;\n"
+    "  int dd2 = fcntl(dd, F_DUPFD, 20);\n"
+    "  if (dd2 < 0) return 37;\n"
+    "  if (unlinkat(dd2, \"victim\", 0) != 0) return 38;\n"
+    "  close(dd); close(dd2);\n"
+    "  if (access(\"/base/dupdir/victim\", F_OK) == 0) return 39;\n"
+    "  if (rmdir(\"/base/dupdir\") != 0) return 40;\n"
     "  return 42;\n}\n";
 
 int main() {

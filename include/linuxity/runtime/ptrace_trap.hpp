@@ -417,6 +417,25 @@ public:
         return ok(std::int64_t{0});
     }
 
+    // Like forward(), but SYNCHRONOUS: step the syscall to its EXIT stop and
+    // return the kernel's real result (rax). Used for dup/dup2/dup3/fcntl,
+    // whose returned fd we must observe to mirror the source fd's path/dir
+    // binding onto the new fd. Safe because these calls never block on a
+    // sibling. `post_exit` runs while the task is still stopped at exit.
+    [[nodiscard]] Result<std::int64_t> forward_sync(
+            std::function<void(std::int64_t)> post_exit = {}) {
+        Task& t = tasks_[cur_];
+        t.action = Action::none;
+        if (!step_to_exit(cur_)) return ok(std::int64_t{-1});   // task exited
+        struct user_regs_struct rr{};
+        ::ptrace(PTRACE_GETREGS, cur_, 0, &rr);
+        std::int64_t ret = static_cast<std::int64_t>(rr.rax);
+        tasks_[cur_].in_call = false;
+        if (post_exit) post_exit(ret);
+        resume_task(cur_);
+        return ok(ret);
+    }
+
     // REDIRECT: rewrite the char* path arg to the translated host path (in the
     // task's stack scratch), then run the syscall to its EXIT stop and return
     // the kernel's real result (e.g. the fd for openat). This is SYNCHRONOUS:
