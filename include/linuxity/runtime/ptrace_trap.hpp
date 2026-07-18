@@ -620,8 +620,14 @@ public:
     }
 
     // Read a task's full NUL-joined argv from the host's /proc/<tid>/cmdline
-    // at exec, so the process monitor shows the real command line.
-    static std::string cmdline_of(::pid_t tid) {
+    // at exec, so the process monitor shows the real command line. The raw
+    // host argv is in HOST terms: linuxity launches a dynamic guest as
+    // `<root>/lib64/ld-linux-x86-64.so.2 <root>/bin/prog ...`, so we (1) drop a
+    // leading ELF interpreter (ld-linux/ld-musl) token — it's a linuxity
+    // launch artifact, not part of the guest's command — and (2) de-translate
+    // the overlay/root prefix off every remaining token so /proc shows the
+    // GUEST path (/bin/htop) instead of /tmp/arch/root.x86_64/bin/htop.
+    std::string cmdline_of(::pid_t tid) const {
         std::string path = "/proc/" + std::to_string(tid) + "/cmdline";
         int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
         if (fd < 0) return {};
@@ -629,11 +635,38 @@ public:
         while ((n = ::read(fd, buf, sizeof buf)) > 0)
             s.append(buf, static_cast<std::size_t>(n));
         ::close(fd);
-        // Present argv as space-separated for the guest's cmdline field; the
-        // procfs synthesizer re-appends the trailing NUL it needs.
-        for (char& c : s) if (c == '\0') c = ' ';
-        while (!s.empty() && s.back() == ' ') s.pop_back();
-        return s;
+        // Split on the NUL argv separators into individual tokens.
+        std::vector<std::string> args;
+        std::string cur;
+        for (char c : s) {
+            if (c == '\0') { if (!cur.empty() || !args.empty()) args.push_back(cur); cur.clear(); }
+            else cur.push_back(c);
+        }
+        if (!cur.empty()) args.push_back(cur);
+        if (args.empty()) return {};
+        // De-translate a host path back to the guest view: strip the overlay
+        // upper prefix or the --root prefix so the guest sees its own path.
+        auto detranslate = [this](std::string a) -> std::string {
+            if (!root_.empty() && a.size() > root_.size() &&
+                a.compare(0, root_.size(), root_) == 0 && a[root_.size()] == '/')
+                a.erase(0, root_.size());
+            return a;
+        };
+        // Drop a leading ELF interpreter token (ld-linux*.so* / ld-musl*.so*):
+        // it's how linuxity launches a dynamic binary, not the guest command.
+        auto is_interp = [](const std::string& a) {
+            auto slash = a.find_last_of('/');
+            std::string base = slash == std::string::npos ? a : a.substr(slash + 1);
+            return base.rfind("ld-linux", 0) == 0 || base.rfind("ld-musl", 0) == 0 ||
+                   base.rfind("ld.so", 0) == 0;
+        };
+        std::size_t start = (args.size() > 1 && is_interp(args[0])) ? 1 : 0;
+        std::string out;
+        for (std::size_t i = start; i < args.size(); ++i) {
+            if (!out.empty()) out.push_back(' ');
+            out += detranslate(args[i]);
+        }
+        return out;
     }
 
     // Map a host tid to a small, stable GUEST pid: the root task is pid 1,
