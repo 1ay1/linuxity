@@ -349,6 +349,23 @@ public:
                     rr = wr;
                 }
             }
+        } else if (rr.orig_rax == 247 /*waitid*/) {
+            // waitid(idtype /*rdi*/, id /*rsi*/, siginfo* /*rdx*/, opts /*r10*/).
+            // Kernel idtype enum: P_ALL=0, P_PID=1, P_PGID=2, P_PIDFD=3. For
+            // P_PID/P_PGID the `id` is a GUEST pid/pgid we map to a host tid;
+            // P_ALL and P_PIDFD carry no guest pid.
+            auto idtype = static_cast<unsigned>(rr.rdi);
+            auto gid = static_cast<std::int32_t>(static_cast<long long>(rr.rsi));
+            if ((idtype == 1 /*P_PID*/ || idtype == 2 /*P_PGID*/) && gid > 0) {
+                ::pid_t host = host_tid_of(gid);
+                if (host > 0) {
+                    struct user_regs_struct wr = rr;
+                    wr.rsi = static_cast<unsigned long long>(host);
+                    ::ptrace(PTRACE_SETREGS, w, 0, &wr);
+                    t.regs = wr;
+                    rr = wr;
+                }
+            }
         }
     }
 
@@ -918,7 +935,35 @@ private:
             // through untouched.
             struct user_regs_struct r{};
             ::ptrace(PTRACE_GETREGS, w, 0, &r);
-            if (returns_pid(r.orig_rax)) {
+            if (r.orig_rax == 247 /*waitid*/) {
+                // waitid returns 0 in RAX (not a pid) and instead fills a
+                // siginfo_t (guest ptr in rdx at entry, preserved at exit)
+                // whose si_pid holds the reaped child — as a HOST tid. Rust's
+                // std/nix reads si_pid and compares it to the guest pid it got
+                // from fork; an untranslated host pid there makes fish's job
+                // control panic ("Unexpected waitpid() return"). Rewrite
+                // si_pid (offset 16 in the x86-64 siginfo_t) to the guest pid.
+                auto ret = static_cast<long long>(r.rax);
+                std::uint64_t infop = r.rdx;
+                if (ret == 0 && infop != 0) {
+                    errno = 0;
+                    long word = ::ptrace(PTRACE_PEEKDATA, w,
+                                         reinterpret_cast<void*>(infop + 16), 0);
+                    if (errno == 0) {
+                        auto host = static_cast<std::int32_t>(
+                            static_cast<std::uint32_t>(word & 0xffffffffu));
+                        if (host > 0) {
+                            std::int32_t g = gpid_of(host);
+                            std::uint64_t uw = static_cast<std::uint64_t>(word);
+                            uw = (uw & ~0xffffffffull) |
+                                 static_cast<std::uint32_t>(g);
+                            ::ptrace(PTRACE_POKEDATA, w,
+                                     reinterpret_cast<void*>(infop + 16),
+                                     reinterpret_cast<void*>(uw));
+                        }
+                    }
+                }
+            } else if (returns_pid(r.orig_rax)) {
                 auto host = static_cast<::pid_t>(static_cast<long long>(r.rax));
                 if (host > 0) {
                     r.rax = static_cast<unsigned long long>(gpid_of(host));

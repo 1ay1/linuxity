@@ -58,6 +58,7 @@ inline constexpr int kTrappedX86_64[] = {
     102, 104, 107, 108,          // getuid/getgid/geteuid/getegid
     118, 120,                    // getresuid/getresgid (bash/sudo $UID at init)
     56, 57, 58,                  // clone/fork/vfork      (pid translated)
+    435,                         // clone3 (glibc fork/posix_spawn) (pid translated)
     59, 322,                     // execve/execveat
     // A NATIVE guest execve resolves its target against the child's ROOT.
     // Unprivileged, chroot(2) fails, so that root is the HOST tree: a native
@@ -69,6 +70,7 @@ inline constexpr int kTrappedX86_64[] = {
     // arms TRACESECCOMP) is handled in start(): the child tgkill-SIGSTOPs
     // itself after TRACEME so the parent arms options first.
     61,                          // wait4                 (pid translated both ways)
+    247,                         // waitid    (id in, siginfo.si_pid out, both xlated)
     62,                          // kill                  (signal to guest pid)
     // tgkill(234)/tkill(200) are intentionally NOT filtered: glibc's raise()
     // uses tgkill, and the child raises SIGSTOP during bootstrap BEFORE the
