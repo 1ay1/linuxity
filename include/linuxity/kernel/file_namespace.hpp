@@ -112,6 +112,15 @@ public:
             meta_attached_ = true;
             whiteout_journal_ = upper + "/.linuxity-whiteout";
             load_whiteouts();
+            // Manager-layer hygiene, run ONCE at attach while no guest is
+            // live: a pacman transaction that was interrupted (session leader
+            // exited, host reap) can leave a stale db.lck and half-written
+            // local-DB entries (a package dir with only `mtree`, no `desc`) in
+            // the durable upper. On a real machine you'd `rm db.lck` and
+            // reinstall; we do the equivalent so the next run isn't poisoned.
+            // proot-distro performs the same class of lock/partial cleanup at
+            // its container-manager layer. Only touches the writable UPPER.
+            repair_pacman_db(upper);
         }
         mounts_.push_back(Mount{std::move(prefix), std::move(host_base),
                                 std::move(upper), {}});
@@ -456,17 +465,62 @@ private:
         ::closedir(d);
     }
 
+    // Manager-layer repair of a durable pacman DB in the overlay upper, run
+    // ONCE at attach while no guest is live. An interrupted transaction can
+    // leave two artifacts that poison the NEXT run:
+    //   (1) a stale lock  <upper>/var/lib/pacman/db.lck  -> `unable to lock
+    //       database` (or the misleading `... unless you are root`);
+    //   (2) a half-written local-DB entry  <upper>/var/lib/pacman/local/<pkg>/
+    //       with `mtree` but no `desc`  -> `could not open file .../desc` and
+    //       `invalid or corrupted package`.
+    // Both are exactly what a killed pacman leaves on a real machine, where
+    // the fix is `rm db.lck` + reinstall. We do the equivalent, touching ONLY
+    // the writable upper (never the pristine lower). A local dir is considered
+    // partial iff it has no `desc` file; removing it makes pacman re-create a
+    // clean entry on the next install.
+    static void repair_pacman_db(const std::string& upper) {
+        std::string lck = upper + "/var/lib/pacman/db.lck";
+        if (exists(lck.c_str())) ::unlink(lck.c_str());
+
+        std::string localdir = upper + "/var/lib/pacman/local";
+        DIR* d = ::opendir(localdir.c_str());
+        if (!d) return;
+        struct ::dirent* e;
+        while ((e = ::readdir(d)) != nullptr) {
+            std::string name = e->d_name;
+            if (name == "." || name == "..") continue;
+            std::string entry = localdir + "/" + name;
+            if (!is_dir(entry.c_str())) continue;
+            std::string desc = entry + "/desc";
+            if (exists(desc.c_str())) continue;      // complete entry
+            // Partial: drop the whole dir (best-effort recursive unlink).
+            remove_tree(entry);
+        }
+        ::closedir(d);
+    }
+
+    // Best-effort recursive removal of a host directory tree (upper-layer
+    // scratch only). Used to prune a half-written pacman DB entry.
+    static void remove_tree(const std::string& path) {
+        DIR* d = ::opendir(path.c_str());
+        if (d) {
+            struct ::dirent* e;
+            while ((e = ::readdir(d)) != nullptr) {
+                std::string name = e->d_name;
+                if (name == "." || name == "..") continue;
+                std::string child = path + "/" + name;
+                if (is_dir(child.c_str())) remove_tree(child);
+                else ::unlink(child.c_str());
+            }
+            ::closedir(d);
+        }
+        ::rmdir(path.c_str());
+    }
+
     // Ensure `up` exists in the upper layer, copying its bytes up from the
     // read-only lower `lo` on first write and creating parent directories.
     // Best-effort: if the lower doesn't exist this just preps the parent dirs
     // so an O_CREAT open can make the new file in upper.
-    //
-    // Crucially, the parent chain is MIRRORED from lower to upper: a directory
-    // that exists only in the read-only lower (e.g. /opt from the pristine
-    // rootfs) has no upper counterpart, so a bare mkdir/create of a CHILD in
-    // upper would ENOENT on the missing parent. mirror_parents_from_lower
-    // reproduces each lower ancestor as a real upper directory first, so the
-    // upper layer is a coherent writable view of the whole tree.
     static void copy_up(const std::string& up, const std::string& lo) {
         mirror_parents_from_lower(up, lo);
         if (exists(up.c_str())) return;                 // already copied up

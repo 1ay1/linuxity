@@ -40,6 +40,7 @@
 #include <functional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <fcntl.h>
@@ -882,20 +883,72 @@ public:
 private:
     // Bring the whole traced tree down after the root/session leader exited.
     // Any surviving task is a detached daemon (gpg-agent/dirmngr etc.) that the
-    // guest orphaned; it will not exit on its own and may hold our stdout open.
-    // PTRACE_O_EXITKILL already guarantees these die when we detach/exit, but a
-    // task stopped under ptrace must be KILLed explicitly to make progress, and
-    // we drain its exit so no zombie is left parented to us. Best-effort: a
-    // task may already be gone (ESRCH) between the snapshot and the kill.
+    // guest orphaned, OR a foreground child (e.g. pacman mid-transaction) that
+    // was still running when the session leader exited. We must take the whole
+    // tree down, but NOT with an immediate SIGKILL: a package manager killed
+    // uncatchably leaves a stale db.lck and a half-written local-DB entry
+    // (dir + mtree but no desc), which then poisons every later transaction.
+    // So we do what a real machine's shutdown does -- deliver a CATCHABLE
+    // SIGTERM first (via PTRACE_CONT, since a ptrace-stopped task only receives
+    // an injected signal on resume), give the tree a bounded grace window to
+    // run its own cleanup handlers (pacman removes the lock and rolls back the
+    // partial transaction), then ESCALATE to SIGKILL for anything that ignores
+    // SIGTERM (detached gpg-agent/dirmngr). PTRACE_O_EXITKILL still backstops
+    // us if we exit before the drain completes. Best-effort throughout: a task
+    // may already be gone (ESRCH) between the snapshot and each step.
     void reap_tree() {
         std::vector<::pid_t> victims;
         victims.reserve(tasks_.size());
         for (const auto& [tid, _] : tasks_) victims.push_back(tid);
-        for (::pid_t tid : victims) ::ptrace(PTRACE_KILL, tid, 0, 0);
-        for (::pid_t tid : victims) ::kill(tid, SIGKILL);
-        // Drain exit notifications so we don't leave zombies. A stopped tracee
-        // needs a resume for the SIGKILL to take effect, then reports WIFSIGNALED.
+
+        // Phase 1: graceful. Resume each stopped task delivering SIGTERM, so
+        // its handler runs (SIGCONT first in case it was group-stopped). This
+        // lets pacman's signal handler unlink db.lck and undo the in-progress
+        // transaction, exactly as on native Linux.
+        std::unordered_set<::pid_t> alive;
         for (::pid_t tid : victims) {
+            ::kill(tid, SIGCONT);
+            // Inject SIGTERM through the ptrace resume so a stopped tracee
+            // actually receives it; also kill(2) it in case it is running.
+            if (::ptrace(PTRACE_CONT, tid, 0, SIGTERM) != 0)
+                ::kill(tid, SIGTERM);
+            alive.insert(tid);
+        }
+
+        // Phase 2: bounded drain. Reap any task that exits on its own within
+        // the grace window. Poll waitpid(WNOHANG) across all victims for up to
+        // ~2s (pacman's rollback is sub-second); resume any that re-stop under
+        // ptrace so the pending SIGTERM keeps propagating. As soon as the tree
+        // is empty we stop early.
+        constexpr int kGraceMs = 2000;
+        constexpr int kStepMs = 20;
+        for (int waited = 0; waited < kGraceMs && !alive.empty(); waited += kStepMs) {
+            bool progressed = false;
+            for (auto it = alive.begin(); it != alive.end();) {
+                ::pid_t tid = *it;
+                int st = 0;
+                ::pid_t r = ::waitpid(tid, &st, __WALL | WNOHANG);
+                if (r == tid && (WIFEXITED(st) || WIFSIGNALED(st))) {
+                    it = alive.erase(it); progressed = true; continue;
+                }
+                if (r == tid && WIFSTOPPED(st)) {
+                    // Re-stopped (e.g. group-stop or trap): resume, keep the
+                    // SIGTERM heading its way.
+                    ::ptrace(PTRACE_CONT, tid, 0, SIGTERM);
+                    progressed = true;
+                }
+                if (r < 0) { it = alive.erase(it); progressed = true; continue; }
+                ++it;
+            }
+            if (!progressed)
+                ::usleep(static_cast<useconds_t>(kStepMs) * 1000);
+        }
+
+        // Phase 3: escalate. Anything still alive ignored SIGTERM (detached
+        // daemons); force it down and drain its exit so no zombie is left.
+        for (::pid_t tid : alive) {
+            ::ptrace(PTRACE_KILL, tid, 0, 0);
+            ::kill(tid, SIGKILL);
             for (;;) {
                 int st = 0;
                 ::pid_t r = ::waitpid(tid, &st, __WALL);
