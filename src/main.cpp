@@ -150,6 +150,10 @@ int main(int argc, char** argv) {
     // --persist at a directory and every write (installed packages, the pacman
     // local DB, config) survives across runs — a real, mutable machine.
     std::string persist;
+    // Transparent pacman --overwrite "*": ON by default whenever a --root
+    // distro is mounted (the bootstrap rootfs has orphan library files that
+    // would otherwise abort installs). --no-pacman-overwrite disables it.
+    bool pacman_overwrite = true;
     kernel::ResourceSpec res;
     // --bind host[:guest] mounts a real host directory into the guest tree at
     // `guest` (default: same path). Thin wrapper over FileNamespace::mount_host
@@ -168,6 +172,8 @@ int main(int argc, char** argv) {
         std::string f = argv[i];
         if (f == "--root") { root = need("--root"); }
         else if (f == "--persist" || f == "--upper") { persist = need("--persist"); }
+        else if (f == "--no-pacman-overwrite") { pacman_overwrite = false; }
+        else if (f == "--pacman-overwrite")    { pacman_overwrite = true; }
         else if (f == "--cpus")        { res.cpus = std::atof(need("--cpus")); }
         else if (f == "--memory" || f == "-m") {
             if (auto b = kernel::parse_bytes(need("--memory"))) res.mem_max = *b;
@@ -208,6 +214,9 @@ int main(int argc, char** argv) {
             "  --root <dir>        mount an extracted distro rootfs as guest '/'\n"
             "  --persist <dir>     durable overlay upper: installs/writes survive\n"
             "                      across runs (default: ephemeral per-run)\n"
+            "  --no-pacman-overwrite  don't auto-pass pacman --overwrite \"*\"\n"
+            "                      (default: on with --root, so a bootstrap\n"
+            "                      rootfs's orphan lib files never block installs)\n"
             "  --cpus <N>          bound CPU to N cores' worth (e.g. 1.5)\n"
             "  --memory <SZ>       hard memory ceiling (e.g. 512M, 2G)\n"
             "  --memory-swap <SZ>  combined memory+swap ceiling\n"
@@ -261,6 +270,17 @@ int main(int argc, char** argv) {
         set_env("HOME", "/root");
         set_env("SHELL", "/bin/bash");
     }
+
+    // Transparent pacman --overwrite "*": expose the mode to the dispatcher
+    // (abi::path_exec reads this via getenv on the linuxity process) so a
+    // pacman execve anywhere in the guest tree gets `--overwrite "*"` appended.
+    // A bootstrap rootfs ships unowned lib files (libgcc_s/libstdc++/...) that
+    // pacman would otherwise refuse to overwrite; the first install then
+    // registers ownership, so it's a no-op afterward. Only with --root.
+    if (!root.empty() && pacman_overwrite)
+        ::setenv("LINUXITY_PACMAN_OVERWRITE", "1", 1);
+    else
+        ::unsetenv("LINUXITY_PACMAN_OVERWRITE");
 
     host::PosixHost hw;
     kernel::Kernel<host::PosixHost> k{hw};
@@ -473,6 +493,26 @@ int main(int argc, char** argv) {
         for (std::size_t j = 1; j < gargv.size(); ++j)
             child_argv.push_back(gargv[j]);  // the guest program's args
         exec_path = interp_host;             // exec the interpreter itself
+    }
+
+    // If the top-level program is pacman and transparent-overwrite is on,
+    // append `--overwrite "*"` to the child argv (same rationale as the
+    // in-guest path_exec handling — bootstrap rootfs orphan lib files).
+    if (!root.empty() && pacman_overwrite) {
+        auto slash = path.find_last_of('/');
+        std::string base = slash == std::string::npos ? path : path.substr(slash + 1);
+        bool is_txn = false, end_opts = false;
+        for (std::size_t j = 1; j < gargv.size(); ++j) {
+            const std::string& a = gargv[j];
+            if (a == "--") { end_opts = true; continue; }
+            if (end_opts || a.size() < 2 || a[0] != '-') continue;
+            if (a[1] == '-') { if (a == "--sync" || a == "--upgrade") is_txn = true; }
+            else for (char c : a) if (c == 'S' || c == 'U') is_txn = true;
+        }
+        if (base == "pacman" && is_txn) {
+            child_argv.push_back("--overwrite");
+            child_argv.push_back("*");
+        }
     }
     runtime::PtraceTrap trap{exec_path, child_argv, genvp, {},
                              [&governor]() {

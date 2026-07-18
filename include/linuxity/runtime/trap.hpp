@@ -186,7 +186,8 @@ public:
                 if constexpr (requires {
                         trap_.exec_through_interp(0, std::string{}, std::string{}); }) {
                     auto er = trap_.exec_through_interp(
-                        o.path_arg, o.interp_host, o.prog_guest, o.interp_prefix);
+                        o.path_arg, o.interp_host, o.prog_guest, o.interp_prefix,
+                        o.exec_extra_args);
                     if (!er) { LX_TRY(recover_syscall(er.error())); continue; }
                 } else {
                     auto fr = trap_.forward();

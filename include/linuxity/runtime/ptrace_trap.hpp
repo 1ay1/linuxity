@@ -534,7 +534,8 @@ public:
     [[nodiscard]] Result<std::int64_t> exec_through_interp(
             int path_arg, const std::string& interp_host,
             const std::string& prog_guest,
-            const std::vector<std::string>& prefix = {}) {
+            const std::vector<std::string>& prefix = {},
+            const std::vector<std::string>& extra_args = {}) {
         Task& t = tasks_[cur_];
         struct user_regs_struct r = t.regs;
         int argv_reg = path_arg + 1;
@@ -555,10 +556,12 @@ public:
         // Layout: interp_host, each prefix token, prog_guest, then the array
         // [ &interp, &prefix..., &prog, orig_argv[1..], NULL ].
         std::size_t nprefix = prefix.size();
-        std::size_t narg = 2 + nprefix + (orig.empty() ? 0 : orig.size() - 1);
+        std::size_t narg = 2 + nprefix +
+                           (orig.empty() ? 0 : orig.size() - 1) + extra_args.size();
         std::size_t arr_bytes = (narg + 1) * 8;
         std::size_t strbytes = interp_host.size() + 1 + prog_guest.size() + 1;
         for (const auto& s : prefix) strbytes += s.size() + 1;
+        for (const auto& s : extra_args) strbytes += s.size() + 1;
         std::size_t block = strbytes + arr_bytes + 64;
         std::uint64_t base = (t.regs.rsp - 512 - block) & ~std::uint64_t{15};
 
@@ -572,11 +575,15 @@ public:
         std::vector<std::uint64_t> p_prefix;
         for (const auto& s : prefix) p_prefix.push_back(put(s));
         std::uint64_t p_prog = put(prog_guest);
+        std::vector<std::uint64_t> p_extra;
+        for (const auto& s : extra_args) p_extra.push_back(put(s));
 
         if (!write_cstr(p_interp, interp_host)) return err<std::int64_t>(Errno::efault);
         for (std::size_t i = 0; i < nprefix; ++i)
             if (!write_cstr(p_prefix[i], prefix[i])) return err<std::int64_t>(Errno::efault);
         if (!write_cstr(p_prog, prog_guest)) return err<std::int64_t>(Errno::efault);
+        for (std::size_t i = 0; i < extra_args.size(); ++i)
+            if (!write_cstr(p_extra[i], extra_args[i])) return err<std::int64_t>(Errno::efault);
 
         std::uint64_t arr = (cursor + 15) & ~std::uint64_t{15};
         std::vector<std::uint64_t> ptrs;
@@ -585,6 +592,7 @@ public:
         ptrs.push_back(p_prog);            // the program (guest path)
         for (std::size_t i = 1; i < orig.size(); ++i)
             ptrs.push_back(orig[i]);       // original argv[1..]
+        for (auto p : p_extra) ptrs.push_back(p);  // appended --overwrite "*"
         ptrs.push_back(0);                 // NULL terminator
         std::vector<std::byte> arrbytes(ptrs.size() * 8);
         std::memcpy(arrbytes.data(), ptrs.data(), arrbytes.size());

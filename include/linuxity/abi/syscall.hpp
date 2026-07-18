@@ -104,6 +104,12 @@ struct Outcome {
     // own host path (so argv = ld.so, /bin/sh-host, [-e], script-guest, ...).
     std::vector<std::string> interp_prefix;
 
+    // Extra argv tokens APPENDED after the program's original arguments. Used
+    // to transparently pass `--overwrite "*"` to pacman so a bootstrap rootfs
+    // with orphan (unowned-but-on-disk) library files never aborts an install
+    // with "<file> exists in filesystem". Empty for every other program.
+    std::vector<std::string> exec_extra_args;
+
     // POST-REDIRECT id scrub. Host-backed stat/lstat/newfstatat/statx are
     // REDIRECTED, so the host kernel fills the guest buffer with the HOST
     // file's uid/gid (whatever user unpacked the rootfs). linuxity presents a
@@ -979,11 +985,60 @@ private:
         return val(static_cast<std::int64_t>(n));
     }
 
+    // Does this pacman invocation perform a SYNC or UPGRADE transaction (-S /
+    // --sync / -U / --upgrade)? `--overwrite` is only a valid option for those
+    // operations; appending it to a query (-Q) or other op makes pacman abort
+    // with "invalid option '--overwrite'". Scan argv (the guest pointer array
+    // at path_arg+1): a short cluster like -Syu counts if it contains S or U;
+    // a long --sync/--upgrade counts; tokens after `--` or non-flag operands
+    // are ignored.
+    [[nodiscard]] bool pacman_is_transaction(const Regs& r, int path_arg) {
+        std::uint64_t argv_ptr = r.arg[static_cast<std::size_t>(path_arg) + 1];
+        if (argv_ptr == 0) return false;
+        bool end_opts = false;
+        for (std::size_t i = 0; i < 256; ++i) {
+            std::array<std::byte, 8> b{};
+            if (!mem_.copy_in(uaddr(argv_ptr + i * 8), b)) break;
+            std::uint64_t p = 0; std::memcpy(&p, b.data(), 8);
+            if (p == 0) break;
+            if (i == 0) continue;                 // argv[0] is the program name
+            std::string a = read_cstr(uaddr(p));
+            if (a == "--") { end_opts = true; continue; }
+            if (end_opts || a.size() < 2 || a[0] != '-') continue;
+            if (a[1] == '-') {                    // long option
+                if (a == "--sync" || a == "--upgrade") return true;
+            } else {                              // short cluster, e.g. -Syu
+                for (std::size_t k = 1; k < a.size(); ++k)
+                    if (a[k] == 'S' || a[k] == 'U') return true;
+            }
+        }
+        return false;
+    }
+
     // execve/execveat: rewrite the program-path argument to the translated
     // host path (host-backed) and forward. Virtual exec targets are refused.
     [[nodiscard]] Outcome path_exec(const Regs& r, int path_arg) {
         std::string abs = resolve_arg(r, path_arg, path_arg == 1);
         auto pc = k_.files().classify(abs);
+        // Should this exec get `--overwrite "*"` appended? Only when the
+        // program is pacman AND the transparent-overwrite mode is on
+        // (LINUXITY_PACMAN_OVERWRITE, set by main.cpp's --pacman-overwrite,
+        // default ON with --root). A bootstrap rootfs ships library files
+        // (libgcc_s, libstdc++, ...) that no local-DB package owns yet; pacman
+        // correctly refuses to clobber an unowned file, so EVERY install of a
+        // package delivering one aborts with "<file> exists in filesystem".
+        // On a real system those files ARE owned, so overwriting is exactly
+        // right; --overwrite "*" makes the first install succeed and REGISTER
+        // ownership, after which it's a no-op. Scoped to argv[0]==pacman so no
+        // other program is affected.
+        std::vector<std::string> extra;
+        {
+            auto slash = abs.find_last_of('/');
+            std::string base = slash == std::string::npos ? abs : abs.substr(slash + 1);
+            if (base == "pacman" && std::getenv("LINUXITY_PACMAN_OVERWRITE") &&
+                pacman_is_transaction(r, path_arg))
+                extra = {"--overwrite", "*"};
+        }
         if (pc.realm == kernel::Realm2::host_backed) {
             // termux-exec's inspectFileHeader lesson: a FOREIGN-arch ELF (an
             // aarch64 binary on an x86-64 host, say) cannot run natively —
@@ -1011,6 +1066,7 @@ private:
                 o.interp_host = ipc.realm == kernel::Realm2::host_backed
                                     ? std::move(ipc.host_path) : interp;
                 o.prog_guest  = abs;   // guest path; loader's openat redirects
+                o.exec_extra_args = std::move(extra);
                 return o;
             }
             // A `#!` script: the host kernel would launch the shebang
