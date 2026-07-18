@@ -250,6 +250,15 @@ private:
                         pi.vsize_bytes = 4u << 20;   // plausible until first exec
                         pi.rss_pages = 256;
                         kernel_.procs().upsert(pi);
+                        // A freshly forked child inherits a COPY of its
+                        // parent's cwd AT FORK TIME. Seeding it here (rather
+                        // than lazily on the child's first syscall) means the
+                        // record is correct even if the parent chdir's away
+                        // before the child runs, and a later pid reuse can't
+                        // pick up a stale parent cwd.
+                        kernel_.files().inherit_cwd(
+                            static_cast<std::int32_t>(e.pid),
+                            static_cast<std::int32_t>(e.ppid));
                         break;
                     }
                     case EV::exec:
@@ -270,8 +279,17 @@ private:
                     case EV::reap:
                         // pid 1 (our init) is never removed: /proc must always
                         // have a root even as the last guest thread winds down.
-                        if (e.pid != 1)
+                        if (e.pid != 1) {
                             kernel_.procs().remove(static_cast<std::int32_t>(e.pid));
+                            // Drop the exited pid's cwd record so a later pid
+                            // REUSE starts from its real parent's cwd instead
+                            // of resurrecting the dead process's directory
+                            // (this is the git pack-helper tmp_pack_* leak:
+                            // the helper chdir'd into a temp dir, exited, and
+                            // the reused pid inherited that stale cwd).
+                            kernel_.files().forget_pid(
+                                static_cast<std::int32_t>(e.pid));
+                        }
                         break;
                 }
             }
