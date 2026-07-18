@@ -49,6 +49,18 @@ static const char* kSrc =
     "  close(rf);\n"
     "  if (unlink(\"/base/pkg/link\") != 0) return 13;\n"
     "  if (access(\"/base/pkg/link\", F_OK) == 0) return 14;\n"
+    // WHITEOUT: /lower_only exists ONLY in the read-only lower rootfs. unlink
+    // must SUCCEED (overlay view), the path must then read back as absent, and
+    // the pristine lower file must survive (asserted host-side). Forwarding
+    // the unlink to the lower path would destroy the rootfs.
+    "  if (access(\"/lower_only\", F_OK) != 0) return 15;\n"
+    "  if (unlink(\"/lower_only\") != 0) return 16;\n"
+    "  if (access(\"/lower_only\", F_OK) == 0) return 17;\n"
+    // Re-create at the whited-out path: it must reappear (whiteout cleared).
+    "  int rf2 = open(\"/lower_only\", O_WRONLY|O_CREAT|O_TRUNC, 0644);\n"
+    "  if (rf2 < 0) return 18;\n"
+    "  close(rf2);\n"
+    "  if (access(\"/lower_only\", F_OK) != 0) return 19;\n"
     "  return 42;\n}\n";
 
 int main() {
@@ -59,7 +71,8 @@ int main() {
     const std::string root  = "/tmp/lx_mutate_root";
     const std::string upper = "/tmp/lx_mutate_upper";
     std::system(("rm -rf " + root + " " + upper +
-                 " && mkdir -p " + root + "/bin " + root + "/base " + upper).c_str());
+                 " && mkdir -p " + root + "/bin " + root + "/base " + upper +
+                 " && printf lower > " + root + "/lower_only").c_str());
 
     { std::FILE* f = std::fopen("/tmp/lx_mutate_src.c", "w");
       if (!f) { std::puts("run_mutate: skipped (no /tmp)"); return 0; }
@@ -85,6 +98,8 @@ int main() {
     };
     bool upper_has  = exists(upper + "/base/pkg/bin/hello");
     bool lower_clean = !exists(root + "/base/pkg");
+    // The whited-out lower-only file must STILL exist on the pristine rootfs.
+    bool lower_only_survives = exists(root + "/lower_only");
 
     std::system(("rm -rf " + root + " " + upper).c_str());
     std::remove("/tmp/lx_mutate_src.c");
@@ -103,8 +118,14 @@ int main() {
         std::puts("run_mutate: FAIL the pristine lower rootfs was mutated");
         return 1;
     }
+    if (!lower_only_survives) {
+        std::puts("run_mutate: FAIL unlink of a lower-only file DESTROYED the "
+                  "pristine rootfs (whiteout not applied)");
+        return 1;
+    }
     std::puts("run_mutate: mkdir/write/chmod/chown/rename/symlink/unlink all "
-              "translate to the overlay upper layer, lower stays pristine, exit=42");
+              "translate to the overlay upper layer, lower stays pristine, "
+              "lower-only unlink whiteouts (rootfs survives), exit=42");
     return 0;
 #endif
 }

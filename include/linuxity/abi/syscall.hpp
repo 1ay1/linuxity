@@ -1101,6 +1101,15 @@ private:
         auto pc = k_.files().classify(abs, /*for_write=*/true, /*follow=*/false, wi);
         if (pc.realm == kernel::Realm2::virtual_file)
             return eno(Errno::erofs);
+        // A removal whose target lives ONLY in the read-only lower layer:
+        // forwarding the unlink would destroy the pristine rootfs. Record a
+        // whiteout (hides the lower file in the overlay view) and report
+        // success WITHOUT touching the host. Also drop any shadow meta.
+        if (pc.whiteout_lower) {
+            k_.files().add_whiteout(abs);
+            k_.files().meta().forget(abs);
+            return val(0);
+        }
         if (pc.host_path.empty()) return eno(pc.error);
         // A removal drops any shadow record so a fresh file created at the same
         // path later starts from the host defaults, not a stale owner/mode.

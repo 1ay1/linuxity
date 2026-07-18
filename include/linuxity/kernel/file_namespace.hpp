@@ -37,6 +37,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace lx::kernel {
@@ -54,6 +55,12 @@ struct PathClass {
     // whose producer must be consulted — not the original link path. Empty
     // means "same as the path passed to classify".
     std::string virtual_path;
+    // Set for a REMOVE (unlink/rmdir) whose target exists ONLY in the
+    // read-only lower layer. The pristine rootfs must never be mutated, so the
+    // dispatcher records a WHITEOUT (hiding the lower file in the overlay view)
+    // and reports success WITHOUT forwarding the unlink to the host. When set,
+    // `host_path` is empty and the syscall must NOT be redirected.
+    bool whiteout_lower{false};
 };
 
 // A synthesized virtual file: a producer of bytes for a virtual path. If
@@ -103,6 +110,8 @@ public:
         if (prefix == "/" && !upper.empty() && !meta_attached_) {
             meta_.attach(upper);
             meta_attached_ = true;
+            whiteout_journal_ = upper + "/.linuxity-whiteout";
+            load_whiteouts();
         }
         mounts_.push_back(Mount{std::move(prefix), std::move(host_base),
                                 std::move(upper), {}});
@@ -196,15 +205,32 @@ public:
                     if (exists(up.c_str()))
                         return PathClass{Realm2::host_backed, std::move(up),
                                          Errno::enoent, {}};
-                    return PathClass{Realm2::host_backed, std::move(lo),
-                                     Errno::enoent, {}};
+                    // Target lives ONLY in the read-only lower layer. Forwarding
+                    // the unlink to `lo` would DESTROY the pristine rootfs. If
+                    // the lower file doesn't exist at all (or is already whited
+                    // out), the removal is a no-op ENOENT. Otherwise signal a
+                    // whiteout: the dispatcher records it and reports success
+                    // without touching the host.
+                    if (is_whiteout(abs) || !exists(lo.c_str()))
+                        return PathClass{Realm2::absent, {}, Errno::enoent, {}};
+                    PathClass wo{Realm2::absent, {}, Errno::enoent, {}};
+                    wo.whiteout_lower = true;
+                    return wo;
                 }
                 if (wi == WriteIntent::parents_only)
                     mirror_parents_from_lower(up, lo);
                 else
                     copy_up(up, lo);
+                // A create/write at a whited-out path revives it: the upper
+                // now shadows the (still-pristine) lower, so drop the whiteout.
+                if (!whiteouts_.empty()) clear_whiteout(std::string{abs});
                 return PathClass{Realm2::host_backed, std::move(up), Errno::enoent, {}};
             }
+            // READ. A whited-out path that hasn't been re-created in the upper
+            // reads back as absent — the lower file was "removed" in the
+            // overlay view even though the pristine rootfs still holds it.
+            if (!whiteouts_.empty() && !exists(up.c_str()) && is_whiteout(abs))
+                return PathClass{Realm2::absent, {}, Errno::enoent, {}};
             std::string host = exists(up.c_str()) ? up : lo;
             if (follow) return follow_symlink(*m, std::move(host), for_write, wi, depth);
             return PathClass{Realm2::host_backed, std::move(host), Errno::enoent, {}};
@@ -244,6 +270,25 @@ public:
         // The shadow-metadata journal is an implementation file in the upper
         // layer, not part of the guest tree — never let it show up in a listing.
         seen.erase(std::string{MetaStore::journal_leaf()});
+        seen.erase(".linuxity-whiteout");
+        // Drop names whited-out from the lower layer (removed in the overlay
+        // view but still present on the pristine rootfs) unless the upper has
+        // re-created them (merge_dir(up) already recorded those, so a name
+        // present in `seen` from the upper survives — only lower-only whited
+        // names must go).
+        if (!whiteouts_.empty()) {
+            std::string dir{abs};
+            if (dir != "/" && dir.back() == '/') dir.pop_back();
+            std::string up_dir = up;
+            for (auto it = seen.begin(); it != seen.end();) {
+                std::string child = (dir == "/" ? "/" : dir + "/") + it->first;
+                if (is_whiteout(child) &&
+                    !exists((up_dir + "/" + it->first).c_str()))
+                    it = seen.erase(it);
+                else
+                    ++it;
+            }
+        }
         out.reserve(seen.size());
         for (auto& [name, isdir] : seen) out.push_back({name, isdir});
         return out;
@@ -501,6 +546,65 @@ private:
     std::unordered_map<int, DirStream> dir_streams_;
     MetaStore meta_{};
     bool meta_attached_{false};
+
+    // WHITEOUTS. Removing a file that lives ONLY in the read-only lower layer
+    // must not touch the pristine rootfs. Instead we record the guest path
+    // here so it reads back as absent (classify) and is filtered from
+    // directory listings (overlay_dir_union). A re-create at the same path
+    // (copy_leaf/parents_only classify, or an open O_CREAT) clears the
+    // whiteout. Journaled to `.linuxity-whiteout` in the upper layer so the
+    // removal persists across runs, exactly like copied-up files and meta.
+    mutable std::unordered_set<std::string> whiteouts_;
+    std::string whiteout_journal_;
+
+public:
+    // Record a lower-only removal. Returns nothing; the caller reports success.
+    void add_whiteout(const std::string& guest_path) const {
+        if (whiteouts_.insert(guest_path).second && !whiteout_journal_.empty()) {
+            if (std::FILE* fp = std::fopen(whiteout_journal_.c_str(), "a")) {
+                std::fputs(guest_path.c_str(), fp);
+                std::fputc('\n', fp);
+                std::fclose(fp);
+            }
+        }
+    }
+
+    // Clear a whiteout because the path is being (re-)created. In-memory only;
+    // the create materializes a real upper file that shadows the lower, and a
+    // stale journal line is harmless (replay is order-preserving: a later
+    // create in the upper wins over an earlier whiteout at read time). We
+    // append a clearing marker so a cross-run replay stays exact.
+    void clear_whiteout(const std::string& guest_path) const {
+        if (whiteouts_.erase(guest_path) && !whiteout_journal_.empty()) {
+            if (std::FILE* fp = std::fopen(whiteout_journal_.c_str(), "a")) {
+                std::fputc('!', fp);            // '!' prefix = un-whiteout
+                std::fputs(guest_path.c_str(), fp);
+                std::fputc('\n', fp);
+                std::fclose(fp);
+            }
+        }
+    }
+
+    [[nodiscard]] bool is_whiteout(std::string_view guest_path) const {
+        return whiteouts_.find(std::string{guest_path}) != whiteouts_.end();
+    }
+
+private:
+    void load_whiteouts() {
+        if (whiteout_journal_.empty()) return;
+        std::FILE* fp = std::fopen(whiteout_journal_.c_str(), "r");
+        if (!fp) return;
+        char line[4096];
+        while (std::fgets(line, sizeof line, fp)) {
+            std::string s{line};
+            while (!s.empty() && (s.back() == '\n' || s.back() == '\r'))
+                s.pop_back();
+            if (s.empty()) continue;
+            if (s.front() == '!') whiteouts_.erase(s.substr(1)); // un-whiteout
+            else                  whiteouts_.insert(s);
+        }
+        std::fclose(fp);
+    }
 };
 
 } // namespace lx::kernel
