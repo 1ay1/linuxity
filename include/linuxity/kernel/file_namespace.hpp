@@ -66,7 +66,19 @@ struct PathClass {
 // A synthesized virtual file: a producer of bytes for a virtual path. If
 // `is_dir`, `entries` names its children (for getdents enumeration) and
 // `bytes` is ignored.
-struct VirtualDirent { std::string name; bool is_dir{false}; };
+enum class DType : std::uint8_t { regular, dir, symlink };
+struct VirtualDirent {
+    std::string name;
+    DType type{DType::regular};
+    // Back-compat helpers so existing `{name, true/false}` sites and .is_dir
+    // reads keep working while carrying the richer symlink type.
+    VirtualDirent() = default;
+    VirtualDirent(std::string n, bool dir)
+        : name(std::move(n)), type(dir ? DType::dir : DType::regular) {}
+    VirtualDirent(std::string n, DType t) : name(std::move(n)), type(t) {}
+    [[nodiscard]] bool is_dir() const noexcept { return type == DType::dir; }
+    [[nodiscard]] bool is_symlink() const noexcept { return type == DType::symlink; }
+};
 struct VirtualFile {
     std::vector<std::byte> bytes;
     bool is_dir{false};
@@ -138,8 +150,42 @@ public:
         mounts_.push_back(Mount{std::move(prefix), {}, {}, std::move(prod)});
     }
 
-    [[nodiscard]] std::string_view cwd() const noexcept { return cwd_; }
-    void set_cwd(std::string c) { cwd_ = normalize(c); }
+    [[nodiscard]] std::string_view cwd() const noexcept { return cwd_of(cur_pid_); }
+    void set_cwd(std::string c) { cwds_[cur_pid_] = normalize(c); }
+
+    // Per-process cwd. linuxity runs a whole guest PROCESS TREE against one
+    // FileNamespace, but each process has its OWN current directory — a single
+    // shared cwd_ let a forked child's chdir clobber the parent's (git's
+    // pack helpers chdir into .git/objects/pack/tmp_pack_* and, on exit, left
+    // the shell resolving relative paths against the deleted tempdir, e.g.
+    // `cd repo` after a clone -> "cannot open directory '.'"). The dispatcher
+    // sets cur_pid_ to the trapped task's guest pid before each syscall, so
+    // chdir/fchdir/getcwd and every relative-path absolutize act on the RIGHT
+    // process's cwd. A pid with no record inherits the tree default "/".
+    void set_current_pid(std::int32_t pid) const noexcept { cur_pid_ = pid; }
+    // Select the active pid AND, if this pid has no cwd record yet, seed it
+    // from its parent's cwd (a freshly forked child inherits the parent's
+    // directory). Called by the dispatcher with (pid, ppid) it already knows,
+    // so inheritance happens on the child's very first syscall without the
+    // trap layer having to plumb fork events into the filesystem.
+    void set_current_pid(std::int32_t pid, std::int32_t ppid) const {
+        cur_pid_ = pid;
+        if (cwds_.find(pid) == cwds_.end()) {
+            auto it = cwds_.find(ppid);
+            cwds_[pid] = (it != cwds_.end()) ? it->second : std::string{"/"};
+        }
+    }
+    // On fork/clone the child inherits a COPY of the parent's cwd.
+    void inherit_cwd(std::int32_t child, std::int32_t parent) {
+        auto it = cwds_.find(parent);
+        cwds_[child] = (it != cwds_.end()) ? it->second : std::string{"/"};
+    }
+    void forget_pid(std::int32_t pid) { cwds_.erase(pid); }
+    [[nodiscard]] std::string_view cwd_of(std::int32_t pid) const noexcept {
+        auto it = cwds_.find(pid);
+        return it != cwds_.end() ? std::string_view{it->second}
+                                 : std::string_view{"/"};
+    }
 
     // Resolve a (possibly relative, possibly dirfd-relative) path to an
     // absolute guest path. `dir_path` is the path bound to a guest dirfd, or
@@ -147,7 +193,7 @@ public:
     [[nodiscard]] std::string absolutize(std::string_view path,
                                          std::string_view dir_path = {}) const {
         if (!path.empty() && path.front() == '/') return normalize(std::string{path});
-        std::string base = dir_path.empty() ? cwd_ : std::string{dir_path};
+        std::string base = dir_path.empty() ? std::string{cwd()} : std::string{dir_path};
         if (base.empty()) base = "/";
         if (base.back() != '/') base += '/';
         base += path;
@@ -273,7 +319,7 @@ public:
         std::string lo = join_host(m->host_base, rel);
         std::string up = join_host(m->upper, rel);
         if (!is_dir(lo.c_str()) && !is_dir(up.c_str())) return out;
-        std::unordered_map<std::string, bool> seen;   // name -> is_dir
+        std::unordered_map<std::string, DType> seen;   // name -> type
         merge_dir(up, seen);   // upper first (wins)
         merge_dir(lo, seen);
         // The shadow-metadata journal is an implementation file in the upper
@@ -299,7 +345,7 @@ public:
             }
         }
         out.reserve(seen.size());
-        for (auto& [name, isdir] : seen) out.push_back({name, isdir});
+        for (auto& [name, type] : seen) out.push_back({name, type});
         return out;
     }
 
@@ -446,21 +492,34 @@ private:
         return ::stat(path, &st) == 0 && S_ISDIR(st.st_mode);
     }
 
-    // Read a real host directory's entries into `seen` (name -> is_dir),
+    // Read a real host directory's entries into `seen` (name -> type),
     // skipping "."/".." and not overwriting a name already present (so the
-    // caller can merge upper before lower and have upper win).
+    // caller can merge upper before lower and have upper win). Symlink type is
+    // captured (via d_type or an lstat that does NOT follow the link) so the
+    // overlay listing reports DT_LNK -- git and other tools probe symlink
+    // support by lstat-checking S_ISLNK on a listed entry.
     static void merge_dir(const std::string& host_dir,
-                          std::unordered_map<std::string, bool>& seen) {
+                          std::unordered_map<std::string, DType>& seen) {
         ::DIR* d = ::opendir(host_dir.c_str());
         if (!d) return;
         while (::dirent* e = ::readdir(d)) {
             std::string name = e->d_name;
             if (name == "." || name == "..") continue;
             if (seen.count(name)) continue;
-            bool isdir = e->d_type == DT_DIR;
-            if (e->d_type == DT_UNKNOWN)
-                isdir = is_dir((host_dir + "/" + name).c_str());
-            seen.emplace(std::move(name), isdir);
+            DType t;
+            if      (e->d_type == DT_LNK) t = DType::symlink;
+            else if (e->d_type == DT_DIR) t = DType::dir;
+            else if (e->d_type == DT_REG) t = DType::regular;
+            else {                                   // DT_UNKNOWN: lstat it
+                struct ::stat ls{};
+                if (::lstat((host_dir + "/" + name).c_str(), &ls) == 0)
+                    t = S_ISLNK(ls.st_mode) ? DType::symlink
+                      : S_ISDIR(ls.st_mode) ? DType::dir
+                                            : DType::regular;
+                else
+                    t = DType::regular;
+            }
+            seen.emplace(std::move(name), t);
         }
         ::closedir(d);
     }
@@ -595,7 +654,10 @@ private:
     }
 
     std::vector<Mount> mounts_;
-    std::string cwd_{"/"};
+    // Per-process current directory (see set_current_pid/inherit_cwd). cur_pid_
+    // is mutable so a const cwd()/absolutize path can select the active pid.
+    mutable std::unordered_map<std::int32_t, std::string> cwds_{};
+    mutable std::int32_t cur_pid_{1};   // root/init
     std::unordered_map<int, std::string> fd_paths_;
     std::unordered_map<int, DirStream> dir_streams_;
     MetaStore meta_{};

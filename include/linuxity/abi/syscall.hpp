@@ -160,6 +160,15 @@ public:
 
     [[nodiscard]] Outcome dispatch(const Regs& r) {
         const Sysno sc = decode(arch_, r.nr);
+        // Select the trapped task's per-process cwd for this syscall, so
+        // chdir/fchdir/getcwd and every relative-path absolutize act on THIS
+        // process's directory rather than a single shared one (a forked
+        // child's chdir must not clobber the parent's cwd). Passing ppid lets
+        // a first-seen child inherit the parent's cwd automatically.
+        {
+            auto id = ids();
+            k_.files().set_current_pid(id.pid, id.ppid);
+        }
         switch (sc) {
             // -- process lifecycle: let the task ACTUALLY exit in the kernel
             //    (forward), so the trap reaps it and attributes the code. In
@@ -278,7 +287,15 @@ public:
             case Sysno::lstat:       return path_stat(r, 0, false, false);
             case Sysno::access:      return path_at(r, 0, false);
             case Sysno::chdir:       return do_chdir(r);
-            case Sysno::newfstatat:  return path_stat(r, 1, true);
+            case Sysno::newfstatat: {
+                // Honor AT_SYMLINK_NOFOLLOW (flags = arg3, bit 0x100): with it
+                // set, stat the LINK itself (follow=false) so a symlink reports
+                // S_IFLNK, not its target's type. git probes symlink support
+                // via fstatat(...,AT_SYMLINK_NOFOLLOW) + S_ISLNK; following the
+                // link made it see a regular file and disable symlinks.
+                bool nofollow = (r.arg[3] & 0x100) != 0;
+                return path_stat(r, 1, true, !nofollow);
+            }
             case Sysno::statx:       return path_statx(r);
             case Sysno::faccessat:
             case Sysno::faccessat2:  return path_at(r, 1, true);
@@ -822,7 +839,11 @@ private:
             return fwd();
         }
         std::string abs = resolve_arg(r, 1, true);
-        auto pc = k_.files().classify(abs);
+        // Honor AT_SYMLINK_NOFOLLOW (0x100): coreutils `stat`/`ls -la` statx a
+        // symlink with this flag and expect S_IFLNK; following it reported the
+        // target's type ("regular file") and made git's symlink probe fail.
+        bool nofollow = (flags & 0x100) != 0;
+        auto pc = k_.files().classify(abs, /*for_write=*/false, /*follow=*/!nofollow);
         if (pc.realm == kernel::Realm2::host_backed) {
             Outcome o{};
             o.redirect = true; o.path_arg = 1; o.host_path = std::move(pc.host_path);
@@ -1544,7 +1565,7 @@ private:
 
         // struct linux_dirent64 { u64 d_ino; s64 d_off; u16 d_reclen;
         //                         u8 d_type; char d_name[]; } — 8-aligned.
-        constexpr std::uint8_t kDtDir = 4, kDtReg = 8;
+        constexpr std::uint8_t kDtDir = 4, kDtReg = 8, kDtLnk = 10;
         while (ds->pos < ds->entries.size()) {
             const auto& e = ds->entries[ds->pos];
             std::size_t namelen = e.name.size() + 1;                 // incl NUL
@@ -1561,7 +1582,8 @@ private:
             put64(8, static_cast<std::uint64_t>(ds->pos + 1));      // d_off
             out[base + 16] = static_cast<std::byte>(reclen & 0xff); // d_reclen lo
             out[base + 17] = static_cast<std::byte>((reclen >> 8) & 0xff);
-            out[base + 18] = static_cast<std::byte>(e.is_dir ? kDtDir : kDtReg);
+            out[base + 18] = static_cast<std::byte>(
+                e.is_symlink() ? kDtLnk : e.is_dir() ? kDtDir : kDtReg);
             for (std::size_t i = 0; i < e.name.size(); ++i)
                 out[base + 19 + i] = static_cast<std::byte>(e.name[i]);
             ++ds->pos;
