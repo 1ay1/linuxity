@@ -61,6 +61,26 @@ static const char* kSrc =
     "  if (rf2 < 0) return 18;\n"
     "  close(rf2);\n"
     "  if (access(\"/lower_only\", F_OK) != 0) return 19;\n"
+    // fchdir cwd tracking: open a dir fd, fchdir into it, then create a file
+    // with a RELATIVE path. It must land INSIDE that dir (guest cwd tracked),
+    // not at the root. This is what `mkdir -p`, `tar -C`, and pacman scriptlets
+    // rely on.
+    "  if (mkdir(\"/base/cwd\", 0755) != 0) return 20;\n"
+    "  int dfd = open(\"/base/cwd\", O_RDONLY|O_DIRECTORY);\n"
+    "  if (dfd < 0) return 21;\n"
+    "  if (fchdir(dfd) != 0) return 22;\n"
+    "  int relf = open(\"rel.txt\", O_WRONLY|O_CREAT|O_TRUNC, 0644);\n"
+    "  if (relf < 0) return 23;\n"
+    "  close(relf); close(dfd);\n"
+    "  if (access(\"/base/cwd/rel.txt\", F_OK) != 0) return 24;\n"
+    // chmod +x must make the file REALLY executable on the host inode (a
+    // scriptlet is chmod 0755'd then execve'd) — verify via access(X_OK).
+    "  int xf = open(\"/base/cwd/script\", O_WRONLY|O_CREAT|O_TRUNC, 0644);\n"
+    "  if (xf < 0) return 25;\n"
+    "  if (write(xf, \"#!/bin/true\\n\", 11) != 11) return 26;\n"
+    "  close(xf);\n"
+    "  if (chmod(\"/base/cwd/script\", 0755) != 0) return 27;\n"
+    "  if (access(\"/base/cwd/script\", X_OK) != 0) return 28;\n"
     "  return 42;\n}\n";
 
 int main() {
@@ -100,6 +120,14 @@ int main() {
     bool lower_clean = !exists(root + "/base/pkg");
     // The whited-out lower-only file must STILL exist on the pristine rootfs.
     bool lower_only_survives = exists(root + "/lower_only");
+    // fchdir-relative create must have landed inside /base/cwd in the UPPER.
+    bool fchdir_rel = exists(upper + "/base/cwd/rel.txt");
+    // chmod 0755 must have physically set +x on the host inode.
+    auto is_exec = [](const std::string& p) {
+        struct ::stat st{};
+        return ::stat(p.c_str(), &st) == 0 && (st.st_mode & 0111) != 0;
+    };
+    bool chmod_exec = is_exec(upper + "/base/cwd/script");
 
     std::system(("rm -rf " + root + " " + upper).c_str());
     std::remove("/tmp/lx_mutate_src.c");
@@ -123,9 +151,20 @@ int main() {
                   "pristine rootfs (whiteout not applied)");
         return 1;
     }
+    if (!fchdir_rel) {
+        std::puts("run_mutate: FAIL fchdir cwd not tracked — a relative create "
+                  "after fchdir landed in the wrong overlay location");
+        return 1;
+    }
+    if (!chmod_exec) {
+        std::puts("run_mutate: FAIL chmod 0755 did not set +x on the host inode "
+                  "(scriptlet execve would EACCES)");
+        return 1;
+    }
     std::puts("run_mutate: mkdir/write/chmod/chown/rename/symlink/unlink all "
               "translate to the overlay upper layer, lower stays pristine, "
-              "lower-only unlink whiteouts (rootfs survives), exit=42");
+              "lower-only unlink whiteouts (rootfs survives), fchdir tracks cwd, "
+              "chmod +x lands on the inode, exit=42");
     return 0;
 #endif
 }

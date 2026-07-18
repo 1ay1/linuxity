@@ -91,6 +91,7 @@ inline constexpr int kTrappedX86_64[] = {
     137,                         // statfs        (path -> overlay redirect)
     21, 269, 439,                // access/faccessat/faccessat2
     80,                          // chdir
+    81,                          // fchdir        (syncs tracked cwd from fd)
     161,                         // chroot        (accepted namespace no-op)
     89, 267,                     // readlink/readlinkat
     79,                          // getcwd

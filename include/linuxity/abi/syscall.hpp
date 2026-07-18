@@ -433,8 +433,8 @@ public:
             // forward (the host applies what bits it can). ftruncate/fchdir
             // carry no metadata, so just forward.
             case Sysno::fchmod:     return do_fchmod(r);
-            case Sysno::ftruncate:
-            case Sysno::fchdir:     return fwd();
+            case Sysno::ftruncate:  return fwd();
+            case Sysno::fchdir:     return do_fchdir(r);
 
             // -- TWO-PATH mutations: both operands are guest paths. rename /
             //    link translate both; symlink stores its first operand as the
@@ -608,10 +608,18 @@ private:
     }
 
     // The path bound to a guest dirfd, or empty for AT_FDCWD (-100).
+    // A dirfd is an `int` in the kernel ABI: only the low 32 bits of the
+    // register are meaningful. glibc may pass AT_FDCWD (-100) as a bare 32-bit
+    // value (0xFFFFFF9C) that is NOT sign-extended in the 64-bit register, so
+    // we MUST narrow to int32 before comparing/looking up — otherwise -100
+    // reads as 4294967196, misses the AT_FDCWD check, and the path resolves
+    // relative to a bogus "fd" instead of the cwd (breaking `mkdir -p`, and
+    // every *at call a relative path is passed to).
     [[nodiscard]] std::string_view dir_of(std::int64_t dirfd) const {
-        constexpr std::int64_t kAtFdCwd = -100;
-        if (dirfd == kAtFdCwd) return {};
-        return k_.files().path_of_fd(static_cast<int>(dirfd));
+        constexpr std::int32_t kAtFdCwd = -100;
+        std::int32_t fd = static_cast<std::int32_t>(dirfd);
+        if (fd == kAtFdCwd) return {};
+        return k_.files().path_of_fd(fd);
     }
 
     // Resolve arg-carried path to an absolute, normalized guest path.
@@ -749,6 +757,31 @@ private:
     // statx(dirfd, path, flags, mask, buf): host-backed -> redirect; virtual
     // -> synthesize a `struct statx` into the guest buffer (arg[4]).
     [[nodiscard]] Outcome path_statx(const Regs& r) {
+        // statx(dirfd, path, flags, mask, buf). With AT_EMPTY_PATH (0x1000) and
+        // an empty path the call stats the dirfd ITSELF (fstat-equivalent) —
+        // fish opens config.fish then statx(fd,"",AT_EMPTY_PATH) to check it.
+        // Resolve to the fd's bound guest path so we stat the right inode; a
+        // real (host-backed) fd we don't track just forwards to the kernel,
+        // which fstats the fd correctly.
+        constexpr std::uint64_t kAtEmptyPath = 0x1000;
+        std::uint64_t flags = r.arg[2];
+        std::string raw1 = read_cstr(uaddr(r.arg[1]));
+        if (raw1.empty() && (flags & kAtEmptyPath)) {
+            std::string_view gp = k_.files().path_of_fd(static_cast<int>(r.arg[0]));
+            if (gp.empty()) return fwd();   // untracked fd: kernel fstats it
+            auto pc = k_.files().classify(std::string{gp});
+            if (pc.realm == kernel::Realm2::virtual_file) {
+                const std::string& vp = pc.virtual_path.empty()
+                                            ? std::string{gp} : pc.virtual_path;
+                auto vf = k_.files().produce(vp);
+                if (!vf) return eno(vf.error());
+                return write_statx(uaddr(r.arg[4]), vf->is_dir, vf->bytes.size());
+            }
+            // A host-backed fd is already open on the correct inode — the
+            // kernel fstats it directly; forward unchanged (do NOT re-resolve
+            // the empty path, which would wrongly stat the cwd/root).
+            return fwd();
+        }
         std::string abs = resolve_arg(r, 1, true);
         auto pc = k_.files().classify(abs);
         if (pc.realm == kernel::Realm2::host_backed) {
@@ -1016,6 +1049,22 @@ private:
         return val(0);
     }
 
+    // fchdir(fd): the guest changes cwd to an already-open directory fd. The
+    // FORWARDED call moves the real child's cwd, but the guest's *tracked* cwd
+    // (used to absolutize every later relative path) would go stale unless we
+    // also sync it here. coreutils `mkdir -p`, `tar -C`, `rm -r`, and libalpm's
+    // scriptlet runner all fchdir into a saved dir fd and then issue RELATIVE
+    // paths; without this the relative paths resolve against the wrong (stale)
+    // cwd and land in the wrong overlay location or ENOENT. We look up the
+    // guest path bound to the fd and REDIRECT the fd to its overlay host path
+    // (so the real fchdir lands in the same layer we believe it does), and
+    // update the tracked cwd. If the fd isn't one we bound, just forward.
+    [[nodiscard]] Outcome do_fchdir(const Regs& r) {
+        std::string_view gp = k_.files().path_of_fd(static_cast<int>(r.arg[0]));
+        if (!gp.empty()) k_.files().set_cwd(std::string{gp});
+        return fwd();
+    }
+
     // chroot(path): a guest chroot would chroot our real HOST child to an
     // UNTRANSLATED host path — either failing (unprivileged) or, worse,
     // escaping linuxity's namespace onto the host tree. linuxity already
@@ -1152,6 +1201,22 @@ private:
         if (pc.realm == kernel::Realm2::virtual_file) return eno(Errno::erofs);
         if (pc.realm == kernel::Realm2::absent)       return eno(pc.error);
         k_.files().meta().set_mode(abs, mode);
+        // ALSO apply the mode to the real host inode, best-effort. The shadow
+        // store makes the FULL guest-intended mode authoritative at stat time,
+        // but some bits must physically land on the inode to have any effect:
+        // above all the EXECUTE bits, which a later execve(2) reads straight
+        // from the host file (a pacman/apk .INSTALL scriptlet is chmod 0755'd
+        // then execve'd — record-only left it non-executable → EACCES
+        // "Permission denied"). We chmod the file we actually own in the
+        // overlay upper; a copy-up first ensures a lower-only file gains a
+        // writable upper twin to mark. Failure is ignored (the shadow store
+        // still presents the intended mode).
+        {
+            auto wc = k_.files().classify(abs, /*for_write=*/true,
+                                          /*follow=*/false, Wi::copy_leaf);
+            if (!wc.host_path.empty())
+                (void)::chmod(wc.host_path.c_str(), mode & 07777);
+        }
         return val(0);
     }
 
@@ -1161,9 +1226,15 @@ private:
     // forwarded host fchmod on an unprivileged process can EPERM/drop bits).
     [[nodiscard]] Outcome do_fchmod(const Regs& r) {
         std::string_view gp = k_.files().path_of_fd(static_cast<int>(r.arg[0]));
-        if (!gp.empty())
-            k_.files().meta().set_mode(std::string{gp},
-                                       static_cast<std::uint32_t>(r.arg[1]));
+        std::uint32_t mode = static_cast<std::uint32_t>(r.arg[1]);
+        if (!gp.empty()) {
+            k_.files().meta().set_mode(std::string{gp}, mode);
+            // Best-effort apply to the host inode (execute bit for execve).
+            auto wc = k_.files().classify(std::string{gp}, /*for_write=*/true,
+                                          /*follow=*/false, Wi::copy_leaf);
+            if (!wc.host_path.empty())
+                (void)::chmod(wc.host_path.c_str(), mode & 07777);
+        }
         return val(0);
     }
 
