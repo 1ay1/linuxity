@@ -36,8 +36,12 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
+#include <optional>
 
 namespace lx::runtime {
 
@@ -79,14 +83,102 @@ enum class Default { term, core, ignore, stop, cont };
     }
 }
 
+// The per-PROCESS signal disposition table. Shared by every thread (Linux
+// has no per-thread handlers -- only the blocked mask is per-thread), so it
+// lives in ProcessState under its lock.
+class SignalDispositions {
+public:
+    [[nodiscard]] LinuxSigaction get(int s) const noexcept {
+        return valid(s) ? act_[s - 1] : LinuxSigaction{};
+    }
+    // Returns false for SIGKILL/SIGSTOP, whose disposition cannot change.
+    bool set(int s, const LinuxSigaction& a) noexcept {
+        if (!valid(s) || s == 9 || s == 19) return false;
+        act_[s - 1] = a;
+        return true;
+    }
+    // execve(2): handlers point at code that no longer exists, so caught
+    // signals revert to SIG_DFL; ignored stay ignored.
+    void on_exec() noexcept {
+        for (auto& a : act_) if (a.handler > 1) a = {};
+    }
+    [[nodiscard]] static constexpr bool valid(int s) noexcept {
+        return s >= 1 && s <= kLinuxNsig;
+    }
+
+private:
+    std::array<LinuxSigaction, kLinuxNsig> act_{};
+};
+
 // -- Host-side pending set ----------------------------------------------------
-// One process == one guest process == one vCPU, so a single global is the
-// honest representation. The handler touches nothing but this and the
-// framework's documented async-safe exit call.
+// A host signal arrives at LINUXITY, on whichever thread the kernel picks.
+// The handler must be async-signal-safe, so it does the minimum: set a bit
+// and kick the vCPUs so every thread leaves the guest promptly and checks.
+//
+// Delivery itself happens at a trap boundary, where the guest is stopped and
+// we own its registers -- the same "on return to user space" rule Linux uses.
 struct PendingSignals {
     std::atomic<std::uint64_t> bits{0};
-    std::atomic<hv_vcpu_t> vcpu{0};
-    std::atomic<bool> vcpu_valid{false};
+    // Up to 64 live vCPUs to kick. Written under ProcessState's lock when
+    // threads start/stop; read from a signal handler, hence atomic.
+    static constexpr int kMaxCpus = 64;
+    std::atomic<hv_vcpu_t> cpus[kMaxCpus]{};
+    std::atomic<int> cpu_count{0};
+    std::mutex wait_mu_;
+    std::condition_variable wait_cv_;
+
+    void register_cpu(hv_vcpu_t v) noexcept {
+        const int n = cpu_count.load(std::memory_order_relaxed);
+        for (int i = 0; i < n; ++i)
+            if (cpus[i].load(std::memory_order_relaxed) == v) return;
+        if (n < kMaxCpus) {
+            cpus[n].store(v, std::memory_order_relaxed);
+            cpu_count.store(n + 1, std::memory_order_release);
+        }
+    }
+    void unregister_cpu(hv_vcpu_t v) noexcept {
+        const int n = cpu_count.load(std::memory_order_acquire);
+        for (int i = 0; i < n; ++i)
+            if (cpus[i].load(std::memory_order_relaxed) == v)
+                cpus[i].store(0, std::memory_order_relaxed);
+    }
+    void kick_all() noexcept {
+        const int n = cpu_count.load(std::memory_order_acquire);
+        for (int i = 0; i < n; ++i) {
+            hv_vcpu_t v = cpus[i].load(std::memory_order_relaxed);
+            if (v) ::hv_vcpus_exit(&v, 1);
+        }
+    }
+
+    // Block until one of `interesting` is pending, then return. Used by
+    // sigsuspend/pause, which must be genuinely idle rather than spinning.
+    //
+    // The handler cannot take a mutex (not async-signal-safe), so it only
+    // sets the bit and bumps a sequence counter; the waiter polls that
+    // counter under its own lock with a bounded wait. That keeps the handler
+    // safe AND the waiter asleep.
+    void wait_for_signal(std::uint64_t interesting) {
+        std::unique_lock lk{wait_mu_};
+        wait_cv_.wait_for(lk, std::chrono::milliseconds{50}, [&] {
+            return (bits.load(std::memory_order_relaxed) & interesting) != 0;
+        });
+        while (!(bits.load(std::memory_order_relaxed) & interesting))
+            if (wait_cv_.wait_for(lk, std::chrono::milliseconds{50}, [&] {
+                    return (bits.load(std::memory_order_relaxed) & interesting) != 0;
+                }))
+                break;
+    }
+    void notify_waiters() noexcept { wait_cv_.notify_all(); }
+
+    // A forked child inherits the PARENT's vCPU handles -- this table is a
+    // process global, and fork copies it. Those handles name vCPUs in a
+    // DIFFERENT process; kicking them is meaningless and can wedge this one.
+    // Start empty: the child's own threads register themselves.
+    void reset_for_fork_child() noexcept {
+        cpu_count.store(0, std::memory_order_release);
+        for (auto& c : cpus) c.store(0, std::memory_order_relaxed);
+        bits.store(0, std::memory_order_relaxed);
+    }
 };
 inline PendingSignals g_pending;
 
@@ -94,13 +186,11 @@ extern "C" inline void hvf_host_signal(int host_sig) {
     const int ls = signal_to_linux(host_sig);
     if (ls > 0 && ls <= kLinuxNsig)
         g_pending.bits.fetch_or(sigbit(ls), std::memory_order_relaxed);
-    // Kick the guest out of hv_vcpu_run so the loop notices promptly. The
-    // call is async-signal-safe by design (it only sets a flag the vCPU
-    // thread polls on its way out).
-    if (g_pending.vcpu_valid.load(std::memory_order_relaxed)) {
-        hv_vcpu_t v = g_pending.vcpu.load(std::memory_order_relaxed);
-        ::hv_vcpus_exit(&v, 1);
-    }
+    g_pending.kick_all();
+    // notify_all() on a condvar is not formally async-signal-safe, but the
+    // waiter also re-checks on a 50 ms timeout, so a missed wake costs
+    // latency rather than correctness.
+    g_pending.notify_waiters();
 }
 
 // Route host signal `ls` (Linux number) to the guest: catch it on the host,

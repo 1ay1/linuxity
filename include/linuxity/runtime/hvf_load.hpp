@@ -40,7 +40,7 @@ struct HvfImage {
 // Map every PT_LOAD of `host_path` into guest RAM. A PIE (ET_DYN, as every
 // musl/glibc binary and ld.so is) has p_vaddr near 0, which would collide
 // with our hypervisor-private area, so it is loaded at `bias`.
-[[nodiscard]] inline Result<HvfImage> hvf_load_elf(HvfVm& vm,
+[[nodiscard]] inline Result<HvfImage> hvf_load_elf(HvfMachine& vm,
                                                    const std::string& host_path,
                                                    std::uint64_t bias) {
     std::FILE* f = std::fopen(host_path.c_str(), "rb");
@@ -119,7 +119,7 @@ struct HvfImage {
 // a dynamic loader find the program it must relocate, and AT_RANDOM must
 // point at 16 real bytes or musl's stack-guard init faults.
 [[nodiscard]] inline Result<std::uint64_t> hvf_build_stack(
-        HvfVm& vm, const HvfImage& img,
+        HvfMachine& vm, const HvfImage& img,
         const std::vector<std::string>& argv,
         const std::vector<std::string>& envp,
         std::uint64_t at_base = 0,

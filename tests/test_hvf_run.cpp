@@ -72,7 +72,7 @@ struct RunResult {
 [[nodiscard]] RunResult run_guest(const std::string& root,
                                   const std::string& guest_path,
                                   const std::vector<std::string>& argv) {
-    runtime::HvfVm vm;
+    runtime::HvfMachine vm;
     if (auto st = vm.init(512ull << 20); !st) return {};
 
     host::PosixHost hw;
@@ -107,8 +107,13 @@ struct RunResult {
                                         "TERM=dumb", "LANG=C"});
     if (!sp) return {};
 
+    runtime::HvfCpu cpu;
+    if (!cpu.create()) return {};
     runtime::PidSpace pids;
-    runtime::HvfTrap trap{vm, pids};
+    runtime::ProcessState proc;
+    runtime::TaskState task;
+    task.tid = 1;
+    runtime::HvfTrap trap{vm, cpu, proc, task, pids};
     runtime::HvfMem mem{vm, &trap};
     trap.set_arena(img->image_end, vm.mem_size() - (8ull << 20));
     // Hand the loader's own mappings to the VMA map, or the guest's mprotect
@@ -125,9 +130,10 @@ struct RunResult {
     trap.adopt(*sp & ~std::uint64_t{0xfff}, vm.mem_size() - 0x10000,
                runtime::GuestProt::read | runtime::GuestProt::write);
 
-    runtime::Cpu cpu{trap, k, mem, abi::Arch::aarch64};
+    cpu.set_entry(img->entry, *sp);
+    runtime::Cpu loop{trap, k, mem, abi::Arch::aarch64};
     std::fflush(stdout);
-    auto rc = cpu.run(uaddr(img->entry), uaddr(*sp));
+    auto rc = loop.run(uaddr(0), uaddr(0));
     if (!rc) {
         std::fprintf(stderr, "  run error: errno %d\n", int(rc.error()));
         return {};
@@ -145,7 +151,7 @@ int main() {
     }
     {
         // Probe the entitlement once so the skip message is accurate.
-        runtime::HvfVm probe;
+        runtime::HvfMachine probe;
         if (auto st = probe.init(2ull << 20); !st) {
             std::puts("hvf_run: skipped (no hypervisor entitlement)");
             return 0;

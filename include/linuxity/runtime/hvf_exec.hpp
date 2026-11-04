@@ -59,7 +59,7 @@ struct ExecResult {
 
 // Load `path` into a FRESH address space (execve replaces the image). Handles
 // static programs, dynamic programs (with PT_INTERP), and #! scripts.
-[[nodiscard]] inline Result<ExecResult> hvf_exec(HvfVm& vm,
+[[nodiscard]] inline Result<ExecResult> hvf_exec(HvfMachine& vm,
                                                  const ResolvePath& resolve,
                                                  std::string guest_path,
                                                  std::vector<std::string> argv,

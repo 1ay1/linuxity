@@ -135,11 +135,25 @@ enum class Sysno {
     landlock_create_ruleset, landlock_add_rule, landlock_restrict_self,
     // AF_UNIX sockets: bind/connect carry a filesystem path in sockaddr_un
     // that must be translated to the overlay upper like any other path arg.
+    // Sockets. The guest's network stack IS the host's: linuxity translates
+    // the ABI (see runtime/hvf_net.hpp on macOS) rather than routing packets.
+    socket, socketpair, listen, accept, accept4, getpeername,
+    sendto, recvfrom, sendmsg, recvmsg, setsockopt, getsockopt, shutdown,
     bind, connect,
     // Miscellany the guest may probe; forwarded or benign by default.
     prctl,
     // aarch64 additions (decoded for both arches where they exist).
     getsockname, capget, copy_file_range, fadvise64,
+    // Interval + POSIX timers. setitimer is behind every alarm(3) and
+    // SIGALRM timeout; timer_create is what glibc's timer_* and anything
+    // using CLOCK_* notifications calls. Missing, these produce the
+    // "Could not set timeout: Function not implemented" class of failure.
+    getitimer, setitimer, timer_create, timer_settime, timer_gettime,
+    timer_getoverrun, timer_delete, clock_settime, settimeofday,
+    // Bulk fd close: the modern way libc implements closefrom(), used by
+    // every spawn helper before exec. (The set*id credential syscalls are
+    // already declared above.)
+    close_range,
 };
 
 // Decode an arch-specific raw syscall number into the canonical identity.
@@ -217,6 +231,31 @@ enum class Sysno {
                 case 160: return Sysno::setrlimit;
                 case 302: return Sysno::prlimit64;
                 case 318: return Sysno::getrandom;
+                // -- timers ----------------------------------------------
+                case 36:  return Sysno::getitimer;
+                case 38:  return Sysno::setitimer;
+                case 222: return Sysno::timer_create;
+                case 224: return Sysno::timer_gettime;
+                case 225: return Sysno::timer_getoverrun;
+                case 223: return Sysno::timer_settime;
+                case 226: return Sysno::timer_delete;
+                case 227: return Sysno::clock_settime;
+                case 164: return Sysno::settimeofday;
+                case 436: return Sysno::close_range;
+                // -- sockets ---------------------------------------------
+                case 41:  return Sysno::socket;
+                case 53:  return Sysno::socketpair;
+                case 50:  return Sysno::listen;
+                case 43:  return Sysno::accept;
+                case 288: return Sysno::accept4;
+                case 52:  return Sysno::getpeername;
+                case 44:  return Sysno::sendto;
+                case 45:  return Sysno::recvfrom;
+                case 54:  return Sysno::setsockopt;
+                case 55:  return Sysno::getsockopt;
+                case 48:  return Sysno::shutdown;
+                case 46:  return Sysno::sendmsg;
+                case 47:  return Sysno::recvmsg;
                 case 202: return Sysno::futex;
                 case 273: return Sysno::set_robust_list;
                 case 334: return Sysno::rseq;
@@ -436,6 +475,41 @@ enum class Sysno {
                 case 90:  return Sysno::capget;
                 case 285: return Sysno::copy_file_range;
                 case 223: return Sysno::fadvise64;
+                // -- timers ----------------------------------------------
+                case 102: return Sysno::getitimer;
+                case 103: return Sysno::setitimer;
+                case 107: return Sysno::timer_create;
+                case 108: return Sysno::timer_gettime;
+                case 109: return Sysno::timer_getoverrun;
+                case 110: return Sysno::timer_settime;
+                case 111: return Sysno::timer_delete;
+                case 112: return Sysno::clock_settime;
+                case 170: return Sysno::settimeofday;
+                // -- credentials (asm-generic numbers) -------------------
+                case 143: return Sysno::setregid;
+                case 144: return Sysno::setgid;
+                case 145: return Sysno::setreuid;
+                case 146: return Sysno::setuid;
+                case 147: return Sysno::setresuid;
+                case 149: return Sysno::setresgid;
+                case 151: return Sysno::setfsuid;
+                case 152: return Sysno::setfsgid;
+                case 159: return Sysno::setgroups;
+                case 436: return Sysno::close_range;
+                // -- sockets (aarch64 has no socketcall multiplexer) -----
+                case 198: return Sysno::socket;
+                case 199: return Sysno::socketpair;
+                case 201: return Sysno::listen;
+                case 202: return Sysno::accept;
+                case 242: return Sysno::accept4;
+                case 204: return Sysno::getpeername;
+                case 206: return Sysno::sendto;
+                case 207: return Sysno::recvfrom;
+                case 208: return Sysno::setsockopt;
+                case 209: return Sysno::getsockopt;
+                case 210: return Sysno::shutdown;
+                case 211: return Sysno::sendmsg;
+                case 212: return Sysno::recvmsg;
                 case 98:  return Sysno::futex;
                 case 99:  return Sysno::set_robust_list;
                 case 293: return Sysno::rseq;

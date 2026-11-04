@@ -36,23 +36,29 @@ KVM platform use this same model.
       linuxity, which services it through the SAME portable core and the SAME
       `runtime::Cpu` loop the Linux ptrace backend uses.
 
-      Working today, against a real Arch Linux ARM rootfs:
-        * glibc's `ld.so` runs to completion (`--help`, `--version`).
-        * the full dynamic-loading path: `ld.so.cache`, `openat` on
-          `libc.so.6`, layered library mapping (PROT_NONE reservation →
-          MAP_FIXED text → MAP_FIXED data → MAP_FIXED|MAP_ANON .bss),
-          relocation, and RELRO via `mprotect`.
-        * `uname`/`getuid` answered by the portable core, so the guest sees
-          linuxity's identity, and paths resolve into the rootfs.
-      Known gap: a dynamically-linked program then faults inside libc on a
-      pointer holding `\x7fELF` bytes — one byte range of a layered mapping
-      still differs from what Linux produces. Next thing to fix.
-
-      Still to do for M5: signal delivery (SIGSEGV/SIGILL to the guest
-      instead of ending the run), `clone`/threads (one vCPU per thread),
-      `fork` (teardown → fork → rebuild; the mechanism is implemented and
-      probe-verified but not yet wired to the guest), and per-page W^X
-      (mprotect is tracked in the VMA map but the stage-1 tables are RWX).
+      Working today against a real Arch Linux ARM rootfs:
+        * `linuxity --root ~/arch /usr/bin/bash` is an interactive shell:
+          prompt, job control, pipelines, scripts, `trap`, redirection.
+        * **Threads.** `clone(CLONE_THREAD)` gives each guest thread its own
+          host thread and vCPU over shared guest RAM, so threads run in
+          parallel on the real cores (8 threads of CPU work: 0.167 s vs
+          0.115 s for one). futex is REAL -- macOS 14's
+          os_sync_wait_on_address has the same compare-and-sleep contract,
+          including cross-process shared support.
+        * **Processes.** fork via COW snapshot + spawn, execve (program +
+          PT_INTERP + `#!` chains), wait4, a shared guest pid namespace.
+        * **Signals.** Full rt_sigframe delivery with FP/SIMD state,
+          sigreturn, sigaltstack, per-thread masks, sigsuspend, and
+          group/broadcast kills confined to the guest's own process tree.
+        * **Timers.** setitimer and the POSIX timer_* family on a timer
+          wheel, so `timeout`, `alarm` and connect deadlines work.
+        * **Sockets.** socket/bind/connect/send/recv/poll translated to
+          Darwin, so the guest uses the Mac's real network. DNS resolves.
+        * coreutils, `pacman -Q`, vim, ssh, openssl, tar, find/xargs, git.
+      Remaining: TLS fails if the HOST clock is wrong (certificates look
+      not-yet-valid), no write overlay on macOS yet (guest writes land in the
+      rootfs directory), mprotect is tracked but not enforced in the page
+      tables, and `ps` needs a fuller /proc.
 - [ ] **M1: Linux completeness ladder.** Each rung is a release:
       1. busybox / coreutils / bash
       2. `pacman -Syu`, `apk add`, `apt install`

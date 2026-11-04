@@ -180,6 +180,11 @@ enum class DType : std::uint8_t {
 // diverge, and these are the ones real programs branch on.
 [[nodiscard]] inline std::int32_t errno_to_linux(int e) noexcept {
     switch (e) {
+        // Darwin 35 is EAGAIN/EWOULDBLOCK; Linux's is 11, and Linux's 35 is
+        // EDEADLK. Getting this wrong turns every non-blocking "try again"
+        // into an I/O error -- which is exactly how a TLS handshake died
+        // here with "Recv failure: Input/output error".
+        case EAGAIN:         return 11;
         case EDEADLK:        return 35;
         case ENAMETOOLONG:   return 36;
         case ENOLCK:         return 37;
@@ -231,6 +236,8 @@ enum class DType : std::uint8_t {
         case ECANCELED:      return 125;
         case EOWNERDEAD:     return 130;
         case ENOTRECOVERABLE:return 131;
+        // 1..34 are identical in both ABIs (EPERM..ERANGE). Anything else
+        // unmapped would be a LIE if passed through, so report EIO.
         default:             return e <= 34 ? e : 5 /*EIO*/;
     }
 }

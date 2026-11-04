@@ -51,10 +51,14 @@
 #include "linuxity/runtime/hvf_darwin.hpp"
 #include "linuxity/runtime/hvf_exec.hpp"
 #include "linuxity/runtime/hvf_fd.hpp"
+#include "linuxity/runtime/hvf_futex.hpp"
 #include "linuxity/runtime/hvf_proc.hpp"
 #include "linuxity/runtime/hvf_signal.hpp"
+#include "linuxity/runtime/hvf_task.hpp"
+#include "linuxity/runtime/hvf_timer.hpp"
 #include "linuxity/runtime/hvf_tty.hpp"
 #include "linuxity/runtime/hvf_mem.hpp"
+#include "linuxity/runtime/hvf_net.hpp"
 #include "linuxity/runtime/hvf_regs.hpp"
 #include "linuxity/runtime/hvf_vm.hpp"
 #include "linuxity/runtime/hvf_vma.hpp"
@@ -102,7 +106,13 @@ namespace lx::runtime {
 //               check-then-use race lives. Structurally absent here.
 class HvfTrap {
 public:
-    HvfTrap(HvfVm& vm, PidSpace& pids) noexcept : vm_{vm}, pids_{pids} {}
+    // A trap serves ONE guest thread: its own vCPU and TaskState, plus the
+    // ProcessState it shares with its siblings. `proc` and `machine` outlive
+    // every trap built on them (main owns them); `cpu` and `task` belong to
+    // this thread alone.
+    HvfTrap(HvfMachine& machine, HvfCpu& cpu, ProcessState& proc,
+            TaskState& task, PidSpace& pids) noexcept
+        : machine_{machine}, cpu_{cpu}, proc_{proc}, task_{task}, pids_{pids} {}
 
     // Translate a guest path to a host path through the portable namespace.
     // Installed by the embedder (main/test), which owns the Kernel; the trap
@@ -118,18 +128,18 @@ public:
     //    and /proc/self answer with this process's GUEST pid.
     struct TaskIds { std::int32_t pid, tid, ppid; };
     [[nodiscard]] TaskIds current_ids() const noexcept {
-        return {self_, self_, parent_};
+        return {task_.tid, task_.tid, parent_};
     }
 
     // The loader has already written the image and stack into guest RAM, so
     // starting is just placing the entry state. `image_end` seeds the heap.
     [[nodiscard]] Status start(UAddr entry, UAddr sp) {
-        if (value(entry)) vm_.set_entry(value(entry), value(sp));
+        if (value(entry)) cpu_.set_entry(value(entry), value(sp));
         return ok();
     }
 
     void set_arena(std::uint64_t image_end, std::uint64_t stack_floor) {
-        as_.reset(image_end, stack_floor);
+        proc_.with_space([&](AddressSpace& t) { return t.reset(image_end, stack_floor); });
     }
 
     // Record a region the LOADER mapped directly into guest RAM (ELF
@@ -139,15 +149,15 @@ public:
     // and the program dies with "cannot apply additional memory protection
     // after relocation".
     void adopt(std::uint64_t begin, std::uint64_t end, GuestProt prot) {
-        as_.adopt({AddressSpace::page_down(begin), AddressSpace::page_up(end),
-                   prot, /*anonymous=*/false});
+        proc_.with_space([&](AddressSpace& t) { return t.adopt({AddressSpace::page_down(begin), AddressSpace::page_up(end),
+                   prot, /*anonymous=*/false}); });
     }
 
     // The startup stack: from the initial sp's page up to the top of RAM.
     void adopt_stack(std::uint64_t sp, std::uint64_t mem_top) {
-        as_.adopt({AddressSpace::page_down(sp) - kStackReserve,
+        proc_.with_space([&](AddressSpace& t) { return t.adopt({AddressSpace::page_down(sp) - kStackReserve,
                    AddressSpace::page_down(mem_top),
-                   GuestProt::read | GuestProt::write, /*anonymous=*/true});
+                   GuestProt::read | GuestProt::write, /*anonymous=*/true}); });
     }
     // Room below the initial sp for the stack to grow (Linux's default
     // RLIMIT_STACK, which is what prlimit64 reports).
@@ -155,10 +165,17 @@ public:
 
     [[nodiscard]] Result<bool> next(TrapFrame& f) {
         constexpr std::uint64_t kEcSvc64 = 0x15;
-        g_pending.vcpu.store(vm_.vcpu(), std::memory_order_relaxed);
-        g_pending.vcpu_valid.store(true, std::memory_order_relaxed);
         for (;;) {
             if (exited_) return ok(false);
+            // A sibling called exit_group(2): this thread dies too, with the
+            // group's status. Checked here (and again after every trap)
+            // because the kick that woke us may have arrived while we were
+            // inside the guest.
+            if (proc_.group_exiting()) {
+                exited_ = true;
+                code_ = proc_.group_status();
+                return ok(false);
+            }
             // Signals are delivered here -- after resume() has written the
             // previous syscall's result into the vCPU, so the frame captures
             // the COMPLETED call (x0 = its return value, PC past the svc).
@@ -167,7 +184,7 @@ public:
             // and the interrupted code then dereferences garbage.
             (void)deliver_pending();
             if (exited_) return ok(false);
-            auto regs = vm_.run();
+            auto regs = cpu_.run();
             if (!regs) {
                 if (regs.error() == Errno::eintr) continue;   // kicked: deliver
                 return err<bool>(regs.error());
@@ -185,15 +202,15 @@ public:
     [[nodiscard]] Status resume(std::int64_t ret) {
         // rt_sigreturn restored the ENTIRE interrupted context, x0 and PC
         // included; writing a return value would corrupt it.
-        if (std::exchange(sigreturned_, false)) return ok();
+        if (std::exchange(task_.in_sigreturn, false)) return ok();
         // A successful execve has REPLACED the image: the vCPU already points
         // at the new entry with a clean register file. Writing a return value
         // into x0 would hand the new program's _start a garbage argument.
         if (std::exchange(execed_, false)) {
-            vm_.set_entry(regs_.elr, vm_.sp());
+            cpu_.set_entry(regs_.elr, cpu_.sp());
             return ok();
         }
-        vm_.set_result(regs_, ret);
+        cpu_.set_result(regs_, ret);
         return ok();
     }
 
@@ -206,32 +223,44 @@ public:
     // back to our own handler and is delivered on the next trap; a signal to
     // another guest process is delivered by its own linuxity the same way.
     [[nodiscard]] std::int64_t deliver_signal(std::int32_t gpid, std::int32_t sig) {
-        const int hs = signal_from_linux(sig);
         if (sig < 0 || sig > kLinuxNsig) return -22;
-        pid_t target;
-        if (gpid > 0) {
-            auto h = gpid == self_ ? std::optional<pid_t>{::getpid()} : pids_.host_of(gpid);
-            if (!h) return -3;                                       // ESRCH
-            target = *h;
-        } else if (gpid == 0) {
-            target = 0;
-        } else if (gpid == -1) {
-            target = -1;
-        } else {
-            auto h = pids_.host_of(-gpid);
-            if (!h) return -3;
-            target = -*h;
+        const int hs = signal_from_linux(sig);
+
+        // A GROUP or broadcast signal must stay INSIDE the guest's process
+        // tree. Passing 0 or -1 to the host kill(2) would signal linuxity's
+        // own host process group -- which is the user's terminal session, so
+        // `timeout` sending SIGTERM to its group killed linuxity itself (and
+        // would kill the shell that launched it). Enumerate the guest's
+        // processes from the shared pid table instead.
+        if (gpid <= 0) {
+            const bool to_self = gpid == 0 || gpid == -1;
+            std::int64_t delivered = 0;
+            if (to_self) {
+                mark_self_pending(sig);
+                delivered = 1;
+            }
+            for (const Child& c : children_) {
+                if (auto h = pids_.host_of(c.guest); h && ::kill(*h, hs) == 0)
+                    ++delivered;
+            }
+            return delivered ? 0 : -3;                               // ESRCH
         }
-        if (sig == 0) return ::kill(target, 0) < 0 ? darwin::fail() : 0;
-        // A self-signal must not race past the syscall return: Linux delivers
-        // it before kill() returns to user space. Mark it pending directly so
-        // the very next trap boundary delivers it, independent of when the
-        // host handler runs.
-        if (target == ::getpid() && sig != 9 && sig != 19) {
-            g_pending.bits.fetch_or(sigbit(sig), std::memory_order_relaxed);
-            return 0;
-        }
-        return ::kill(target, hs) < 0 ? darwin::fail() : 0;
+
+        if (gpid == task_.tid) { mark_self_pending(sig); return 0; }
+        auto h = pids_.host_of(gpid);
+        if (!h) return -3;
+        if (sig == 0) return ::kill(*h, 0) < 0 ? darwin::fail() : 0;
+        return ::kill(*h, hs) < 0 ? darwin::fail() : 0;
+    }
+
+    // A signal to OURSELVES is marked pending directly rather than sent
+    // through the host: Linux delivers it before kill(2) returns to user
+    // space, and our trap boundary is that point.
+    void mark_self_pending(int sig) {
+        if (sig == 0) return;
+        if (sig == 9 || sig == 19) { kill_with(sig); return; }   // unblockable
+        g_pending.bits.fetch_or(sigbit(sig), std::memory_order_relaxed);
+        g_pending.notify_waiters();
     }
 
     [[nodiscard]] Result<std::int64_t> forward() {
@@ -276,7 +305,12 @@ public:
         return complete(do_execve(resolve_(prog_guest)));
     }
 
-    [[nodiscard]] const AddressSpace& address_space() const noexcept { return as_; }
+    // A snapshot of the address space, for diagnostics and tests. Copies
+    // under the lock rather than handing out a reference that another
+    // thread could mutate while the caller walks it.
+    [[nodiscard]] std::vector<Vma> address_space_snapshot() {
+        return proc_.with_space([&](AddressSpace& t) { return t.vmas(); });
+    }
 
 private:
     [[nodiscard]] Result<std::int64_t> complete(std::int64_t rc) {
@@ -286,7 +320,7 @@ private:
         static const bool strace = std::getenv("LINUXITY_STRACE") != nullptr;
         if (strace)
             std::fprintf(stderr, "[%d] %3llu(%#llx, %#llx, %#llx, %#llx) = %lld\n",
-                         self_, static_cast<unsigned long long>(regs_.nr()),
+                         task_.tid, static_cast<unsigned long long>(regs_.nr()),
                          static_cast<unsigned long long>(regs_.arg(0)),
                          static_cast<unsigned long long>(regs_.arg(1)),
                          static_cast<unsigned long long>(regs_.arg(2)),
@@ -311,7 +345,7 @@ private:
             case 0x00: kind = "undefined instruction";   sig = 4; break;
             default: break;
         }
-        const Vma* v = as_.find(regs_.far);
+        const Vma* v = proc_.with_space([&](AddressSpace& t) { return t.find(regs_.far); });
         std::fprintf(stderr,
             "linuxity: guest %s at pc=%#llx addr=%#llx (%s) esr=%#llx\n",
             kind, static_cast<unsigned long long>(regs_.elr),
@@ -337,29 +371,287 @@ private:
         if (auto r = do_process(sc))        return *r;
         if (auto r = do_memory(sc))         return *r;
         if (auto r = do_io(sc))             return *r;
+        if (auto r = do_socket(sc))         return *r;
         if (auto r = do_path(sc, path, path2)) return *r;
         return -38;                                     // ENOSYS, honestly
     }
 
     using Maybe = std::optional<std::int64_t>;
 
-    // -- Signals ------------------------------------------------------------
+    // -- Sockets -------------------------------------------------------------
+    // The guest's network IS the host's: linuxity translates the ABI rather
+    // than routing packets, so a guest gets the Mac's real connectivity
+    // (including whatever VPN or resolver the host uses). See hvf_net.hpp
+    // for why every field crossing this boundary is translated by name.
+    [[nodiscard]] Maybe do_socket(abi::Sysno sc) {
+        using S = abi::Sysno;
+        const GuestRam ram = machine_.ram();
+        const std::uint64_t a1 = regs_.arg(1), a2 = regs_.arg(2),
+                            a3 = regs_.arg(3), a4 = regs_.arg(4);
+        const auto gfd = static_cast<int>(regs_.arg(0));
+
+        switch (sc) {
+            case S::socket: {
+                const auto af = net::af_to_darwin(static_cast<std::uint16_t>(regs_.arg(0)));
+                if (!af) return -97;                                 // EAFNOSUPPORT
+                // Linux packs SOCK_NONBLOCK/SOCK_CLOEXEC into the type word;
+                // Darwin has no such flags, so apply them with fcntl.
+                const int type = static_cast<int>(a1 & ~(net::kSockNonblock | net::kSockCloexec));
+                const int h = ::socket(*af, type, static_cast<int>(a2));
+                if (h < 0) return darwin::fail();
+                finish_socket(h, a1);
+                return install_socket(h, (a1 & net::kSockCloexec) != 0);
+            }
+            case S::socketpair: {
+                const auto af = net::af_to_darwin(static_cast<std::uint16_t>(regs_.arg(0)));
+                if (!af) return -97;
+                const int type = static_cast<int>(a1 & ~(net::kSockNonblock | net::kSockCloexec));
+                int hp[2];
+                if (::socketpair(*af, type, static_cast<int>(a2), hp) < 0)
+                    return darwin::fail();
+                for (int e : hp) finish_socket(e, a1);
+                const bool cx = (a1 & net::kSockCloexec) != 0;
+                const auto g = proc_.with_fds([&](FdTable& t) {
+                    return std::pair{t.install(hp[0], cx), t.install(hp[1], cx)};
+                });
+                if (g.first < 0 || g.second < 0) return -24;
+                const std::int32_t pair[2] = {g.first, g.second};
+                return ram.put(a3, pair) ? 0 : -14;
+            }
+            case S::listen: {
+                const int h = host_fd(gfd);
+                if (h < 0) return -9;
+                return ::listen(h, static_cast<int>(a1)) < 0 ? darwin::fail() : 0;
+            }
+            case S::accept: case S::accept4: {
+                const int h = host_fd(gfd);
+                if (h < 0) return -9;
+                ::sockaddr_storage ss{};
+                socklen_t len = sizeof ss;
+                const int c = ::accept(h, reinterpret_cast<::sockaddr*>(&ss), &len);
+                if (c < 0) return darwin::fail();
+                if (a1 && !write_sockaddr(ss, a1, a2)) { ::close(c); return -14; }
+                const std::uint64_t flags = sc == S::accept4 ? a3 : 0;
+                finish_socket(c, flags);
+                return install_socket(c, (flags & net::kSockCloexec) != 0);
+            }
+            case S::getsockname: case S::getpeername: {
+                const int h = host_fd(gfd);
+                if (h < 0) return -9;
+                ::sockaddr_storage ss{};
+                socklen_t len = sizeof ss;
+                const int rc = sc == S::getsockname
+                    ? ::getsockname(h, reinterpret_cast<::sockaddr*>(&ss), &len)
+                    : ::getpeername(h, reinterpret_cast<::sockaddr*>(&ss), &len);
+                if (rc < 0) return darwin::fail();
+                return write_sockaddr(ss, a1, a2) ? 0 : -14;
+            }
+            case S::shutdown: {
+                const int h = host_fd(gfd);
+                if (h < 0) return -9;
+                return ::shutdown(h, static_cast<int>(a1)) < 0 ? darwin::fail() : 0;
+            }
+            case S::sendto: {
+                const int h = host_fd(gfd);
+                if (h < 0) return -9;
+                auto buf = ram.clamp(a1, a2);
+                if (buf.empty() && a2) return -14;
+                ::sockaddr_storage ss{};
+                socklen_t slen = 0;
+                if (a4) {
+                    auto addr = ram.at(a4, regs_.arg(5));
+                    if (addr.empty()) return -14;
+                    auto n = net::to_darwin(addr, ss);
+                    if (!n) return -97;
+                    slen = *n;
+                }
+                const auto n = ::sendto(h, buf.data(), buf.size(),
+                                        net::msg_flags_to_darwin(a3),
+                                        slen ? reinterpret_cast<::sockaddr*>(&ss) : nullptr,
+                                        slen);
+                return n < 0 ? darwin::fail() : n;
+            }
+            case S::recvfrom: {
+                const int h = host_fd(gfd);
+                if (h < 0) return -9;
+                auto buf = ram.clamp(a1, a2);
+                if (buf.empty() && a2) return -14;
+                ::sockaddr_storage ss{};
+                socklen_t slen = sizeof ss;
+                const auto n = ::recvfrom(h, buf.data(), buf.size(),
+                                          net::msg_flags_to_darwin(a3),
+                                          a4 ? reinterpret_cast<::sockaddr*>(&ss) : nullptr,
+                                          a4 ? &slen : nullptr);
+                if (n < 0) return darwin::fail();
+                if (a4 && !write_sockaddr(ss, a4, regs_.arg(5))) return -14;
+                return n;
+            }
+            case S::setsockopt: {
+                const int h = host_fd(gfd);
+                if (h < 0) return -9;
+                const auto opt = net::opt_to_darwin(static_cast<int>(a1),
+                                                    static_cast<int>(a2));
+                // An unknown option is accepted silently rather than failed:
+                // libcurl and openssl set a long tail of tuning options and
+                // treat EINVAL as fatal, though none of them is required for
+                // correctness.
+                if (!opt) return 0;
+                auto val = ram.at(a3, a4);
+                if (val.empty() && a4) return -14;
+                return ::setsockopt(h, opt->level, opt->name, val.data(),
+                                    static_cast<socklen_t>(a4)) < 0
+                           ? darwin::fail() : 0;
+            }
+            case S::getsockopt: {
+                const int h = host_fd(gfd);
+                if (h < 0) return -9;
+                const auto opt = net::opt_to_darwin(static_cast<int>(a1),
+                                                    static_cast<int>(a2));
+                if (!opt) return -92;                                // ENOPROTOOPT
+                std::uint32_t want = 0;
+                if (!ram.get(a4, want)) return -14;
+                auto val = ram.at(a3, want);
+                if (val.empty() && want) return -14;
+                socklen_t len = static_cast<socklen_t>(want);
+                if (::getsockopt(h, opt->level, opt->name, val.data(), &len) < 0)
+                    return darwin::fail();
+                return ram.put(a4, static_cast<std::uint32_t>(len)) ? 0 : -14;
+            }
+            case S::sendmsg: case S::recvmsg:
+                return do_msg(sc == S::sendmsg, gfd, a1, a2);
+            default:
+                return std::nullopt;
+        }
+    }
+
+    // Apply the Linux type-word flags Darwin's socket() doesn't take, and
+    // make the socket behave like Linux's default: a write to a closed peer
+    // must return EPIPE, not kill the process. Linux programs ask for that
+    // per-call with MSG_NOSIGNAL; Darwin's equivalent is per-socket.
+    void finish_socket(int h, std::uint64_t linux_type_flags) const noexcept {
+        int on = 1;
+        ::setsockopt(h, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
+        if (linux_type_flags & net::kSockNonblock)
+            ::fcntl(h, F_SETFL, ::fcntl(h, F_GETFL) | O_NONBLOCK);
+        ::fcntl(h, F_SETFD, FD_CLOEXEC);      // the HOST fd is ours; never leak it
+    }
+
+    [[nodiscard]] int host_fd(int gfd) {
+        return proc_.with_fds([&](FdTable& t) { return t.host(gfd).value_or(-1); });
+    }
+    [[nodiscard]] std::int64_t install_socket(int h, bool cloexec) {
+        const int g = proc_.with_fds([&](FdTable& t) { return t.install(h, cloexec); });
+        if (g < 0) { ::close(h); return -24; }
+        return g;
+    }
+
+    // Write a Darwin address back in Linux form. Linux reports the FULL
+    // length even when the guest's buffer was too small (the address is
+    // truncated, the length is not), which is what tells a caller to retry
+    // with a bigger buffer.
+    [[nodiscard]] bool write_sockaddr(const ::sockaddr_storage& ss,
+                                      std::uint64_t addr_at, std::uint64_t len_at) {
+        const GuestRam ram = machine_.ram();
+        std::uint32_t cap = 0;
+        if (len_at && !ram.get(len_at, cap)) return false;
+        auto out = ram.clamp(addr_at, cap);
+        const std::size_t full = net::to_linux(ss, out);
+        return !len_at || ram.put(len_at, static_cast<std::uint32_t>(full));
+    }
+
+    // sendmsg/recvmsg: walk the guest msghdr. Ancillary data (SCM_RIGHTS fd
+    // passing) is NOT translated -- the fd numbers inside would name host
+    // fds, not guest ones -- so it is dropped, which is what a guest sees
+    // from a peer that sends none.
+    [[nodiscard]] std::int64_t do_msg(bool sending, int gfd,
+                                      std::uint64_t msg_at, std::uint64_t flags) {
+        const int h = host_fd(gfd);
+        if (h < 0) return -9;
+        struct LinuxMsghdr {
+            std::uint64_t name; std::uint32_t namelen; std::uint32_t pad_;
+            std::uint64_t iov; std::uint64_t iovlen;
+            std::uint64_t control; std::uint64_t controllen;
+            std::int32_t flags; std::uint32_t pad2_;
+        };
+        static_assert(sizeof(LinuxMsghdr) == 56);
+        const GuestRam ram = machine_.ram();
+        LinuxMsghdr m{};
+        if (!ram.get(msg_at, m)) return -14;
+
+        // Translate the iovec array into host pointers into guest RAM.
+        constexpr std::uint64_t kIovMax = 1024;
+        if (m.iovlen > kIovMax) return -22;
+        std::vector<::iovec> hiov(m.iovlen);
+        for (std::uint64_t i = 0; i < m.iovlen; ++i) {
+            GuestIovec gi{};
+            if (!ram.get(m.iov + i * sizeof(GuestIovec), gi)) return -14;
+            auto win = ram.clamp(gi.base, gi.len);
+            if (win.empty() && gi.len) return -14;
+            hiov[i] = {win.data(), win.size()};
+        }
+
+        ::sockaddr_storage ss{};
+        ::msghdr hm{};
+        hm.msg_iov = hiov.data();
+        hm.msg_iovlen = static_cast<int>(hiov.size());
+        if (sending && m.name) {
+            auto addr = ram.at(m.name, m.namelen);
+            if (addr.empty()) return -14;
+            auto n = net::to_darwin(addr, ss);
+            if (!n) return -97;
+            hm.msg_name = &ss;
+            hm.msg_namelen = *n;
+        } else if (!sending && m.name) {
+            hm.msg_name = &ss;
+            hm.msg_namelen = sizeof ss;
+        }
+
+        const auto n = sending
+            ? ::sendmsg(h, &hm, net::msg_flags_to_darwin(flags))
+            : ::recvmsg(h, &hm, net::msg_flags_to_darwin(flags));
+        if (n < 0) return darwin::fail();
+        if (!sending) {
+            if (m.name && !write_sockaddr(ss, m.name, msg_at + offsetof(LinuxMsghdr, namelen)))
+                return -14;
+            m.controllen = 0;                  // no ancillary data passed through
+            m.flags = 0;
+            (void)ram.put(msg_at, m);
+        }
+        return n;
+    }
+    // TimerSet speaks std::chrono; the guest speaks struct itimerval /
+    // itimerspec. Two small converters keep that boundary in one place.
+    [[nodiscard]] static LinuxItimerval to_itimerval(const TimerSet::Interval& i) {
+        using namespace std::chrono;
+        return {{duration_cast<seconds>(i.interval).count(),
+                 duration_cast<microseconds>(i.interval % seconds{1}).count()},
+                {duration_cast<seconds>(i.value).count(),
+                 duration_cast<microseconds>(i.value % seconds{1}).count()}};
+    }
+    [[nodiscard]] static LinuxItimerspec to_itimerspec(const TimerSet::Interval& i) {
+        using namespace std::chrono;
+        return {{duration_cast<seconds>(i.interval).count(),
+                 (i.interval % seconds{1}).count()},
+                {duration_cast<seconds>(i.value).count(),
+                 (i.value % seconds{1}).count()}};
+    }
+
     [[nodiscard]] Maybe do_signal(abi::Sysno sc) {
         using S = abi::Sysno;
         const std::uint64_t a0 = regs_.arg(0), a1 = regs_.arg(1),
                             a2 = regs_.arg(2), a3 = regs_.arg(3);
-        const GuestRam ram = vm_.ram();
+        const GuestRam ram = machine_.ram();
         switch (sc) {
             case S::rt_sigaction: {
                 // rt_sigaction(sig, act*, oact*, sigsetsize)
                 const int s = static_cast<int>(a0);
                 if (s < 1 || s > kLinuxNsig || a3 != 8) return -22;
-                if (a2 && !ram.put(a2, actions_[s - 1])) return -14;
+                if (a2 && !ram.put(a2, proc_.with_signals([&](SignalDispositions& t) { return t.get(s); }))) return -14;
                 if (!a1) return 0;
                 if (s == 9 || s == 19) return -22;              // KILL/STOP fixed
                 LinuxSigaction act{};
                 if (!ram.get(a1, act)) return -14;
-                actions_[s - 1] = act;
+                if (!proc_.with_signals([&](SignalDispositions& t) { return t.set(s, act); })) return -22;
                 // Catch the host signal only while the guest has a handler
                 // (or ignores it); otherwise leave the host default so a
                 // terminal Ctrl-C kills us exactly like it kills a process.
@@ -373,42 +665,50 @@ private:
             case S::rt_sigprocmask: {
                 // rt_sigprocmask(how, set*, oset*, sigsetsize)
                 if (a3 != 8) return -22;
-                if (a2 && !ram.put(a2, mask_)) return -14;
+                if (a2 && !ram.put(a2, task_.sig_mask)) return -14;
                 if (!a1) return 0;
                 std::uint64_t set = 0;
                 if (!ram.get(a1, set)) return -14;
                 set &= ~(sigbit(9) | sigbit(19));               // never blockable
                 switch (a0) {
-                    case 0: mask_ |= set;  break;               // SIG_BLOCK
-                    case 1: mask_ &= ~set; break;               // SIG_UNBLOCK
-                    case 2: mask_ = set;   break;               // SIG_SETMASK
+                    case 0: task_.sig_mask |= set;  break;               // SIG_BLOCK
+                    case 1: task_.sig_mask &= ~set; break;               // SIG_UNBLOCK
+                    case 2: task_.sig_mask = set;   break;               // SIG_SETMASK
                     default: return -22;
                 }
                 return 0;
             }
             case S::rt_sigpending:
                 return ram.put(a0, std::uint64_t{
-                    g_pending.bits.load(std::memory_order_relaxed) & mask_}) ? 0 : -14;
+                    g_pending.bits.load(std::memory_order_relaxed) & task_.sig_mask}) ? 0 : -14;
             case S::rt_sigreturn:
                 return do_sigreturn();
             case S::sigaltstack: {
                 // sigaltstack(ss*, oss*): record it; delivery honours SA_ONSTACK.
-                if (a1 && !ram.put(a1, altstack_)) return -14;
+                if (a1 && !ram.put(a1, task_.alt_stack)) return -14;
                 if (a0) {
                     LinuxStack ss{};
                     if (!ram.get(a0, ss)) return -14;
-                    altstack_ = ss;
+                    task_.alt_stack = ss;
                 }
                 return 0;
             }
             case S::rt_sigsuspend: {
-                // Wait with a temporary mask until a signal we deliver arrives.
+                // Replace the blocked mask, then WAIT until a signal we will
+                // actually deliver becomes pending.
+                //
+                // The subtlety: this must genuinely block. A spin that keeps
+                // returning EINTR turns `timeout 1 sleep 5` -- which loops
+                // wait4(WNOHANG) + sigsuspend -- into a busy loop that burns
+                // a core and never lets the alarm fire. Sleep on a condition
+                // variable the signal path notifies instead, so the thread is
+                // genuinely idle and wakes the instant a signal arrives.
                 std::uint64_t tmp = 0;
                 if (!ram.get(a0, tmp)) return -14;
-                const std::uint64_t saved = mask_;
-                mask_ = tmp;
-                while (!(g_pending.bits.load() & ~mask_)) ::usleep(1000);
-                suspend_restore_ = saved;
+                const std::uint64_t saved = task_.sig_mask;
+                task_.sig_mask = tmp & ~(sigbit(9) | sigbit(19));
+                g_pending.wait_for_signal(~task_.sig_mask);
+                task_.suspend_restore = saved;
                 return -4;                                       // EINTR, as Linux
             }
             default:
@@ -420,13 +720,33 @@ private:
     // on the guest stack and redirecting the vCPU into the handler. Returns
     // true if the guest's state changed (a handler was entered, or it died).
     [[nodiscard]] bool deliver_pending() {
-        if (suspend_restore_) { mask_ = *suspend_restore_; suspend_restore_.reset(); }
-        const std::uint64_t ready =
-            g_pending.bits.load(std::memory_order_relaxed) & ~mask_;
-        if (!ready) return false;
+        // Signals pending for this thread specifically (tgkill) plus the
+        // process-wide set (kill).
+        const std::uint64_t pending = g_pending.bits.load(std::memory_order_relaxed)
+                                    | task_.pending.load(std::memory_order_relaxed);
+        const std::uint64_t ready = pending & ~task_.sig_mask;
+        if (!ready) {
+            // Nothing deliverable. If sigsuspend replaced the mask and no
+            // signal arrived, restore it now -- but ONLY now: restoring
+            // before this test would re-block the very signal sigsuspend
+            // was waiting for, so the handler would never run and
+            // `timeout 1 sleep 5` would spin forever.
+            if (task_.suspend_restore) {
+                task_.sig_mask = *task_.suspend_restore;
+                task_.suspend_restore.reset();
+            }
+            return false;
+        }
         const int s = std::countr_zero(ready) + 1;
         g_pending.bits.fetch_and(~sigbit(s), std::memory_order_relaxed);
-        LinuxSigaction& act = actions_[s - 1];
+        task_.pending.fetch_and(~sigbit(s), std::memory_order_relaxed);
+        // The sigsuspend mask covered exactly this delivery; the handler
+        // runs with it, and the saved mask is what sigreturn restores.
+        if (task_.suspend_restore) {
+            task_.sig_mask = *task_.suspend_restore;
+            task_.suspend_restore.reset();
+        }
+        LinuxSigaction act = proc_.with_signals([&](SignalDispositions& t) { return t.get(s); });
 
         if (act.handler == 1) return false;                      // SIG_IGN
         if (act.handler == 0) {                                  // SIG_DFL
@@ -449,11 +769,11 @@ private:
         // -- Build the frame. The interrupted state is the vCPU's CURRENT
         // state: we are between guest instructions (after a syscall's result
         // was written, or after a kick out of hv_vcpu_run).
-        const HvfVm::CpuState cpu = vm_.save();
+        const HvfCpu::CpuState cpu = cpu_.save();
         std::uint64_t sp = cpu.sp_el0;
-        if ((act.flags & sigflag::kOnstack) && altstack_.ss_size &&
-            !(sp > altstack_.ss_sp && sp <= altstack_.ss_sp + altstack_.ss_size))
-            sp = altstack_.ss_sp + altstack_.ss_size;
+        if ((act.flags & sigflag::kOnstack) && task_.alt_stack.ss_size &&
+            !(sp > task_.alt_stack.ss_sp && sp <= task_.alt_stack.ss_sp + task_.alt_stack.ss_size))
+            sp = task_.alt_stack.ss_sp + task_.alt_stack.ss_size;
         // Stack layout, top to bottom:  [trampoline (16)] [rt_sigframe] <- sp
         // rt_sigreturn finds the frame at the SP the handler returns with,
         // which is exactly where we entered it -- so the frame must be the
@@ -463,8 +783,8 @@ private:
         const bool need_tramp = !(act.flags & sigflag::kRestorer) || !ret;
         if (need_tramp) {
             sp -= 16;
-            if (!vm_.ram().put(sp, kSigreturnTrampoline)) { kill_with(11); return true; }
-            vm_.publish_code(sp, 8);
+            if (!machine_.ram().put(sp, kSigreturnTrampoline)) { kill_with(11); return true; }
+            machine_.publish_code(sp, 8);
             ret = sp;
         }
         sp = (sp - sizeof(RtSigframe)) & ~std::uint64_t{15};
@@ -473,8 +793,8 @@ private:
         RtSigframe frame{};
         frame.info.si_signo = s;
         frame.info.si_code = 0;                                  // SI_USER
-        frame.uc.uc_stack = altstack_;
-        frame.uc.uc_sigmask = mask_;
+        frame.uc.uc_stack = task_.alt_stack;
+        frame.uc.uc_sigmask = task_.sig_mask;
         auto& mc = frame.uc.uc_mcontext;
         std::memcpy(mc.regs, cpu.x, sizeof mc.regs);
         mc.sp = cpu.sp_el0;
@@ -486,10 +806,10 @@ private:
         std::memcpy(fp.vregs, cpu.q, sizeof fp.vregs);
         std::memcpy(mc.reserved, &fp, sizeof fp);                // then a zero terminator
 
-        if (!vm_.ram().put(frame_at, frame)) { kill_with(11); return true; }
+        if (!machine_.ram().put(frame_at, frame)) { kill_with(11); return true; }
 
         // Enter the handler: x0 = signo, x1 = &info, x2 = &uc, lr = restorer.
-        HvfVm::CpuState h = cpu;
+        HvfCpu::CpuState h = cpu;
         h.x[0] = static_cast<std::uint64_t>(s);
         h.x[1] = frame_at + offsetof(RtSigframe, info);
         h.x[2] = frame_at + offsetof(RtSigframe, uc);
@@ -497,10 +817,10 @@ private:
         h.sp_el0 = sp;
         h.pc = act.handler;
         h.cpsr = 0;
-        vm_.load(h);
+        cpu_.load(h);
 
-        mask_ |= act.mask;
-        if (!(act.flags & sigflag::kNodefer)) mask_ |= sigbit(s);
+        task_.sig_mask |= act.mask;
+        if (!(act.flags & sigflag::kNodefer)) task_.sig_mask |= sigbit(s);
         if (act.flags & sigflag::kResethand) { act = {}; route_host_signal(s, false); }
         return true;
     }
@@ -510,8 +830,8 @@ private:
     // libraries and some JITs work), so read it back from guest memory.
     [[nodiscard]] std::int64_t do_sigreturn() {
         RtSigframe frame{};
-        if (!vm_.ram().get(vm_.save().sp_el0, frame)) { kill_with(11); return 0; }
-        HvfVm::CpuState c = vm_.save();
+        if (!machine_.ram().get(cpu_.save().sp_el0, frame)) { kill_with(11); return 0; }
+        HvfCpu::CpuState c = cpu_.save();
         const auto& mc = frame.uc.uc_mcontext;
         std::memcpy(c.x, mc.regs, sizeof c.x);
         c.sp_el0 = mc.sp;
@@ -524,9 +844,9 @@ private:
             c.fpcr = fp.fpcr;
             std::memcpy(c.q, fp.vregs, sizeof c.q);
         }
-        vm_.load(c);
-        mask_ = frame.uc.uc_sigmask & ~(sigbit(9) | sigbit(19));
-        sigreturned_ = true;           // resume() must not clobber x0/PC
+        cpu_.load(c);
+        task_.sig_mask = frame.uc.uc_sigmask & ~(sigbit(9) | sigbit(19));
+        task_.in_sigreturn = true;           // resume() must not clobber x0/PC
         return 0;
     }
 
@@ -571,27 +891,15 @@ private:
             // refuse it honestly (EAGAIN is what pthread_create reports when
             // a thread can't be made, and callers handle it).
             case S::clone: {
-                constexpr std::uint64_t kCloneVm = 0x100, kCloneVfork = 0x4000,
-                                        kSetTls = 0x80000, kChildCleartid = 0x200000,
-                                        kChildSettid = 0x1000000, kParentSettid = 0x100000;
-                const bool vfork = (a0 & kCloneVfork) != 0;
-                // CLONE_VM|CLONE_VFORK (glibc's posix_spawn, behind xargs,
-                // make, find -exec, every spawn helper) is "share memory
-                // and suspend the parent until the child execs or exits".
-                // A full fork is a valid implementation of that contract:
-                // the child can only exec or _exit, so the memory it would
-                // have shared is never observably written. The one subtle
-                // part is the child's stack: posix_spawn hands it a
-                // private one in arg1, which do_fork installs.
-                if ((a0 & kCloneVm) && !vfork) return -11;            // EAGAIN
-                const std::int64_t child = do_fork(a0, a1, a2, a3, regs_.arg(4),
-                               (a0 & kSetTls) != 0, (a0 & kChildSettid) != 0,
-                               (a0 & kParentSettid) != 0, (a0 & kChildCleartid) != 0);
+                const CloneRequest req{a0, a1, a2, a3, regs_.arg(4)};
+                if (req.is_thread()) return do_clone_thread(req);
+                const std::int64_t child = do_fork(req);
                 // vfork: the parent must not run until the child has exec'd
-                // or exited (posix_spawn reads an error the child writes into
-                // shared memory, which with a real fork is never shared --
-                // waiting for exec keeps the observable ordering identical).
-                if (vfork && child > 0) wait_for_exec(static_cast<std::int32_t>(child));
+                // or exited. posix_spawn reads an error the child writes
+                // into what it believes is shared memory; waiting for exec
+                // keeps the observable ordering identical.
+                if (req.is_vfork() && child > 0)
+                    wait_for_exec(static_cast<std::int32_t>(child));
                 return child;
             }
             case S::clone3: return -38;     // glibc falls back to clone
@@ -600,28 +908,65 @@ private:
                                             static_cast<int>(a2), a3);
 
             case S::kill: case S::tkill: case S::tgkill: {
+                // One implementation, in deliver_signal: it keeps group and
+                // broadcast signals inside the guest's process tree instead
+                // of letting them reach linuxity's host process group.
                 const bool tg = sc == S::tgkill;
-                const auto gpid = static_cast<std::int32_t>(tg ? a1 : a0);
-                const int sig = signal_from_linux(static_cast<int>(tg ? a2 : a1));
-                pid_t target;
-                if (gpid == 0)      target = 0;                    // own group
-                else if (gpid == -1) target = -1;                  // everyone
-                else if (gpid < -1) {
-                    auto h = pids_.host_of(-gpid);
-                    if (!h) return -3;                             // ESRCH
-                    target = -*h;
-                } else {
-                    auto h = pids_.host_of(gpid);
-                    if (!h) return -3;
-                    target = *h;
-                }
-                return ::kill(target, sig) < 0 ? darwin::fail() : 0;
+                return deliver_signal(static_cast<std::int32_t>(tg ? a1 : a0),
+                                      static_cast<std::int32_t>(tg ? a2 : a1));
             }
 
-            case S::getpid: case S::gettid: return self_;
+            case S::getpid: case S::gettid: return task_.tid;
             case S::getppid:                 return parent_;
             default:                         return std::nullopt;
         }
+    }
+
+    // A host pointer to a 4-byte guest word, for the futex primitives.
+    // Guest RAM is a shared mapping, so this address is valid in every
+    // thread AND every forked process -- which is what makes a shared
+    // (non-private) futex work across a guest's whole process tree.
+    [[nodiscard]] void* futex_ptr(std::uint64_t gaddr) const noexcept {
+        if (gaddr % 4) return nullptr;                   // Linux requires 4-byte alignment
+        auto win = machine_.ram().at(gaddr, 4);
+        return win.empty() ? nullptr : win.data();
+    }
+
+    // clone(CLONE_VM|CLONE_THREAD|...): a new thread in THIS process.
+    //
+    // The new thread gets a host thread of its own, which creates its own
+    // vCPU over the same guest RAM -- so guest threads are scheduled by XNU
+    // across the physical cores and genuinely run in parallel. Everything
+    // the Linux flags say is shared (address space, fd table, signal
+    // dispositions, pid) lives in ProcessState; everything per-thread
+    // (stack, TLS, tid, blocked mask) is the new TaskState.
+    [[nodiscard]] std::int64_t do_clone_thread(const CloneRequest& req) {
+        if (!spawn_thread_) return -38;
+        if (!req.stack) return -22;                      // a thread needs a stack
+        const std::int32_t tid = proc_.next_tid();
+
+        // The child resumes at the same PC as the parent (right after the
+        // svc) with x0 = 0 and its own stack/TLS -- exactly what the kernel
+        // hands a cloned thread.
+        ThreadStart start;
+        start.cpu = cpu_.save();
+        start.cpu.x[0] = 0;
+        start.cpu.pc = regs_.elr;
+        start.cpu.cpsr = regs_.spsr;
+        start.cpu.sp_el0 = req.stack;
+        if (req.flags & clone_flag::settls) start.cpu.tpidr_el0 = req.tls;
+        start.tid = tid;
+        start.sig_mask = task_.sig_mask;        // inherited, per POSIX
+        start.clear_child_tid =
+            (req.flags & clone_flag::child_cleartid) ? req.child_tid_addr : 0;
+
+        if (req.flags & clone_flag::child_settid)
+            (void)machine_.ram().put(req.child_tid_addr, std::int32_t{tid});
+        if (req.flags & clone_flag::parent_settid)
+            (void)machine_.ram().put(req.parent_tid_addr, std::int32_t{tid});
+
+        if (!spawn_thread_(std::move(start))) return -11;   // EAGAIN
+        return tid;
     }
 
     // Guest fork, the macOS way (see runtime/hvf_fork.hpp for why fork(2) of
@@ -631,40 +976,43 @@ private:
     //   2. serializes everything that isn't RAM into a ForkImage,
     //   3. hands RAM (COW snapshot) + image to the embedder's spawn hook,
     //      which starts a fresh linuxity that resumes the guest with x0 = 0.
-    [[nodiscard]] std::int64_t do_fork(std::uint64_t, std::uint64_t stack,
-                                       std::uint64_t ptid, std::uint64_t tls,
-                                       std::uint64_t ctid, bool set_tls,
-                                       bool child_settid, bool parent_settid,
-                                       bool child_cleartid) {
+    [[nodiscard]] std::int64_t do_fork(const CloneRequest& req) {
         if (!pids_.valid() || !spawn_) return -38;
         const std::int32_t child = pids_.allocate(0);   // placeholder host pid
         if (child < 0) return -11;                       // EAGAIN
 
         ForkImage img;
-        img.cpu = vm_.save();
+        img.cpu = cpu_.save();
         img.cpu.x[0] = 0;                                // fork() returns 0 in the child
         img.cpu.pc = regs_.elr;                          // resume after the svc
         img.cpu.cpsr = regs_.spsr;
-        if (stack) img.cpu.sp_el0 = stack;
-        if (set_tls) img.cpu.tpidr_el0 = tls;
+        if (req.stack) img.cpu.sp_el0 = req.stack;
+        if (req.flags & clone_flag::settls) img.cpu.tpidr_el0 = req.tls;
         img.self = child;
-        img.parent = self_;
-        img.child_settid = child_settid ? ctid : 0;
-        img.clear_child_tid = child_cleartid ? ctid : 0;
-        img.umask = umask_;
-        img.vmas = as_.vmas();
-        img.brk = as_.brk();
-        img.arena = as_.arena();
-        img.fds = fds_.export_table();
-        img.sig_actions = actions_;
-        img.sig_mask = mask_;
-        img.altstack = altstack_;
+        img.parent = task_.tid;
+        img.child_settid =
+            (req.flags & clone_flag::child_settid) ? req.child_tid_addr : 0;
+        img.clear_child_tid =
+            (req.flags & clone_flag::child_cleartid) ? req.child_tid_addr : 0;
+        img.umask = proc_.umask.load(std::memory_order_relaxed);
+        img.sig_mask = task_.sig_mask;
+        img.altstack = task_.alt_stack;
+        proc_.with_space([&](AddressSpace& sp) {
+            img.vmas = sp.vmas();
+            img.brk = sp.brk();
+            img.arena = sp.arena();
+        });
+        img.fds = proc_.with_fds([&](FdTable& t) { return t.export_table(); });
+        proc_.with_signals([&](SignalDispositions& d) {
+            for (int s = 1; s <= kLinuxNsig; ++s) img.sig_actions[s - 1] = d.get(s);
+        });
 
         std::fflush(nullptr);
         const pid_t host = spawn_(img);
         if (host < 0) { pids_.release(child); return -11; }
         pids_.bind(child, host);
-        if (parent_settid) (void)vm_.ram().put(ptid, std::int32_t{child});
+        if (req.flags & clone_flag::parent_settid)
+            (void)machine_.ram().put(req.parent_tid_addr, std::int32_t{child});
         children_.push_back({child, host});
         return child;
     }
@@ -673,7 +1021,7 @@ public:
     // Everything a fork child needs that isn't guest RAM. Plain data: the
     // embedder serializes it into the handoff message.
     struct ForkImage {
-        HvfVm::CpuState cpu{};
+        HvfCpu::CpuState cpu{};
         std::int32_t self{}, parent{};
         std::uint64_t child_settid{}, clear_child_tid{};
         std::uint32_t umask{022};
@@ -689,27 +1037,63 @@ public:
     using SpawnFork = std::function<pid_t(ForkImage&)>;
     void set_fork_spawner(SpawnFork f) { spawn_ = std::move(f); }
 
+    // What a new guest THREAD needs: its starting CPU state plus the
+    // per-thread fields. The embedder turns this into a host thread that
+    // creates its own vCPU and runs its own Cpu loop.
+    struct ThreadStart {
+        HvfCpu::CpuState cpu{};
+        std::int32_t tid{};
+        std::uint64_t sig_mask{};
+        std::uint64_t clear_child_tid{};
+    };
+    using SpawnThread = std::function<bool(ThreadStart)>;
+    void set_thread_spawner(SpawnThread f) { spawn_thread_ = std::move(f); }
+
+    // Arm the timer wheel. A fire marks the signal pending and kicks the
+    // vCPUs, so it is delivered at the next trap boundary through the SAME
+    // path as any other signal -- never as a host signal interrupting
+    // linuxity's own work.
+    void start_timers() {
+        // SIGCHLD from a dying guest child arrives as a host SIGCHLD; route
+        // it so `timeout`, `wait` and job control see it.
+        route_host_signal(17, true);
+        timers_.start([](int linux_sig) {
+            if (std::getenv("LINUXITY_STRACE"))
+                std::fprintf(stderr, "[timer] fire signal %d\n", linux_sig);
+            if (linux_sig > 0 && linux_sig <= kLinuxNsig) {
+                g_pending.bits.fetch_or(sigbit(linux_sig), std::memory_order_relaxed);
+                g_pending.kick_all();
+            }
+        });
+    }
+
+    // This thread is done but the process may live on (exit(2) vs
+    // exit_group(2)); the embedder uses this to join rather than tear down.
+    [[nodiscard]] bool thread_exited() const noexcept { return thread_exited_; }
+
     // Child side: become the forked process described by `img`. The VM is
     // already up over the snapshot RAM; restore everything else.
     void resume_fork_child(const ForkImage& img, const std::vector<int>& host_fds) {
-        vm_.load(img.cpu);
-        self_ = img.self;
+        cpu_.load(img.cpu);
+        task_.tid = img.self;
         parent_ = img.parent;
-        umask_ = img.umask;
-        as_.restore(img.vmas, img.brk, img.arena);
-        fds_.import_table(img.fds, host_fds);
+        proc_.umask = img.umask;
+        proc_.with_space([&](AddressSpace& t) { return t.restore(img.vmas, img.brk, img.arena); });
+        proc_.with_fds([&](FdTable& t) { return t.import_table(img.fds, host_fds); });
         // fork(2): the child inherits handlers, mask and alt stack verbatim.
-        actions_ = img.sig_actions;
-        mask_ = img.sig_mask;
-        altstack_ = img.altstack;
+        proc_.with_signals([&](SignalDispositions& d) {
+            for (int s = 1; s <= kLinuxNsig; ++s) (void)d.set(s, img.sig_actions[s - 1]);
+        });
+        task_.sig_mask = img.sig_mask;
+        task_.alt_stack = img.altstack;
         for (int s = 1; s <= kLinuxNsig; ++s) {
-            const auto h = actions_[s - 1].handler;
+            const auto h = proc_.with_signals([&](SignalDispositions& t) { return t.get(s); }).handler;
             if (h == 1) { const int hs = signal_from_linux(s);
                           if (hs > 0 && hs != SIGKILL && hs != SIGSTOP) ::signal(hs, SIG_IGN); }
             else if (h) route_host_signal(s, true);
         }
-        if (img.child_settid) (void)vm_.ram().put(img.child_settid, std::int32_t{self_});
-        clear_child_tid_ = img.clear_child_tid;
+        if (img.child_settid) (void)machine_.ram().put(img.child_settid, std::int32_t{task_.tid});
+        task_.clear_child_tid = img.clear_child_tid;
         regs_.elr = img.cpu.pc;
         regs_.spsr = img.cpu.cpsr;
     }
@@ -732,10 +1116,10 @@ private:
         if (got < 0) return darwin::fail();
         if (got == 0) return 0;                                   // WNOHANG
         std::int32_t g = pids_.guest_of(got);
-        if (status) (void)vm_.ram().put(status, std::int32_t{wstatus_to_linux(st)});
+        if (status) (void)machine_.ram().put(status, std::int32_t{wstatus_to_linux(st)});
         if (rusage) {
             std::byte zero[144]{};                                // struct rusage
-            (void)vm_.ram().put(rusage, zero);
+            (void)machine_.ram().put(rusage, zero);
         }
         if (WIFEXITED(st) || WIFSIGNALED(st)) {
             pids_.release(g);
@@ -779,7 +1163,7 @@ private:
     // the vCPU at the new entry. Nothing of the old image may survive except
     // what POSIX says does: the pid, the fd table minus FD_CLOEXEC, and cwd.
     [[nodiscard]] std::int64_t do_execve(const std::string& host_path) {
-        const GuestRam ram = vm_.ram();
+        const GuestRam ram = machine_.ram();
         auto read_vec = [&](std::uint64_t at) {
             std::vector<std::string> v;
             for (std::size_t i = 0; at && i < 4096; ++i) {
@@ -820,8 +1204,8 @@ private:
         // zeros -- is a page fault plus a page copy. Untouched pages are
         // already zero (fresh anonymous memory) or stale-but-unmapped, and
         // the loader zeroes every segment and .bss it places.
-        for (const Vma& v : as_.vmas()) vm_.zero(v.begin, v.size());
-        auto ex = hvf_exec(vm_, resolve, guest_path, argv, envp);
+        for (const Vma& v : proc_.with_space([&](AddressSpace& t) { return t.vmas(); })) machine_.zero(v.begin, v.size());
+        auto ex = hvf_exec(machine_, resolve, guest_path, argv, envp);
         if (!ex) {
             std::fprintf(stderr, "linuxity: execve %s failed (errno %d)\n",
                          guest_path.c_str(), static_cast<int>(ex.error()));
@@ -829,39 +1213,56 @@ private:
             code_ = 127;
             return 0;
         }
-        set_arena(ex->brk_base, ExecArena::mmap_top(vm_.mem_size()));
+        set_arena(ex->brk_base, ExecArena::mmap_top(machine_.mem_size()));
         for (const auto& sg : ex->segments)
             adopt(sg.begin, sg.end, prot_from_elf(sg.flags));
-        adopt_stack(ex->sp, vm_.mem_size());
-        fds_.on_exec();
+        adopt_stack(ex->sp, machine_.mem_size());
+        proc_.with_fds([&](FdTable& t) { return t.on_exec(); });
         dirs_.clear();
         // execve(2): caught signals revert to SIG_DFL (the handler code is
-        // gone); ignored stay ignored; the mask is preserved; the alt stack
-        // is cleared.
-        for (int s = 1; s <= kLinuxNsig; ++s) {
-            auto& a = actions_[s - 1];
-            if (a.handler > 1) { a = {}; route_host_signal(s, false); }
-        }
-        altstack_ = {};
+        // gone); ignored stay ignored; the blocked mask is preserved; the
+        // alt stack is cleared.
+        for (int s = 1; s <= kLinuxNsig; ++s)
+            if (proc_.with_signals([&](SignalDispositions& t) { return t.get(s); }).handler > 1) route_host_signal(s, false);
+        proc_.with_signals([&](SignalDispositions& t) { return t.on_exec(); });
+        task_.alt_stack = {};
         // The new image starts fresh: clear every GPR (no state may leak from
         // the old program into the new one), then enter.
-        for (int i = 0; i < 31; ++i) vm_.set_x(i, 0);
-        vm_.set_tls(0);
+        for (int i = 0; i < 31; ++i) cpu_.set_x(i, 0);
+        cpu_.set_tls(0);
         regs_.elr = ex->entry;
         regs_.spsr = 0;
-        vm_.set_sp(ex->sp);
+        cpu_.set_sp(ex->sp);
         execed_ = true;
-        pids_.mark_execed(self_);           // releases a vfork parent
+        pids_.mark_execed(task_.tid);           // releases a vfork parent
         return 0;
     }
 
     [[nodiscard]] Maybe do_process(abi::Sysno sc) {
         using S = abi::Sysno;
-        const std::uint64_t a0 = regs_.arg(0), a1 = regs_.arg(1), a2 = regs_.arg(2);
-        const GuestRam ram = vm_.ram();
+        const std::uint64_t a0 = regs_.arg(0), a1 = regs_.arg(1),
+                            a2 = regs_.arg(2), a3 = regs_.arg(3);
+        const GuestRam ram = machine_.ram();
         switch (sc) {
             case S::exit:
+                // exit(2) ends THIS THREAD. With siblings alive the process
+                // lives on, so this thread just unwinds: clear its
+                // clear_child_tid word and wake anyone joining on it (that
+                // is precisely how pthread_join learns the thread is gone),
+                // then stop running it.
+                if (task_.clear_child_tid) {
+                    (void)machine_.ram().put(task_.clear_child_tid, std::int32_t{0});
+                    if (auto* p = futex_ptr(task_.clear_child_tid))
+                        (void)Futex::wake(p, 1, true);
+                }
+                exited_ = true;
+                code_ = static_cast<int>(a0 & 0xff);
+                thread_exited_ = true;
+                return 0;
             case S::exit_group:
+                // exit_group(2) ends every thread. Mark the group dead and
+                // kick the siblings out of the guest so they observe it.
+                proc_.request_group_exit(static_cast<int>(a0 & 0xff));
                 exited_ = true;
                 code_ = static_cast<int>(a0 & 0xff);
                 return 0;
@@ -915,46 +1316,96 @@ private:
                 return ram.put(regs_.arg(3), out) ? 0 : -14;
             }
 
-            // -- futex(uaddr, op, val, ...). This backend runs ONE guest
-            //    thread, which makes futex exact rather than approximate:
-            //      WAIT: if *uaddr != val the caller must see EAGAIN (that is
-            //            the whole race-free contract). If it still matches,
-            //            no other thread exists to ever change it, so blocking
-            //            would be a deadlock -- report EAGAIN as well, which
-            //            every libc treats as "recheck and retry".
-            //      WAKE: there is nobody to wake; 0 woken is the true answer.
-            //    glibc's "futex facility returned an unexpected error code"
-            //    abort is what ENOSYS here produced.
+            // -- futex(uaddr, op, val, timeout/val2, uaddr2, val3).
+            //
+            // THE threading primitive: every pthread mutex, condvar,
+            // semaphore, barrier, once-flag and join bottoms out here.
+            // macOS 14's os_sync_wait_on_address has the same contract
+            // (compare-and-sleep atomically, wake by address) including
+            // cross-process SHARED support, so this is a real futex rather
+            // than an approximation -- see hvf_futex.hpp.
             case S::futex: {
-                constexpr std::uint64_t kCmdMask = 0x7f;   // strip PRIVATE/CLOCK
-                constexpr std::uint64_t kWait = 0, kWake = 1, kWaitBitset = 9,
-                                        kWakeBitset = 10;
-                switch (a1 & kCmdMask) {
-                    case kWait: case kWaitBitset: {
-                        std::uint32_t cur = 0;
-                        if (!ram.get(a0, cur)) return -14;            // EFAULT
-                        return -11;                                   // EAGAIN
+                const std::uint32_t cmd = static_cast<std::uint32_t>(a1) & kFutexCmdMask;
+                const bool shared = (static_cast<std::uint32_t>(a1) & kFutexPrivate) == 0;
+                void* p = futex_ptr(a0);
+                if (!p) return -14;                                  // EFAULT
+                switch (static_cast<FutexOp>(cmd)) {
+                    case FutexOp::wait:
+                    case FutexOp::wait_bitset: {
+                        // The bitset is ignored: Linux permits spurious
+                        // wakeups, so a waiter whose bit did not match
+                        // rechecks and sleeps again.
+                        std::uint64_t ns = 0;
+                        if (a3) {
+                            struct { std::int64_t sec, nsec; } ts{};
+                            if (!machine_.ram().get(a3, ts)) return -14;
+                            ns = static_cast<std::uint64_t>(ts.sec) * 1'000'000'000ull
+                               + static_cast<std::uint64_t>(ts.nsec);
+                            if (ns == 0) ns = 1;        // 0 would mean "forever"
+                        }
+                        return Futex::wait(p, static_cast<std::uint32_t>(a2), ns, shared);
                     }
-                    case kWake: case kWakeBitset:
-                        return 0;
+                    case FutexOp::wake:
+                    case FutexOp::wake_bitset:
+                        return Futex::wake(p, static_cast<std::uint32_t>(a2), shared);
+
+                    case FutexOp::requeue:
+                    case FutexOp::cmp_requeue: {
+                        // Requeue exists to avoid a thundering herd, never
+                        // for correctness: waking both addresses is a valid
+                        // (if less efficient) implementation.
+                        if (cmd == static_cast<std::uint32_t>(FutexOp::cmp_requeue)) {
+                            std::uint32_t cur = 0;
+                            if (!machine_.ram().get(a0, cur)) return -14;
+                            if (cur != static_cast<std::uint32_t>(regs_.arg(5))) return -11;
+                        }
+                        std::int64_t woke = Futex::wake(p, static_cast<std::uint32_t>(a2), shared);
+                        if (void* p2 = futex_ptr(regs_.arg(4)))
+                            woke += Futex::wake(p2, ~0u, shared);
+                        return woke;
+                    }
+                    case FutexOp::wake_op: {
+                        // FUTEX_WAKE_OP: atomically apply an op to *uaddr2,
+                        // wake val waiters on uaddr, and wake val2 on uaddr2
+                        // if the OLD value satisfies the comparison.
+                        void* p2 = futex_ptr(regs_.arg(4));
+                        if (!p2) return -14;
+                        const auto spec = WakeOpSpec::decode(
+                            static_cast<std::uint32_t>(regs_.arg(5)));
+                        // The guest word is plain shared memory; atomic_ref
+                        // gives it atomic semantics without copying it.
+                        std::atomic_ref<std::uint32_t> ref{
+                            *static_cast<std::uint32_t*>(p2)};
+                        std::uint32_t old = ref.load(std::memory_order_relaxed);
+                        while (!ref.compare_exchange_weak(old, spec.apply(old),
+                                                          std::memory_order_acq_rel,
+                                                          std::memory_order_relaxed)) {}
+                        std::int64_t woke = Futex::wake(p, static_cast<std::uint32_t>(a2), shared);
+                        if (spec.compare(old))
+                            woke += Futex::wake(p2, static_cast<std::uint32_t>(a3), shared);
+                        return woke;
+                    }
                     default:
+                        // Priority-inheritance futexes need a real PI mutex
+                        // in the kernel. glibc only uses them for
+                        // PTHREAD_PRIO_INHERIT mutexes, which it falls back
+                        // from on ENOSYS.
                         return -38;
                 }
             }
 
-            // Per-thread registrations glibc makes at startup. Accepting them
-            // is correct for a single thread: robust-list cleanup only runs
-            // when a thread dies holding a lock, and rseq is an optimization
-            // glibc already disables when registration fails -- but it
-            // probes with a specific errno, so answer the way an old kernel
-            // would (ENOSYS) and let it take its fallback.
             case S::set_robust_list:
                 return 0;
             case S::rseq:
-                return -38;
+                return -38;       // glibc disables rseq when registration fails
             case S::membarrier:
-                return 0;           // one thread: every barrier is trivially met
+                // Guest threads are host threads on real cores; a full
+                // barrier here orders this thread, and the host's own
+                // coherency does the rest.
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                return 0;
             case S::sched_yield:
+                ::sched_yield();
                 return 0;
 
             case S::nanosleep: case S::clock_nanosleep: {
@@ -979,12 +1430,113 @@ private:
             }
 
             case S::umask: {
-                const auto old = umask_;
-                umask_ = static_cast<std::uint32_t>(a0 & 0777);
-                return old;
+                return proc_.umask.exchange(static_cast<std::uint32_t>(a0 & 0777),
+                                           std::memory_order_relaxed);
             }
             case S::getgroups:
                 return 0;           // root, no supplementary groups
+
+            // -- Credentials. linuxity's world is uid 0 and has exactly one
+            //    identity, so a request to BECOME root (or stay root) is
+            //    satisfied; a request to become someone else cannot be, and
+            //    EPERM is what a real kernel tells an unprivileged caller.
+            //    Refusing with ENOSYS instead makes libc think the kernel is
+            //    broken rather than the operation disallowed.
+            case S::setuid: case S::setgid: case S::setfsuid: case S::setfsgid:
+                return a0 == 0 || a0 == static_cast<std::uint64_t>(-1) ? 0 : -1;
+            case S::setreuid: case S::setregid:
+                return (a0 == 0 || a0 == ~0ull) && (a1 == 0 || a1 == ~0ull) ? 0 : -1;
+            case S::setresuid: case S::setresgid:
+                return (a0 == 0 || a0 == ~0ull) && (a1 == 0 || a1 == ~0ull) &&
+                       (a2 == 0 || a2 == ~0ull) ? 0 : -1;
+            case S::setgroups:
+                return 0;                        // only the empty/root set exists
+
+            // -- Time of day. gettimeofday is the single most-called syscall
+            //    in a shell session (every prompt, every `date`, every log
+            //    line), and the core forwards it here.
+            case S::gettimeofday: {
+                struct ::timeval tv{};
+                if (::gettimeofday(&tv, nullptr) < 0) return darwin::fail();
+                if (a0) {
+                    const LinuxTimeval out{tv.tv_sec, tv.tv_usec};
+                    if (!ram.put(a0, out)) return -14;
+                }
+                if (a1) {                        // struct timezone: obsolete, zeros
+                    const std::int32_t tz[2] = {0, 0};
+                    if (!ram.put(a1, tz)) return -14;
+                }
+                return 0;
+            }
+            case S::clock_settime: case S::settimeofday:
+                return -1;                       // EPERM: the host clock is not ours
+
+            // -- Interval timers (alarm, SIGALRM timeouts). See hvf_timer.hpp.
+            case S::setitimer: {
+                const int which = static_cast<int>(a0);
+                if (!TimerSet::valid_itimer(which)) return -22;
+                TimerSet::Interval next{};
+                if (a1) {
+                    LinuxItimerval v{};
+                    if (!ram.get(a1, v)) return -14;
+                    next.value = std::chrono::seconds{v.value.sec}
+                               + std::chrono::microseconds{v.value.usec};
+                    next.interval = std::chrono::seconds{v.interval.sec}
+                                  + std::chrono::microseconds{v.interval.usec};
+                }
+                const auto prev = timers_.set_interval(which, next);
+                if (a2 && !ram.put(a2, to_itimerval(prev))) return -14;
+                return 0;
+            }
+            case S::getitimer: {
+                const int which = static_cast<int>(a0);
+                if (!TimerSet::valid_itimer(which)) return -22;
+                return ram.put(a1, to_itimerval(timers_.get_interval(which))) ? 0 : -14;
+            }
+
+            // -- POSIX timers (timer_create and friends).
+            case S::timer_create: {
+                // sigevent { sigval, signo, notify, ... }: we need signo and
+                // notify. SIGEV_THREAD is implemented as SIGEV_SIGNAL --
+                // glibc itself builds SIGEV_THREAD on a helper thread plus a
+                // signal, so the observable behaviour is a signal either way.
+                int signo = 14, notify = kSigevSignal;
+                if (a1) {
+                    struct LinuxSigevent {
+                        std::uint64_t value;
+                        std::int32_t signo, notify;
+                    } ev{};
+                    if (!ram.get(a1, ev)) return -14;
+                    signo = ev.signo;
+                    notify = ev.notify;
+                }
+                const int id = timers_.create(signo, notify);
+                return ram.put(a2, std::int32_t{id}) ? 0 : -14;
+            }
+            case S::timer_settime: {
+                constexpr std::uint64_t kAbstime = 1;
+                LinuxItimerspec v{};
+                if (a2 && !ram.get(a2, v)) return -14;
+                TimerSet::Interval next{
+                    std::chrono::seconds{v.value.sec} + std::chrono::nanoseconds{v.value.nsec},
+                    std::chrono::seconds{v.interval.sec} + std::chrono::nanoseconds{v.interval.nsec}};
+                const auto prev = timers_.set_posix(static_cast<int>(a0), next,
+                                                    (a1 & kAbstime) != 0);
+                if (!prev) return -22;           // EINVAL: no such timer
+                if (a3 && !ram.put(a3, to_itimerspec(*prev))) return -14;
+                return 0;
+            }
+            case S::timer_gettime: {
+                const auto cur = timers_.get_posix(static_cast<int>(a0));
+                if (!cur) return -22;
+                return ram.put(a1, to_itimerspec(*cur)) ? 0 : -14;
+            }
+            case S::timer_getoverrun: {
+                const auto n = timers_.overrun(static_cast<int>(a0));
+                return n ? *n : -22;
+            }
+            case S::timer_delete:
+                return timers_.erase(static_cast<int>(a0)) ? 0 : -22;
 
             default:
                 return std::nullopt;
@@ -997,22 +1549,22 @@ private:
                             a2 = regs_.arg(2), a3 = regs_.arg(3);
         switch (sc) {
             case S::brk:
-                return static_cast<std::int64_t>(as_.set_brk(a0));
+                return static_cast<std::int64_t>(proc_.with_space([&](AddressSpace& t) { return t.set_brk(a0); }));
             case S::mmap: {
                 constexpr std::uint64_t kFixed = 0x10, kAnon = 0x20;
                 const bool anon = (a3 & kAnon) != 0;
                 const std::uint64_t len = AddressSpace::page_up(a1);
-                std::uint64_t at = as_.map(a0, a1, prot_from_linux(a2),
-                                           (a3 & kFixed) != 0, anon);
+                std::uint64_t at = proc_.with_space([&](AddressSpace& t) { return t.map(a0, a1, prot_from_linux(a2),
+                                           (a3 & kFixed) != 0, anon); });
                 if (at == AddressSpace::kFail) return -12;          // ENOMEM
-                auto win = vm_.ram().at(at, len);
+                auto win = machine_.ram().at(at, len);
                 if (win.empty()) return -12;
 
                 if (anon) {
                     // A fresh anonymous mapping must read as zero -- and for
                     // an ANON map the guest asked for the whole page span, so
                     // clearing to the page-rounded end is correct here.
-                    vm_.zero(at, len);
+                    machine_.zero(at, len);
                     return static_cast<std::int64_t>(at);
                 }
 
@@ -1036,24 +1588,24 @@ private:
                 // segments SHARE pages. libc's data segment starts at vaddr
                 // 0x1bd090, 0x90 bytes into a page the text segment already
                 // covers, so rounding up here would wipe a neighbour.
-                const int ffd = fds_.host(static_cast<int>(regs_.arg(4))).value_or(-1);
+                const int ffd = proc_.with_fds([&](FdTable& t) { return t.host(static_cast<int>(regs_.arg(4))); }).value_or(-1);
                 if (ffd < 0) return -9;                              // EBADF
                 const auto foff = static_cast<off_t>(regs_.arg(5));
                 auto n = ::pread(ffd, win.data(), a1, foff);
                 if (n < 0) return darwin::fail();
                 const auto got = static_cast<std::uint64_t>(n);
                 if (got < a1) {
-                    auto tail = vm_.ram().at(at + got, a1 - got);
+                    auto tail = machine_.ram().at(at + got, a1 - got);
                     if (!tail.empty()) std::memset(tail.data(), 0, tail.size());
                 }
                 // The mapping may be an executable segment written through the
                 // host's data view; publish it to the instruction stream.
                 if (has(prot_from_linux(a2), GuestProt::exec))
-                    vm_.publish_code(at, len);
+                    machine_.publish_code(at, len);
                 return static_cast<std::int64_t>(at);
             }
             case S::munmap:
-                as_.unmap(a0, a1);
+                proc_.with_space([&](AddressSpace& t) { return t.unmap(a0, a1); });
                 return 0;
             case S::mprotect:
                 // Tracked in the VMA map but NOT enforced in the page tables:
@@ -1061,15 +1613,15 @@ private:
                 // reprotection would need a table walk plus TLB maintenance
                 // on every call. Recorded so /proc/self/maps is truthful and
                 // so enforcement can be added without an ABI change.
-                return as_.protect(a0, a1, prot_from_linux(a2)) ? 0 : -12;
+                return proc_.with_space([&](AddressSpace& t) { return t.protect(a0, a1, prot_from_linux(a2)); }) ? 0 : -12;
             case S::madvise: {
                 // Only MADV_DONTNEED changes visible state: anonymous pages
                 // must read back as zero afterwards. glibc's malloc relies
                 // on it when trimming. Every other advice is a hint.
                 constexpr std::uint64_t kDontNeed = 4;
                 if (a2 == kDontNeed) {
-                    const Vma* v = as_.find(a0);
-                    if (v && v->anonymous) vm_.zero(a0, AddressSpace::page_up(a1));
+                    const Vma* v = proc_.with_space([&](AddressSpace& t) { return t.find(a0); });
+                    if (v && v->anonymous) machine_.zero(a0, AddressSpace::page_up(a1));
                 }
                 return 0;
             }
@@ -1081,23 +1633,23 @@ private:
                 constexpr std::uint64_t kMayMove = 1;
                 const std::uint64_t old_len = AddressSpace::page_up(a1);
                 const std::uint64_t new_len = AddressSpace::page_up(a2);
-                const Vma* v = as_.find(a0);
+                const Vma* v = proc_.with_space([&](AddressSpace& t) { return t.find(a0); });
                 if (!v) return -14;
                 if (new_len <= old_len) {
-                    as_.unmap(a0 + new_len, old_len - new_len);
+                    proc_.with_space([&](AddressSpace& t) { return t.unmap(a0 + new_len, old_len - new_len); });
                     return static_cast<std::int64_t>(a0);
                 }
                 if (!(a3 & kMayMove)) return -12;
                 const GuestProt prot = v->prot;
                 const bool anon = v->anonymous;
-                std::uint64_t to = as_.map(0, new_len, prot, false, anon);
+                std::uint64_t to = proc_.with_space([&](AddressSpace& t) { return t.map(0, new_len, prot, false, anon); });
                 if (to == AddressSpace::kFail) return -12;
-                auto src = vm_.ram().at(a0, old_len);
-                auto dst = vm_.ram().at(to, new_len);
+                auto src = machine_.ram().at(a0, old_len);
+                auto dst = machine_.ram().at(to, new_len);
                 if (src.empty() || dst.empty()) return -14;
                 std::memmove(dst.data(), src.data(), old_len);
-                vm_.zero(to + old_len, new_len - old_len);
-                as_.unmap(a0, old_len);
+                machine_.zero(to + old_len, new_len - old_len);
+                proc_.with_space([&](AddressSpace& t) { return t.unmap(a0, old_len); });
                 return static_cast<std::int64_t>(to);
             }
             default:
@@ -1108,28 +1660,59 @@ private:
     [[nodiscard]] Maybe do_io(abi::Sysno sc) {
         using S = abi::Sysno;
         const auto gfd = static_cast<int>(regs_.arg(0));
-        const std::uint64_t a1 = regs_.arg(1), a2 = regs_.arg(2), a3 = regs_.arg(3);
-        const GuestRam ram = vm_.ram();
+        const std::uint64_t a0 = regs_.arg(0), a1 = regs_.arg(1),
+                            a2 = regs_.arg(2), a3 = regs_.arg(3);
+        const GuestRam ram = machine_.ram();
 
         // fd-table operations first: they don't need a resolved host fd.
         switch (sc) {
             case S::close:
                 dirs_.erase(gfd);                  // drop any directory stream
-                return fds_.close(gfd);
-            case S::dup:   return fds_.dup(gfd, std::nullopt, false);
+                return proc_.with_fds([&](FdTable& t) { return t.close(gfd); });
+            case S::dup:   return proc_.with_fds([&](FdTable& t) { return t.dup(gfd, std::nullopt, false); });
             case S::dup3: {
                 constexpr std::uint64_t kCloexec = 02000000;
                 if (static_cast<int>(a1) == gfd) return -22;          // EINVAL
-                return fds_.dup(gfd, static_cast<int>(a1), (a2 & kCloexec) != 0);
+                return proc_.with_fds([&](FdTable& t) { return t.dup(gfd, static_cast<int>(a1), (a2 & kCloexec) != 0); });
             }
             case S::fcntl: return do_fcntl(gfd, a1, a2);
             case S::ioctl: {
-                auto h = fds_.host(gfd);
+                auto h = proc_.with_fds([&](FdTable& t) { return t.host(gfd); });
                 if (!h) return -9;
                 return do_ioctl(*h, a1, a2);
             }
             case S::ppoll:    return do_ppoll(regs_.arg(0), a1, a2);
             case S::pselect6: return do_pselect(regs_.arg(0), a1, a2, a3, regs_.arg(4));
+
+            // eventfd2(initval, flags): a counter you can poll. curl, glib
+            // and every event loop uses one as a wakeup channel, and curl
+            // reports a failure here as "Out of memory". Darwin has no
+            // eventfd, but a pipe has the property that matters -- it is
+            // pollable and can be written from another thread -- and the
+            // counter semantics only have to be consistent, since nothing
+            // but the owner interprets the bytes.
+            case S::eventfd2: {
+                constexpr std::uint64_t kNonblock = 0x800, kCloexec = 0x80000;
+                int p[2];
+                if (::pipe(p) < 0) return darwin::fail();
+                for (int e : p) {
+                    ::fcntl(e, F_SETFD, FD_CLOEXEC);
+                    if (a1 & kNonblock)
+                        ::fcntl(e, F_SETFL, ::fcntl(e, F_GETFL) | O_NONBLOCK);
+                }
+                // One guest fd, both pipe ends: a read drains, a write
+                // signals. The write end is kept alive by the EventFd record
+                // so the read end never sees EOF.
+                const int g = proc_.with_fds([&](FdTable& t) {
+                    return t.install_eventfd(p[0], p[1], (a1 & kCloexec) != 0);
+                });
+                if (g < 0) { ::close(p[0]); ::close(p[1]); return -24; }
+                if (a0) {
+                    const std::uint64_t init = a0;
+                    (void)::write(p[1], &init, sizeof init);
+                }
+                return g;
+            }
             case S::sync:  ::sync(); return 0;
             case S::pipe2: {
                 // pipe2(int fds[2], flags): a real Darwin pipe, installed
@@ -1143,14 +1726,25 @@ private:
                         ::fcntl(e, F_SETFL, ::fcntl(e, F_GETFL) | O_NONBLOCK);
                 }
                 const bool cx = (a1 & kCloexec) != 0;
-                std::int32_t g[2] = {fds_.install(p[0], cx), fds_.install(p[1], cx)};
-                if (g[0] < 0 || g[1] < 0) return -24;
-                return ram.put(regs_.arg(0), g) ? 0 : -14;
+                // BOTH ends in ONE locked section. Two separate install()
+                // calls would also be correct here, but doing it atomically
+                // keeps the guest's fd numbering deterministic when another
+                // thread is opening files concurrently -- pipe(2) promises
+                // the two lowest free descriptors.
+                const auto g = proc_.with_fds([&](FdTable& t) {
+                    return std::pair{t.install(p[0], cx), t.install(p[1], cx)};
+                });
+                if (g.first < 0 || g.second < 0) return -24;         // EMFILE
+                const std::int32_t pair[2] = {g.first, g.second};
+                return ram.put(regs_.arg(0), pair) ? 0 : -14;
             }
             default: break;
         }
 
-        const auto hfd = fds_.host(gfd);
+        const auto hfd = proc_.with_fds([&](FdTable& t) { return t.host(gfd); });
+        // An eventfd is one guest fd over a pipe PAIR: reads drain the read
+        // end, writes signal the write end.
+        const auto wfd = proc_.with_fds([&](FdTable& t) { return t.write_host(gfd); });
         auto need_fd = [&]() -> bool { return hfd.has_value(); };
         switch (sc) {
             case S::read: {
@@ -1164,7 +1758,7 @@ private:
                 if (!need_fd()) return -9;
                 auto win = ram.clamp(a1, a2);
                 if (win.empty() && a2) return -14;
-                auto n = ::write(*hfd, win.data(), win.size());
+                auto n = ::write(*wfd, win.data(), win.size());
                 return n < 0 ? darwin::fail() : n;
             }
             case S::pread64: {
@@ -1178,12 +1772,12 @@ private:
                 if (!need_fd()) return -9;
                 auto win = ram.clamp(a1, a2);
                 if (win.empty() && a2) return -14;
-                auto n = ::pwrite(*hfd, win.data(), win.size(), static_cast<off_t>(a3));
+                auto n = ::pwrite(*wfd, win.data(), win.size(), static_cast<off_t>(a3));
                 return n < 0 ? darwin::fail() : n;
             }
             case S::readv: case S::writev:
                 if (!need_fd()) return -9;
-                return do_vector(sc == S::writev, *hfd, a1, a2);
+                return do_vector(sc == S::writev, sc == S::writev ? *wfd : *hfd, a1, a2);
             case S::lseek: {
                 if (!need_fd()) return -9;
                 auto off = ::lseek(*hfd, static_cast<off_t>(a1), static_cast<int>(a2));
@@ -1224,6 +1818,16 @@ private:
             case S::getdents64:
                 if (!need_fd()) return -9;
                 return do_getdents(gfd, *hfd, a1, a2);
+            // close_range(first, last, flags): libc's closefrom(), used by
+            // every spawn helper right before exec.
+            case S::close_range: {
+                const auto lo = static_cast<int>(a0);
+                const auto hi = static_cast<int>(std::min<std::uint64_t>(a1, FdTable::kMaxFds - 1));
+                proc_.with_fds([&](FdTable& t) {
+                    for (int fd = lo; fd <= hi; ++fd) (void)t.close(fd);
+                });
+                return 0;
+            }
             default:
                 return std::nullopt;
         }
@@ -1247,7 +1851,7 @@ private:
             ds.dir = ::fdopendir(d);
             if (!ds.dir) { ::close(d); return darwin::fail(); }
         }
-        auto out = vm_.ram().clamp(buf, cap);
+        auto out = machine_.ram().clamp(buf, cap);
         if (out.empty()) return -14;
         std::size_t used = 0;
         for (;;) {
@@ -1286,30 +1890,50 @@ private:
         constexpr std::uint64_t kDupfd = 0, kGetfd = 1, kSetfd = 2, kGetfl = 3,
                                 kSetfl = 4, kDupfdCloexec = 1030;
         constexpr std::uint64_t kFdCloexec = 1;
-        auto h = fds_.host(gfd);
-        if (!h) return -9;
+
+        // The descriptor-flag and dup commands are properties of the GUEST
+        // fd, so they are decided entirely inside the table -- one locked
+        // section, no nested locking.
         switch (cmd) {
             case kDupfd:
-            case kDupfdCloexec: {
-                // Lowest free fd >= arg: dup to the first gap at or above it.
-                for (int to = static_cast<int>(arg); to < FdTable::kMaxFds; ++to)
-                    if (!fds_.host(to))
-                        return fds_.dup(gfd, to, cmd == kDupfdCloexec);
-                return -24;                                          // EMFILE
-            }
-            case kGetfd: return fds_.cloexec(gfd) ? kFdCloexec : 0;
-            case kSetfd: fds_.set_cloexec(gfd, (arg & kFdCloexec) != 0); return 0;
+            case kDupfdCloexec:
+                return proc_.with_fds([&](FdTable& t) -> std::int64_t {
+                    if (!t.host(gfd)) return -9;                     // EBADF
+                    // Lowest free guest fd at or above `arg`.
+                    for (int to = static_cast<int>(arg); to < FdTable::kMaxFds; ++to)
+                        if (!t.host(to)) return t.dup(gfd, to, cmd == kDupfdCloexec);
+                    return -24;                                      // EMFILE
+                });
+            case kGetfd:
+                return proc_.with_fds([&](FdTable& t) -> std::int64_t {
+                    if (!t.host(gfd)) return -9;
+                    return t.cloexec(gfd) ? static_cast<std::int64_t>(kFdCloexec) : 0;
+                });
+            case kSetfd:
+                return proc_.with_fds([&](FdTable& t) -> std::int64_t {
+                    if (!t.host(gfd)) return -9;
+                    t.set_cloexec(gfd, (arg & kFdCloexec) != 0);
+                    return 0;
+                });
+            default:
+                break;
+        }
+
+        // The rest act on the host file description. Resolve the fd, release
+        // the lock, then do the blocking-capable host call outside it.
+        const int h = proc_.with_fds([&](FdTable& t) { return t.host(gfd).value_or(-1); });
+        if (h < 0) return -9;
+        switch (cmd) {
             case kGetfl: {
-                int fl = ::fcntl(*h, F_GETFL);
-                if (fl < 0) return darwin::fail();
-                return darwin::open_flags_to_linux(fl);
+                const int fl = ::fcntl(h, F_GETFL);
+                return fl < 0 ? darwin::fail() : darwin::open_flags_to_linux(fl);
             }
             case kSetfl: {
-                int cur = ::fcntl(*h, F_GETFL);
+                int cur = ::fcntl(h, F_GETFL);
                 if (cur < 0) return darwin::fail();
                 cur &= ~(O_APPEND | O_NONBLOCK);
                 cur |= darwin::open_flags(arg) & (O_APPEND | O_NONBLOCK);
-                return ::fcntl(*h, F_SETFL, cur) < 0 ? darwin::fail() : 0;
+                return ::fcntl(h, F_SETFL, cur) < 0 ? darwin::fail() : 0;
             }
             default:
                 return -22;                                          // EINVAL
@@ -1319,7 +1943,7 @@ private:
     // ioctl(fd, req, arg). Terminals are the whole story for an interactive
     // shell; see hvf_tty.hpp for why every field is translated by name.
     [[nodiscard]] std::int64_t do_ioctl(int hfd, std::uint64_t req, std::uint64_t arg) {
-        const GuestRam ram = vm_.ram();
+        const GuestRam ram = machine_.ram();
         using namespace tty;
         switch (req) {
             case L_TCGETS: case L_TCGETS2: {
@@ -1389,12 +2013,12 @@ private:
         struct LinuxPollfd { std::int32_t fd; std::int16_t events, revents; };
         constexpr std::uint64_t kMax = FdTable::kMaxFds;
         if (n > kMax) return -22;
-        const GuestRam ram = vm_.ram();
+        const GuestRam ram = machine_.ram();
         std::vector<LinuxPollfd> g(n);
         std::vector<struct ::pollfd> h(n);
         for (std::uint64_t i = 0; i < n; ++i) {
             if (!ram.get(fds_at + i * sizeof(LinuxPollfd), g[i])) return -14;
-            auto hfd = g[i].fd < 0 ? std::nullopt : fds_.host(g[i].fd);
+            auto hfd = g[i].fd < 0 ? std::nullopt : proc_.with_fds([&](FdTable& t) { return t.host(g[i].fd); });
             h[i].fd = hfd ? *hfd : -1;
             h[i].events = static_cast<short>(g[i].events & 0x3f);   // drop POLLRDHUP
             h[i].revents = 0;
@@ -1421,7 +2045,7 @@ private:
                                           std::uint64_t wr, std::uint64_t ex,
                                           std::uint64_t ts_at) {
         if (nfds > FdTable::kMaxFds) return -22;
-        const GuestRam ram = vm_.ram();
+        const GuestRam ram = machine_.ram();
         const std::size_t bytes = (nfds + 7) / 8;
         std::vector<std::uint8_t> sets[3];
         const std::uint64_t at[3] = {rd, wr, ex};
@@ -1441,7 +2065,7 @@ private:
             if (sets[1][fd / 8] & (1u << (fd % 8))) ev |= POLLOUT;
             if (sets[2][fd / 8] & (1u << (fd % 8))) ev |= POLLPRI;
             if (!ev) continue;
-            auto h = fds_.host(static_cast<int>(fd));
+            auto h = proc_.with_fds([&](FdTable& t) { return t.host(static_cast<int>(fd)); });
             if (!h) return -9;                                        // EBADF
             p.push_back({*h, ev, 0});
             guest.push_back(static_cast<int>(fd));
@@ -1473,7 +2097,7 @@ private:
     // real vectors are short (musl's stdio uses two).
     [[nodiscard]] std::int64_t do_vector(bool writing, int fd,
                                          std::uint64_t vec, std::uint64_t cnt) {
-        const GuestRam ram = vm_.ram();
+        const GuestRam ram = machine_.ram();
         std::int64_t total = 0;
         constexpr std::uint64_t kIovMax = 1024;
         for (std::uint64_t i = 0; i < std::min(cnt, kIovMax); ++i) {
@@ -1532,11 +2156,11 @@ private:
         // macOS has no /proc, so answer from the guest fd table here.
         if (path) {
             if (auto g = proc_fd_number(*path)) {
-                auto h = fds_.host(*g);
+                auto h = proc_.with_fds([&](FdTable& t) { return t.host(*g); });
                 if (!h) return -2;                                   // ENOENT
                 if (sc == S::readlinkat) {
                     const std::string target = describe_fd(*h);
-                    auto win = vm_.ram().clamp(regs_.arg(2), regs_.arg(3));
+                    auto win = machine_.ram().clamp(regs_.arg(2), regs_.arg(3));
                     if (win.empty()) return -14;
                     const std::size_t n = std::min(win.size(), target.size());
                     std::memcpy(win.data(), target.data(), n);
@@ -1548,7 +2172,7 @@ private:
                 path = &fd_path_storage_;
             }
         }
-        const GuestRam ram = vm_.ram();
+        const GuestRam ram = machine_.ram();
         const std::uint64_t a2 = regs_.arg(2), a3 = regs_.arg(3);
         switch (sc) {
             case S::open: case S::openat: {
@@ -1564,7 +2188,7 @@ private:
                                 static_cast<mode_t>(lmode));
                 if (fd < 0) return darwin::fail();
                 constexpr std::uint64_t kCloexec = 02000000;
-                return fds_.install(fd, (lflags & kCloexec) != 0);
+                return proc_.with_fds([&](FdTable& t) { return t.install(fd, (lflags & kCloexec) != 0); });
             }
             case S::newfstatat: {
                 if (!path) return -2;
@@ -1634,7 +2258,7 @@ private:
                 }
                 constexpr std::uint64_t kNoFollow = 0x100;
                 if (!path) {
-                    auto h = fds_.host(static_cast<int>(regs_.arg(0)));
+                    auto h = proc_.with_fds([&](FdTable& t) { return t.host(static_cast<int>(regs_.arg(0))); });
                     if (!h) return -9;
                     return ::futimens(*h, ts) < 0 ? darwin::fail() : 0;
                 }
@@ -1666,31 +2290,59 @@ private:
                 if (!path) return -2;
                 return ::truncate(path->c_str(), static_cast<off_t>(regs_.arg(1))) < 0
                            ? darwin::fail() : 0;
+            case S::bind: case S::connect: {
+                // The CORE decides these: for AF_UNIX it translates the
+                // sockaddr_un path into the rootfs (so a guest's
+                // /run/foo.sock is a real file under the rootfs), which is
+                // why they arrive here as a path syscall rather than in
+                // do_socket. `path` is that translated path, or null for an
+                // IP address the guest supplied directly.
+                const int h = host_fd(static_cast<int>(regs_.arg(0)));
+                if (h < 0) return -9;
+                ::sockaddr_storage ss{};
+                socklen_t slen = 0;
+                if (path) {
+                    auto* sun = reinterpret_cast<::sockaddr_un*>(&ss);
+                    if (path->size() >= sizeof sun->sun_path) return -36;  // ENAMETOOLONG
+                    sun->sun_family = AF_UNIX;
+                    std::memcpy(sun->sun_path, path->c_str(), path->size() + 1);
+                    sun->sun_len = static_cast<std::uint8_t>(
+                        offsetof(::sockaddr_un, sun_path) + path->size() + 1);
+                    slen = sun->sun_len;
+                } else {
+                    auto addr = ram.at(regs_.arg(1), regs_.arg(2));
+                    if (addr.empty()) return -14;
+                    auto n = net::to_darwin(addr, ss);
+                    if (!n) return -97;
+                    slen = *n;
+                }
+                const int rc = sc == S::bind
+                    ? ::bind(h, reinterpret_cast<::sockaddr*>(&ss), slen)
+                    : ::connect(h, reinterpret_cast<::sockaddr*>(&ss), slen);
+                return rc < 0 ? darwin::fail() : 0;
+            }
             default:
                 return std::nullopt;
         }
     }
 
-    HvfVm& vm_;
-    AddressSpace as_;
-    FdTable fds_;
+    HvfMachine& machine_;
+    HvfCpu& cpu_;
+    ProcessState& proc_;
+    TaskState& task_;
     PidSpace& pids_;
-    std::int32_t self_{1}, parent_{0};
+    std::int32_t parent_{0};
     struct Child { std::int32_t guest; pid_t host; };
     std::vector<Child> children_;
-    std::uint64_t clear_child_tid_{0};
     Resolver resolve_;
     Resolver unresolve_;
     std::string fd_path_storage_;
     SpawnFork spawn_;
+    SpawnThread spawn_thread_;
     std::vector<std::string> env_;
     bool execed_{false};
-    // Signal state: the guest's dispositions, blocked mask and alt stack.
-    std::array<LinuxSigaction, kLinuxNsig> actions_{};
-    std::uint64_t mask_{0};
-    LinuxStack altstack_{};
-    std::optional<std::uint64_t> suspend_restore_;
-    bool sigreturned_{false};
+    bool thread_exited_{false};
+    TimerSet timers_;
     // Open directory streams for getdents64, keyed by guest fd.
     struct Entry {
         std::uint64_t ino{};
@@ -1708,7 +2360,6 @@ private:
     };
     std::map<int, DirStream> dirs_;
     GuestRegs regs_{};
-    std::uint32_t umask_{022};
     bool exited_{false};
     int code_{0};
 };
@@ -1720,8 +2371,8 @@ private:
 // buffer straddles an unmapped page -- and a TOCTOU window besides.
 class HvfMem {
 public:
-    explicit HvfMem(const HvfVm& vm, const HvfTrap* trap = nullptr) noexcept
-        : vm_{vm}, trap_{trap} {}
+    explicit HvfMem(const HvfMachine& machine, const HvfTrap* trap = nullptr) noexcept
+        : machine_{machine}, trap_{trap} {}
 
     // The identity bridge abi::Syscalls probes for (`requires { mem_.current_ids(); }`),
     // so the portable core's getpid/getppid and /proc/self see this
@@ -1735,21 +2386,21 @@ public:
     }
 
     [[nodiscard]] Status copy_in(UAddr src, std::span<std::byte> dst) const {
-        auto win = vm_.ram().at(value(src), dst.size());
+        auto win = machine_.ram().at(value(src), dst.size());
         if (win.empty() && !dst.empty()) return err(Errno::efault);
         std::memcpy(dst.data(), win.data(), dst.size());
         return ok();
     }
 
     [[nodiscard]] Status copy_out(UAddr dst, std::span<const std::byte> src) const {
-        auto win = vm_.ram().at(value(dst), src.size());
+        auto win = machine_.ram().at(value(dst), src.size());
         if (win.empty() && !src.empty()) return err(Errno::efault);
         std::memcpy(win.data(), src.data(), src.size());
         return ok();
     }
 
 private:
-    const HvfVm& vm_;
+    const HvfMachine& machine_;
     const HvfTrap* trap_;
 };
 

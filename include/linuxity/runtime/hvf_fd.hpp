@@ -108,6 +108,32 @@ public:
         if (host(g)) slots_[static_cast<std::size_t>(g)].cloexec = on;
     }
 
+    // eventfd(2): ONE guest fd backed by a pipe PAIR. The guest reads and
+    // writes the same descriptor, so the table holds both ends and keeps the
+    // write end alive -- otherwise the read end would report EOF instead of
+    // blocking, and an event loop would spin.
+    [[nodiscard]] int install_eventfd(int read_end, int write_end, bool cloexec) {
+        auto file = std::make_shared<HostFd>(read_end);
+        auto peer = std::make_shared<HostFd>(write_end);
+        for (std::size_t g = 0; g < slots_.size(); ++g)
+            if (!slots_[g].file) {
+                slots_[g] = {std::move(file), cloexec, std::move(peer)};
+                return static_cast<int>(g);
+            }
+        if (slots_.size() >= kMaxFds) return -24;
+        slots_.push_back({std::move(file), cloexec, std::move(peer)});
+        return static_cast<int>(slots_.size() - 1);
+    }
+
+    // The write end, if `g` is an eventfd; a write must go there, not to the
+    // read end the guest holds.
+    [[nodiscard]] std::optional<int> write_host(int g) const noexcept {
+        if (g < 0 || static_cast<std::size_t>(g) >= slots_.size()) return std::nullopt;
+        const Slot& s = slots_[static_cast<std::size_t>(g)];
+        if (!s.file) return std::nullopt;
+        return s.peer ? s.peer->get() : s.file->get();
+    }
+
     // execve: drop every FD_CLOEXEC descriptor.
     void on_exec() {
         for (auto& s : slots_) if (s.cloexec) s = {};
@@ -156,6 +182,8 @@ private:
     struct Slot {
         std::shared_ptr<HostFd> file;
         bool cloexec{false};
+        // eventfd's write end (null for an ordinary descriptor).
+        std::shared_ptr<HostFd> peer;
     };
 
     void install_at(int g, std::shared_ptr<HostFd> file, bool cloexec) {

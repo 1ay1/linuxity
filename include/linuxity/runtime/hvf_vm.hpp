@@ -1,10 +1,20 @@
 // linuxity/runtime/hvf_vm.hpp
 //
 // The kernel-less virtual machine: guest physical memory, page tables, the
-// EL1 vector stub and the vCPU. No syscall knowledge lives here -- this is
-// the "CPU + RAM" that the trap backend (hvf_trap.hpp) and the program
-// loader (hvf_load.hpp) both build on, which is why it is its own header:
-// exec needs the loader, the trap needs exec, and both need the VM.
+// EL1 vector stub, and vCPUs.
+//
+// The split here is the one Hypervisor.framework forces and that SMP needs:
+//
+//   HvfMachine -- guest RAM + the address translation that makes it a Linux
+//                 userspace address space. Exactly one per process (the
+//                 framework allows one hv_vm), shared by every vCPU.
+//   HvfCpu     -- one vCPU: its register file and its run loop. Created ON
+//                 and used ONLY FROM its own host thread; the framework ties
+//                 a vcpu to the thread that created it, so a guest thread IS
+//                 a host thread, scheduled by XNU across the real cores.
+//
+// No syscall knowledge lives here. This is the "CPU + RAM" layer that the
+// trap backend (hvf_trap.hpp) and the loader (hvf_load.hpp) build on.
 #pragma once
 
 #if defined(__APPLE__) && defined(__aarch64__)
@@ -19,7 +29,9 @@
 #include <unistd.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <utility>
 
 namespace lx::runtime {
 
@@ -82,9 +94,9 @@ struct ExecArena {
 // every one does the same thing: `hvc #<index>` so the hypervisor (us) sees
 // which vector fired. We always resume the guest by writing PC/CPSR
 // ourselves, so the stub never returns.
-inline void write_vector_stub(std::uint8_t* mem) {
+inline void write_vector_stub(std::byte* mem) {
     for (int v = 0; v < 16; ++v) {
-        std::uint32_t hvc = 0xD4000002u | (static_cast<std::uint32_t>(v) << 5);
+        const std::uint32_t hvc = 0xD4000002u | (static_cast<std::uint32_t>(v) << 5);
         std::memcpy(mem + HvfLayout::vectors + static_cast<std::size_t>(v) * 0x80,
                     &hvc, 4);
     }
@@ -94,7 +106,7 @@ inline void write_vector_stub(std::uint8_t* mem) {
 // below priv_end is EL1-only (AP=0b00); the rest is EL0 read/write/execute
 // (AP=0b01). Not setting UXN per region is deliberate: mprotect is tracked
 // in the VMA map, and a JIT in the guest needs to make pages executable.
-inline void build_page_tables(std::uint8_t* mem, std::uint64_t ram) {
+inline void build_page_tables(std::byte* mem, std::uint64_t ram) {
     auto put64 = [mem](std::uint64_t at, std::uint64_t v) {
         std::memcpy(mem + at, &v, 8);
     };
@@ -122,55 +134,68 @@ inline void build_page_tables(std::uint8_t* mem, std::uint64_t ram) {
     }
 }
 
-// -- The virtual machine ---------------------------------------------------
-// Owns guest physical memory and the single vCPU. Hypervisor.framework
-// permits exactly one VM per process, which is why fork support is a
-// teardown/rebuild rather than a second instance.
+// -- The machine: guest RAM shared by every vCPU ---------------------------
 //
-// Non-copyable, non-movable: the hv_vcpu_exit_t* the framework hands back
-// points into VM-owned state, so the object's address is part of its
-// identity. Pinning it is the honest encoding of that constraint.
-class HvfVm {
+// Non-copyable and non-movable: hv_vm is a process-global resource and vCPUs
+// hold a reference to this object, so its address is part of its identity.
+class HvfMachine {
 public:
-    HvfVm() = default;
-    HvfVm(const HvfVm&) = delete;
-    HvfVm& operator=(const HvfVm&) = delete;
-    HvfVm(HvfVm&&) = delete;
-    HvfVm& operator=(HvfVm&&) = delete;
-    ~HvfVm() {
-        teardown();
-        if (base_) ::munmap(base_, size_);
+    HvfMachine() = default;
+    HvfMachine(const HvfMachine&) = delete;
+    HvfMachine& operator=(const HvfMachine&) = delete;
+    HvfMachine(HvfMachine&&) = delete;
+    HvfMachine& operator=(HvfMachine&&) = delete;
+    ~HvfMachine() {
+        if (vm_live_) ::hv_vm_destroy();
+        if (owns_ram_ && base_) ::munmap(base_, size_);
     }
 
     [[nodiscard]] Status init(std::uint64_t mem_size) {
-        // Round up to a 2 MiB block so the L3 page-table loop covers whole
-        // blocks, and clamp to the 36-bit IPA the hardware exposes.
-        constexpr std::uint64_t kBlock = 1ull << 21;
+        constexpr std::uint64_t kBlock = HvfLayout::block;
         size_ = (mem_size + kBlock - 1) & ~(kBlock - 1);
-        if (size_ > (1ull << 36)) return err(Errno::einval);
-        void* p = ::mmap(nullptr, size_, PROT_READ | PROT_WRITE,
-                         MAP_ANON | MAP_PRIVATE, -1, 0);
+        if (size_ > (1ull << 36)) return err(Errno::einval);   // 36-bit IPA
+        // Guest RAM lives in an anonymous SHARED mapping, not MAP_PRIVATE.
+        // Two things need that:
+        //   * futex. os_sync_wait_on_address's SHARED flags require memory
+        //     that is genuinely shared, which is what a Linux process-shared
+        //     futex (a pthread mutex in shared memory, and every futex in a
+        //     multi-process guest) means.
+        //   * threads. A guest thread is a host thread in THIS process, so
+        //     it already shares the mapping -- but keeping one representation
+        //     for both cases means fork and threads can't disagree.
+        // A forked child still gets copy-on-write semantics: the Mach memory
+        // entry it receives is a COW snapshot (see hvf_fork.hpp), so sharing
+        // here does not leak writes across a guest fork.
+        int fd = -1;
+        char tmpl[] = "/tmp/linuxity-ram-XXXXXX";
+        fd = ::mkstemp(tmpl);
+        if (fd < 0) return err(Errno::enomem);
+        ::unlink(tmpl);
+        if (::ftruncate(fd, static_cast<off_t>(size_)) != 0) { ::close(fd); return err(Errno::enomem); }
+        void* p = ::mmap(nullptr, size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        ::close(fd);
         if (p == MAP_FAILED) return err(Errno::enomem);
         base_ = static_cast<std::byte*>(p);
+        owns_ram_ = true;
         return attach();
     }
 
-    // Fork child: adopt a parent's copy-on-write RAM snapshot (already
-    // mapped, see hvf_fork.hpp) as this VM's guest memory, and bring the VM
-    // up in this FRESH process -- one whose Hypervisor.framework has never
-    // run, so there is no inherited helper-thread state to trip over.
+    // Fork child: adopt the parent's copy-on-write RAM snapshot (already
+    // mapped, see hvf_fork.hpp) as this machine's guest memory, in a FRESH
+    // process whose Hypervisor.framework has never run.
     [[nodiscard]] Status init_from(void* ram, std::uint64_t size) {
         base_ = static_cast<std::byte*>(ram);
         size_ = size;
+        owns_ram_ = false;          // the Mach entry mapping owns it
         return attach();
     }
-    [[nodiscard]] std::byte* raw_base() const noexcept { return base_; }
 
     // -- Memory -----------------------------------------------------------
     [[nodiscard]] GuestRam ram() const noexcept {
         return GuestRam{base_, size_, HvfLayout::priv_end(size_)};
     }
     [[nodiscard]] std::uint64_t mem_size() const noexcept { return size_; }
+    [[nodiscard]] std::byte* raw_base() const noexcept { return base_; }
 
     // Clear a guest range, touching NO byte outside [gpa, gpa+n).
     //
@@ -179,160 +204,49 @@ public:
     //  * mmap(MAP_FIXED) over guest RAM is forbidden: it replaces the host
     //    pages while the guest's IPA translation still points at the OLD
     //    ones, so the guest keeps reading stale data (verified, macOS 27).
-    //  * madvise(MADV_ZERO) works at HOST page granularity, which is 16 KiB,
-    //    while the guest uses 4 KiB pages. A 4 KiB MADV_ZERO silently zeroes
-    //    the whole surrounding 16 KiB host page (verified: zeroing
-    //    [0x6000,0x7000) also wiped 0x4000..0x8000). That destroyed up to
-    //    12 KiB of neighbouring guest memory on every anonymous mmap and
-    //    .bss clear -- e.g. libc data a moment before relocation, which made
-    //    RELR relocation produce libc_base instead of libc_base+offset and
-    //    the guest load its own ELF header as a pointer ("\x7fELF" faults).
+    //  * madvise(MADV_ZERO) works at HOST page granularity -- 16 KiB on
+    //    Apple Silicon -- while the guest uses 4 KiB pages. A 4 KiB
+    //    MADV_ZERO silently zeroes the surrounding 16 KiB host page
+    //    (verified: zeroing [0x6000,0x7000) also wiped 0x4000..0x8000),
+    //    destroying up to 12 KiB of neighbouring guest memory on every
+    //    anonymous mmap and .bss clear. That corrupted libc's data a moment
+    //    before relocation, so RELR produced libc_base instead of
+    //    libc_base+offset and the guest loaded its own ELF header as a
+    //    pointer ("\x7fELF" faults).
     //
-    // So: MADV_ZERO only the 16 KiB-aligned interior (cheap, no page touch),
-    // and memset the unaligned head and tail.
+    // So: MADV_ZERO only the host-page-aligned interior (cheap, no page
+    // touched), and memset the unaligned head and tail.
     void zero(std::uint64_t gpa, std::size_t n) noexcept {
         auto win = ram().at(gpa, n);
         if (win.empty()) return;
-        static const std::uint64_t kHostPage =
-            static_cast<std::uint64_t>(::getpagesize());
+        static const std::uintptr_t host_page =
+            static_cast<std::uintptr_t>(::getpagesize());
         const auto base = reinterpret_cast<std::uintptr_t>(win.data());
-        const std::uintptr_t lo = (base + kHostPage - 1) & ~(kHostPage - 1);
-        const std::uintptr_t hi = (base + n) & ~(kHostPage - 1);
+        const std::uintptr_t lo = (base + host_page - 1) & ~(host_page - 1);
+        const std::uintptr_t hi = (base + win.size()) & ~(host_page - 1);
 #if defined(MADV_ZERO)
         if (hi > lo &&
             ::madvise(reinterpret_cast<void*>(lo), hi - lo, MADV_ZERO) == 0) {
-            std::memset(win.data(), 0, lo - base);                  // head
-            std::memset(reinterpret_cast<void*>(hi), 0, base + n - hi); // tail
+            std::memset(win.data(), 0, lo - base);
+            std::memset(reinterpret_cast<void*>(hi), 0, base + win.size() - hi);
             return;
         }
 #endif
         std::memset(win.data(), 0, win.size());
     }
 
-    // Publish freshly written guest code. The host wrote it through a data
-    // mapping; the guest will FETCH it, and on arm64 those are separate
+    // Publish freshly written guest code: the host wrote it through a data
+    // mapping, the guest will FETCH it, and on arm64 those are separate
     // caches with no coherency guarantee.
     void publish_code(std::uint64_t gpa, std::size_t n) const noexcept {
         auto win = ram().at(gpa, n);
         if (!win.empty()) ::sys_icache_invalidate(win.data(), win.size());
     }
 
-    // -- Execution --------------------------------------------------------
-    void set_entry(std::uint64_t pc, std::uint64_t sp) noexcept {
-        ::hv_vcpu_set_sys_reg(cpu_, HV_SYS_REG_SP_EL0, sp);
-        ::hv_vcpu_set_reg(cpu_, HV_REG_PC, pc);
-        ::hv_vcpu_set_reg(cpu_, HV_REG_CPSR, 0);   // EL0t, DAIF clear
-    }
-
-    // Run until the guest traps, returning its register snapshot. HV_EXIT
-    // reasons other than EXCEPTION (vtimer, cancel) are not guest events, so
-    // they surface as EINTR for the caller to retry.
-    [[nodiscard]] Result<GuestRegs> run() {
-        if (::hv_vcpu_run(cpu_) != HV_SUCCESS) return err<GuestRegs>(Errno::eio);
-        if (exit_->reason != HV_EXIT_REASON_EXCEPTION)
-            return err<GuestRegs>(Errno::eintr);
-        return ok(read_regs(cpu_));
-    }
-
-    void set_result(const GuestRegs& r, std::int64_t ret) noexcept {
-        write_return(cpu_, r, ret);
-    }
-
-    // -- fork(2) ----------------------------------------------------------
-    // Hypervisor.framework refuses to operate in a forked child: hv_vm_create
-    // returns HV_BAD_ARGUMENT (0xfae94002) there and the inherited handle is
-    // dead. Verified on macOS 27. But guest RAM is ordinary COW anonymous
-    // memory, so a guest fork is:
-    //
-    //     teardown() -> ::fork() -> attach() on BOTH sides
-    //
-    // The child inherits an exact copy-on-write image of guest memory, which
-    // IS fork(2) semantics for the guest, and each side rebuilds its own VM
-    // over its own copy. Registers are carried across explicitly because
-    // destroying the vCPU discards them.
-    void teardown() noexcept {
-        if (cpu_live_) { ::hv_vcpu_destroy(cpu_); cpu_live_ = false; }
-        if (vm_live_)  { ::hv_vm_destroy();       vm_live_  = false; }
-    }
-    [[nodiscard]] Status rebuild() { return attach(); }
-
-    // The COMPLETE user-visible CPU state. Destroying a vCPU discards every
-    // register, and a guest fork must resume BOTH sides bit-exactly -- so this
-    // includes the FP/SIMD file (q0..q31, FPCR, FPSR), which glibc's memcpy
-    // and every compiler-vectorized loop keep live across a syscall. Saving
-    // only the GPRs (the obvious version) corrupts the parent's floating
-    // point state on every fork.
-    struct CpuState {
-        std::uint64_t x[31]{};
-        std::uint64_t pc{}, cpsr{}, sp_el0{}, tpidr_el0{}, tpidrro_el0{};
-        std::uint64_t fpcr{}, fpsr{};
-        hv_simd_fp_uchar16_t q[32]{};
-    };
-    [[nodiscard]] CpuState save() const noexcept {
-        CpuState s;
-        for (int i = 0; i < 31; ++i)
-            ::hv_vcpu_get_reg(cpu_, static_cast<hv_reg_t>(HV_REG_X0 + i), &s.x[i]);
-        ::hv_vcpu_get_reg(cpu_, HV_REG_PC, &s.pc);
-        ::hv_vcpu_get_reg(cpu_, HV_REG_CPSR, &s.cpsr);
-        ::hv_vcpu_get_reg(cpu_, HV_REG_FPCR, &s.fpcr);
-        ::hv_vcpu_get_reg(cpu_, HV_REG_FPSR, &s.fpsr);
-        ::hv_vcpu_get_sys_reg(cpu_, HV_SYS_REG_SP_EL0, &s.sp_el0);
-        ::hv_vcpu_get_sys_reg(cpu_, HV_SYS_REG_TPIDR_EL0, &s.tpidr_el0);
-        ::hv_vcpu_get_sys_reg(cpu_, HV_SYS_REG_TPIDRRO_EL0, &s.tpidrro_el0);
-        for (int i = 0; i < 32; ++i)
-            ::hv_vcpu_get_simd_fp_reg(cpu_, static_cast<hv_simd_fp_reg_t>(HV_SIMD_FP_REG_Q0 + i), &s.q[i]);
-        return s;
-    }
-    void load(const CpuState& s) noexcept {
-        for (int i = 0; i < 31; ++i)
-            ::hv_vcpu_set_reg(cpu_, static_cast<hv_reg_t>(HV_REG_X0 + i), s.x[i]);
-        ::hv_vcpu_set_reg(cpu_, HV_REG_PC, s.pc);
-        ::hv_vcpu_set_reg(cpu_, HV_REG_CPSR, s.cpsr);
-        ::hv_vcpu_set_reg(cpu_, HV_REG_FPCR, s.fpcr);
-        ::hv_vcpu_set_reg(cpu_, HV_REG_FPSR, s.fpsr);
-        ::hv_vcpu_set_sys_reg(cpu_, HV_SYS_REG_SP_EL0, s.sp_el0);
-        ::hv_vcpu_set_sys_reg(cpu_, HV_SYS_REG_TPIDR_EL0, s.tpidr_el0);
-        ::hv_vcpu_set_sys_reg(cpu_, HV_SYS_REG_TPIDRRO_EL0, s.tpidrro_el0);
-        for (int i = 0; i < 32; ++i)
-            ::hv_vcpu_set_simd_fp_reg(cpu_, static_cast<hv_simd_fp_reg_t>(HV_SIMD_FP_REG_Q0 + i), s.q[i]);
-    }
-
-    void restore(const GuestRegs& r, std::uint64_t sp, std::uint64_t tls) noexcept {
-        for (std::size_t i = 0; i < r.x.size(); ++i)
-            ::hv_vcpu_set_reg(cpu_, static_cast<hv_reg_t>(HV_REG_X0 + i), r.x[i]);
-        ::hv_vcpu_set_sys_reg(cpu_, HV_SYS_REG_SP_EL0, sp);
-        ::hv_vcpu_set_sys_reg(cpu_, HV_SYS_REG_TPIDR_EL0, tls);
-        ::hv_vcpu_set_reg(cpu_, HV_REG_PC, r.elr);
-        ::hv_vcpu_set_reg(cpu_, HV_REG_CPSR, r.spsr);
-    }
-    [[nodiscard]] std::uint64_t sp() const noexcept {
-        std::uint64_t v = 0;
-        ::hv_vcpu_get_sys_reg(cpu_, HV_SYS_REG_SP_EL0, &v);
-        return v;
-    }
-    [[nodiscard]] std::uint64_t tls() const noexcept {
-        std::uint64_t v = 0;
-        ::hv_vcpu_get_sys_reg(cpu_, HV_SYS_REG_TPIDR_EL0, &v);
-        return v;
-    }
-    void set_tls(std::uint64_t v) noexcept {
-        ::hv_vcpu_set_sys_reg(cpu_, HV_SYS_REG_TPIDR_EL0, v);
-    }
-    void set_sp(std::uint64_t v) noexcept {
-        ::hv_vcpu_set_sys_reg(cpu_, HV_SYS_REG_SP_EL0, v);
-    }
-    void set_x(int i, std::uint64_t v) noexcept {
-        ::hv_vcpu_set_reg(cpu_, static_cast<hv_reg_t>(HV_REG_X0 + i), v);
-    }
-    [[nodiscard]] hv_vcpu_t vcpu() const noexcept { return cpu_; }
-
 private:
-    // Create VM + vCPU over the existing memory and put the machine into
-    // "Linux userspace" state: MMU on, EL0 unprivileged, vectors installed.
-    // Runs at init and again after every fork.
     [[nodiscard]] Status attach() {
-        build_page_tables(reinterpret_cast<std::uint8_t*>(base_), size_);
-        write_vector_stub(reinterpret_cast<std::uint8_t*>(base_));
+        build_page_tables(base_, size_);
+        write_vector_stub(base_);
         ::sys_icache_invalidate(base_ + HvfLayout::vectors, 16 * 0x80);
 
         if (::hv_vm_create(nullptr) != HV_SUCCESS) return err(Errno::enodev);
@@ -341,10 +255,34 @@ private:
             HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
         if (::hv_vm_map(base_, 0, size_, flags) != HV_SUCCESS)
             return err(Errno::enomem);
+        return ok();
+    }
+
+    std::byte* base_{nullptr};
+    std::uint64_t size_{0};
+    bool vm_live_{false};
+    bool owns_ram_{false};
+};
+
+// -- One vCPU --------------------------------------------------------------
+//
+// MUST be created on, and only ever used from, the host thread that will run
+// it: Hypervisor.framework binds a vcpu to its creating thread. That is also
+// exactly what we want for SMP -- one guest thread per host thread, so XNU
+// schedules guest threads across the physical cores.
+class HvfCpu {
+public:
+    HvfCpu() = default;
+    HvfCpu(const HvfCpu&) = delete;
+    HvfCpu& operator=(const HvfCpu&) = delete;
+    ~HvfCpu() { if (live_) ::hv_vcpu_destroy(cpu_); }
+
+    // Bring this vCPU up in "Linux userspace" state: MMU on, EL0
+    // unprivileged, our vector stub installed.
+    [[nodiscard]] Status create() {
         if (::hv_vcpu_create(&cpu_, &exit_, nullptr) != HV_SUCCESS)
             return err(Errno::enodev);
-        cpu_live_ = true;
-
+        live_ = true;
         auto sr = [this](hv_sys_reg_t r, std::uint64_t v) {
             ::hv_vcpu_set_sys_reg(cpu_, r, v);
         };
@@ -365,11 +303,100 @@ private:
         return ok();
     }
 
-    std::byte* base_{nullptr};
-    std::uint64_t size_{0};
+    [[nodiscard]] bool live() const noexcept { return live_; }
+    [[nodiscard]] hv_vcpu_t handle() const noexcept { return cpu_; }
+
+    // -- Execution --------------------------------------------------------
+    void set_entry(std::uint64_t pc, std::uint64_t sp) noexcept {
+        ::hv_vcpu_set_sys_reg(cpu_, HV_SYS_REG_SP_EL0, sp);
+        ::hv_vcpu_set_reg(cpu_, HV_REG_PC, pc);
+        ::hv_vcpu_set_reg(cpu_, HV_REG_CPSR, 0);   // EL0t, DAIF clear
+    }
+
+    // Run until the guest traps, returning its register snapshot. HV_EXIT
+    // reasons other than EXCEPTION (vtimer, hv_vcpus_exit) are not guest
+    // events, so they surface as EINTR for the caller to retry.
+    [[nodiscard]] Result<GuestRegs> run() {
+        if (::hv_vcpu_run(cpu_) != HV_SUCCESS) return err<GuestRegs>(Errno::eio);
+        if (exit_->reason != HV_EXIT_REASON_EXCEPTION)
+            return err<GuestRegs>(Errno::eintr);
+        return ok(read_regs(cpu_));
+    }
+
+    void set_result(const GuestRegs& r, std::int64_t ret) noexcept {
+        write_return(cpu_, r, ret);
+    }
+
+    // -- Full user-visible state ------------------------------------------
+    // Includes the FP/SIMD file (q0..q31, FPCR, FPSR): glibc's memcpy and
+    // every vectorized loop keep those live across a syscall, so a fork or
+    // thread-start that saves only the GPRs corrupts floating point state.
+    struct CpuState {
+        std::uint64_t x[31]{};
+        std::uint64_t pc{}, cpsr{}, sp_el0{}, tpidr_el0{}, tpidrro_el0{};
+        std::uint64_t fpcr{}, fpsr{};
+        hv_simd_fp_uchar16_t q[32]{};
+    };
+
+    [[nodiscard]] CpuState save() const noexcept {
+        CpuState s;
+        for (int i = 0; i < 31; ++i)
+            ::hv_vcpu_get_reg(cpu_, static_cast<hv_reg_t>(HV_REG_X0 + i), &s.x[i]);
+        ::hv_vcpu_get_reg(cpu_, HV_REG_PC, &s.pc);
+        ::hv_vcpu_get_reg(cpu_, HV_REG_CPSR, &s.cpsr);
+        ::hv_vcpu_get_reg(cpu_, HV_REG_FPCR, &s.fpcr);
+        ::hv_vcpu_get_reg(cpu_, HV_REG_FPSR, &s.fpsr);
+        ::hv_vcpu_get_sys_reg(cpu_, HV_SYS_REG_SP_EL0, &s.sp_el0);
+        ::hv_vcpu_get_sys_reg(cpu_, HV_SYS_REG_TPIDR_EL0, &s.tpidr_el0);
+        ::hv_vcpu_get_sys_reg(cpu_, HV_SYS_REG_TPIDRRO_EL0, &s.tpidrro_el0);
+        for (int i = 0; i < 32; ++i)
+            ::hv_vcpu_get_simd_fp_reg(
+                cpu_, static_cast<hv_simd_fp_reg_t>(HV_SIMD_FP_REG_Q0 + i), &s.q[i]);
+        return s;
+    }
+
+    void load(const CpuState& s) noexcept {
+        for (int i = 0; i < 31; ++i)
+            ::hv_vcpu_set_reg(cpu_, static_cast<hv_reg_t>(HV_REG_X0 + i), s.x[i]);
+        ::hv_vcpu_set_reg(cpu_, HV_REG_PC, s.pc);
+        ::hv_vcpu_set_reg(cpu_, HV_REG_CPSR, s.cpsr);
+        ::hv_vcpu_set_reg(cpu_, HV_REG_FPCR, s.fpcr);
+        ::hv_vcpu_set_reg(cpu_, HV_REG_FPSR, s.fpsr);
+        ::hv_vcpu_set_sys_reg(cpu_, HV_SYS_REG_SP_EL0, s.sp_el0);
+        ::hv_vcpu_set_sys_reg(cpu_, HV_SYS_REG_TPIDR_EL0, s.tpidr_el0);
+        ::hv_vcpu_set_sys_reg(cpu_, HV_SYS_REG_TPIDRRO_EL0, s.tpidrro_el0);
+        for (int i = 0; i < 32; ++i)
+            ::hv_vcpu_set_simd_fp_reg(
+                cpu_, static_cast<hv_simd_fp_reg_t>(HV_SIMD_FP_REG_Q0 + i), s.q[i]);
+    }
+
+    [[nodiscard]] std::uint64_t sp() const noexcept { return sys(HV_SYS_REG_SP_EL0); }
+    [[nodiscard]] std::uint64_t tls() const noexcept { return sys(HV_SYS_REG_TPIDR_EL0); }
+    void set_sp(std::uint64_t v) noexcept { ::hv_vcpu_set_sys_reg(cpu_, HV_SYS_REG_SP_EL0, v); }
+    void set_tls(std::uint64_t v) noexcept { ::hv_vcpu_set_sys_reg(cpu_, HV_SYS_REG_TPIDR_EL0, v); }
+    void set_x(int i, std::uint64_t v) noexcept {
+        ::hv_vcpu_set_reg(cpu_, static_cast<hv_reg_t>(HV_REG_X0 + i), v);
+    }
+
+    // Force this vCPU out of hv_vcpu_run from ANOTHER thread. The only
+    // cross-thread operation the framework permits, and the basis of both
+    // signal delivery and thread-group exit.
+    void kick() noexcept {
+        if (!live_) return;
+        hv_vcpu_t v = cpu_;
+        ::hv_vcpus_exit(&v, 1);
+    }
+
+private:
+    [[nodiscard]] std::uint64_t sys(hv_sys_reg_t r) const noexcept {
+        std::uint64_t v = 0;
+        ::hv_vcpu_get_sys_reg(cpu_, r, &v);
+        return v;
+    }
+
     hv_vcpu_t cpu_{};
     hv_vcpu_exit_t* exit_{nullptr};
-    bool vm_live_{false}, cpu_live_{false};
+    bool live_{false};
 };
 
 } // namespace lx::runtime

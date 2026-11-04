@@ -29,6 +29,8 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <mutex>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -175,8 +177,8 @@ struct Machine {
 // inherits 0/1/2 just as a forked process would.
 class Forker {
 public:
-    Forker(const Options& o, Machine& m, runtime::HvfVm& vm, runtime::PidSpace& pids)
-        : opts_{o}, machine_{m}, vm_{vm}, pids_{pids} {}
+    Forker(const Options& o, Machine& m, runtime::HvfMachine& machine, runtime::PidSpace& pids)
+        : opts_{o}, machine_wrap_{m}, machine_{machine}, pids_{pids} {}
 
     [[nodiscard]] pid_t operator()(runtime::HvfTrap::ForkImage& img) {
         static const bool profile = std::getenv("LINUXITY_PROFILE_FORK") != nullptr;
@@ -188,7 +190,7 @@ public:
             std::fprintf(stderr, "[fork %d] %-10s %7lld us\n", ::getpid(), what,
                          static_cast<long long>(us));
         };
-        img.namespace_state = machine_.k.files().export_process_state();
+        img.namespace_state = machine_wrap_.k.files().export_process_state();
 
         // One host fd per distinct open file, placed at 3, 4, 5... in the child.
         //
@@ -292,10 +294,10 @@ public:
             return -1;
         }
         mark("hello");
-        const mach_port_t mem = runtime::fork_ipc::snapshot(vm_.raw_base(), vm_.mem_size());
+        const mach_port_t mem = runtime::fork_ipc::snapshot(machine_.raw_base(), machine_.mem_size());
         mark("snapshot");
         const bool sent = runtime::fork_ipc::send(hello.h.msgh_remote_port, mem,
-                                                  vm_.mem_size(), runtime::wire::encode(img));
+                                                  machine_.mem_size(), runtime::wire::encode(img));
         mark("sent");
         ::mach_port_mod_refs(::mach_task_self(), svc, MACH_PORT_RIGHT_RECEIVE, -1);
         return sent ? pid : -1;
@@ -303,8 +305,8 @@ public:
 
 private:
     const Options& opts_;
-    Machine& machine_;
-    runtime::HvfVm& vm_;
+    Machine& machine_wrap_;
+    runtime::HvfMachine& machine_;
     runtime::PidSpace& pids_;
 };
 
@@ -315,7 +317,7 @@ struct ChildArgs {
     std::vector<int> group_fds;
 };
 
-[[nodiscard]] bool receive_fork(const ChildArgs& ca, runtime::HvfVm& vm,
+[[nodiscard]] bool receive_fork(const ChildArgs& ca, runtime::HvfMachine& vm,
                                 runtime::HvfTrap::ForkImage& img) {
     mach_port_t parent = MACH_PORT_NULL;
 #pragma clang diagnostic push
@@ -343,19 +345,101 @@ struct ChildArgs {
     return runtime::wire::decode(in.blob, img);
 }
 
-// -- Run a guest to completion (shared by root and fork children) ---------------
-[[nodiscard]] int run(const Options& o, Machine& m, runtime::HvfVm& vm,
-                      runtime::PidSpace& pids, runtime::HvfTrap& trap) {
-    runtime::HvfMem mem{vm, &trap};
-    Forker forker{o, m, vm, pids};
-    trap.set_resolver([&m](const std::string& g) { return m.resolve(g); });
-    trap.set_unresolver([&m](const std::string& h) { return m.unresolve(h); });
-    trap.set_fork_spawner([&forker](runtime::HvfTrap::ForkImage& img) { return forker(img); });
+// -- Running one guest THREAD ------------------------------------------------
+// Every guest thread is a host thread that owns its own vCPU and TaskState
+// and runs its own copy of the portable Cpu loop. Hypervisor.framework binds
+// a vcpu to its creating thread, so the vCPU must be created HERE, inside
+// the thread that will run it -- which is also exactly what we want: XNU
+// then schedules guest threads across the physical cores.
+struct ThreadContext {
+    const Options& opts;
+    Machine& machine_wrap;
+    runtime::HvfMachine& machine;
+    runtime::ProcessState& proc;
+    runtime::PidSpace& pids;
+    Forker& forker;
+    std::vector<std::thread>& threads;
+    std::mutex& threads_mu;
+};
 
-    runtime::Cpu cpu{trap, m.k, mem, abi::Arch::aarch64};
-    // The root enters at the image entry; a fork child is already positioned
-    // (its PC/SP came from the parent), so it starts with entry 0 = "as is".
-    auto rc = cpu.run(uaddr(0), uaddr(0));
+void run_guest_thread(ThreadContext& ctx, runtime::HvfTrap::ThreadStart start);
+
+// Install the hooks a trap needs to create more tasks. Shared by the initial
+// thread and every thread it spawns, so a thread can itself fork or spawn.
+void wire_spawners(runtime::HvfTrap& trap, ThreadContext& ctx) {
+    trap.set_resolver([&ctx](const std::string& g) { return ctx.machine_wrap.resolve(g); });
+    trap.set_unresolver([&ctx](const std::string& h) { return ctx.machine_wrap.unresolve(h); });
+    trap.set_fork_spawner([&ctx](runtime::HvfTrap::ForkImage& img) {
+        return ctx.forker(img);
+    });
+    trap.set_thread_spawner([&ctx](runtime::HvfTrap::ThreadStart s) {
+        try {
+            std::lock_guard g{ctx.threads_mu};
+            ctx.threads.emplace_back([&ctx, s = std::move(s)]() mutable {
+                run_guest_thread(ctx, std::move(s));
+            });
+            return true;
+        } catch (const std::system_error&) {
+            return false;                      // EAGAIN to the guest
+        }
+    });
+}
+
+void run_guest_thread(ThreadContext& ctx, runtime::HvfTrap::ThreadStart start) {
+    runtime::HvfCpu cpu;
+    if (!cpu.create()) {
+        std::fputs("linuxity: cannot create a vCPU for a guest thread\n", stderr);
+        return;
+    }
+    cpu.load(start.cpu);
+
+    runtime::TaskState task;
+    task.tid = start.tid;
+    task.sig_mask = start.sig_mask;
+    task.clear_child_tid = start.clear_child_tid;
+
+    runtime::HvfTrap trap{ctx.machine, cpu, ctx.proc, task, ctx.pids};
+    wire_spawners(trap, ctx);
+    runtime::HvfMem mem{ctx.machine, &trap};
+
+    ctx.proc.add_thread(task.tid, &cpu);
+    runtime::g_pending.register_cpu(cpu.handle());
+
+    runtime::Cpu loop{trap, ctx.machine_wrap.k, mem, abi::Arch::aarch64};
+    (void)loop.run(uaddr(0), uaddr(0));          // already positioned
+
+    runtime::g_pending.unregister_cpu(cpu.handle());
+    ctx.proc.remove_thread(task.tid);
+}
+
+// -- Run a guest to completion (shared by root and fork children) ---------------
+[[nodiscard]] int run(const Options& o, Machine& m, runtime::HvfMachine& machine,
+                      runtime::HvfCpu& cpu, runtime::ProcessState& proc,
+                      runtime::TaskState& task, runtime::PidSpace& pids,
+                      runtime::HvfTrap& trap) {
+    runtime::HvfMem mem{machine, &trap};
+    Forker forker{o, m, machine, pids};
+    std::vector<std::thread> threads;
+    std::mutex threads_mu;
+    ThreadContext ctx{o, m, machine, proc, pids, forker, threads, threads_mu};
+    wire_spawners(trap, ctx);
+
+    proc.add_thread(task.tid, &cpu);
+    runtime::g_pending.register_cpu(cpu.handle());
+    trap.start_timers();
+
+    runtime::Cpu loop{trap, m.k, mem, abi::Arch::aarch64};
+    auto rc = loop.run(uaddr(0), uaddr(0));
+
+    // The process exits when the INITIAL thread's loop ends. Threads still
+    // running are told to stop (exit_group semantics) and joined, so no
+    // thread touches guest RAM after it is unmapped.
+    proc.request_group_exit(rc ? *rc : 1);
+    {
+        std::lock_guard g{threads_mu};
+        for (auto& t : threads) if (t.joinable()) t.join();
+    }
+
     if (!rc) {
         std::fprintf(stderr, "linuxity: runtime error %d\n", static_cast<int>(rc.error()));
         return 1;
@@ -388,7 +472,7 @@ int main(int argc, char** argv) {
             }
         }
         Machine m{o};
-        runtime::HvfVm vm;
+        runtime::HvfMachine machine;
         runtime::HvfTrap::ForkImage img;
         const auto c0 = std::chrono::steady_clock::now();
         const bool prof = std::getenv("LINUXITY_PROFILE_FORK") != nullptr;
@@ -398,16 +482,25 @@ int main(int argc, char** argv) {
                          static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
                              std::chrono::steady_clock::now() - c0).count()));
         };
-        if (!receive_fork(ca, vm, img)) {
+        if (!receive_fork(ca, machine, img)) {
             std::fputs("linuxity: fork handoff failed\n", stderr);
             return 127;
         }
         cmark("vm-up");
         m.k.files().import_process_state(img.namespace_state);
+        runtime::g_pending.reset_for_fork_child();
         runtime::PidSpace pids{ca.pid_fd};
-        runtime::HvfTrap trap{vm, pids};
+        // The initial thread of the forked process.
+        runtime::HvfCpu cpu;
+        if (!cpu.create()) {
+            std::fputs("linuxity: cannot create a vCPU\n", stderr);
+            return 127;
+        }
+        runtime::ProcessState proc;
+        runtime::TaskState task;
+        runtime::HvfTrap trap{machine, cpu, proc, task, pids};
         trap.resume_fork_child(img, ca.group_fds);
-        return run(o, m, vm, pids, trap);
+        return run(o, m, machine, cpu, proc, task, pids, trap);
     }
 
     if (i >= argc) { usage(); return 2; }
@@ -416,13 +509,20 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    runtime::HvfVm vm;
-    if (auto st = vm.init(o.mem_mib << 20); !st) {
+    runtime::HvfMachine machine;
+    if (auto st = machine.init(o.mem_mib << 20); !st) {
         std::fprintf(stderr,
             "linuxity: cannot create a hypervisor VM. This binary must be signed\n"
             "with the com.apple.security.hypervisor entitlement:\n"
             "  codesign -s - --entitlements hypervisor.entitlements -f %s\n",
             argv[0]);
+        return 1;
+    }
+    // The initial guest thread's vCPU, created on THIS thread because
+    // Hypervisor.framework binds a vcpu to its creator.
+    runtime::HvfCpu cpu;
+    if (auto st = cpu.create(); !st) {
+        std::fputs("linuxity: cannot create a vCPU\n", stderr);
         return 1;
     }
 
@@ -450,7 +550,7 @@ int main(int argc, char** argv) {
     if (const char* t = std::getenv("TERM")) env.push_back(std::string{"TERM="} + t);
 
     std::vector<std::string> gargv(argv + i, argv + argc);
-    auto ex = runtime::hvf_exec(vm, [&m](const std::string& g) { return m.resolve(g); },
+    auto ex = runtime::hvf_exec(machine, [&m](const std::string& g) { return m.resolve(g); },
                                 gargv[0], gargv, env);
     if (!ex) {
         std::fprintf(stderr, "linuxity: %s: cannot execute (errno %d)\n",
@@ -459,11 +559,15 @@ int main(int argc, char** argv) {
     }
 
     runtime::PidSpace pids;
-    runtime::HvfTrap trap{vm, pids};
-    trap.set_arena(ex->brk_base, runtime::ExecArena::mmap_top(vm.mem_size()));
+    runtime::ProcessState proc;
+    runtime::TaskState task;
+    task.tid = 1;                      // the initial thread IS the process
+    proc.set_tid_base(2);
+    runtime::HvfTrap trap{machine, cpu, proc, task, pids};
+    trap.set_arena(ex->brk_base, runtime::ExecArena::mmap_top(machine.mem_size()));
     for (const auto& sg : ex->segments)
         trap.adopt(sg.begin, sg.end, runtime::prot_from_elf(sg.flags));
-    trap.adopt_stack(ex->sp, vm.mem_size());
-    vm.set_entry(ex->entry, ex->sp);
-    return run(o, m, vm, pids, trap);
+    trap.adopt_stack(ex->sp, machine.mem_size());
+    cpu.set_entry(ex->entry, ex->sp);
+    return run(o, m, machine, cpu, proc, task, pids, trap);
 }
