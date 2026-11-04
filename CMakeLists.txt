@@ -31,6 +31,17 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_subdirectory(src/host)
     add_executable(linuxity src/main.cpp)
     target_link_libraries(linuxity PRIVATE linuxity_core linuxity_host)
+elseif(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
+    # macOS: the Hypervisor.framework backend. hv_vm_create is entitlement-
+    # gated, so sign ad-hoc with com.apple.security.hypervisor after linking.
+    add_executable(linuxity src/main_macos.cpp)
+    target_link_libraries(linuxity PRIVATE linuxity_core "-framework Hypervisor")
+    add_custom_command(TARGET linuxity POST_BUILD
+        COMMAND codesign -s - --entitlements
+                ${CMAKE_SOURCE_DIR}/tests/hypervisor.entitlements
+                -f $<TARGET_FILE:linuxity>
+        COMMENT "Signing linuxity with the hypervisor entitlement"
+        VERBATIM)
 else()
     message(STATUS "linuxity: no trap backend for ${CMAKE_SYSTEM_NAME} yet; "
                    "building the portable core + tests only")

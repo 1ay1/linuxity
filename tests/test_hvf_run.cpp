@@ -21,6 +21,7 @@ int main() { std::puts("hvf_run: skipped (not macOS/arm64)"); return 0; }
 
 #include "linuxity/host/posix_host.hpp"
 #include "linuxity/kernel/kernel.hpp"
+#include "linuxity/runtime/hvf_exec.hpp"
 #include "linuxity/runtime/hvf_load.hpp"
 #include "linuxity/runtime/hvf_trap.hpp"
 #include "linuxity/runtime/trap.hpp"
@@ -95,7 +96,8 @@ struct RunResult {
     auto pc = k.files().classify(k.files().absolutize(guest_path));
     if (pc.realm != kernel::Realm2::host_backed) return {};
 
-    auto img = runtime::hvf_load_elf(vm, pc.host_path, runtime::HvfLayout::priv_end);
+    auto img = runtime::hvf_load_elf(vm, pc.host_path,
+                                     runtime::ExecLayout::program_base(vm.mem_size()));
     if (!img) {
         std::fprintf(stderr, "  load failed: errno %d\n", int(img.error()));
         return {};
@@ -105,8 +107,9 @@ struct RunResult {
                                         "TERM=dumb", "LANG=C"});
     if (!sp) return {};
 
-    runtime::HvfMem mem{vm};
-    runtime::HvfTrap trap{vm};
+    runtime::PidSpace pids;
+    runtime::HvfTrap trap{vm, pids};
+    runtime::HvfMem mem{vm, &trap};
     trap.set_arena(img->image_end, vm.mem_size() - (8ull << 20));
     // Hand the loader's own mappings to the VMA map, or the guest's mprotect
     // on them (glibc applies RELRO right before transferring control) fails

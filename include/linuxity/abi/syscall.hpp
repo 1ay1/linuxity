@@ -1703,9 +1703,36 @@ private:
         return val(0);
     }
 
-    // Synthesize a `struct stat` (x86-64 layout) for a virtual file into the
-    // guest buffer. Only the fields programs read are populated.
+    // Synthesize a `struct stat` for a virtual file into the guest buffer,
+    // in THIS GUEST ARCH's layout. The two 64-bit Linux ABIs differ: x86-64
+    // has st_nlink as u64 before st_mode and is 144 bytes; aarch64 (the
+    // asm-generic layout) has u32 st_mode then u32 st_nlink and is 128
+    // bytes. Writing the x86-64 struct into an aarch64 guest overruns its
+    // buffer by 16 bytes -- glibc's stack protector catches that as "stack
+    // smashing detected" the first time anything stats /dev/pts.
     [[nodiscard]] Outcome write_statbuf(UAddr buf, bool is_dir, std::uint64_t size) {
+        constexpr std::uint32_t kIfDir = 0040000, kIfReg = 0100000;
+        const std::uint32_t mode = is_dir ? kIfDir | 0555u : kIfReg | 0444u;
+        const auto blocks = static_cast<std::int64_t>((size + 511) / 512);
+        if (arch_ == Arch::aarch64) {
+            struct StatGeneric {
+                std::uint64_t st_dev, st_ino;
+                std::uint32_t st_mode, st_nlink, st_uid, st_gid;
+                std::uint64_t st_rdev, pad1_;
+                std::int64_t st_size;
+                std::int32_t st_blksize, pad2_;
+                std::int64_t st_blocks;
+                std::int64_t atime, atime_ns, mtime, mtime_ns, ctime, ctime_ns;
+                std::uint32_t unused_[2];
+            } st{};
+            static_assert(sizeof(StatGeneric) == 128);
+            st.st_ino = 1; st.st_nlink = 1; st.st_mode = mode;
+            st.st_size = static_cast<std::int64_t>(size);
+            st.st_blksize = 4096; st.st_blocks = blocks;
+            if (!mem_.copy_out(buf, {reinterpret_cast<const std::byte*>(&st), sizeof st}))
+                return eno(Errno::efault);
+            return val(0);
+        }
         struct Stat64 {
             std::uint64_t st_dev; std::uint64_t st_ino; std::uint64_t st_nlink;
             std::uint32_t st_mode; std::uint32_t st_uid; std::uint32_t st_gid;
@@ -1714,13 +1741,13 @@ private:
             std::uint64_t atime, atime_ns, mtime, mtime_ns, ctime, ctime_ns;
             std::int64_t reserved_[3];
         } st{};
-        constexpr std::uint32_t kIfDir = 0040000, kIfReg = 0100000;
+        static_assert(sizeof(Stat64) == 144);
         st.st_ino     = 1;
         st.st_nlink   = 1;
-        st.st_mode    = (is_dir ? kIfDir | 0555u : kIfReg | 0444u);
+        st.st_mode    = mode;
         st.st_size    = static_cast<std::int64_t>(size);
         st.st_blksize = 4096;
-        st.st_blocks  = static_cast<std::int64_t>((size + 511) / 512);
+        st.st_blocks  = blocks;
         if (!mem_.copy_out(buf, {reinterpret_cast<const std::byte*>(&st), sizeof st}))
             return eno(Errno::efault);
         return val(0);
@@ -1940,11 +1967,15 @@ public:
     void scrub_ids(const Outcome& o) {
         if (o.scrub == Outcome::ScrubKind::none) return;
         const bool is_statx = o.scrub == Outcome::ScrubKind::statx;
-        // struct stat  (x86-64): st_mode u32 @24, st_uid u32 @28, st_gid @32.
-        // struct statx        : stx_mode u16 @28, stx_uid u32 @20, stx_gid @24.
-        const std::size_t mode_off = is_statx ? 28 : 24;
-        const std::size_t uid_off  = is_statx ? 20 : 28;
-        const std::size_t gid_off  = is_statx ? 24 : 32;
+        // Field offsets differ per ABI:
+        //   struct stat x86-64  : st_mode u32 @24, st_uid @28, st_gid @32.
+        //   struct stat aarch64 : st_mode u32 @16, st_uid @24, st_gid @28
+        //                         (asm-generic: nlink is u32 and AFTER mode).
+        //   struct statx (both) : stx_mode u16 @28, stx_uid @20, stx_gid @24.
+        const bool generic = arch_ == Arch::aarch64;
+        const std::size_t mode_off = is_statx ? 28 : (generic ? 16 : 24);
+        const std::size_t uid_off  = is_statx ? 20 : (generic ? 24 : 28);
+        const std::size_t gid_off  = is_statx ? 24 : (generic ? 28 : 32);
         const std::uint64_t base = value(o.scrub_buf);
 
         // The shadow record for this guest path, if the guest ever chmod/chown'd

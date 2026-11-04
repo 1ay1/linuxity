@@ -94,6 +94,20 @@ enum class Sysno {
     // guard and malloc randomization, and musl uses it to seed its RNG. An
     // ENOSYS makes glibc abort before main, so every backend must answer.
     getrandom,
+    // Threads, synchronization and the glibc startup handshake. futex is the
+    // primitive under every pthread mutex/condvar and glibc's once-init;
+    // set_robust_list and rseq are registered by every glibc thread at start.
+    futex, set_robust_list, rseq, membarrier, sched_yield,
+    // Memory advice/resize (malloc trims with madvise, realloc uses mremap).
+    madvise, mremap,
+    // Time.
+    nanosleep, clock_nanosleep,
+    // I/O multiplexing and pipes (shells, make, every interactive tool).
+    pipe2, ppoll, pselect6, epoll_create1, epoll_ctl, epoll_pwait, eventfd2,
+    // File sync and locking (package managers, git).
+    fsync, fdatasync, sync, flock,
+    // Process attributes.
+    umask, getgroups, clone3,
     // Signal state (per-task mask + disposition table).
     rt_sigreturn, rt_sigpending, rt_sigsuspend, sigaltstack,
     // Session / process-group control.
@@ -124,6 +138,8 @@ enum class Sysno {
     bind, connect,
     // Miscellany the guest may probe; forwarded or benign by default.
     prctl,
+    // aarch64 additions (decoded for both arches where they exist).
+    getsockname, capget, copy_file_range, fadvise64,
 };
 
 // Decode an arch-specific raw syscall number into the canonical identity.
@@ -201,6 +217,29 @@ enum class Sysno {
                 case 160: return Sysno::setrlimit;
                 case 302: return Sysno::prlimit64;
                 case 318: return Sysno::getrandom;
+                case 202: return Sysno::futex;
+                case 273: return Sysno::set_robust_list;
+                case 334: return Sysno::rseq;
+                case 324: return Sysno::membarrier;
+                case 24:  return Sysno::sched_yield;
+                case 28:  return Sysno::madvise;
+                case 25:  return Sysno::mremap;
+                case 35:  return Sysno::nanosleep;
+                case 230: return Sysno::clock_nanosleep;
+                case 293: return Sysno::pipe2;
+                case 271: return Sysno::ppoll;
+                case 270: return Sysno::pselect6;
+                case 291: return Sysno::epoll_create1;
+                case 233: return Sysno::epoll_ctl;
+                case 281: return Sysno::epoll_pwait;
+                case 290: return Sysno::eventfd2;
+                case 74:  return Sysno::fsync;
+                case 75:  return Sysno::fdatasync;
+                case 162: return Sysno::sync;
+                case 73:  return Sysno::flock;
+                case 95:  return Sysno::umask;
+                case 115: return Sysno::getgroups;
+                case 435: return Sysno::clone3;
                 case 98:  return Sysno::getrusage;
                 case 15:  return Sysno::rt_sigreturn;
                 case 127: return Sysno::rt_sigpending;
@@ -387,6 +426,39 @@ enum class Sysno {
                 case 153: return Sysno::times;
                 case 261: return Sysno::prlimit64;
                 case 278: return Sysno::getrandom;
+                // Signals. These were MISSING from the aarch64 table, so every
+                // guest's sigaction/sigprocmask decoded as `unknown` -- shells
+                // couldn't install a single handler.
+                case 134: return Sysno::rt_sigaction;
+                case 135: return Sysno::rt_sigprocmask;
+                case 167: return Sysno::prctl;
+                case 205: return Sysno::getsockname;
+                case 90:  return Sysno::capget;
+                case 285: return Sysno::copy_file_range;
+                case 223: return Sysno::fadvise64;
+                case 98:  return Sysno::futex;
+                case 99:  return Sysno::set_robust_list;
+                case 293: return Sysno::rseq;
+                case 283: return Sysno::membarrier;
+                case 124: return Sysno::sched_yield;
+                case 233: return Sysno::madvise;
+                case 216: return Sysno::mremap;
+                case 101: return Sysno::nanosleep;
+                case 115: return Sysno::clock_nanosleep;
+                case 59:  return Sysno::pipe2;
+                case 73:  return Sysno::ppoll;
+                case 72:  return Sysno::pselect6;
+                case 20:  return Sysno::epoll_create1;
+                case 21:  return Sysno::epoll_ctl;
+                case 22:  return Sysno::epoll_pwait;
+                case 19:  return Sysno::eventfd2;
+                case 82:  return Sysno::fsync;
+                case 83:  return Sysno::fdatasync;
+                case 81:  return Sysno::sync;
+                case 32:  return Sysno::flock;
+                case 166: return Sysno::umask;
+                case 158: return Sysno::getgroups;
+                case 435: return Sysno::clone3;
                 case 165: return Sysno::getrusage;
                 case 139: return Sysno::rt_sigreturn;
                 case 136: return Sysno::rt_sigpending;

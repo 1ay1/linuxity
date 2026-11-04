@@ -18,6 +18,7 @@
 
 #include <cerrno>
 #include <fcntl.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 
 #include <cstdint>
@@ -56,6 +57,19 @@ enum class LinuxOpen : std::uint64_t {
     if (bit(LinuxOpen::nofollow))  df |= O_NOFOLLOW;
     if (bit(LinuxOpen::cloexec))   df |= O_CLOEXEC;
     return df;
+}
+
+// Darwin -> Linux, for F_GETFL: the guest must see its OWN flag values back.
+[[nodiscard]] inline std::int64_t open_flags_to_linux(int df) noexcept {
+    std::uint64_t lf = 0;
+    switch (df & O_ACCMODE) {
+        case O_WRONLY: lf = 1; break;
+        case O_RDWR:   lf = 2; break;
+        default:       lf = 0; break;
+    }
+    if (df & O_APPEND)   lf |= static_cast<std::uint64_t>(LinuxOpen::append);
+    if (df & O_NONBLOCK) lf |= static_cast<std::uint64_t>(LinuxOpen::nonblock);
+    return static_cast<std::int64_t>(lf);
 }
 
 // -- struct stat -----------------------------------------------------------
@@ -107,6 +121,33 @@ static_assert(offsetof(LinuxStat, st_blocks) == 64);
     o.st_ctime_sec  = s.st_ctimespec.tv_sec;
     o.st_ctime_nsec = static_cast<std::uint64_t>(s.st_ctimespec.tv_nsec);
     return o;
+}
+
+// -- struct statfs ---------------------------------------------------------
+// asm-generic (aarch64) layout. `df` reads f_blocks/f_bfree/f_bavail *
+// f_bsize; f_type picks the filesystem name it prints.
+struct LinuxStatfs {
+    std::int64_t f_type, f_bsize;
+    std::uint64_t f_blocks, f_bfree, f_bavail, f_files, f_ffree;
+    std::int32_t f_fsid[2];
+    std::int64_t f_namelen, f_frsize, f_flags;
+    std::int64_t f_spare[4];
+};
+static_assert(sizeof(LinuxStatfs) == 120);
+
+[[nodiscard]] inline LinuxStatfs statfs_to_linux(const struct ::statfs& s) noexcept {
+    LinuxStatfs l{};
+    l.f_type = 0x794c7630;             // OVERLAYFS_SUPER_MAGIC: it IS an overlay
+    l.f_bsize = s.f_bsize;
+    l.f_frsize = s.f_bsize;
+    l.f_blocks = s.f_blocks;
+    l.f_bfree = s.f_bfree;
+    l.f_bavail = s.f_bavail;
+    l.f_files = s.f_files;
+    l.f_ffree = s.f_ffree;
+    std::memcpy(l.f_fsid, &s.f_fsid, sizeof l.f_fsid);
+    l.f_namelen = 255;
+    return l;
 }
 
 // -- linux_dirent64 --------------------------------------------------------

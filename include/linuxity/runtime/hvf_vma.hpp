@@ -45,6 +45,15 @@ enum class GuestProt : unsigned { none = 0, read = 1, write = 2, exec = 4 };
     return out;
 }
 
+// ELF PF_X=1, PF_W=2, PF_R=4 -> GuestProt.
+[[nodiscard]] constexpr GuestProt prot_from_elf(std::uint64_t pf) noexcept {
+    auto out = GuestProt::none;
+    if (pf & 4) out = out | GuestProt::read;
+    if (pf & 2) out = out | GuestProt::write;
+    if (pf & 1) out = out | GuestProt::exec;
+    return out;
+}
+
 struct Vma {
     std::uint64_t begin{}, end{};      // [begin, end), page-aligned
     GuestProt prot{GuestProt::none};
@@ -72,14 +81,29 @@ public:
         arena_high_ = page_down(high);
     }
 
+    // The allocator's bounds, so a fork child resumes with an identical map.
+    struct Arena { std::uint64_t low{}, high{}, brk_base{}; };
+    [[nodiscard]] Arena arena() const noexcept { return {arena_low_, arena_high_, brk_base_}; }
+    void restore(std::vector<Vma> vmas, std::uint64_t brk, Arena a) {
+        vmas_ = std::move(vmas);
+        arena_low_ = a.low;
+        arena_high_ = a.high;
+        brk_base_ = a.brk_base;
+        brk_cur_ = brk;
+    }
+
     // -- brk ---------------------------------------------------------------
     [[nodiscard]] std::uint64_t brk() const noexcept { return brk_cur_; }
     [[nodiscard]] std::uint64_t set_brk(std::uint64_t want) {
         if (want == 0) return brk_cur_;                 // query
-        want = page_up(want);
         if (want < brk_base_) return brk_cur_;          // below the heap floor
-        // The heap may not run into the lowest existing mapping.
-        if (want > lowest_mapping_or(arena_high_)) return brk_cur_;
+        // The heap may grow until the first mapping ABOVE its base. (Testing
+        // against the lowest mapping overall -- the program's own text and
+        // data, which sit BELOW the heap -- refuses every grow, and glibc's
+        // malloc silently falls back to mmap for everything.)
+        if (page_up(want) > ceiling_above(brk_base_)) return brk_cur_;
+        // Linux returns the requested (unrounded) break, and libc compares
+        // against exactly what it asked for.
         brk_cur_ = want;
         return brk_cur_;
     }
@@ -181,13 +205,17 @@ private:
                 return ceiling - len;
             ceiling = std::min(ceiling, it->begin);
         }
-        std::uint64_t floor = std::max(brk_cur_, arena_low_);
+        std::uint64_t floor = std::max(page_up(brk_cur_), arena_low_);
         if (ceiling >= floor && ceiling - floor >= len) return ceiling - len;
         return std::nullopt;
     }
 
-    [[nodiscard]] std::uint64_t lowest_mapping_or(std::uint64_t fallback) const noexcept {
-        return vmas_.empty() ? fallback : vmas_.front().begin;
+    // The lowest address at or above `addr` that is already mapped, or the
+    // arena top: the hard ceiling for anything growing upward from `addr`.
+    [[nodiscard]] std::uint64_t ceiling_above(std::uint64_t addr) const noexcept {
+        for (const Vma& v : vmas_)
+            if (v.begin >= addr) return v.begin;
+        return arena_high_;
     }
 
     [[nodiscard]] bool fully_mapped(std::uint64_t lo, std::uint64_t hi) const noexcept {

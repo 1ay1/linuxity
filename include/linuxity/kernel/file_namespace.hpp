@@ -33,6 +33,7 @@
 
 #include <cstdint>
 #include <algorithm>
+#include <cstring>
 #include <functional>
 #include <string>
 #include <string_view>
@@ -379,6 +380,53 @@ public:
     [[nodiscard]] std::string_view path_of_fd(int fd) const {
         auto it = fd_paths_.find(fd);
         return it == fd_paths_.end() ? std::string_view{} : std::string_view{it->second};
+    }
+
+    // -- Per-process state that a fork must carry to the child --------------
+    // A backend that forks by spawning a FRESH process (macOS: see
+    // runtime/hvf_fork.hpp) rebuilds the mounts from the same command line,
+    // but the dynamic state -- this process's cwd and which guest path each
+    // fd names -- exists only in the parent. These two functions are the
+    // complete list; a length-prefixed byte format keeps them trivially
+    // forward-compatible.
+    [[nodiscard]] std::string export_process_state() const {
+        std::string out;
+        auto put = [&out](std::string_view s) {
+            const auto n = static_cast<std::uint32_t>(s.size());
+            out.append(reinterpret_cast<const char*>(&n), 4);
+            out.append(s);
+        };
+        put(cwd());
+        const auto count = static_cast<std::uint32_t>(fd_paths_.size());
+        out.append(reinterpret_cast<const char*>(&count), 4);
+        for (const auto& [fd, path] : fd_paths_) {
+            out.append(reinterpret_cast<const char*>(&fd), sizeof fd);
+            put(path);
+        }
+        return out;
+    }
+    void import_process_state(std::string_view in) {
+        std::size_t at = 0;
+        auto u32 = [&]() -> std::uint32_t {
+            std::uint32_t v = 0;
+            if (at + 4 <= in.size()) std::memcpy(&v, in.data() + at, 4);
+            at += 4;
+            return v;
+        };
+        auto str = [&]() {
+            const std::uint32_t n = u32();
+            std::string s{in.substr(std::min(at, in.size()), n)};
+            at += n;
+            return s;
+        };
+        set_cwd(str());
+        fd_paths_.clear();
+        for (std::uint32_t i = 0, n = u32(); i < n && at < in.size(); ++i) {
+            int fd = 0;
+            std::memcpy(&fd, in.data() + at, sizeof fd);
+            at += sizeof fd;
+            fd_paths_[fd] = str();
+        }
     }
 
     // -- Virtual directory streams -----------------------------------------

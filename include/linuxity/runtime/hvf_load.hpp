@@ -12,7 +12,8 @@
 
 #include "linuxity/abi/result.hpp"
 #include "linuxity/loader/elf.hpp"
-#include "linuxity/runtime/hvf_trap.hpp"
+#include "linuxity/runtime/hvf_vm.hpp"
+#include "linuxity/runtime/hvf_vma.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -103,10 +104,10 @@ struct HvfImage {
         img.segments.push_back({beg, end, ph.p_flags});
     }
     img.entry = img.load_bias + eh.e_entry;
-    // Guest code was just written through the host's data mapping; the
-    // guest will FETCH it. Flush so the i-cache doesn't serve stale bytes.
-    vm.publish_code(HvfLayout::priv_end,
-                    img.image_end - HvfLayout::priv_end);
+    // Guest code was just written through the host's data mapping; the guest
+    // will FETCH it. Flush each segment (not one span from the RAM floor,
+    // which would also cover unrelated memory between images).
+    for (const auto& sg : img.segments) vm.publish_code(sg.begin, sg.end - sg.begin);
     return ok(img);
 }
 
@@ -120,7 +121,9 @@ struct HvfImage {
 [[nodiscard]] inline Result<std::uint64_t> hvf_build_stack(
         HvfVm& vm, const HvfImage& img,
         const std::vector<std::string>& argv,
-        const std::vector<std::string>& envp) {
+        const std::vector<std::string>& envp,
+        std::uint64_t at_base = 0,
+        const std::string& execfn = {}) {
     std::uint64_t sp = vm.mem_size() - HvfLayout::stack_guard;
 
     auto push_bytes = [&](const void* data, std::size_t n) -> std::uint64_t {
@@ -137,8 +140,13 @@ struct HvfImage {
     std::vector<std::uint64_t> argp, envp_addr;
     for (const auto& s : envp) envp_addr.push_back(push_str(s));
     for (const auto& s : argv) argp.push_back(push_str(s));
-    const unsigned char rnd[16] = {0x5a, 0x17, 0x3c, 0x91, 0x44, 0x08, 0xd2, 0x6b,
-                                   0x1f, 0xe0, 0x77, 0xa9, 0x33, 0xcc, 0x4e, 0x82};
+    const std::uint64_t execfn_addr =
+        push_str(execfn.empty() ? (argv.empty() ? std::string{} : argv[0]) : execfn);
+    const std::uint64_t platform_addr = push_str("aarch64");
+    // AT_RANDOM: 16 bytes seeding glibc's stack protector and pointer guard.
+    // Real entropy -- a fixed value would make every guest's canary equal.
+    unsigned char rnd[16];
+    ::arc4random_buf(rnd, sizeof rnd);
     std::uint64_t rnd_addr = push_bytes(rnd, sizeof rnd);
 
     // The vector itself, built bottom-up then pushed as one block so the
@@ -156,11 +164,19 @@ struct HvfImage {
     aux(4,  img.phent);                        // AT_PHENT
     aux(5,  img.phnum);                        // AT_PHNUM
     aux(6,  0x1000);                           // AT_PAGESZ
-    aux(7,  0);                                // AT_BASE (no interp preload)
+    aux(7,  at_base);                          // AT_BASE: the interpreter
+    aux(8,  0);                                // AT_FLAGS
     aux(9,  img.entry);                        // AT_ENTRY
     aux(11, 0); aux(12, 0); aux(13, 0); aux(14, 0);  // AT_UID/EUID/GID/EGID
+    aux(15, platform_addr);                    // AT_PLATFORM
+    // AT_HWCAP: FP | ASIMD | AES | PMULL | SHA1 | SHA2 | CRC32 | ATOMICS.
+    // All are present on every Apple Silicon core, and glibc's ifunc
+    // resolvers pick the fast memcpy/strlen variants from these bits.
+    aux(16, 0x1 | 0x2 | 0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x100);
+    aux(17, 100);                              // AT_CLKTCK
     aux(23, 0);                                // AT_SECURE
     aux(25, rnd_addr);                         // AT_RANDOM
+    aux(31, execfn_addr);                      // AT_EXECFN
     aux(0,  0);                                // AT_NULL
     if (v.size() % 2) v.push_back(0);          // keep sp 16-aligned
 
