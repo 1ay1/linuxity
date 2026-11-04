@@ -30,6 +30,29 @@ KVM platform use this same model.
 
 - [x] **M0: portable core.** abi/kernel/vfs build and pass unit tests on macOS
       (gcc and Apple clang). CI for Linux and macOS.
+- [ ] **M5a: HVF backend (macOS arm64) — IN PROGRESS.** Runs aarch64 Linux
+      binaries on Apple Silicon with no guest kernel: the ELF executes at EL0
+      inside a bare Hypervisor.framework VM, and every `svc` traps to
+      linuxity, which services it through the SAME portable core and the SAME
+      `runtime::Cpu` loop the Linux ptrace backend uses.
+
+      Working today, against a real Arch Linux ARM rootfs:
+        * glibc's `ld.so` runs to completion (`--help`, `--version`).
+        * the full dynamic-loading path: `ld.so.cache`, `openat` on
+          `libc.so.6`, layered library mapping (PROT_NONE reservation →
+          MAP_FIXED text → MAP_FIXED data → MAP_FIXED|MAP_ANON .bss),
+          relocation, and RELRO via `mprotect`.
+        * `uname`/`getuid` answered by the portable core, so the guest sees
+          linuxity's identity, and paths resolve into the rootfs.
+      Known gap: a dynamically-linked program then faults inside libc on a
+      pointer holding `\x7fELF` bytes — one byte range of a layered mapping
+      still differs from what Linux produces. Next thing to fix.
+
+      Still to do for M5: signal delivery (SIGSEGV/SIGILL to the guest
+      instead of ending the run), `clone`/threads (one vCPU per thread),
+      `fork` (teardown → fork → rebuild; the mechanism is implemented and
+      probe-verified but not yet wired to the guest), and per-page W^X
+      (mprotect is tracked in the VMA map but the stage-1 tables are RWX).
 - [ ] **M1: Linux completeness ladder.** Each rung is a release:
       1. busybox / coreutils / bash
       2. `pacman -Syu`, `apk add`, `apt install`
@@ -45,9 +68,7 @@ KVM platform use this same model.
 - [ ] **M4: seccomp-unotify backend (Linux).** Faster than ptrace. The tracer
       opens files and injects fds (`SECCOMP_IOCTL_NOTIF_ADDFD`), so there is
       no path-rewrite race.
-- [ ] **M5: HVF backend (macOS arm64).** Runs aarch64 rootfs (Arch Linux ARM,
-      Alpine, Debian arm64). linuxity owns guest page tables (mmap/brk/fork
-      COW), vCPU per thread, signal frames, futex.
+- [ ] **M5: HVF backend (macOS arm64).** See M5a above — started.
 - [ ] **M6: WHP backend (Windows x86-64).**
 - [ ] **M7 (optional): foreign arch.** x86-64 rootfs on arm64 via FEX.
 

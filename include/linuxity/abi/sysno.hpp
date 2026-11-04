@@ -90,6 +90,10 @@ enum class Sysno {
     clock_gettime, gettimeofday, time, clock_getres, times,
     // Resource limits & usage.
     getrlimit, setrlimit, prlimit64, getrusage,
+    // getrandom(buf, len, flags): glibc's startup REQUIRES it for the stack
+    // guard and malloc randomization, and musl uses it to seed its RNG. An
+    // ENOSYS makes glibc abort before main, so every backend must answer.
+    getrandom,
     // Signal state (per-task mask + disposition table).
     rt_sigreturn, rt_sigpending, rt_sigsuspend, sigaltstack,
     // Session / process-group control.
@@ -196,6 +200,7 @@ enum class Sysno {
                 case 97:  return Sysno::getrlimit;
                 case 160: return Sysno::setrlimit;
                 case 302: return Sysno::prlimit64;
+                case 318: return Sysno::getrandom;
                 case 98:  return Sysno::getrusage;
                 case 15:  return Sysno::rt_sigreturn;
                 case 127: return Sysno::rt_sigpending;
@@ -381,6 +386,7 @@ enum class Sysno {
                 case 169: return Sysno::gettimeofday;
                 case 153: return Sysno::times;
                 case 261: return Sysno::prlimit64;
+                case 278: return Sysno::getrandom;
                 case 165: return Sysno::getrusage;
                 case 139: return Sysno::rt_sigreturn;
                 case 136: return Sysno::rt_sigpending;

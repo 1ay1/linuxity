@@ -3,7 +3,7 @@
 # Windows) — they are the contract that keeps the core portable.
 set(LX_PORTABLE_TESTS
     core authority vfs hostfs loader interp file_namespace sysfs_proctree
-    resources)
+    resources hvf_vma)
 
 # Live tests: run real guest ELF binaries through a trap backend. Today the
 # only backend is ptrace (Linux), so they are Linux-only until the HVF/WHP
@@ -24,3 +24,21 @@ foreach(t IN LISTS LX_TESTS)
     target_link_libraries(test_${t} PRIVATE linuxity_core)
     add_test(NAME ${t} COMMAND test_${t})
 endforeach()
+
+# The macOS hypervisor backend. Needs the Hypervisor framework and -- because
+# hv_vm_create is entitlement-gated -- an ad-hoc code signature carrying
+# com.apple.security.hypervisor. Without it the test SKIPS rather than fails,
+# so an unsigned build still passes; the signing step below means a local
+# developer build actually exercises the guest.
+if(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
+    add_executable(test_hvf_run test_hvf_run.cpp)
+    target_link_libraries(test_hvf_run PRIVATE linuxity_core
+                          "-framework Hypervisor")
+    add_custom_command(TARGET test_hvf_run POST_BUILD
+        COMMAND codesign -s - --entitlements
+                ${CMAKE_CURRENT_SOURCE_DIR}/hypervisor.entitlements
+                -f $<TARGET_FILE:test_hvf_run>
+        COMMENT "Signing test_hvf_run with the hypervisor entitlement"
+        VERBATIM)
+    add_test(NAME hvf_run COMMAND test_hvf_run)
+endif()
