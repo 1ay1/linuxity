@@ -1712,7 +1712,7 @@ private:
             std::uint32_t __pad0; std::uint64_t st_rdev; std::int64_t st_size;
             std::int64_t st_blksize; std::int64_t st_blocks;
             std::uint64_t atime, atime_ns, mtime, mtime_ns, ctime, ctime_ns;
-            std::int64_t __unused[3];
+            std::int64_t reserved_[3];
         } st{};
         constexpr std::uint32_t kIfDir = 0040000, kIfReg = 0100000;
         st.st_ino     = 1;

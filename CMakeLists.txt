@@ -24,11 +24,17 @@ target_include_directories(linuxity_core INTERFACE ${CMAKE_SOURCE_DIR}/include)
 target_compile_features(linuxity_core INTERFACE cxx_std_23)
 
 # ---- Host backends -------------------------------------------------------
-add_subdirectory(src/host)
-
-# ---- The executable that wires a host to the core ------------------------
-add_executable(linuxity src/main.cpp)
-target_link_libraries(linuxity PRIVATE linuxity_core linuxity_host)
+# The core above is header-only and host-agnostic. The executable needs a
+# trap backend; today that is ptrace (Linux). macOS (Hypervisor.framework)
+# and Windows (WHP) backends are on the roadmap.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_subdirectory(src/host)
+    add_executable(linuxity src/main.cpp)
+    target_link_libraries(linuxity PRIVATE linuxity_core linuxity_host)
+else()
+    message(STATUS "linuxity: no trap backend for ${CMAKE_SYSTEM_NAME} yet; "
+                   "building the portable core + tests only")
+endif()
 
 # ---- Tests ---------------------------------------------------------------
 enable_testing()

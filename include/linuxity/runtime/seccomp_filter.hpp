@@ -175,10 +175,10 @@ inline constexpr int kTrappedX86_64[] = {
 // caller must drive tasks with PTRACE_SYSCALL instead.
 //
 // The classic-BPF program:
-//   1. load arch; if not the expected AUDIT_ARCH, ALLOW (never mis-filter a
-//      foreign personality — those calls simply run, the tracer decodes arch
-//      independently).
-//   2. load nr; for each trapped nr, RET TRACE; otherwise RET ALLOW.
+//   1. load arch; if not the expected AUDIT_ARCH, ENOSYS (an i386 int 0x80
+//      would otherwise bypass path translation entirely).
+//   2. load nr; x32 (bit 30) and io_uring -> ENOSYS.
+//   3. for each trapped nr, RET TRACE; otherwise RET ALLOW.
 //
 // A per-nr linear compare is O(n) in the filter but n is ~90 and the filter
 // runs in-kernel per syscall — negligible next to the context switch it saves.
@@ -194,32 +194,60 @@ inline constexpr int kTrappedX86_64[] = {
     //
     //   idx 0 : A = arch
     //   idx 1 : if (A == kArch) skip 1 else fall through   [JEQ jt=1,jf=0]
-    //   idx 2 : RET ALLOW        (arch mismatch -> run natively)
+    //   idx 2 : RET ERRNO(ENOSYS) (foreign personality, e.g. i386 int 0x80)
     //   idx 3 : A = nr
-    //   idx 4..4+n-1 : for each trapped nr: JEQ nr -> jump to TRACE leaf
-    //   idx 4+n     : RET ALLOW   (no match -> run natively)
-    //   idx 4+n+1   : RET TRACE   (matched -> notify the tracer)
+    //   idx 4 : if (A >= X32_BIT) -> ENOSYS leaf             [JGE]
+    //   idx 5 : if (A in [io_uring_setup, io_uring_register]) -> ENOSYS leaf
+    //   idx 6 :   (second half of the range check)
+    //   idx 7..7+n-1 : for each trapped nr: JEQ nr -> jump to TRACE leaf
+    //   idx 7+n     : RET ALLOW   (no match -> run natively)
+    //   idx 7+n+1   : RET TRACE   (matched -> notify the tracer)
+    //   idx 7+n+2   : RET ERRNO(ENOSYS)
     //
-    // For the JEQ at position (4 + i), the TRACE leaf is the LAST statement.
+    // SECURITY: the three ENOSYS gates close raw-path escapes. The audit arch
+    // for x32 is AUDIT_ARCH_X86_64, so an x32 call (nr | 0x40000000) would
+    // otherwise miss every JEQ and run open() etc. untranslated on the host;
+    // an i386 `int 0x80` has a different arch and used to be ALLOWed outright;
+    // io_uring's IORING_OP_OPENAT/STATX/RENAMEAT/... take paths from a shared
+    // ring the kernel reads asynchronously, which no tracer can rewrite.
+    // liburing users and runtimes (Go, Node, Rust tokio-uring) all fall back
+    // to plain syscalls on ENOSYS.
+    //
+    // For the JEQ at position (7 + i), the TRACE leaf is at 7+n+1.
     // Statements strictly after this JEQ and before TRACE are:
     //   remaining JEQs (n-1-i) + the ALLOW leaf (1)  => jt = (n-1-i) + 1.
     std::vector<sock_filter> f;
-    f.reserve(nTrapped + 6);
+    f.reserve(nTrapped + 10);
 
     f.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
                          offsetof(seccomp_data, arch)));       // 0
     f.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kArch, 1, 0)); // 1
-    f.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));  // 2 (foreign arch)
+    constexpr std::uint32_t kEnosys = SECCOMP_RET_ERRNO | 38u;  // ENOSYS
+    constexpr std::uint32_t kX32Bit = 0x40000000u;
+    constexpr std::uint32_t kUringFirst = 425, kUringLast = 427;
+    f.push_back(BPF_STMT(BPF_RET | BPF_K, kEnosys));            // 2 (foreign arch)
     f.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
                          offsetof(seccomp_data, nr)));          // 3
+    // Jump distances to the ENOSYS leaf (index 7+n+2) from idx 4, 5, 6.
+    const auto to_enosys = [&](std::size_t idx) {
+        return static_cast<std::uint8_t>((7 + nTrapped + 2) - idx - 1);
+    };
+    f.push_back(BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, kX32Bit,
+                         to_enosys(4), 0));                     // 4
+    // nr >= first ? (fall to 6) : (skip 6)
+    f.push_back(BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, kUringFirst, 0, 1)); // 5
+    // nr > last ? (continue at 7) : ENOSYS
+    f.push_back(BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K, kUringLast,
+                         0, to_enosys(6)));                     // 6
     for (std::size_t i = 0; i < nTrapped; ++i) {
         std::uint8_t jt = static_cast<std::uint8_t>((nTrapped - 1 - i) + 1);
         f.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
                              static_cast<std::uint32_t>(kTrappedX86_64[i]),
-                             jt, 0));                            // 4 + i
+                             jt, 0));                            // 7 + i
     }
-    f.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));  // 4 + n
-    f.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE));  // 4 + n + 1
+    f.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));  // 7 + n
+    f.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE));  // 7 + n + 1
+    f.push_back(BPF_STMT(BPF_RET | BPF_K, kEnosys));            // 7 + n + 2
 
     sock_fprog prog{
         static_cast<unsigned short>(f.size()),

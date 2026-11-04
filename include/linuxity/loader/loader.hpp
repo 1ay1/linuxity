@@ -39,7 +39,7 @@ public:
     explicit BufferSource(std::span<const std::byte> data) : data_{data} {}
     [[nodiscard]] Result<std::size_t> pread(std::uint64_t off, std::span<std::byte> buf) const {
         if (off >= data_.size()) return ok(std::size_t{0});
-        std::size_t n = std::min(buf.size(), data_.size() - off);
+        std::size_t n = std::min<std::size_t>(buf.size(), data_.size() - off);
         std::memcpy(buf.data(), data_.data() + off, n);
         return ok(n);
     }

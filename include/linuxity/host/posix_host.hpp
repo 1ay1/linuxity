@@ -46,9 +46,20 @@ public:
     }
 
     Status sleep_until(Nanos t) {
+#if defined(__APPLE__)
+        // Darwin lacks clock_nanosleep: sleep the remaining relative delta.
+        Nanos now = mono_now();
+        if (t.v > now.v) {
+            std::uint64_t d = t.v - now.v;
+            std::timespec ts{ .tv_sec = static_cast<time_t>(d / 1'000'000'000ull),
+                              .tv_nsec = static_cast<long>(d % 1'000'000'000ull) };
+            ::nanosleep(&ts, nullptr);
+        }
+#else
         std::timespec ts{ .tv_sec = static_cast<time_t>(t.v / 1'000'000'000ull),
                           .tv_nsec = static_cast<long>(t.v % 1'000'000'000ull) };
         ::clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, nullptr);
+#endif
         return ok();
     }
 

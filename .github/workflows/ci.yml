@@ -1,0 +1,23 @@
+name: ci
+on: [push, pull_request]
+
+jobs:
+  linux:
+    # Full build: portable core + ptrace runtime + live guest tests.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y g++-14 ninja-build
+      - run: cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=g++-14
+      - run: cmake --build build
+      - run: ctest --test-dir build --output-on-failure
+
+  macos:
+    # Portable core only (no macOS trap backend yet). Keeps abi/kernel/vfs
+    # free of Linux-only headers and APIs.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -DCMAKE_CXX_COMPILER=clang++
+      - run: cmake --build build -j
+      - run: ctest --test-dir build --output-on-failure

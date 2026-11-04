@@ -77,7 +77,7 @@ public:
         const File* f = std::get_if<File>(&it->second.body);
         if (!f) return err<std::size_t>(Errno::eisdir);
         if (off >= f->data.size()) return ok(std::size_t{0});
-        std::size_t n = std::min(buf.size(), f->data.size() - off);
+        std::size_t n = std::min<std::size_t>(buf.size(), f->data.size() - off);
         std::memcpy(buf.data(), f->data.data() + off, n);
         return ok(n);
     }
