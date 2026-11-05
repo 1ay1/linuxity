@@ -48,6 +48,7 @@
 
 #include "linuxity/abi/result.hpp"
 #include "linuxity/abi/syscall.hpp"
+#include "linuxity/abi/wire/at_flags.hpp"
 #include "linuxity/abi/wire/dirent64.hpp"
 #include "linuxity/abi/wire/mmap.hpp"
 #include "linuxity/runtime/backend.hpp"
@@ -4126,9 +4127,8 @@ private:
             }
             case S::newfstatat: {
                 if (!path) return -2;
-                constexpr std::uint64_t kNoFollow = 0x100;   // AT_SYMLINK_NOFOLLOW
                 struct ::stat st{};
-                int rc = (a3 & kNoFollow) ? ::lstat(path->c_str(), &st)
+                int rc = abi::wire::has_at(a3, abi::wire::AtFlag::symlink_nofollow) ? ::lstat(path->c_str(), &st)
                                           : ::stat(path->c_str(), &st);
                 if (rc < 0) return darwin::fail();
                 return ram.put(a2, darwin::to_linux(st)) ? 0 : -14;
@@ -4138,15 +4138,14 @@ private:
                 // empty path means "stat the fd itself" -- there is no
                 // fstatat spelling for that, which is why refusing statx
                 // breaks callers outright rather than making them fall back.
-                constexpr std::uint64_t kNoFollow = 0x100, kEmptyPath = 0x1000;
                 struct ::stat st{};
                 int rc;
-                if ((a2 & kEmptyPath) && (!path || path->empty())) {
+                if (abi::wire::has_at(a2, abi::wire::AtFlag::empty_path) && (!path || path->empty())) {
                     const int h = host_fd(static_cast<int>(regs_.arg(0)));
                     if (h < 0) return -9;
                     rc = ::fstat(h, &st);
                 } else if (path) {
-                    rc = (a2 & kNoFollow) ? ::lstat(path->c_str(), &st)
+                    rc = abi::wire::has_at(a2, abi::wire::AtFlag::symlink_nofollow) ? ::lstat(path->c_str(), &st)
                                           : ::stat(path->c_str(), &st);
                 } else {
                     return -2;
@@ -4210,8 +4209,7 @@ private:
             }
             case S::unlinkat: {
                 if (!path) return -2;
-                constexpr std::uint64_t kRemoveDir = 0x200;        // AT_REMOVEDIR
-                int rc = (a2 & kRemoveDir) ? ::rmdir(path->c_str())
+                int rc = abi::wire::has_at(a2, abi::wire::AtFlag::removedir) ? ::rmdir(path->c_str())
                                            : ::unlink(path->c_str());
                 return rc < 0 ? darwin::fail() : 0;
             }
@@ -4249,14 +4247,13 @@ private:
                                       : l[i].nsec == kOmitL ? UTIME_OMIT : l[i].nsec;
                     }
                 }
-                constexpr std::uint64_t kNoFollow = 0x100;
                 if (!path) {
                     auto h = proc_.with_fds([&](FdTable& t) { return t.host(static_cast<int>(regs_.arg(0))); });
                     if (!h) return -9;
                     return ::futimens(*h, ts) < 0 ? darwin::fail() : 0;
                 }
                 return ::utimensat(AT_FDCWD, path->c_str(), ts,
-                                   (a3 & kNoFollow) ? AT_SYMLINK_NOFOLLOW : 0) < 0
+                                   abi::wire::has_at(a3, abi::wire::AtFlag::symlink_nofollow) ? AT_SYMLINK_NOFOLLOW : 0) < 0
                            ? darwin::fail() : 0;
             }
             case S::statfs: {
@@ -4289,9 +4286,8 @@ private:
                 // ENOSYS into "warning ... (Can't set permissions to 0777)"
                 // for each one and then failed the whole transaction.
                 if (!path) return -2;
-                constexpr std::uint64_t kNoFollow = 0x100;
                 const auto mode = static_cast<mode_t>(a2);
-                const int rc = (a3 & kNoFollow) ? ::lchmod(path->c_str(), mode)
+                const int rc = abi::wire::has_at(a3, abi::wire::AtFlag::symlink_nofollow) ? ::lchmod(path->c_str(), mode)
                                                 : ::chmod(path->c_str(), mode);
                 return rc < 0 ? darwin::fail() : 0;
             }

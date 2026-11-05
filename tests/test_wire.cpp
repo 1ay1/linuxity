@@ -1,5 +1,6 @@
 // The abi/wire layer: kernel ABI structs encoded in exactly one place.
 // kernel ABI, so it holds on every host and needs no VM to check.
+#include "linuxity/abi/wire/at_flags.hpp"
 #include "linuxity/abi/wire/dirent64.hpp"
 #include "linuxity/abi/wire/iovec.hpp"
 #include "linuxity/abi/wire/mmap.hpp"
@@ -338,6 +339,39 @@ int main() {
               "NOREPLACE must not clobber an existing mapping");
         check(!fixed_must_not_replace(bits(MapFlag::fixed)),
               "plain MAP_FIXED may clobber");
+    }
+
+    // -- *at() flags -------------------------------------------------------
+    // These were redeclared inline at five points of use (twice in the same
+    // file). Values checked against this host's <fcntl.h>.
+    {
+        using namespace lx::abi::wire;
+        check(kAtFdCwd == -100, "AT_FDCWD is -100");
+        // It's a SENTINEL fd, not a flag: stored unsigned it becomes a huge
+        // positive number that no fd table will ever match.
+        check(kAtFdCwd < 0, "AT_FDCWD must stay negative");
+        check(is_cwd_fd(kAtFdCwd), "AT_FDCWD is recognized");
+        check(!is_cwd_fd(0) && !is_cwd_fd(3), "a real fd is not AT_FDCWD");
+
+        check(bits(AtFlag::symlink_nofollow) == 0x100, "AT_SYMLINK_NOFOLLOW");
+        check(bits(AtFlag::removedir) == 0x200, "AT_REMOVEDIR");
+        check(bits(AtFlag::symlink_follow) == 0x400, "AT_SYMLINK_FOLLOW");
+        check(bits(AtFlag::no_automount) == 0x800, "AT_NO_AUTOMOUNT");
+        check(bits(AtFlag::empty_path) == 0x1000, "AT_EMPTY_PATH");
+
+        // THE TRAP: AT_REMOVEDIR and AT_EACCESS are the same bit. They're
+        // disjoint only because no syscall takes both (unlinkat vs faccessat),
+        // so testing this bit without knowing the syscall reads "remove a
+        // directory" out of an access check.
+        check(bits(AtFlag::removedir) == bits(AtFlag::eaccess),
+              "AT_REMOVEDIR and AT_EACCESS share 0x200 (deliberate)");
+        // Opposite requests must never be the same bit.
+        check(bits(AtFlag::symlink_nofollow) != bits(AtFlag::symlink_follow),
+              "nofollow and follow are distinct");
+
+        check(has_at(bits(AtFlag::empty_path), AtFlag::empty_path), "has_at hits");
+        check(!has_at(bits(AtFlag::removedir), AtFlag::empty_path),
+              "has_at does not cross-match");
     }
 
     if (failures == 0) std::puts("wire: all checks passed");

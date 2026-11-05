@@ -18,6 +18,7 @@
 #include "linuxity/kernel/process_table.hpp"
 #include "linuxity/kernel/subsystem.hpp"
 #include "linuxity/abi/outcome.hpp"
+#include "linuxity/abi/wire/at_flags.hpp"
 #include "linuxity/abi/wire/dirent64.hpp"
 #include "linuxity/abi/wire/open_flags.hpp"
 #include "linuxity/abi/wire/stat.hpp"
@@ -730,12 +731,11 @@ private:
         // faults the loader (glibc probes openat("") during library search).
         // AT_EMPTY_PATH (0x1000) would mean "operate on dirfd itself" — we
         // don't service that here, so forward it to the host unchanged.
-        constexpr std::uint64_t kAtEmptyPath = 0x1000;
         {
             std::string raw0 =
                 read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)]));
             if (raw0.empty())
-                return (flags & kAtEmptyPath) ? fwd() : eno(Errno::enoent);
+                return wire::has_at(flags, wire::AtFlag::empty_path) ? fwd() : eno(Errno::enoent);
         }
         std::string abs = resolve_arg(r, path_arg, at);
         // Write intent (O_WRONLY / O_RDWR / O_CREAT / O_TRUNC) selects the
@@ -869,10 +869,9 @@ private:
         // Resolve to the fd's bound guest path so we stat the right inode; a
         // real (host-backed) fd we don't track just forwards to the kernel,
         // which fstats the fd correctly.
-        constexpr std::uint64_t kAtEmptyPath = 0x1000;
         std::uint64_t flags = r.arg[2];
         std::string raw1 = read_cstr(uaddr(r.arg[1]));
-        if (raw1.empty() && (flags & kAtEmptyPath)) {
+        if (raw1.empty() && wire::has_at(flags, wire::AtFlag::empty_path)) {
             std::string_view gp = k_.files().path_of_fd(static_cast<int>(r.arg[0]));
             if (gp.empty()) return fwd();   // untracked fd: kernel fstats it
             auto pc = k_.files().classify(std::string{gp});
