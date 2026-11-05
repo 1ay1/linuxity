@@ -469,6 +469,23 @@ enum class Sysno {
                 case 460: return Sysno::lsm_set_self_attr;
                 case 461: return Sysno::lsm_list_modules;
                 case 462: return Sysno::mseal;
+                // 463.. are post-6.13 additions. They were present in the
+                // aarch64 table but MISSING here, so on x86-64 they decoded
+                // to Sysno::unknown and were forwarded -- and the *at xattr
+                // calls plus open_tree_attr/file_*attr carry a PATH, so the
+                // host resolved it. Verified: getxattrat(AT_FDCWD,
+                // "/etc/hostname", ...) returned ENODATA inside a guest whose
+                // tree has no /etc/hostname at all, i.e. it reached the HOST
+                // file. Same numbers on both ABIs (asm-generic).
+                case 463: return Sysno::setxattrat;
+                case 464: return Sysno::getxattrat;
+                case 465: return Sysno::listxattrat;
+                case 466: return Sysno::removexattrat;
+                case 467: return Sysno::open_tree_attr;
+                case 468: return Sysno::file_getattr;
+                case 469: return Sysno::file_setattr;
+                case 470: return Sysno::listns;
+                case 471: return Sysno::rseq_slice_yield;
                 default: return Sysno::unknown;
             }
         case Arch::aarch64:

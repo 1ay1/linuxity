@@ -349,6 +349,24 @@ public:
             case Sysno::removexattr:  return path_xattr(r, /*for_write=*/true);
             case Sysno::lsetxattr:
             case Sysno::lremovexattr: return path_xattr(r, /*for_write=*/true, /*follow=*/false);
+            // The *at xattr calls (6.13+): path in arg[1], relative to the
+            // dirfd in arg[0]. These were decoded on aarch64 but NOT on
+            // x86-64, so there they fell through to the host with an
+            // untranslated path -- a confinement hole, verified before fixing
+            // (getxattrat of "/etc/hostname" reached the HOST's file from a
+            // guest tree that has none). AT_SYMLINK_NOFOLLOW lives in arg[2].
+            case Sysno::getxattrat:
+            case Sysno::listxattrat:
+                return path_xattr(r, /*for_write=*/false,
+                                  !wire::has_at(r.arg[2],
+                                                wire::AtFlag::symlink_nofollow),
+                                  /*path_arg=*/1, /*at=*/true);
+            case Sysno::setxattrat:
+            case Sysno::removexattrat:
+                return path_xattr(r, /*for_write=*/true,
+                                  !wire::has_at(r.arg[2],
+                                                wire::AtFlag::symlink_nofollow),
+                                  /*path_arg=*/1, /*at=*/true);
             case Sysno::fgetxattr:    case Sysno::flistxattr:
                 return fwd();
             // fsetxattr/fremovexattr act on an already-open fd (this is what
@@ -406,6 +424,15 @@ public:
             // fall through to the host) is what keeps that path inside our
             // namespace. It was neither trapped nor handled before.
             case Sysno::fspick:
+            // open_tree_attr / file_getattr / file_setattr (6.14+) also carry
+            // a path. linuxity models no mount namespaces and no per-file
+            // attribute API, so ENOSYS is the honest answer -- but it must be
+            // ANSWERED here, because forwarding would hand the host a guest
+            // path. listns enumerates namespaces we do not have.
+            case Sysno::open_tree_attr:
+            case Sysno::file_getattr:
+            case Sysno::file_setattr:
+            case Sysno::listns:
                 return eno(Errno::enosys);
 
             // -- classic mount/umount: an unprivileged guest cannot really
@@ -1404,9 +1431,14 @@ private:
     // leaf is copied up into the writable upper layer first — matching
     // `setcap`, `tar --xattrs -x`, `cp --preserve=xattr`. Virtual paths carry
     // no xattrs (ENOTSUP); absent paths yield their errno.
+    // path_arg/at describe WHERE the path is: setxattr(path,...) puts it in
+    // arg[0]; setxattrat(dirfd,path,...) in arg[1] relative to a dirfd. Same
+    // translation either way, so the *at variants share this rather than
+    // getting a second copy.
     [[nodiscard]] Outcome path_xattr(const Regs& r, bool for_write,
-                                     bool follow = true) {
-        std::string abs = resolve_arg(r, 0, /*at=*/false);
+                                     bool follow = true,
+                                     int path_arg = 0, bool at = false) {
+        std::string abs = resolve_arg(r, path_arg, at);
         // A WRITE (set/remove) whose attribute lives in a PRIVILEGED xattr
         // namespace can never be applied by our unprivileged host process:
         //   * security.*  -- LSM/capabilities. security.capability is the file

@@ -152,6 +152,15 @@ inline constexpr int kTrappedX86_64[] = {
     191, 192, 193,               // getxattr/lgetxattr/fgetxattr
     188, 189, 190,               // setxattr/lsetxattr/fsetxattr
     194, 195, 196,               // listxattr/llistxattr/flistxattr
+    // The 6.13+ *at xattr family and the 6.14+ attribute calls. All carry a
+    // path, and all were decoded on aarch64 but NOT on x86-64 -- so on this
+    // ABI they reached the host with an untranslated path. Verified before
+    // fixing: getxattrat(AT_FDCWD, "/etc/hostname", ...) returned ENODATA
+    // from a guest whose tree has no /etc/hostname, i.e. it read the HOST's.
+    463, 464, 465, 466,          // setxattrat/getxattrat/listxattrat/removexattrat
+    467,                         // open_tree_attr (refused, but must not reach the host)
+    468, 469,                    // file_getattr/file_setattr (refused)
+    470,                         // listns (refused)
     197, 198, 199,               // removexattr/lremovexattr/fremovexattr
     // UNTRAPPED(close,3): it fires constantly (every fd
     // teardown) and linuxity only uses it for fd->path bookkeeping, which is

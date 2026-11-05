@@ -59,6 +59,11 @@ PATH_BEARING = {
  'removexattr','lremovexattr','mount','umount2','pivot_root','swapon','swapoff',
  'acct','quotactl','name_to_handle_at','open_tree','move_mount','fsopen','fspick',
  'execve','execveat','statmount','listmount',
+ # 6.13+/6.14+ *at and attribute calls. Added after the check reported them as
+ # "no path argument" -- they very much have one, and that misclassification
+ # would have downgraded a real confinement hole to a note.
+ 'setxattrat','getxattrat','listxattrat','removexattrat',
+ 'open_tree_attr','file_getattr','file_setattr',
 }
 
 # Deliberately untrapped syscalls carry an explicit marker in the filter:
