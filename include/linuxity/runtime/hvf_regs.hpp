@@ -31,7 +31,6 @@ struct GuestRegs {
     std::uint64_t elr{};                // return address (PC after the svc)
     std::uint64_t spsr{};               // PSTATE to restore
     std::uint64_t esr{};                // why we trapped
-    std::uint64_t far{};                // faulting address, if a data abort
 
     [[nodiscard]] std::uint64_t nr() const noexcept { return x[8]; }
     [[nodiscard]] std::uint64_t arg(std::size_t i) const noexcept { return x[i]; }
@@ -42,6 +41,13 @@ struct GuestRegs {
 // Deliberately NOT a loop over hv_reg_t arithmetic: the enum values for
 // HV_REG_X0..X8 are contiguous, but spelling them out lets the compiler
 // unroll into nine direct calls with no indirection.
+//
+// FAR_EL1 is deliberately NOT read here. It is meaningful only for an abort,
+// and an abort is the rare exit -- the overwhelming majority of exits are
+// `svc`, where FAR holds a stale address from whenever the guest last
+// faulted. Each get_sys_reg is ~14 ns of kernel round trip, so paying for it
+// on every syscall to serve the one-in-ten-thousand fault is backwards:
+// `fault_address()` fetches it on demand instead.
 [[nodiscard]] inline GuestRegs read_regs(hv_vcpu_t cpu) {
     GuestRegs r;
     for (std::size_t i = 0; i < r.x.size(); ++i)
@@ -49,8 +55,15 @@ struct GuestRegs {
     ::hv_vcpu_get_sys_reg(cpu, HV_SYS_REG_ELR_EL1, &r.elr);
     ::hv_vcpu_get_sys_reg(cpu, HV_SYS_REG_SPSR_EL1, &r.spsr);
     ::hv_vcpu_get_sys_reg(cpu, HV_SYS_REG_ESR_EL1, &r.esr);
-    ::hv_vcpu_get_sys_reg(cpu, HV_SYS_REG_FAR_EL1, &r.far);
     return r;
+}
+
+// The address that caused an abort. Valid only when ec() names a data or
+// instruction abort; the register is architecturally UNKNOWN otherwise.
+[[nodiscard]] inline std::uint64_t fault_address(hv_vcpu_t cpu) {
+    std::uint64_t far = 0;
+    ::hv_vcpu_get_sys_reg(cpu, HV_SYS_REG_FAR_EL1, &far);
+    return far;
 }
 
 // Return from the syscall: the result in x0, then PC/PSTATE restored. Three

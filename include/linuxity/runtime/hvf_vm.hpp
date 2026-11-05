@@ -528,6 +528,12 @@ public:
         write_return(cpu_, r, ret);
     }
 
+    // FAR_EL1, fetched only when a caller actually needs it -- see the note
+    // on read_regs(). Valid only for an abort.
+    [[nodiscard]] std::uint64_t fault_address() const noexcept {
+        return ::lx::runtime::fault_address(cpu_);
+    }
+
     // -- Full user-visible state ------------------------------------------
     // Includes the FP/SIMD file (q0..q31, FPCR, FPSR): glibc's memcpy and
     // every vectorized loop keep those live across a syscall, so a fork or

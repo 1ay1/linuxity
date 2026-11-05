@@ -174,18 +174,32 @@ public:
     // so inheritance happens on the child's very first syscall without the
     // trap layer having to plumb fork events into the filesystem.
     void set_current_pid(std::int32_t pid, std::int32_t ppid) const {
+        // The dispatcher calls this before EVERY syscall, and the pid almost
+        // never changes between two consecutive syscalls -- a task runs a
+        // burst of them before another task traps. `seeded_pid_` caches the
+        // pid whose cwd record we already know exists, so the steady state
+        // is one integer compare instead of two unordered_map lookups
+        // (~40 ns of hashing) on every single syscall.
         cur_pid_ = pid;
+        if (pid == seeded_pid_) return;
         if (cwds_.find(pid) == cwds_.end()) {
             auto it = cwds_.find(ppid);
             cwds_[pid] = (it != cwds_.end()) ? it->second : inherited_cwd_;
         }
+        seeded_pid_ = pid;
     }
     // On fork/clone the child inherits a COPY of the parent's cwd.
     void inherit_cwd(std::int32_t child, std::int32_t parent) {
         auto it = cwds_.find(parent);
         cwds_[child] = (it != cwds_.end()) ? it->second : std::string{"/"};
     }
-    void forget_pid(std::int32_t pid) { cwds_.erase(pid); }
+    // Dropping a pid's record must also drop the "already seeded" claim:
+    // the kernel recycles pids, and a new task reusing this number has to
+    // re-seed from ITS parent rather than skip straight past the check.
+    void forget_pid(std::int32_t pid) {
+        cwds_.erase(pid);
+        if (pid == seeded_pid_) seeded_pid_ = 0;
+    }
     [[nodiscard]] std::string_view cwd_of(std::int32_t pid) const noexcept {
         auto it = cwds_.find(pid);
         return it != cwds_.end() ? std::string_view{it->second}
@@ -286,14 +300,28 @@ public:
                 if (!whiteouts_.empty()) clear_whiteout(std::string{abs});
                 return PathClass{Realm2::host_backed, std::move(up), Errno::enoent, {}};
             }
-            // READ. A whited-out path that hasn't been re-created in the upper
-            // reads back as absent — the lower file was "removed" in the
+            // READ. One probe of the upper layer answers everything the read
+            // path needs: whether the upper shadows the lower (layer pick),
+            // and if so whether it is a symlink to chase. This used to be two
+            // `exists(up)` calls -- the same lstat twice, since `whiteouts_`
+            // is usually non-empty -- plus a third `readlink` inside
+            // follow_symlink on the path we just stat'd.
+            std::string target;
+            const Probe up_probe = probe_link(up.c_str(), target);
+            // A whited-out path that hasn't been re-created in the upper
+            // reads back as absent -- the lower file was "removed" in the
             // overlay view even though the pristine rootfs still holds it.
-            if (!whiteouts_.empty() && !exists(up.c_str()) && is_whiteout(abs))
+            if (up_probe == Probe::absent && !whiteouts_.empty() && is_whiteout(abs))
                 return PathClass{Realm2::absent, {}, Errno::enoent, {}};
-            std::string host = exists(up.c_str()) ? up : lo;
-            if (follow) return follow_symlink(*m, std::move(host), for_write, wi, depth);
-            return PathClass{Realm2::host_backed, std::move(host), Errno::enoent, {}};
+            if (up_probe == Probe::absent) {
+                if (follow) return follow_symlink(*m, std::move(lo), for_write, wi, depth);
+                return PathClass{Realm2::host_backed, std::move(lo), Errno::enoent, {}};
+            }
+            // The upper wins. If it is a symlink and we must follow, hand the
+            // ALREADY-READ target to the resolver so it doesn't re-readlink.
+            if (follow && up_probe == Probe::symlink)
+                return resolve_link_target(*m, up, std::move(target), for_write, wi, depth);
+            return PathClass{Realm2::host_backed, std::move(up), Errno::enoent, {}};
         }
         std::string full = join_host(m->host_base, rel);
         if (follow) return follow_symlink(*m, std::move(full), for_write, wi, depth);
@@ -432,6 +460,7 @@ public:
         inherited_cwd_ = normalize(str());
         if (inherited_cwd_.empty()) inherited_cwd_ = "/";
         cwds_.clear();
+        seeded_pid_ = 0;          // no record survives the clear
         fd_paths_.clear();
         for (std::uint32_t i = 0, n = u32(); i < n && at < in.size(); ++i) {
             int fd = 0;
@@ -547,13 +576,33 @@ private:
     // Bounded to avoid symlink loops.
     PathClass follow_symlink(const Mount& m, std::string host,
                              bool for_write, WriteIntent wi, int depth) const {
+        return follow_from(m, std::move(host), {}, for_write, wi, depth);
+    }
+
+    // Continue a chase whose FIRST readlink has already been done by the
+    // caller (the overlay read path probes the upper layer anyway, and that
+    // probe yields the target). `first` is that target; empty means "read it
+    // yourself".
+    PathClass resolve_link_target(const Mount& m, std::string host,
+                                  std::string first, bool for_write,
+                                  WriteIntent wi, int depth) const {
+        return follow_from(m, std::move(host), std::move(first), for_write, wi, depth);
+    }
+
+    PathClass follow_from(const Mount& m, std::string host, std::string pre,
+                          bool for_write, WriteIntent wi, int depth) const {
         for (int hops = 0; hops < 40; ++hops) {
-            char buf[4096];
-            ::ssize_t n = ::readlink(host.c_str(), buf, sizeof buf - 1);
-            if (n < 0)                              // not a symlink (or gone)
-                return PathClass{Realm2::host_backed, std::move(host), Errno::enoent, {}};
-            buf[n] = '\0';
-            std::string target{buf};
+            std::string target;
+            if (!pre.empty()) {
+                target = std::move(pre);
+                pre.clear();
+            } else {
+                char buf[4096];
+                ::ssize_t n = ::readlink(host.c_str(), buf, sizeof buf - 1);
+                if (n < 0)                          // not a symlink (or gone)
+                    return PathClass{Realm2::host_backed, std::move(host), Errno::enoent, {}};
+                target.assign(buf, static_cast<std::size_t>(n));
+            }
             std::string guest_abs;
             if (!target.empty() && target.front() == '/') {
                 guest_abs = normalize(target);       // absolute: re-root it
@@ -588,7 +637,16 @@ private:
             std::string up = m.upper.empty() ? std::string{}
                                              : join_host(m.upper, rel);
             std::string lo = join_host(m.host_base, rel);
-            host = (!up.empty() && exists(up.c_str())) ? up : lo;
+            // Pick the layer for the NEXT hop with the same fused probe the
+            // entry path uses: if the upper holds a symlink we already have
+            // its target, so the loop skips a readlink as well as an lstat.
+            if (up.empty()) { host = std::move(lo); continue; }
+            std::string next;
+            switch (probe_link(up.c_str(), next)) {
+                case Probe::symlink: host = std::move(up); pre = std::move(next); break;
+                case Probe::present: host = std::move(up); break;
+                case Probe::absent:  host = std::move(lo); break;
+            }
         }
         return PathClass{Realm2::host_backed, std::move(host), Errno::enoent, {}};
     }
@@ -596,6 +654,27 @@ private:
     static bool exists(const char* path) {
         struct ::stat st{};
         return ::lstat(path, &st) == 0;
+    }
+
+    // One readlink answers the three questions the overlay read path asks of
+    // a candidate layer, where the obvious code asks them with two syscalls
+    // (lstat to pick the layer, then readlink to chase the link):
+    //
+    //   n >= 0        -> exists AND is a symlink; `out` is its target
+    //   errno EINVAL  -> exists, is NOT a symlink (the common case)
+    //   anything else -> treat as absent (ENOENT, ENOTDIR, EACCES...)
+    //
+    // Halving the host syscalls here matters because openat/readlinkat/statx
+    // are ~33% of a real workload's calls and every one of them classifies a
+    // path. ENOTDIR and EACCES deliberately fold into "absent" for LAYER
+    // SELECTION only: if the upper can't be traversed, the lower is the right
+    // candidate, and the forwarded syscall reports the true error itself.
+    enum class Probe { symlink, present, absent };
+    static Probe probe_link(const char* path, std::string& out) {
+        char buf[4096];
+        const ::ssize_t n = ::readlink(path, buf, sizeof buf - 1);
+        if (n >= 0) { out.assign(buf, static_cast<std::size_t>(n)); return Probe::symlink; }
+        return errno == EINVAL ? Probe::present : Probe::absent;
     }
 
     static bool is_dir(const char* path) {
@@ -770,6 +849,11 @@ private:
     // is mutable so a const cwd()/absolutize path can select the active pid.
     mutable std::unordered_map<std::int32_t, std::string> cwds_{};
     mutable std::int32_t cur_pid_{1};   // root/init
+    // The pid whose cwds_ record set_current_pid has already confirmed, so
+    // the common "same task as last syscall" case costs one compare. Any
+    // path that CLEARS or re-seeds cwds_ must reset this to a pid that can
+    // never match (0 is not a valid guest pid).
+    mutable std::int32_t seeded_pid_{0};
     // cwd for a pid with no record and no recorded parent: "/" for the root
     // process, the parent's cwd in a forked child (import_process_state).
     std::string inherited_cwd_{"/"};

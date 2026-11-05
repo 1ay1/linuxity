@@ -496,8 +496,10 @@ private:
         }
         // A fault inside a MAPPED range is a permission problem (ACCERR);
         // outside any VMA it is an unmapped address (MAPERR). That
-        // distinction is what a guard-page handler keys on.
-        const Vma* v = proc_.with_space([&](AddressSpace& t) { return t.find(regs_.far); });
+        // distinction is what a guard-page handler keys on. FAR_EL1 is read
+        // HERE, not on every trap: faults are rare and syscalls are not.
+        const std::uint64_t far = cpu_.fault_address();
+        const Vma* v = proc_.with_space([&](AddressSpace& t) { return t.find(far); });
         if (sig == 11 && v) code = sicode::kSegvAccerr;
 
         // If the guest installed a handler, deliver the fault to it. The
@@ -507,7 +509,7 @@ private:
         const LinuxSigaction act =
             proc_.with_signals([&](SignalDispositions& t) { return t.get(sig); });
         if (act.handler > 1 && !(task_.sig_mask & sigbit(sig))) {
-            if (deliver_fault(sig, code, regs_.far)) return true;
+            if (deliver_fault(sig, code, far)) return true;
         }
 
         // No handler (or the signal is blocked, which Linux treats as fatal
@@ -516,7 +518,7 @@ private:
         std::fprintf(stderr,
             "linuxity: guest %s at pc=%#llx addr=%#llx (%s) esr=%#llx\n",
             kind, static_cast<unsigned long long>(regs_.elr),
-            static_cast<unsigned long long>(regs_.far),
+            static_cast<unsigned long long>(far),
             v ? "mapped" : "UNMAPPED",
             static_cast<unsigned long long>(regs_.esr));
         std::fflush(nullptr);
