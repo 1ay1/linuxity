@@ -28,6 +28,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -131,6 +132,14 @@ public:
         if (it == posix_.end()) return std::nullopt;
         return remaining_locked(it->second);
     }
+    // A timerfd delivers expirations by WRITING to a pipe rather than by
+    // raising a signal, so each POSIX timer may carry its own notifier.
+    void set_notifier(int id, std::function<void()> fn) {
+        std::lock_guard g{mu_};
+        auto it = posix_.find(id);
+        if (it != posix_.end()) it->second.notify = std::move(fn);
+    }
+
     [[nodiscard]] std::optional<int> overrun(int id) {
         std::lock_guard g{mu_};
         auto it = posix_.find(id);
@@ -144,6 +153,7 @@ private:
         Nanos interval{};                 // zero = one-shot
         int signal{};
         int overrun{};
+        std::function<void()> notify;     // timerfd: write to its pipe instead
     };
 
     [[nodiscard]] static std::size_t idx(int which) noexcept {
@@ -160,13 +170,15 @@ private:
 
     // Fire every entry whose deadline has passed, rearm the periodic ones,
     // and return the next deadline to sleep until.
-    [[nodiscard]] std::optional<Clock::time_point> fire_due(std::vector<int>& signals) {
+    [[nodiscard]] std::optional<Clock::time_point> fire_due(
+            std::vector<int>& signals, std::vector<std::function<void()>>& notifies) {
         const auto now = Clock::now();
         std::optional<Clock::time_point> next;
         auto visit = [&](Entry& e) {
             if (e.deadline == Clock::time_point{}) return;
             if (e.deadline <= now) {
                 if (e.signal) signals.push_back(e.signal);
+                if (e.notify) notifies.push_back(e.notify);
                 if (e.interval.count()) {
                     // Catch up without drifting; count missed ticks as
                     // overruns, which is what timer_getoverrun reports.
@@ -190,9 +202,11 @@ private:
         std::unique_lock lk{mu_};
         while (running_.load(std::memory_order_acquire)) {
             std::vector<int> signals;
-            const auto next = fire_due(signals);
+            std::vector<std::function<void()>> notifies;
+            const auto next = fire_due(signals, notifies);
             lk.unlock();
             for (int s : signals) raise_(s);
+            for (auto& fn : notifies) fn();
             lk.lock();
             if (!running_.load(std::memory_order_acquire)) break;
             if (next) cv_.wait_until(lk, *next);

@@ -3,7 +3,7 @@
 # Windows) — they are the contract that keeps the core portable.
 set(LX_PORTABLE_TESTS
     core authority vfs hostfs loader interp file_namespace sysfs_proctree
-    resources hvf_vma)
+    resources hvf_vma sysno conformance)
 
 # Live tests: run real guest ELF binaries through a trap backend. Today the
 # only backend is ptrace (Linux), so they are Linux-only until the HVF/WHP

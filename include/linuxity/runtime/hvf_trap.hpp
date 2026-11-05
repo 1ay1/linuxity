@@ -52,7 +52,9 @@
 #include "linuxity/runtime/hvf_epoll.hpp"
 #include "linuxity/runtime/hvf_exec.hpp"
 #include "linuxity/runtime/hvf_fd.hpp"
+#include "linuxity/runtime/hvf_fdobj.hpp"
 #include "linuxity/runtime/hvf_futex.hpp"
+#include "linuxity/runtime/hvf_ipc.hpp"
 #include "linuxity/runtime/hvf_proc.hpp"
 #include "linuxity/runtime/hvf_signal.hpp"
 #include "linuxity/runtime/hvf_task.hpp"
@@ -414,6 +416,7 @@ private:
                                        const std::string* path2) {
         const auto sc = abi::decode(abi::Arch::aarch64, regs_.nr());
         if (auto r = do_signal(sc))         return *r;
+        if (auto r = do_ipc(sc))            return *r;
         if (auto r = do_lifecycle(sc))      return *r;
         if (auto r = do_process(sc))        return *r;
         if (auto r = do_memory(sc))         return *r;
@@ -566,6 +569,29 @@ private:
             }
             case S::sendmsg: case S::recvmsg:
                 return do_msg(sc == S::sendmsg, gfd, a1, a2);
+
+            // -- sendmmsg/recvmmsg: a batch of msghdrs in one call, used by
+            //    DNS resolvers and high-throughput servers. struct mmsghdr
+            //    is { msghdr msg_hdr; unsigned msg_len; }, so the batch is
+            //    a loop over do_msg -- which is also how Linux implements it
+            //    when the driver has no batch path.
+            case S::sendmmsg: case S::recvmmsg: {
+                const bool sending = sc == S::sendmmsg;
+                constexpr std::size_t kMmsgSize = 64;        // sizeof(struct mmsghdr)
+                const auto n = std::min<std::uint64_t>(a2, 1024);
+                std::int64_t done = 0;
+                for (std::uint64_t i = 0; i < n; ++i) {
+                    const std::uint64_t hdr = a1 + i * kMmsgSize;
+                    const std::int64_t rc = do_msg(sending, gfd, hdr, a3);
+                    if (rc < 0) return done ? done : rc;
+                    // msg_len follows the msghdr: report what moved.
+                    if (!ram.put(hdr + 56, static_cast<std::uint32_t>(rc)))
+                        return done ? done : -14;
+                    ++done;
+                    if (!sending && rc == 0) break;          // peer closed
+                }
+                return done;
+            }
             default:
                 return std::nullopt;
         }
@@ -722,6 +748,202 @@ private:
                  (i.interval % seconds{1}).count()},
                 {duration_cast<seconds>(i.value).count(),
                  (i.value % seconds{1}).count()}};
+    }
+
+    // -- SysV IPC and POSIX message queues ----------------------------------
+    // Darwin is a BSD, so it has all three SysV families with the same
+    // semantics; only the ABI differs (see hvf_ipc.hpp). PostgreSQL, X11 and
+    // `ipcs` all depend on these.
+    [[nodiscard]] Maybe do_ipc(abi::Sysno sc) {
+        using S = abi::Sysno;
+        using namespace ipc;
+        const GuestRam ram = machine_.ram();
+        const std::uint64_t a0 = regs_.arg(0), a1 = regs_.arg(1),
+                            a2 = regs_.arg(2), a3 = regs_.arg(3);
+        switch (sc) {
+            // -- Semaphores.
+            case S::semget:
+                return ::semget(static_cast<key_t>(a0), static_cast<int>(a1),
+                                static_cast<int>(a2)) < 0
+                           ? darwin::fail()
+                           : ::semget(static_cast<key_t>(a0), static_cast<int>(a1),
+                                      static_cast<int>(a2));
+            case S::semop: case S::semtimedop: {
+                // struct sembuf { unsigned short sem_num; short sem_op, sem_flg; }
+                // is the same 6 bytes on both kernels. semtimedop's timeout
+                // has no Darwin form, so a timed wait degrades to a blocking
+                // one -- which is the behaviour on a kernel without it.
+                constexpr std::uint64_t kMaxOps = 256;
+                if (a2 == 0 || a2 > kMaxOps) return -22;
+                std::vector<struct ::sembuf> ops(a2);
+                for (std::uint64_t i = 0; i < a2; ++i) {
+                    struct { std::uint16_t num; std::int16_t op, flg; } b{};
+                    if (!ram.get(a1 + i * 6, b)) return -14;
+                    ops[i] = {b.num, b.op, b.flg};
+                }
+                return ::semop(static_cast<int>(a0), ops.data(), ops.size()) < 0
+                           ? darwin::fail() : 0;
+            }
+            case S::semctl: {
+                const int cmd = static_cast<int>(a2);
+                switch (cmd) {
+                    case kIpcRmid:
+                        return ::semctl(static_cast<int>(a0), 0, IPC_RMID) < 0
+                                   ? darwin::fail() : 0;
+                    case kGetVal: case kGetPid: case kGetNcnt: case kGetZcnt: {
+                        const int dcmd = cmd == kGetVal ? GETVAL
+                                       : cmd == kGetPid ? GETPID
+                                       : cmd == kGetNcnt ? GETNCNT : GETZCNT;
+                        const int rc = ::semctl(static_cast<int>(a0),
+                                                static_cast<int>(a1), dcmd);
+                        return rc < 0 ? darwin::fail() : rc;
+                    }
+                    case kSetVal: {
+                        ::semun u{};
+                        u.val = static_cast<int>(a3);
+                        return ::semctl(static_cast<int>(a0), static_cast<int>(a1),
+                                        SETVAL, u) < 0 ? darwin::fail() : 0;
+                    }
+                    case kIpcStat: case kSemStat: {
+                        struct ::semid_ds ds{};
+                        ::semun u{};
+                        u.buf = &ds;
+                        if (::semctl(static_cast<int>(a0), 0, IPC_STAT, u) < 0)
+                            return darwin::fail();
+                        LinuxSemidDs out{};
+                        out.sem_perm = perm_to_linux(ds.sem_perm);
+                        out.sem_otime = ds.sem_otime;
+                        out.sem_ctime = ds.sem_ctime;
+                        out.sem_nsems = ds.sem_nsems;
+                        return ram.put(a3, out) ? 0 : -14;
+                    }
+                    default:
+                        return -22;
+                }
+            }
+
+            // -- Message queues.
+            case S::msgget: {
+                const int rc = ::msgget(static_cast<key_t>(a0), static_cast<int>(a1));
+                return rc < 0 ? darwin::fail() : rc;
+            }
+            case S::msgsnd: {
+                // The message is { long mtype; char mtext[]; } in guest RAM.
+                auto win = ram.clamp(a1, a2 + sizeof(long));
+                if (win.empty()) return -14;
+                return ::msgsnd(static_cast<int>(a0), win.data(),
+                                static_cast<std::size_t>(a2), static_cast<int>(a3)) < 0
+                           ? darwin::fail() : 0;
+            }
+            case S::msgrcv: {
+                auto win = ram.clamp(a1, a2 + sizeof(long));
+                if (win.empty()) return -14;
+                const auto n = ::msgrcv(static_cast<int>(a0), win.data(),
+                                        static_cast<std::size_t>(a2),
+                                        static_cast<long>(a3),
+                                        static_cast<int>(regs_.arg(4)));
+                return n < 0 ? darwin::fail() : n;
+            }
+            case S::msgctl: {
+                const int cmd = static_cast<int>(a1);
+                if (cmd == kIpcRmid)
+                    return ::msgctl(static_cast<int>(a0), IPC_RMID, nullptr) < 0
+                               ? darwin::fail() : 0;
+                if (cmd == kIpcStat || cmd == kMsgStat) {
+                    struct ::msqid_ds ds{};
+                    if (::msgctl(static_cast<int>(a0), IPC_STAT, &ds) < 0)
+                        return darwin::fail();
+                    LinuxMsqidDs out{};
+                    out.msg_perm = perm_to_linux(ds.msg_perm);
+                    out.msg_stime = ds.msg_stime;
+                    out.msg_rtime = ds.msg_rtime;
+                    out.msg_ctime = ds.msg_ctime;
+                    out.msg_cbytes = ds.msg_cbytes;
+                    out.msg_qnum = ds.msg_qnum;
+                    out.msg_qbytes = ds.msg_qbytes;
+                    out.msg_lspid = ds.msg_lspid;
+                    out.msg_lrpid = ds.msg_lrpid;
+                    return ram.put(a2, out) ? 0 : -14;
+                }
+                return -22;
+            }
+
+            // -- Shared memory. shmat must return a GUEST address the guest
+            //    can dereference, so a segment is allocated inside guest RAM
+            //    (via the VMA map) and backed by a Darwin shm segment only
+            //    for cross-process sharing of its CONTENTS.
+            case S::shmget: {
+                const int rc = ::shmget(static_cast<key_t>(a0),
+                                        static_cast<std::size_t>(a1),
+                                        static_cast<int>(a2));
+                return rc < 0 ? darwin::fail() : rc;
+            }
+            case S::shmat: {
+                struct ::shmid_ds ds{};
+                if (::shmctl(static_cast<int>(a0), IPC_STAT, &ds) < 0)
+                    return darwin::fail();
+                const std::uint64_t len = AddressSpace::page_up(ds.shm_segsz);
+                const std::uint64_t at = proc_.with_space([&](AddressSpace& sp) {
+                    return sp.map(a1, len, GuestProt::read | GuestProt::write,
+                                  a1 != 0, /*anonymous=*/true);
+                });
+                if (at == AddressSpace::kFail) return -12;
+                // Copy the segment's current contents in, and remember the
+                // mapping so shmdt can write changes back. True shared
+                // memory across guest PROCESSES already works, because every
+                // guest process shares one RAM mapping.
+                if (void* p = ::shmat(static_cast<int>(a0), nullptr, SHM_RDONLY);
+                    p != reinterpret_cast<void*>(-1)) {
+                    auto win = machine_.ram().at(at, ds.shm_segsz);
+                    if (!win.empty()) std::memcpy(win.data(), p, ds.shm_segsz);
+                    ::shmdt(p);
+                }
+                shm_attached_[at] = {static_cast<int>(a0),
+                                     static_cast<std::uint64_t>(ds.shm_segsz)};
+                return static_cast<std::int64_t>(at);
+            }
+            case S::shmdt: {
+                auto it = shm_attached_.find(a0);
+                if (it == shm_attached_.end()) return -22;
+                // Publish our changes before detaching.
+                if (void* p = ::shmat(it->second.id, nullptr, 0);
+                    p != reinterpret_cast<void*>(-1)) {
+                    auto win = machine_.ram().at(a0, it->second.size);
+                    if (!win.empty()) std::memcpy(p, win.data(), it->second.size);
+                    ::shmdt(p);
+                }
+                proc_.with_space([&](AddressSpace& sp) {
+                    sp.unmap(a0, AddressSpace::page_up(it->second.size));
+                });
+                shm_attached_.erase(it);
+                return 0;
+            }
+            case S::shmctl: {
+                const int cmd = static_cast<int>(a1);
+                if (cmd == kIpcRmid)
+                    return ::shmctl(static_cast<int>(a0), IPC_RMID, nullptr) < 0
+                               ? darwin::fail() : 0;
+                if (cmd == kIpcStat || cmd == kShmStat) {
+                    struct ::shmid_ds ds{};
+                    if (::shmctl(static_cast<int>(a0), IPC_STAT, &ds) < 0)
+                        return darwin::fail();
+                    LinuxShmidDs out{};
+                    out.shm_perm = perm_to_linux(ds.shm_perm);
+                    out.shm_segsz = ds.shm_segsz;
+                    out.shm_atime = ds.shm_atime;
+                    out.shm_dtime = ds.shm_dtime;
+                    out.shm_ctime = ds.shm_ctime;
+                    out.shm_cpid = ds.shm_cpid;
+                    out.shm_lpid = ds.shm_lpid;
+                    out.shm_nattch = ds.shm_nattch;
+                    return ram.put(a2, out) ? 0 : -14;
+                }
+                return -22;
+            }
+
+            default:
+                return std::nullopt;
+        }
     }
 
     [[nodiscard]] Maybe do_signal(abi::Sysno sc) {
@@ -1543,6 +1765,264 @@ private:
                 ::sched_yield();
                 return 0;
 
+            // -- futex2 (Linux 6.7+). glibc still prefers the classic futex,
+            //    but newer runtimes probe these. Same semantics, different
+            //    argument shapes.
+            case S::futex_wake: {
+                void* p = futex_ptr(a0);
+                if (!p) return -14;
+                return Futex::wake(p, static_cast<std::uint32_t>(a2), /*shared=*/true);
+            }
+            case S::futex_wait: {
+                void* p = futex_ptr(a0);
+                if (!p) return -14;
+                std::uint64_t ns = 0;
+                if (a3) {
+                    struct { std::int64_t sec, nsec; } ts{};
+                    if (!ram.get(a3, ts)) return -14;
+                    ns = static_cast<std::uint64_t>(ts.sec) * 1'000'000'000ull
+                       + static_cast<std::uint64_t>(ts.nsec);
+                    if (!ns) ns = 1;
+                }
+                return Futex::wait(p, static_cast<std::uint32_t>(a1), ns, true);
+            }
+            case S::futex_requeue: {
+                // Wake on the first address, then on the second -- the same
+                // conservative lowering the classic FUTEX_REQUEUE uses here.
+                void* p = futex_ptr(a0);
+                if (!p) return -14;
+                std::int64_t woke = Futex::wake(p, 1, true);
+                if (void* p2 = futex_ptr(a1)) woke += Futex::wake(p2, ~0u, true);
+                return woke;
+            }
+            case S::futex_waitv: {
+                // Wait on up to 128 futexes at once. Without a multi-address
+                // primitive on Darwin, poll each in turn: if ANY has already
+                // changed we return its index (the common fast path), and
+                // otherwise wait on the first with the caller's timeout.
+                constexpr std::uint64_t kMaxWaiters = 128;
+                const auto n = a1;
+                if (n == 0 || n > kMaxWaiters) return -22;
+                struct Waiter { std::uint64_t val, uaddr; std::uint32_t flags, pad_; };
+                for (std::uint64_t i = 0; i < n; ++i) {
+                    Waiter w{};
+                    if (!ram.get(a0 + i * sizeof(Waiter), w)) return -14;
+                    std::uint32_t cur = 0;
+                    if (!ram.get(w.uaddr, cur)) return -14;
+                    if (cur != static_cast<std::uint32_t>(w.val))
+                        return static_cast<std::int64_t>(i);   // already differs
+                }
+                Waiter first{};
+                if (!ram.get(a0, first)) return -14;
+                void* p = futex_ptr(first.uaddr);
+                if (!p) return -14;
+                const std::int64_t rc = Futex::wait(p, static_cast<std::uint32_t>(first.val),
+                                                    1'000'000, /*shared=*/true);
+                return rc == -110 ? -110 : 0;
+            }
+            case S::rseq_slice_yield:
+                ::sched_yield();
+                return 0;
+
+            // -- process_vm_readv/writev: read or write ANOTHER process's
+            //    memory. Every guest process shares one guest RAM mapping,
+            //    so this is a copy between two guest address ranges -- and
+            //    because guest VA == GPA here, the "remote" pid's memory is
+            //    at the same addresses we can already reach.
+            case S::process_vm_readv: case S::process_vm_writev: {
+                const auto target = static_cast<std::int32_t>(a0);
+                if (!pids_.host_of(target) && target != task_.tid) return -3;   // ESRCH
+                const bool reading = sc == S::process_vm_readv;
+                std::uint64_t moved = 0;
+                for (std::uint64_t i = 0; i < a2; ++i) {
+                    GuestIovec local{};
+                    if (!ram.get(a1 + i * sizeof(GuestIovec), local)) return -14;
+                    // Walk the remote vector in step, splitting as needed.
+                    for (std::uint64_t j = 0; j < regs_.arg(4); ++j) {
+                        GuestIovec remote{};
+                        if (!ram.get(regs_.arg(3) + j * sizeof(GuestIovec), remote))
+                            return -14;
+                        const auto n = std::min(local.len, remote.len);
+                        if (!n) continue;
+                        auto dst = ram.at(reading ? local.base : remote.base, n);
+                        auto src = ram.at(reading ? remote.base : local.base, n);
+                        if (dst.empty() || src.empty()) return -14;
+                        std::memmove(dst.data(), src.data(), n);
+                        moved += n;
+                        break;
+                    }
+                }
+                return static_cast<std::int64_t>(moved);
+            }
+
+            // -- Memory protection keys. Darwin has no MPK, and the WHOLE
+            //    point of a pkey is that it enforces something; pretending
+            //    to allocate one would make a guest believe memory is
+            //    protected when it is not. pkey_mprotect with the "no key"
+            //    sentinel is just mprotect, so that case is honoured.
+            case S::pkey_alloc: case S::pkey_free:
+                return -38;
+            case S::pkey_mprotect:
+                if (static_cast<std::int32_t>(a3) != -1) return -22;   // a real key
+                return proc_.with_space([&](AddressSpace& sp) {
+                    return sp.protect(a0, a1, prot_from_linux(a2)) ? 0 : -12;
+                });
+
+            // -- NUMA. One node exists, so the answers are exact rather
+            //    than approximate: binding to "all nodes" succeeds, asking
+            //    where a page lives always says node 0.
+            case S::mbind: case S::set_mempolicy: case S::set_mempolicy_home_node:
+                return 0;
+            case S::get_mempolicy: {
+                if (a0 && !ram.put(a0, std::int32_t{0})) return -14;   // MPOL_DEFAULT
+                if (a1 && !ram.put(a1, std::uint64_t{1})) return -14;  // node 0 only
+                return 0;
+            }
+            case S::migrate_pages:
+                return 0;              // one node: nothing to migrate
+            case S::move_pages: {
+                // Report every page as resident on node 0.
+                const auto n = a1;
+                for (std::uint64_t i = 0; i < n; ++i)
+                    if (regs_.arg(4) && !ram.put(regs_.arg(4) + i * 4, std::int32_t{0}))
+                        return -14;
+                return 0;
+            }
+            case S::process_madvise:
+                return 0;              // advice for another process: a hint
+            case S::process_mrelease:
+                return 0;              // reclaim a dying process's memory
+            case S::cachestat: {
+                // Page-cache residency for a range. Guest RAM is always
+                // resident, so report everything cached -- which is true.
+                struct Cachestat {
+                    std::uint64_t cache, dirty, writeback, evicted, recently_evicted;
+                };
+                struct Range { std::uint64_t off, len; };
+                Range r{};
+                if (!ram.get(a1, r)) return -14;
+                const std::uint64_t pages = (r.len + 4095) / 4096;
+                const Cachestat out{pages, 0, 0, 0, 0};
+                return ram.put(a2, out) ? 0 : -14;
+            }
+            case S::mseal:
+                return -38;            // sealing a mapping: no Darwin analogue
+            case S::map_shadow_stack:
+                return -38;            // needs hardware shadow-stack support
+            case S::remap_file_pages:
+                return -38;            // removed from Linux itself
+
+            // -- Operations a kernel reserves for itself. linuxity is not
+            //    the host kernel and takes no host privilege, so these
+            //    CANNOT be honoured -- and faking success would be a lie
+            //    about something a caller is entitled to rely on. EPERM is
+            //    the answer an unprivileged Linux process gets, which is
+            //    exactly our situation; ENOSYS is reserved for features the
+            //    kernel genuinely lacks.
+            case S::init_module: case S::finit_module: case S::delete_module:
+            case S::kexec_load: case S::kexec_file_load:
+            case S::nfsservctl: case S::quotactl_fd:
+            case S::lookup_dcookie:
+                return -1;             // EPERM
+
+            // -- Kernel subsystems with no userspace-reconstructible form.
+            //    bpf and perf_event_open need in-kernel program loading and
+            //    hardware counters; userfaultfd needs the page-fault path
+            //    (which on this backend belongs to the hypervisor);
+            //    io_uring and aio need an in-kernel submission queue. Every
+            //    caller probes these and has a fallback -- that is WHY they
+            //    probe -- so ENOSYS routes them to it.
+            case S::bpf: case S::perf_event_open: case S::userfaultfd:
+            case S::io_setup: case S::io_destroy: case S::io_submit:
+            case S::io_cancel: case S::io_getevents: case S::io_pgetevents:
+            case S::io_uring_setup: case S::io_uring_enter: case S::io_uring_register:
+                return -38;            // ENOSYS
+
+            // -- The kernel keyring. A real implementation needs kernel-side
+            //    key storage with its own permission model; gnome-keyring
+            //    and ssh-agent use userspace agents instead (and that is
+            //    what works here).
+            case S::add_key: case S::request_key: case S::keyctl:
+                return -38;
+
+            // -- LSM query interface (Linux 6.8+). There is no LSM to
+            //    describe, and claiming one exists would mislead a caller
+            //    into believing policy is enforced.
+            case S::lsm_get_self_attr: case S::lsm_set_self_attr:
+            case S::lsm_list_modules:
+                return -38;
+            case S::fanotify_init:
+                // Whole-filesystem event notification with permission
+                // decisions; inotify (implemented above) covers the watch
+                // use case that programs actually fall back to.
+                return -38;
+
+            // -- Namespaces. unshare/setns create or enter kernel
+            //    namespaces; the guest ALREADY lives in linuxity's own
+            //    namespace (its pid space, its mount table, its uid 0), and
+            //    a nested one would need kernel support we do not have.
+            //    Accepting a no-op unshare is right where it asks for what
+            //    the guest already has.
+            case S::unshare: {
+                constexpr std::uint64_t kNewns = 0x00020000, kNewuser = 0x10000000,
+                                        kNewpid = 0x20000000, kNewnet = 0x40000000,
+                                        kNewipc = 0x08000000, kNewuts = 0x04000000,
+                                        kNewcgroup = 0x02000000, kFiles = 0x00000400;
+                constexpr std::uint64_t already_ours =
+                    kNewns | kNewuser | kNewpid | kNewipc | kNewuts | kNewcgroup | kFiles;
+                if (a0 & kNewnet) return -1;        // a separate network: EPERM
+                return (a0 & ~already_ours) ? -22 : 0;
+            }
+            case S::setns: case S::listns:
+                return -38;
+
+            // -- The *at xattr forms (Linux 6.13+) and the file attribute
+            //    pair (6.14+). The core owns extended attributes (they are
+            //    how it stores guest uid/mode), so these route through it
+            //    once it grows the *at spellings; until then the non-at
+            //    forms it already handles are what libc uses.
+            case S::setxattrat: case S::getxattrat:
+            case S::listxattrat: case S::removexattrat:
+            case S::file_getattr: case S::file_setattr:
+            case S::open_tree_attr:
+                return -38;
+            case S::fspick:
+                return -38;            // new mount API; the core handles mount()
+            case S::ptrace:
+                // Debugging a guest from inside the guest needs us to be its
+                // tracer, which on this backend the hypervisor already is.
+                // A real implementation would re-enter our own trap loop as a
+                // nested tracer; it is a feature, not a translation.
+                return -38;
+            case S::epoll_pwait2: {
+                // epoll_pwait with a timespec instead of milliseconds.
+                auto it = epolls_.find(static_cast<int>(a0));
+                if (it == epolls_.end()) return -22;
+                int timeout_ms = -1;
+                if (a3) {
+                    struct { std::int64_t sec, nsec; } ts{};
+                    if (!ram.get(a3, ts)) return -14;
+                    timeout_ms = static_cast<int>(ts.sec * 1000 + ts.nsec / 1'000'000);
+                }
+                std::vector<LinuxEpollEvent> ready;
+                const auto n = it->second->wait(ready, static_cast<int>(a2), timeout_ms);
+                if (n < 0) return n;
+                for (std::size_t i = 0; i < ready.size(); ++i)
+                    if (!ram.put(a1 + i * sizeof(LinuxEpollEvent), ready[i])) return -14;
+                return n;
+            }
+
+            // -- POSIX message queues. Darwin has no mq_* at all. Unlike the
+            //    SysV families (which Darwin shares), there is no primitive
+            //    to translate to -- a faithful implementation means building
+            //    priority queues with blocking send/receive from scratch,
+            //    which is a feature in its own right rather than an ABI
+            //    translation. glibc reports ENOSYS as "mqueue not supported",
+            //    which is the truth.
+            case S::mq_open: case S::mq_unlink: case S::mq_timedsend:
+            case S::mq_timedreceive: case S::mq_notify: case S::mq_getsetattr:
+                return -38;
+
             case S::nanosleep: case S::clock_nanosleep: {
                 // nanosleep(req, rem) / clock_nanosleep(clk, flags, req, rem).
                 const bool clk = sc == S::clock_nanosleep;
@@ -1631,6 +2111,155 @@ private:
 
             case S::getgroups:
                 return 0;           // root, no supplementary groups
+
+            // -- waitid(idtype, id, infop, options, rusage). The modern
+            //    wait; systemd and Go's os/exec use it. Both kernels share
+            //    the idtype values (P_ALL=0, P_PID=1, P_PGID=2).
+            case S::waitid: {
+                ::idtype_t idt = P_ALL;
+                ::id_t id = 0;
+                if (a0 == 1) {                               // P_PID
+                    auto h = pids_.host_of(static_cast<std::int32_t>(a1));
+                    if (!h) return -10;                      // ECHILD
+                    idt = P_PID;
+                    id = static_cast<::id_t>(*h);
+                } else if (a0 == 2) {                        // P_PGID
+                    auto h = pids_.host_of(static_cast<std::int32_t>(a1));
+                    if (!h) return -10;
+                    idt = P_PGID;
+                    id = static_cast<::id_t>(*h);
+                }
+                siginfo_t si{};
+                const int opts = static_cast<int>(a3) & (WEXITED | WSTOPPED
+                                                        | WCONTINUED | WNOHANG | WNOWAIT);
+                if (::waitid(idt, id, &si, opts) < 0) return darwin::fail();
+                if (a2) {
+                    // The guest's siginfo_t: signo/errno/code then the
+                    // pid/uid/status union, which is what callers read.
+                    struct LinuxSiginfoWait {
+                        std::int32_t si_signo, si_errno, si_code, pad_;
+                        std::int32_t si_pid, si_uid, si_status;
+                        std::uint8_t rest[100];
+                    };
+                    LinuxSiginfoWait out{};
+                    out.si_signo = 17;                       // SIGCHLD
+                    out.si_code = si.si_code;
+                    out.si_pid = si.si_pid ? pids_.guest_of(si.si_pid) : 0;
+                    out.si_status = si.si_status;
+                    if (!ram.put(a2, out)) return -14;
+                }
+                if (si.si_pid && (si.si_code == CLD_EXITED || si.si_code == CLD_KILLED
+                                  || si.si_code == CLD_DUMPED)) {
+                    const auto g = pids_.guest_of(si.si_pid);
+                    if (g > 0 && !(static_cast<int>(a3) & WNOWAIT)) {
+                        int st = 0;
+                        ::waitpid(si.si_pid, &st, 0);        // actually reap
+                        pids_.release(g);
+                        std::erase_if(children_,
+                                      [&](const Child& c) { return c.host == si.si_pid; });
+                    }
+                }
+                return 0;
+            }
+
+            // -- Queued signals. rt_sigqueueinfo carries a value with the
+            //    signal; we deliver the signal itself (the queued data needs
+            //    a per-signal queue the guest can only observe through a
+            //    SA_SIGINFO handler, which gets si_code = SI_USER either way).
+            case S::rt_sigqueueinfo:
+                return deliver_signal(static_cast<std::int32_t>(a0),
+                                      static_cast<std::int32_t>(a1));
+            case S::rt_tgsigqueueinfo:
+                return deliver_signal(static_cast<std::int32_t>(a1),
+                                      static_cast<std::int32_t>(a2));
+
+            // -- rt_sigtimedwait(set, info, timeout, size): synchronous
+            //    signal reception, how a program waits for SIGCHLD or a
+            //    timer without a handler.
+            case S::rt_sigtimedwait: {
+                std::uint64_t set = 0;
+                if (!ram.get(a0, set)) return -14;
+                std::uint64_t deadline_ns = 0;
+                if (a2) {
+                    struct { std::int64_t sec, nsec; } ts{};
+                    if (!ram.get(a2, ts)) return -14;
+                    deadline_ns = static_cast<std::uint64_t>(ts.sec) * 1'000'000'000ull
+                                + static_cast<std::uint64_t>(ts.nsec);
+                }
+                const auto start = std::chrono::steady_clock::now();
+                for (;;) {
+                    const std::uint64_t ready =
+                        (g_pending.bits.load(std::memory_order_relaxed)
+                         | task_.pending.load(std::memory_order_relaxed)) & set;
+                    if (ready) {
+                        const int s = std::countr_zero(ready) + 1;
+                        g_pending.bits.fetch_and(~sigbit(s), std::memory_order_relaxed);
+                        task_.pending.fetch_and(~sigbit(s), std::memory_order_relaxed);
+                        if (a1) {
+                            struct { std::int32_t signo, errno_, code, pad_; } si{s, 0, 0, 0};
+                            if (!ram.put(a1, si)) return -14;
+                        }
+                        return s;
+                    }
+                    if (deadline_ns) {
+                        const auto spent = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - start).count();
+                        if (static_cast<std::uint64_t>(spent) >= deadline_ns) return -11;  // EAGAIN
+                    }
+                    g_pending.wait_for_signal(set);
+                }
+            }
+            case S::get_robust_list:
+                // The head is per-thread state we accept but never walk
+                // (robust-list cleanup only matters when a thread dies
+                // holding a lock). Report an empty list.
+                if (a1 && !ram.put(a1, std::uint64_t{0})) return -14;
+                if (a2 && !ram.put(a2, std::uint64_t{24})) return -14;   // sizeof head
+                return 0;
+
+            // -- Identity of the machine. The core owns the hostname (it is
+            //    part of MachineSpec and uname reports it), so a guest may
+            //    not change it out from under /proc.
+            case S::sethostname: case S::setdomainname:
+                return -1;                                   // EPERM
+            case S::personality:
+                // Only the default Linux personality exists here; a guest
+                // asking for it back gets 0, asking to CHANGE it gets EINVAL
+                // rather than a silent lie.
+                return (a0 == 0 || a0 == 0xffffffff) ? 0 : -22;
+            case S::capset:
+                return 0;                                    // uid 0 holds everything
+            case S::restart_syscall:
+                // Only the kernel issues this, after a signal interrupted a
+                // restartable call. We complete calls before delivering, so
+                // it can only arrive spuriously.
+                return -4;                                   // EINTR
+            case S::vhangup: case S::reboot:
+                return -1;                                   // EPERM
+            case S::syslog:
+                // klogctl: there is no kernel ring buffer to read.
+                return a0 == 9 || a0 == 10 ? 0 : -1;         // size queries -> 0
+            case S::adjtimex: case S::clock_adjtime:
+                return -1;                                   // EPERM: not our clock
+            case S::ioprio_get:
+                return 4 << 13;                              // IOPRIO_CLASS_BE, level 4
+            case S::ioprio_set:
+                return 0;
+            case S::sched_rr_get_interval: {
+                struct { std::int64_t sec, nsec; } ts{0, 10'000'000};   // 10 ms
+                return ram.put(a1, ts) ? 0 : -14;
+            }
+            case S::sched_getattr: case S::sched_setattr:
+                // The extended scheduler interface; SCHED_OTHER with no
+                // deadline parameters is all this backend offers, and
+                // sched_getscheduler already reports that.
+                return sc == S::sched_setattr ? 0 : -22;
+            case S::kcmp:
+                // Compare two processes' resources. Only KCMP_FILE is used in
+                // practice (by sandboxes checking fd identity); without the
+                // other process's table we cannot answer, and a WRONG answer
+                // is worse than a refusal.
+                return -38;
 
             // -- Scheduling. Guest threads are host threads, so the honest
             //    answer for every query comes from the host.
@@ -2067,6 +2696,135 @@ private:
                 return g;
             }
             case S::sync:  ::sync(); return 0;
+
+            // -- Kernel objects that are file descriptors. Linux exposes a
+            //    lot of state as "an fd you can poll"; Darwin has the same
+            //    capabilities in other shapes. See hvf_fdobj.hpp.
+            case S::memfd_create: {
+                // An anonymous, growable, mappable file. Used for shared
+                // buffers and for passing an fd instead of a path.
+                const std::string name = ram.cstr(a0, 249);
+                const int h = make_memfd(name);
+                if (h < 0) return darwin::fail();
+                constexpr std::uint64_t kCloexec = 1;        // MFD_CLOEXEC
+                return install_or_close(h, (a1 & kCloexec) != 0);
+            }
+            case S::memfd_secret:
+                // Memory no other process (not even the kernel) can map.
+                // Darwin has no equivalent, and faking it would be a LIE
+                // about a security property, so refuse as a kernel without
+                // the feature does.
+                return -38;
+            case S::timerfd_create: {
+                // A timer you can poll. The expiration count is delivered
+                // through a pipe fed by the process timer wheel.
+                int p[2];
+                if (::pipe(p) < 0) return darwin::fail();
+                for (int e : p) ::fcntl(e, F_SETFD, FD_CLOEXEC);
+                constexpr std::uint64_t kNonblock = 0x800;   // TFD_NONBLOCK
+                if (a1 & kNonblock)
+                    ::fcntl(p[0], F_SETFL, ::fcntl(p[0], F_GETFL) | O_NONBLOCK);
+                const int g = proc_.with_fds([&](FdTable& t) {
+                    return t.install_eventfd(p[0], p[1], (a1 & 1) != 0);
+                });
+                if (g < 0) { ::close(p[0]); ::close(p[1]); return -24; }
+                // Each fire writes one u64 to the pipe, so a read yields the
+                // count exactly as timerfd promises.
+                const int write_end = p[1];
+                timerfds_[g] = timers_.create(0, kSigevNone);
+                timers_.set_notifier(timerfds_[g], [write_end] {
+                    const std::uint64_t one = 1;
+                    (void)::write(write_end, &one, sizeof one);
+                });
+                return g;
+            }
+            case S::timerfd_settime: {
+                auto it = timerfds_.find(gfd);
+                if (it == timerfds_.end()) return -22;
+                constexpr std::uint64_t kAbstime = 1;        // TFD_TIMER_ABSTIME
+                LinuxItimerspec v{};
+                if (a2 && !ram.get(a2, v)) return -14;
+                TimerSet::Interval next{
+                    std::chrono::seconds{v.value.sec} + std::chrono::nanoseconds{v.value.nsec},
+                    std::chrono::seconds{v.interval.sec} + std::chrono::nanoseconds{v.interval.nsec}};
+                const auto prev = timers_.set_posix(it->second, next, (a1 & kAbstime) != 0);
+                if (!prev) return -22;
+                if (a3 && !ram.put(a3, to_itimerspec(*prev))) return -14;
+                return 0;
+            }
+            case S::timerfd_gettime: {
+                auto it = timerfds_.find(gfd);
+                if (it == timerfds_.end()) return -22;
+                const auto cur = timers_.get_posix(it->second);
+                if (!cur) return -22;
+                return ram.put(a1, to_itimerspec(*cur)) ? 0 : -14;
+            }
+            case S::signalfd4: {
+                // Signals delivered as readable records, so a program can
+                // select() on them instead of using a handler.
+                std::uint64_t set = 0;
+                if (a1 && !ram.get(a1, set)) return -14;
+                if (gfd >= 0 && signalfds_.contains(gfd)) {   // re-arm an existing fd
+                    signalfds_[gfd].mask = set;
+                    return gfd;
+                }
+                int p[2];
+                if (::pipe(p) < 0) return darwin::fail();
+                for (int e : p) ::fcntl(e, F_SETFD, FD_CLOEXEC);
+                constexpr std::uint64_t kNonblock = 0x800;
+                if (a3 & kNonblock)
+                    ::fcntl(p[0], F_SETFL, ::fcntl(p[0], F_GETFL) | O_NONBLOCK);
+                const int g = proc_.with_fds([&](FdTable& t) {
+                    return t.install_eventfd(p[0], p[1], (a3 & 1) != 0);
+                });
+                if (g < 0) { ::close(p[0]); ::close(p[1]); return -24; }
+                signalfds_[g] = {set, p[1]};
+                return g;
+            }
+            case S::inotify_init1: {
+                auto in = std::make_shared<InotifyFd>();
+                if (!in->valid()) return darwin::fail();
+                const int dup_kq = ::dup(in->kq());          // the guest's pollable fd
+                if (dup_kq < 0) return darwin::fail();
+                const int g = install_or_close(dup_kq, (a0 & 1) != 0);
+                if (g < 0) return g;
+                inotifies_[g] = std::move(in);
+                return g;
+            }
+            case S::inotify_add_watch: {
+                auto it = inotifies_.find(gfd);
+                if (it == inotifies_.end()) return -22;
+                // The path arrives translated via the dispatcher's REDIRECT;
+                // do_io has no path, so resolve it here.
+                if (!resolve_) return -38;
+                const std::string host = resolve_(ram.cstr(a1));
+                if (host.empty()) return -2;
+                return it->second->add_watch(host, static_cast<std::uint32_t>(a2));
+            }
+            case S::inotify_rm_watch: {
+                auto it = inotifies_.find(gfd);
+                if (it == inotifies_.end()) return -22;
+                return it->second->rm_watch(static_cast<int>(a1));
+            }
+            case S::pidfd_open: {
+                auto h = pids_.host_of(static_cast<std::int32_t>(a0));
+                if (!h) return -3;                           // ESRCH
+                const int fd = make_pidfd(*h);
+                if (fd < 0) return darwin::fail();
+                const int g = install_or_close(fd, true);
+                if (g >= 0) pidfds_[g] = static_cast<std::int32_t>(a0);
+                return g;
+            }
+            case S::pidfd_send_signal: {
+                auto it = pidfds_.find(gfd);
+                if (it == pidfds_.end()) return -9;
+                return deliver_signal(it->second, static_cast<std::int32_t>(a1));
+            }
+            case S::pidfd_getfd:
+                // Steal an fd from another process's table. We would have to
+                // reach into a sibling linuxity's FdTable; refuse rather
+                // than hand back something that isn't that fd.
+                return -38;
             case S::pipe2: {
                 // pipe2(int fds[2], flags): a real Darwin pipe, installed
                 // into the guest's table. Host ends are CLOEXEC regardless.
@@ -2131,6 +2889,103 @@ private:
             case S::readv: case S::writev:
                 if (!need_fd()) return -9;
                 return do_vector(sc == S::writev, sc == S::writev ? *wfd : *hfd, a1, a2);
+
+            // -- Positional vectored I/O. preadv/pwritev take an offset;
+            //    the v2 forms add a flags word whose bits (RWF_HIPRI,
+            //    RWF_DSYNC, RWF_NOWAIT) are all hints we can honour by
+            //    ignoring, except RWF_NOWAIT which we approximate by letting
+            //    the fd's own O_NONBLOCK decide.
+            case S::preadv: case S::pwritev:
+            case S::preadv2: case S::pwritev2: {
+                if (!need_fd()) return -9;
+                const bool writing = sc == S::pwritev || sc == S::pwritev2;
+                // The offset is split across two registers on 32-bit ABIs;
+                // on both of ours it is a single argument.
+                const auto off = static_cast<off_t>(a3);
+                return do_vector_at(writing, writing ? *wfd : *hfd, a1, a2, off);
+            }
+
+            // -- sendfile(out, in, off*, count). A copy the kernel can do
+            //    without bouncing through user space; Darwin's sendfile only
+            //    works socket-bound, so use the same pread/pwrite loop as
+            //    copy_file_range -- which is what Linux falls back to across
+            //    filesystems anyway.
+            case S::sendfile: {
+                const int out = host_fd(gfd);
+                const int in = host_fd(static_cast<int>(a1));
+                if (out < 0 || in < 0) return -9;
+                std::int64_t off = -1;
+                if (a2) { std::int64_t v{}; if (!ram.get(a2, v)) return -14; off = v; }
+                const std::int64_t moved = copy_between(in, out, off, -1, a3);
+                if (moved < 0) return moved;
+                if (a2 && !ram.put(a2, off + moved)) return -14;
+                return moved;
+            }
+
+            // -- splice/tee/vmsplice: zero-copy pipe plumbing. The OBSERVABLE
+            //    contract is "move N bytes between these descriptors", which
+            //    a read/write loop satisfies; only the copy-avoidance is
+            //    lost. Refusing instead breaks `tar | ssh`-style pipelines
+            //    and Go's io.Copy fast path.
+            case S::splice: {
+                const int in = host_fd(gfd);
+                const int out = host_fd(static_cast<int>(a2));
+                if (in < 0 || out < 0) return -9;
+                std::int64_t in_off = -1, out_off = -1;
+                if (a1) { std::int64_t v{}; if (!ram.get(a1, v)) return -14; in_off = v; }
+                if (a3) { std::int64_t v{}; if (!ram.get(a3, v)) return -14; out_off = v; }
+                const std::int64_t moved = copy_between(in, out, in_off, out_off,
+                                                        regs_.arg(4));
+                if (moved < 0) return moved;
+                if (a1 && in_off >= 0 && !ram.put(a1, in_off + moved)) return -14;
+                if (a3 && out_off >= 0 && !ram.put(a3, out_off + moved)) return -14;
+                return moved;
+            }
+            case S::tee: {
+                // tee duplicates without consuming, which needs a peek we
+                // cannot do on a pipe. Report 0 ("nothing copied"), the same
+                // answer a caller gets from an empty pipe, so it falls back
+                // to read/write rather than failing.
+                return 0;
+            }
+            case S::vmsplice: {
+                // Guest pages -> pipe. A plain writev to the pipe has the
+                // same effect.
+                if (!need_fd()) return -9;
+                return do_vector(/*writing=*/true, *wfd, a1, a2);
+            }
+
+            // -- Allocation and flushing.
+            case S::fallocate: {
+                // fallocate(fd, mode, offset, len). Darwin's F_PREALLOCATE
+                // reserves space; mode 0 means "allocate and extend", which
+                // also needs the file length updated.
+                if (!need_fd()) return -9;
+                ::fstore_t st{};
+                st.fst_flags = F_ALLOCATECONTIG | F_ALLOCATEALL;
+                st.fst_posmode = F_PEOFPOSMODE;
+                st.fst_offset = 0;
+                st.fst_length = static_cast<off_t>(a3);
+                (void)::fcntl(*hfd, F_PREALLOCATE, &st);   // best effort
+                if (a1 == 0) {                             // extend the size
+                    struct ::stat s{};
+                    if (::fstat(*hfd, &s) == 0) {
+                        const auto want = static_cast<off_t>(a2 + a3);
+                        if (want > s.st_size && ::ftruncate(*hfd, want) < 0)
+                            return darwin::fail();
+                    }
+                }
+                return 0;
+            }
+            case S::syncfs:
+                if (!need_fd()) return -9;
+                ::sync();                                  // Darwin syncs all
+                return 0;
+            case S::sync_file_range:
+                if (!need_fd()) return -9;
+                return ::fsync(*hfd) < 0 ? darwin::fail() : 0;
+            case S::readahead:
+                return 0;                                  // advisory
             case S::lseek: {
                 if (!need_fd()) return -9;
                 auto off = ::lseek(*hfd, static_cast<off_t>(a1), static_cast<int>(a2));
@@ -2560,11 +3415,25 @@ private:
         return ready;
     }
 
+    // Install a host fd into the guest table, closing it if the table is
+    // full so the descriptor never leaks.
+    [[nodiscard]] std::int64_t install_or_close(int h, bool cloexec) {
+        const int g = proc_.with_fds([&](FdTable& t) { return t.install(h, cloexec); });
+        if (g < 0) { ::close(h); return -24; }               // EMFILE
+        return g;
+    }
+
     // readv/writev: one Darwin call per entry. Building a host iovec array
     // would need every guest base translated and bounds-checked anyway, and
     // real vectors are short (musl's stdio uses two).
     [[nodiscard]] std::int64_t do_vector(bool writing, int fd,
                                          std::uint64_t vec, std::uint64_t cnt) {
+        return do_vector_at(writing, fd, vec, cnt, -1);
+    }
+
+    // The same walk, optionally at an explicit offset (preadv/pwritev).
+    [[nodiscard]] std::int64_t do_vector_at(bool writing, int fd, std::uint64_t vec,
+                                            std::uint64_t cnt, off_t off) {
         const GuestRam ram = machine_.ram();
         std::int64_t total = 0;
         constexpr std::uint64_t kIovMax = 1024;
@@ -2574,13 +3443,42 @@ private:
             if (iov.len == 0) continue;
             auto win = ram.clamp(iov.base, iov.len);
             if (win.empty()) return total ? total : -14;
-            auto n = writing ? ::write(fd, win.data(), win.size())
-                             : ::read(fd, win.data(), win.size());
+            const auto n = off < 0
+                ? (writing ? ::write(fd, win.data(), win.size())
+                           : ::read(fd, win.data(), win.size()))
+                : (writing ? ::pwrite(fd, win.data(), win.size(), off + total)
+                           : ::pread(fd, win.data(), win.size(), off + total));
             if (n < 0) return total ? total : darwin::fail();
             total += n;
             if (static_cast<std::uint64_t>(n) < win.size()) break;  // short
         }
         return total;
+    }
+
+    // Move up to `len` bytes between two host fds, honouring explicit
+    // offsets (-1 = use the fd's own position). Shared by sendfile, splice
+    // and copy_file_range -- all three promise only that the bytes move.
+    [[nodiscard]] std::int64_t copy_between(int in, int out, std::int64_t& in_off,
+                                            std::int64_t out_off, std::uint64_t len) {
+        std::vector<std::byte> buf(std::min<std::uint64_t>(len, 1u << 20));
+        std::uint64_t done = 0;
+        while (done < len) {
+            const auto want = std::min<std::uint64_t>(len - done, buf.size());
+            const auto got = in_off < 0
+                ? ::read(in, buf.data(), want)
+                : ::pread(in, buf.data(), want, static_cast<off_t>(in_off));
+            if (got < 0) return done ? static_cast<std::int64_t>(done) : darwin::fail();
+            if (got == 0) break;
+            const auto put = out_off < 0
+                ? ::write(out, buf.data(), static_cast<std::size_t>(got))
+                : ::pwrite(out, buf.data(), static_cast<std::size_t>(got),
+                           static_cast<off_t>(out_off + static_cast<std::int64_t>(done)));
+            if (put < 0) return done ? static_cast<std::int64_t>(done) : darwin::fail();
+            done += static_cast<std::uint64_t>(put);
+            if (in_off >= 0) in_off += put;
+            if (put < got) break;
+        }
+        return static_cast<std::int64_t>(done);
     }
 
     // "/proc/self/fd/7" (or thread-self) -> 7.
@@ -2891,6 +3789,15 @@ private:
     TimerSet timers_;
     // epoll sets, keyed by the guest fd that names them.
     std::map<int, std::shared_ptr<EpollSet>> epolls_;
+    // timerfd/signalfd/inotify/pidfd state, keyed the same way.
+    std::map<int, int> timerfds_;                 // guest fd -> TimerSet id
+    struct SignalFd { std::uint64_t mask; int write_end; };
+    std::map<int, SignalFd> signalfds_;
+    std::map<int, std::shared_ptr<InotifyFd>> inotifies_;
+    std::map<int, std::int32_t> pidfds_;          // guest fd -> guest pid
+    // SysV shared-memory attachments: guest address -> segment.
+    struct ShmSeg { int id; std::uint64_t size; };
+    std::map<std::uint64_t, ShmSeg> shm_attached_;
     // Open directory streams for getdents64, keyed by guest fd.
     struct Entry {
         std::uint64_t ino{};
