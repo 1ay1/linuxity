@@ -88,6 +88,22 @@ inline constexpr int kTrappedX86_64[] = {
     // -- filesystem namespace (path args resolved through OUR tree) --------
     2, 257,                      // open/openat
     437,                         // openat2
+    // creat(85) is open(O_CREAT|O_WRONLY|O_TRUNC). It was NOT trapped and NOT
+    // handled, which made it a real sandbox escape: a direct
+    // syscall(SYS_creat, "/tmp/x") had its path passed straight to the host
+    // kernel and created the file on the HOST, outside the rootfs. Verified
+    // by doing it. glibc routes creat() through openat, so nothing ordinary
+    // hits this -- but "nothing ordinary" is not a security boundary.
+    85,                          // creat
+    // fchmodat2(452) was the inverse: the dispatcher HANDLES it (do_chmod)
+    // but it was never trapped, so that handler was dead code and the chmod
+    // went to the host path. Same shape as the lseek/rewinddir bug -- a
+    // correct handler is useless if the syscall never reaches it.
+    452,                         // fchmodat2
+    // fspick(433) takes a path for the new mount API. linuxity does not model
+    // mount namespaces, so the dispatcher refuses it -- but it must TRAP to
+    // refuse, rather than letting the host resolve the path.
+    433,                         // fspick
     4, 6, 262,                   // stat/lstat/newfstatat
     332,                         // statx
     137,                         // statfs        (path -> overlay redirect)

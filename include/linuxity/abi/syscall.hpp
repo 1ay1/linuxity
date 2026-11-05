@@ -242,6 +242,24 @@ public:
             //    real, unprivileged Linux world.
             case Sysno::open:        return path_open(r, 0, /*at=*/false);
             case Sysno::openat:      return path_open(r, 1, /*at=*/true);
+            // creat(path, mode) is open(path, O_CREAT|O_WRONLY|O_TRUNC, mode).
+            // Its flags are NOT in a register -- they are implied by the
+            // syscall itself -- so it needs the explicit-flags entry point.
+            //
+            // This was an unhandled AND untrapped path-bearing syscall, i.e. a
+            // real sandbox escape: a guest calling creat("/tmp/x") had the path
+            // passed straight to the host kernel and created the file on the
+            // HOST filesystem, outside the rootfs. Verified before fixing --
+            // creat("/tmp/LINUXITY_ESCAPE_PROOF") returned fd 4 and the file
+            // appeared in the host's /tmp, with no /tmp in the guest tree at
+            // all. glibc's creat() routes to openat so this is rare in
+            // practice, but a direct syscall() reaches it, and "rare" is not a
+            // security boundary.
+            case Sysno::creat:
+                return path_open_flags(r, 0, /*at=*/false,
+                                       wire::bits(wire::OpenFlag::creat) |
+                                       wire::bits(wire::OpenFlag::wronly) |
+                                       wire::bits(wire::OpenFlag::trunc));
             // openat2(dirfd, path, struct open_how*, size): the modern openat.
             // Its open flags live in the FIRST 8 bytes of the open_how struct
             // (arg[2]) rather than a register, so read them from guest memory
@@ -384,6 +402,10 @@ public:
             case Sysno::fsmount:       case Sysno::move_mount:
             case Sysno::open_tree:     case Sysno::mount_setattr:
             case Sysno::statmount:     case Sysno::listmount:
+            // fspick takes a PATH, so refusing it here (rather than letting it
+            // fall through to the host) is what keeps that path inside our
+            // namespace. It was neither trapped nor handled before.
+            case Sysno::fspick:
                 return eno(Errno::enosys);
 
             // -- classic mount/umount: an unprivileged guest cannot really
