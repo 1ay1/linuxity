@@ -20,6 +20,45 @@ static std::string bytes_to_string(const std::vector<std::byte>& b) {
     return s;
 }
 
+// A deliberately naive reference normalizer: stage every surviving component
+// in a vector, pop one on "..", then join. Obviously correct and obviously
+// slower than what FileNamespace actually ships (which builds the result
+// in place, with no per-call heap allocation).
+//
+// This exists because an in-place ".." is easy to get subtly wrong: an early
+// version of the fast path truncated the output to rfind('/') + 1, keeping
+// the separator, so "/a/b/../c" became "/a//c" and a LATER ".." then popped
+// only that empty component instead of a real one -- i.e. "a/b/../.." stayed
+// inside "/a" rather than reaching "/". That is a sandbox-escape-shaped bug
+// in a path canonicalizer, and no hand-written case list caught it. The
+// exhaustive comparison below did, immediately.
+static std::string reference_normalize(std::string_view p) {
+    std::vector<std::string_view> stack;
+    std::size_t i = 0;
+    while (i < p.size()) {
+        while (i < p.size() && p[i] == '/') ++i;
+        std::size_t j = i;
+        while (j < p.size() && p[j] != '/') ++j;
+        if (j > i) {
+            const std::string_view comp = p.substr(i, j - i);
+            if (comp == ".") {
+                // skip
+            } else if (comp == "..") {
+                if (!stack.empty()) stack.pop_back();
+            } else {
+                stack.push_back(comp);
+            }
+        }
+        i = j;
+    }
+    std::string out = "/";
+    for (std::size_t k = 0; k < stack.size(); ++k) {
+        out += stack[k];
+        if (k + 1 < stack.size()) out += '/';
+    }
+    return out;
+}
+
 int main() {
     // -- Lexical path normalization (pure). -------------------------------
     using FN = kernel::FileNamespace;
@@ -28,6 +67,51 @@ int main() {
     assert(FN::normalize("/../../x") == "/x");
     assert(FN::normalize("/") == "/");
     assert(FN::normalize("///") == "/");
+    // ".." must not be satisfied by an empty component left behind by a
+    // previous ".." -- these pin the exact bug the differential check below
+    // found, so a regression fails here with a readable case.
+    assert(FN::normalize("/a/b/../c") == "/a/c");       // no "/a//c"
+    assert(FN::normalize("/a/b/../..") == "/");         // reaches the root
+    assert(FN::normalize("/a/b/../../c") == "/c");
+    assert(FN::normalize("/a/..") == "/");
+    assert(FN::normalize("/a/../..") == "/");           // clamps at the root
+    assert(FN::normalize("/...") == "/...");            // not a ".."
+    assert(FN::normalize("/..a/a..") == "/..a/a..");
+
+    // Exhaustive differential check against the naive reference above: every
+    // path of up to 5 components drawn from an alphabet chosen to stress the
+    // parser (".." and "." themselves, empty components, names that merely
+    // START with dots, and multi-char names), each tried with and without a
+    // trailing slash and with and without a leading one. ~265k paths. Pure
+    // and fast, so it runs as part of the normal suite rather than a fuzzer.
+    {
+        const char* alpha[] = {"a", "bb", "..", ".", "", "/",
+                               "...", "..a", "a.."};
+        std::vector<std::string> cur{"", "/"};
+        long checked = 0;
+        for (int depth = 0; depth < 5; ++depth) {
+            std::vector<std::string> next;
+            for (const auto& s : cur) {
+                for (const char* comp : alpha) {
+                    const std::string with_slash = s + comp + "/";
+                    const std::string bare = s + comp;
+                    for (const std::string* v : {&with_slash, &bare}) {
+                        ++checked;
+                        if (FN::normalize(*v) != reference_normalize(*v)) {
+                            std::fprintf(stderr,
+                                "normalize mismatch: %s -> %s, expected %s\n",
+                                v->c_str(), FN::normalize(*v).c_str(),
+                                reference_normalize(*v).c_str());
+                            return 1;
+                        }
+                    }
+                    next.push_back(with_slash);
+                }
+            }
+            cur = std::move(next);
+        }
+        assert(checked > 200000);
+    }
 
     // -- Mount table + longest-prefix classification. ---------------------
     FN f;

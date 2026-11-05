@@ -211,7 +211,10 @@ public:
     // empty for AT_FDCWD.
     [[nodiscard]] std::string absolutize(std::string_view path,
                                          std::string_view dir_path = {}) const {
-        if (!path.empty() && path.front() == '/') return normalize(std::string{path});
+        // `normalize` takes a string_view -- the old `std::string{path}` here
+        // allocated a throwaway copy of every absolute path the guest ever
+        // passed, which is most of them.
+        if (!path.empty() && path.front() == '/') return normalize(path);
         std::string base = dir_path.empty() ? std::string{cwd()} : std::string{dir_path};
         if (base.empty()) base = "/";
         if (base.back() != '/') base += '/';
@@ -540,30 +543,45 @@ public:
 
     // Normalize an absolute path: collapse "//", resolve "." and "..", drop a
     // trailing slash (except root). Pure lexical (no symlink following).
+    //
+    // Builds the result directly instead of staging components in a
+    // std::vector<string_view> first: the vector heap-allocated on EVERY path
+    // syscall, and ".." can be honoured just as well by truncating `out` back
+    // to its previous '/' as by popping a stack. So the only allocation left
+    // is the returned string, reserved once up front -- the output is never
+    // longer than the input plus a leading slash.
     [[nodiscard]] static std::string normalize(std::string_view p) {
-        std::vector<std::string_view> stack;
+        std::string out;
+        out.reserve(p.size() + 1);
+        out += '/';
         std::size_t i = 0;
         while (i < p.size()) {
             while (i < p.size() && p[i] == '/') ++i;
             std::size_t j = i;
             while (j < p.size() && p[j] != '/') ++j;
             if (j > i) {
-                std::string_view comp = p.substr(i, j - i);
+                const std::string_view comp = p.substr(i, j - i);
                 if (comp == ".") {
                     // skip
                 } else if (comp == "..") {
-                    if (!stack.empty()) stack.pop_back();
+                    // Drop the last component AND its separator, leaving "/"
+                    // only when we have popped back to the root. Truncating
+                    // to rfind('/')+1 instead would leave the slash behind,
+                    // so the next component would double it ("/a//b") and a
+                    // later ".." would strip only that empty tail.
+                    if (out.size() > 1) {
+                        const std::size_t slash = out.rfind('/');
+                        out.resize(slash == 0 ? 1 : slash);
+                    }
                 } else {
-                    stack.push_back(comp);
+                    if (out.size() > 1) out += '/';
+                    out += comp;
                 }
             }
             i = j;
         }
-        std::string out = "/";
-        for (std::size_t k = 0; k < stack.size(); ++k) {
-            out += stack[k];
-            if (k + 1 < stack.size()) out += '/';
-        }
+        // Trailing '/' survives only for the root itself; "/a/" -> "/a".
+        if (out.size() > 1 && out.back() == '/') out.pop_back();
         return out;
     }
 
