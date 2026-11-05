@@ -7,6 +7,8 @@
 // checks, from the host side, that the writes landed in the upper layer and
 // NOT in the read-only lower. Skips gracefully off Linux/x86-64, without gcc,
 // or without ptrace.
+#include "guest_harness.hpp"
+
 #include "linuxity/host/posix_host.hpp"
 #include "linuxity/kernel/kernel.hpp"
 #include "linuxity/runtime/linux/ptrace_trap.hpp"
@@ -118,30 +120,18 @@ int main() {
     std::puts("run_mutate: skipped (needs Linux/x86-64 host)");
     return 0;
 #else
-    const std::string root  = "/tmp/lx_mutate_root";
-    const std::string upper = "/tmp/lx_mutate_upper";
-    std::system(("rm -rf " + root + " " + upper +
-                 " && mkdir -p " + root + "/bin " + root + "/base " + upper +
-                 " && printf lower > " + root + "/lower_only" +
-                 " && printf old > " + root + "/excl_lower").c_str());
+    // /base exists only in the read-only LOWER, so creating children of it
+    // forces the overlay to mirror it into upper. lower_only/excl_lower are
+    // the whiteout and O_EXCL-over-lower fixtures.
+    const auto tree = lxtest::make_tree("mutate", /*overlay=*/true,
+        "mkdir -p /tmp/lx_mutate_root/base"
+        " && printf lower > /tmp/lx_mutate_root/lower_only"
+        " && printf old > /tmp/lx_mutate_root/excl_lower");
+    if (!lxtest::compile_guest("run_mutate", tree, kSrc)) return 0;
 
-    { std::FILE* f = std::fopen("/tmp/lx_mutate_src.c", "w");
-      if (!f) { std::puts("run_mutate: skipped (no /tmp)"); return 0; }
-      std::fputs(kSrc, f); std::fclose(f); }
-    int rc = std::system(("gcc -static -O2 -o " + root +
-                          "/bin/prog /tmp/lx_mutate_src.c 2>/dev/null").c_str());
-    if (rc != 0) { std::puts("run_mutate: skipped (no static glibc / gcc)"); return 0; }
-
-    host::PosixHost hw;
-    kernel::Kernel<host::PosixHost> k{hw};
-    k.files().mount_host("/", root, upper);            // overlay: lower + upper
-    k.files().mount_virtual("/proc", vfs::make_procfs(k.procs(), k.machine()));
-
-    std::string exec = root + "/bin/prog";
-    runtime::PtraceTrap trap{exec, {"/bin/prog"}, {}, {}};
-    runtime::Cpu cpu{trap, k, trap, abi::Arch::x86_64};
-
-    auto r = cpu.run(uaddr(0), uaddr(0));
+    const std::string root  = tree.root;
+    const std::string upper = tree.upper;
+    auto r = lxtest::run_guest(tree);
 
     // Host-side invariants: the write landed in UPPER, the LOWER stayed clean.
     auto exists = [](const std::string& p) {
@@ -170,8 +160,7 @@ int main() {
     bool excl_upper_new = read1(upper + "/excl_lower") == "new\n";
     bool excl_lower_old = read1(root  + "/excl_lower") == "old";
 
-    std::system(("rm -rf " + root + " " + upper).c_str());
-    std::remove("/tmp/lx_mutate_src.c");
+    lxtest::remove_tree(tree);
 
     if (!r) { std::puts("run_mutate: skipped (ptrace unavailable)"); return 0; }
     if (*r != 42) {

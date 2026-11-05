@@ -5,6 +5,8 @@
 // /proc/self/fd/N. This test drives a static guest through those nodes and
 // asserts each behaves; it also feeds a known byte on stdin and checks
 // /dev/stdin reads it back. Skips gracefully off Linux/x86-64 or without gcc.
+#include "guest_harness.hpp"
+
 #include "linuxity/host/posix_host.hpp"
 #include "linuxity/kernel/kernel.hpp"
 #include "linuxity/runtime/linux/ptrace_trap.hpp"
@@ -73,15 +75,8 @@ int main() {
     std::puts("run_dev: skipped (needs Linux/x86-64 host)");
     return 0;
 #else
-    const std::string root = "/tmp/lx_dev_root";
-    std::system(("rm -rf " + root + " && mkdir -p " + root + "/bin").c_str());
-
-    { std::FILE* f = std::fopen("/tmp/lx_dev_src.c", "w");
-      if (!f) { std::puts("run_dev: skipped (no /tmp)"); return 0; }
-      std::fputs(kSrc, f); std::fclose(f); }
-    int rc = std::system(("gcc -static -O2 -o " + root +
-                          "/bin/prog /tmp/lx_dev_src.c 2>/dev/null").c_str());
-    if (rc != 0) { std::puts("run_dev: skipped (no static glibc / gcc)"); return 0; }
+    const auto tree = lxtest::make_tree("dev");
+    if (!lxtest::compile_guest("run_dev", tree, kSrc)) return 0;
 
     // Pipe a known byte 'Z' into the guest's stdin so /dev/stdin can echo it.
     int p[2];
@@ -92,22 +87,15 @@ int main() {
     ::dup2(p[0], 0);
     ::close(p[0]);
 
-    host::PosixHost hw;
-    kernel::Kernel<host::PosixHost> k{hw};
-    k.files().mount_host("/", root);
-    k.files().mount_virtual("/proc", vfs::make_procfs(k.procs(), k.machine()));
-    k.files().mount_virtual("/dev", vfs::make_devfs());
-
-    std::string exec = root + "/bin/prog";
-    runtime::PtraceTrap trap{exec, {"/bin/prog"}, {}, {}};
-    runtime::Cpu cpu{trap, k, trap, abi::Arch::x86_64};
-
-    auto r = cpu.run(uaddr(0), uaddr(0));
+    // /dev is this test's own concern, so it mounts it; the rootfs and /proc
+    // come from the harness.
+    auto r = lxtest::run_guest(tree, [](auto& k) {
+        k.files().mount_virtual("/dev", vfs::make_devfs());
+    });
 
     ::dup2(saved_stdin, 0);
     ::close(saved_stdin);
-    std::system(("rm -rf " + root).c_str());
-    std::remove("/tmp/lx_dev_src.c");
+    lxtest::remove_tree(tree);
 
     if (!r) { std::puts("run_dev: skipped (ptrace unavailable)"); return 0; }
     if (*r != 42) {
