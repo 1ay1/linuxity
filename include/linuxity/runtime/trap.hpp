@@ -30,6 +30,7 @@
 #include "linuxity/abi/result.hpp"
 #include "linuxity/abi/syscall.hpp"
 #include "linuxity/host/win_posix.hpp"
+#include "linuxity/runtime/backend.hpp"
 
 #include <concepts>
 #include <cstdint>
@@ -56,32 +57,10 @@ struct TrapFrame {
     std::uint64_t pc{};     // guest program counter at the trap (for logging)
 };
 
-// A host trap backend models this: it arranges for guest syscalls to trap,
-// runs the guest until one occurs (or it exits), and lets us either service
-// the call ourselves (resume with a value) OR forward it to the real host
-// kernel acting on the guest (for memory/host-resource syscalls). The whole
-// native-execution loop is expressed against this concept, so it is identical
-// whether the backend is ptrace, seccomp+SIGSYS, or an in-process trampoline.
-template <class T>
-concept SyscallTrap = requires(T t, TrapFrame& f, std::int64_t ret) {
-    // Begin executing the loaded guest at (entry, sp). Returns when the
-    // guest first traps or exits.
-    { t.start(UAddr{}, UAddr{}) } -> std::same_as<Status>;
-    // Block until the next syscall trap; fills `f`. false => guest exited.
-    { t.next(f) }                 -> std::same_as<Result<bool>>;
-    // VIRTUALIZE: set the syscall return value and resume (no real syscall).
-    { t.resume(ret) }             -> std::same_as<Status>;
-    // FORWARD: let the real host kernel run this syscall in the guest and
-    // return its result. For mmap/brk/mprotect and host-backed I/O.
-    { t.forward() }               -> std::same_as<Result<std::int64_t>>;
-    // REDIRECT: rewrite a char* path argument to a translated host path, then
-    // forward. Carries the guest's virtual namespace onto real host files.
-    { t.redirect(0, std::string{}) } -> std::same_as<Result<std::int64_t>>;
-    // Whether the guest exited during the last resume()/forward().
-    { t.exited() }                -> std::same_as<bool>;
-    // The guest's exit status once it has exited.
-    { t.exit_code() }             -> std::same_as<int>;
-};
+// A host trap backend models SyscallTrap. The contract -- the core every
+// backend must implement, plus the named optional capabilities -- lives in
+// backend.hpp, so "what must a backend provide" is one file to read rather
+// than a scatter of inline `requires` probes through this loop.
 
 // The native execution loop, written ONCE against the concept: run the guest
 // at native speed; each time it traps, dispatch through the kernel and
@@ -188,6 +167,11 @@ public:
                     // AF_UNIX bind/connect: create the socket's parent chain in
                     // the overlay upper, then poke the translated host path into
                     // the guest's sun_path and forward.
+                    //
+                    // The two backends finish differently (see backend.hpp):
+                    // ptrace resumes asynchronously and yields a Status, hvf
+                    // completes the syscall and yields its value. Both are
+                    // named capabilities, so neither can be reached by accident.
                     make_host_parents(sr.host_path);
                     auto rr = trap_.rewrite_sockaddr(sr.path_addr, sr.host_path,
                                                      sr.len_arg, sr.new_len);
@@ -365,11 +349,12 @@ private:
 
     // Fold the trap's observed fork/exec/exit events into the kernel's
     // ProcessTable, so a process monitor (top/htop/ps) reading synthesized
-    // /proc sees linuxity's real, live process tree. Guarded on the trap
-    // actually exposing the bridge, so the loop stays generic over backends
-    // that don't (the concept only requires start/next/resume/forward/...).
+    // /proc sees linuxity's real, live process tree. Gated on the NAMED
+    // capability (backend.hpp), not an inline probe: a backend that misspells
+    // drain_proc_events now fails ReportsProcEvents where it declares itself,
+    // instead of silently reporting no process events forever.
     void apply_proc_events() {
-        if constexpr (requires { trap_.drain_proc_events(); }) {
+        if constexpr (runtime::ReportsProcEvents<T>) {
             for (auto& e : trap_.drain_proc_events()) {
                 using EV = std::decay_t<decltype(e)>;
                 switch (e.kind) {

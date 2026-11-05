@@ -1155,6 +1155,17 @@ private:
     std::unordered_map<::pid_t, Task> tasks_;
 };
 
+// The Linux backend is the reference implementation: it has every capability,
+// so assert the whole contract. If a method here is renamed or its signature
+// drifts, THIS is the build error -- rather than the run loop quietly taking a
+// fallback path and forwarding an untranslated path to the host.
 static_assert(SyscallTrap<PtraceTrap>, "PtraceTrap must model SyscallTrap");
+static_assert(CompleteTrap<PtraceTrap>,
+              "PtraceTrap is the reference backend: it must have every "
+              "capability (two-path redirect, forward_sync, sockets, "
+              "exec-through-interp, signals)");
+static_assert(ReportsProcEvents<PtraceTrap>,
+              "PtraceTrap tracks the guest process tree, so it must report "
+              "clone/exec/exit events");
 
 } // namespace lx::runtime
