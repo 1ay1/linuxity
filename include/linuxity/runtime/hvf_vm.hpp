@@ -20,6 +20,7 @@
 #if defined(__APPLE__) && defined(__aarch64__)
 
 #include "linuxity/abi/result.hpp"
+#include "linuxity/runtime/hvf_fastcall.hpp"
 #include "linuxity/runtime/hvf_mem.hpp"
 #include "linuxity/runtime/hvf_regs.hpp"
 
@@ -60,6 +61,14 @@ namespace lx::runtime {
 struct HvfLayout {
     static constexpr std::uint64_t page       = 0x1000;
     static constexpr std::uint64_t vectors    = 0x0000;   // VBAR_EL1 (2 KiB-aligned)
+    // 512 syscall numbers x {value, live} -- see hvf_fastcall.hpp.
+    static constexpr std::uint64_t fastcall_bytes = 512 * 16;
+    // The in-guest syscall table (hvf_fastcall.hpp). It sits right after the
+    // L2 tables, inside the EL1-only private area, so a guest can neither
+    // read it nor forge an entry.
+    [[nodiscard]] static constexpr std::uint64_t fastcall(std::uint64_t ram) noexcept {
+        return l2_tables + n_l2(ram) * page;
+    }
     static constexpr std::uint64_t l1_table   = 0x1000;
     static constexpr std::uint64_t l2_tables  = 0x2000;
     static constexpr std::uint64_t gib        = 1ull << 30;
@@ -92,7 +101,8 @@ struct HvfLayout {
     // put priv_end past the end of RAM -- the program base then pointed
     // outside memory and the loader walked off the mapping.
     [[nodiscard]] static constexpr std::uint64_t l3_tables(std::uint64_t ram) noexcept {
-        const std::uint64_t after_l2 = l2_tables + n_l2(ram) * page;
+        const std::uint64_t after_l2 = l2_tables + n_l2(ram) * page
+                                     + fastcall_bytes;
         const std::uint64_t floor    = nonpie_base + nonpie_size;
         // Need the window itself plus the table array plus a block to spare.
         // Below 1 GiB keep the compact layout (tests, probes): reserving a
@@ -144,12 +154,19 @@ struct ExecArena {
 // every one does the same thing: `hvc #<index>` so the hypervisor (us) sees
 // which vector fired. We always resume the guest by writing PC/CPSR
 // ourselves, so the stub never returns.
-inline void write_vector_stub(std::byte* mem) {
+//
+// Vector 8 (lower EL, AArch64, synchronous -- i.e. every guest syscall) is
+// the exception: it gets the fast-path handler, which answers the pure
+// syscalls in-guest and falls through to the same `hvc #8` for the rest.
+inline void write_vector_stub(std::byte* mem, std::uint64_t ram) {
     for (int v = 0; v < 16; ++v) {
         const std::uint32_t hvc = 0xD4000002u | (static_cast<std::uint32_t>(v) << 5);
         std::memcpy(mem + HvfLayout::vectors + static_cast<std::size_t>(v) * 0x80,
                     &hvc, 4);
     }
+    auto* v8 = reinterpret_cast<std::uint32_t*>(mem + HvfLayout::vectors + 8 * 0x80);
+    (void)fastcall::emit_handler(v8, HvfLayout::fastcall(ram), 8);
+    std::memset(mem + HvfLayout::fastcall(ram), 0, HvfLayout::fastcall_bytes);
 }
 
 // Build a 3-level, 4 KiB-granule identity map of [0, ram). The private area
@@ -267,6 +284,23 @@ public:
                         win ? HvfLayout::nonpie_base : 0,
                         win ? HvfLayout::nonpie_base + HvfLayout::nonpie_size : 0};
     }
+    // Let a syscall be answered IN-GUEST with a constant (see
+    // hvf_fastcall.hpp): no VM exit, ~32 ns instead of ~930.
+    void set_fastcall(int nr, std::uint64_t value) noexcept {
+        if (nr < 0 || static_cast<std::size_t>(nr) >= fastcall::kMaxNr || !base_) return;
+        auto* t = reinterpret_cast<fastcall::Entry*>(base_ + HvfLayout::fastcall(size_));
+        t[nr].value = value;
+        std::atomic_thread_fence(std::memory_order_release);
+        t[nr].live = 1;
+    }
+    void clear_fastcall(int nr) noexcept {
+        if (nr < 0 || static_cast<std::size_t>(nr) >= fastcall::kMaxNr || !base_) return;
+        reinterpret_cast<fastcall::Entry*>(base_ + HvfLayout::fastcall(size_))[nr].live = 0;
+    }
+    void clear_all_fastcalls() noexcept {
+        if (base_) std::memset(base_ + HvfLayout::fastcall(size_), 0, HvfLayout::fastcall_bytes);
+    }
+
     [[nodiscard]] std::uint64_t mem_size() const noexcept { return size_; }
     [[nodiscard]] std::byte* raw_base() const noexcept { return base_; }
 
@@ -396,7 +430,7 @@ private:
     [[nodiscard]] Status attach(bool build_tables = true) {
         if (build_tables) {
             build_page_tables(base_, size_);
-            write_vector_stub(base_);
+            write_vector_stub(base_, size_);
             ::sys_icache_invalidate(base_ + HvfLayout::vectors, 16 * 0x80);
         }
 

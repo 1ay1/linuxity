@@ -142,7 +142,43 @@ public:
     // starting is just placing the entry state. `image_end` seeds the heap.
     [[nodiscard]] Status start(UAddr entry, UAddr sp) {
         if (value(entry)) cpu_.set_entry(value(entry), value(sp));
+        // A cloned THREAD also comes through here (its loop calls start with
+        // a null entry, already positioned). It must keep the tgid its
+        // creator gave it -- adopting its own tid would publish the wrong
+        // getpid for the whole process.
+        if (!threaded_) tgid_ = task_.tid;
+        refresh_fastcalls();
         return ok();
+    }
+
+    // Publish the syscalls the guest may answer WITHOUT a VM exit (see
+    // hvf_fastcall.hpp). The rule: a constant for this process image, no
+    // side effect, nothing written to guest memory. Identity is exactly
+    // that -- and it is ~8-20% of the syscalls a real workload makes
+    // (measured over screenfetch, python, ls, git).
+    //
+    // Called whenever identity can change: start, after fork, after exec,
+    // after setpgid/setsid. Anything NOT listed keeps trapping, so a
+    // missing refresh is a lost optimisation, never a wrong answer.
+    void refresh_fastcalls() {
+        // The table is PROCESS-wide (one VM, one private page), so only a
+        // value every thread agrees on may go in it. getpid is the THREAD
+        // GROUP id -- the main thread's tid -- which is exactly that;
+        // gettid is not, so a second thread revokes it for good.
+        machine_.set_fastcall(172, static_cast<std::uint64_t>(tgid_));          // getpid
+        if (!threaded_) machine_.set_fastcall(178, static_cast<std::uint64_t>(task_.tid));  // gettid
+        machine_.set_fastcall(173, static_cast<std::uint64_t>(parent_));         // getppid
+        machine_.set_fastcall(174, 0);                                          // getuid
+        machine_.set_fastcall(175, 0);                                          // geteuid
+        machine_.set_fastcall(176, 0);                                          // getgid
+        machine_.set_fastcall(177, 0);                                          // getegid
+        machine_.set_fastcall(124, 0);                                          // sched_yield
+    }
+
+    // A thread adopts its creator's process identity (tgid) and its own tid.
+    void adopt_thread(std::int32_t tgid) noexcept {
+        tgid_ = tgid;
+        threaded_ = true;                      // never publish gettid here
     }
 
     void set_arena(std::uint64_t image_end, std::uint64_t stack_floor) {
@@ -1563,6 +1599,11 @@ private:
     // dispositions, pid) lives in ProcessState; everything per-thread
     // (stack, TLS, tid, blocked mask) is the new TaskState.
     [[nodiscard]] std::int64_t do_clone_thread(const CloneRequest& req) {
+        // A second thread means gettid is no longer a process constant, and
+        // the in-guest table can't tell threads apart: give it back to the
+        // trap path, for every thread, permanently.
+        threaded_ = true;
+        machine_.clear_fastcall(178);
         if (!spawn_thread_) return -38;
         if (!req.stack) return -22;                      // a thread needs a stack
         // A thread's tid lives in the SAME number space as every pid in the
@@ -1589,6 +1630,7 @@ private:
         start.cpu.sp_el0 = req.stack;
         if (req.flags & clone_flag::settls) start.cpu.tpidr_el0 = req.tls;
         start.tid = tid;
+        start.tgid = tgid_;                     // same process, new thread
         start.sig_mask = task_.sig_mask;        // inherited, per POSIX
         start.clear_child_tid =
             (req.flags & clone_flag::child_cleartid) ? req.child_tid_addr : 0;
@@ -1696,6 +1738,7 @@ public:
     struct ThreadStart {
         HvfCpu::CpuState cpu{};
         std::int32_t tid{};
+        std::int32_t tgid{};            // the process this thread belongs to
         std::uint64_t sig_mask{};
         std::uint64_t clear_child_tid{};
     };
@@ -1728,6 +1771,8 @@ public:
         cpu_.load(img.cpu);
         task_.tid = img.self;
         parent_ = img.parent;
+        tgid_ = img.self;             // a fork child is its own thread group
+        refresh_fastcalls();          // new pid/ppid for this process
         proc_.umask = img.umask;
         proc_.with_space([&](AddressSpace& t) { return t.restore(img.vmas, img.brk, img.arena); });
         proc_.with_fds([&](FdTable& t) { return t.import_table(img.fds, host_fds); });
@@ -1917,6 +1962,9 @@ private:
         regs_.spsr = 0;
         cpu_.set_sp(ex->sp);
         execed_ = true;
+        tgid_ = task_.tid;            // exec collapses the thread group to us
+        threaded_ = false;            // ...and kills every other thread
+        refresh_fastcalls();          // same pid, but a fresh image
         pids_.set_exe(task_.tid, exe_path_of(host_path, guest_path));
         pids_.mark_execed(task_.tid);           // releases a vfork parent
         return 0;
@@ -4284,6 +4332,10 @@ private:
     TaskState& task_;
     PidSpace& pids_;
     std::int32_t parent_{0};
+    // The thread-group id: this process's pid, i.e. its MAIN thread's tid.
+    // A cloned thread keeps it while task_.tid becomes its own.
+    std::int32_t tgid_{1};
+    bool threaded_{false};        // a clone(CLONE_THREAD) has happened
     struct Child { std::int32_t guest; pid_t host; };
     std::vector<Child> children_;
     Resolver resolve_;

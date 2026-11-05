@@ -701,6 +701,7 @@ void run_guest_thread(ThreadContext& ctx, runtime::HvfTrap::ThreadStart start) {
     task.clear_child_tid = start.clear_child_tid;
 
     runtime::HvfTrap trap{ctx.machine, cpu, ctx.proc, task, ctx.pids};
+    trap.adopt_thread(start.tgid);
     wire_spawners(trap, ctx);
     runtime::HvfMem mem{ctx.machine, &trap};
 
