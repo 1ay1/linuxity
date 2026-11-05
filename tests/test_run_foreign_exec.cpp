@@ -8,6 +8,8 @@
 // (aarch64) ELF stub in a rootfs, runs `linuxity --root <fs> /foreign`, and
 // asserts a nonzero exit. A native static probe in the same rootfs must still
 // run, proving the guard is arch-specific and not a blanket refusal.
+#include "guest_harness.hpp"
+
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -33,8 +35,11 @@ int main() {
     return 0;
 #else
     const std::string bin  = linuxity_bin();
-    const std::string root = "/tmp/lx_foreign_root";
-    std::system(("rm -rf " + root + " && mkdir -p " + root + "/bin").c_str());
+    // This test drives the real `linuxity` BINARY rather than Cpu directly --
+    // it is checking the refusal path end to end, including the exit code the
+    // CLI reports -- so it uses the harness's tree helpers but not run_guest.
+    const auto tree = lxtest::make_tree("foreign");
+    const std::string root = tree.root;
 
     // Plant a foreign-arch (aarch64, e_machine=183) ELF64 stub at /foreign.
     {
@@ -57,7 +62,12 @@ int main() {
         std::fputs("int main(void){return 0;}\n", f); std::fclose(f);
         int rc = std::system(("gcc -static -O2 -o " + root +
                               "/bin/ok /tmp/lx_foreign_ok.c 2>/dev/null").c_str());
-        if (rc != 0) { std::puts("run_foreign_exec: skipped (no static gcc)"); return 0; }
+        if (rc != 0) {
+            std::puts("run_foreign_exec: skipped (no static gcc)");
+            lxtest::remove_tree(tree);
+            std::remove("/tmp/lx_foreign_ok.c");
+            return 0;
+        }
     }
 
     // The foreign binary must be REFUSED (nonzero exit).
@@ -71,7 +81,7 @@ int main() {
         (bin + " --root " + root + " /bin/ok >/dev/null 2>&1").c_str());
     native_rc = WIFEXITED(native_rc) ? WEXITSTATUS(native_rc) : -1;
 
-    std::system(("rm -rf " + root).c_str());
+    lxtest::remove_tree(tree);
     std::remove("/tmp/lx_foreign_ok.c");
 
     if (foreign_rc != 1) {

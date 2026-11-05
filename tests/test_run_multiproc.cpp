@@ -6,6 +6,8 @@
 // shell child, and assert both read the ROOTFS file. Proves the ptrace trap
 // traces the whole process tree without deadlocking on the parent's wait4.
 // Skips gracefully off Linux/x86-64, without gcc, or without ptrace.
+#include "guest_harness.hpp"
+
 #include "linuxity/host/posix_host.hpp"
 #include "linuxity/kernel/kernel.hpp"
 #include "linuxity/runtime/linux/ptrace_trap.hpp"
@@ -32,20 +34,18 @@ static const char* kForker =
     "  if(p==0){ char* av[]={(char*)\"/bin/reader\",0}; execve(av[0],av,0); _exit(127); }\n"
     "  int st=0; waitpid(p,&st,0); return WIFEXITED(st)?WEXITSTATUS(st):1; }\n";
 
-static std::string run(const std::string& root, const std::string& prog) {
-    host::PosixHost hw;
-    kernel::Kernel<host::PosixHost> k{hw};
-    k.files().mount_host("/", root);
-    k.files().mount_virtual("/proc", vfs::make_procfs(k.procs(), k.machine()));
-    { kernel::ProcInfo init; init.pid = 1; init.cmdline = prog;
-      k.procs().upsert(init); }
-    std::string exec = root + prog;
-    runtime::PtraceTrap trap{exec, {prog}, {}, {}};
-    runtime::Cpu cpu{trap, k, trap, abi::Arch::x86_64};
-
+// Run one of the two guests and return what it printed. Takes the tree by
+// value so each call can point `exec` at a different program.
+static std::string run(lxtest::GuestTree tree, const std::string& prog) {
+    tree.exec = prog;
     std::fflush(stdout);
     std::freopen("/tmp/lx_mp_out.txt", "w", stdout);
-    auto r = cpu.run(uaddr(0), uaddr(0));
+    auto r = lxtest::run_guest(tree, [&](auto& k) {
+        kernel::ProcInfo init;
+        init.pid = 1;
+        init.cmdline = prog;
+        k.procs().upsert(init);
+    });
     std::fflush(stdout);
     std::freopen("/dev/tty", "w", stdout);
     if (!r) return "<skip>";
@@ -62,22 +62,20 @@ int main() {
     std::puts("run_multiproc: skipped (needs Linux/x86-64 host)");
     return 0;
 #else
-    const std::string root = "/tmp/lx_mp_root";
-    std::system(("rm -rf " + root + " && mkdir -p " + root + "/bin " + root + "/etc").c_str());
-    { std::FILE* f = std::fopen((root + "/etc/os-release").c_str(), "w");
-      if (!f) { std::puts("run_multiproc: skipped (no /tmp)"); return 0; }
-      std::fputs("ID=rootfs-marker-mp\n", f); std::fclose(f); }
-    { std::FILE* f = std::fopen("/tmp/lx_mp_reader.c", "w"); std::fputs(kReader, f); std::fclose(f); }
-    { std::FILE* f = std::fopen("/tmp/lx_mp_forker.c", "w"); std::fputs(kForker, f); std::fclose(f); }
-    int rc1 = std::system(("gcc -static -O2 -o " + root + "/bin/reader /tmp/lx_mp_reader.c 2>/dev/null").c_str());
-    int rc2 = std::system(("gcc -static -O2 -o " + root + "/bin/forker /tmp/lx_mp_forker.c 2>/dev/null").c_str());
-    if (rc1 != 0 || rc2 != 0) { std::puts("run_multiproc: skipped (no static gcc)"); return 0; }
+    // The rootfs os-release carries a marker the host's cannot have, so the
+    // output proves BOTH the direct run and the forked child read the rootfs.
+    const auto tree = lxtest::make_tree("mp", /*overlay=*/false,
+        "mkdir -p /tmp/lx_mp_root/etc"
+        " && printf 'ID=rootfs-marker-mp\\n' > /tmp/lx_mp_root/etc/os-release",
+        "/bin/reader");
+    if (!lxtest::compile_guest("run_multiproc", tree, kReader)) return 0;
+    if (!lxtest::compile_extra("run_multiproc", tree, "/bin/forker", kForker))
+        return 0;
 
-    std::string direct = run(root, "/bin/reader");
-    std::string forked = run(root, "/bin/forker");
+    std::string direct = run(tree, "/bin/reader");
+    std::string forked = run(tree, "/bin/forker");
 
-    std::system(("rm -rf " + root).c_str());
-    std::remove("/tmp/lx_mp_reader.c"); std::remove("/tmp/lx_mp_forker.c");
+    lxtest::remove_tree(tree);
     std::remove("/tmp/lx_mp_out.txt");
 
     if (direct == "<skip>" || forked == "<skip>") {

@@ -118,6 +118,57 @@ inline void remove_tree(const GuestTree& g) {
     return true;
 }
 
+// Compile an ADDITIONAL guest program into the tree at `guest_path`.
+//
+// Three tests build more than one binary: run_multiproc (a forker and the
+// reader it execs), run_shebang (a launcher and the interpreter its script
+// names), run_foreign_exec. Returns false having printed the skip reason, so
+// it composes the same way as compile_guest.
+//
+// `flags` lets a caller drop -static: run_shebang needs a DYNAMIC interpreter
+// on purpose, since resolving its PT_INTERP through the translation layer is
+// the thing under test.
+[[nodiscard]] inline bool compile_extra(const char* test_name,
+                                        const GuestTree& g,
+                                        const std::string& guest_path,
+                                        const char* src,
+                                        const char* flags = "-static -O2") {
+    const std::string csrc = "/tmp/lx_" + std::string{test_name} + "_extra.c";
+    {
+        std::FILE* f = std::fopen(csrc.c_str(), "w");
+        if (!f) {
+            std::printf("%s: skipped (no writable /tmp)\n", test_name);
+            return false;
+        }
+        std::fputs(src, f);
+        std::fclose(f);
+    }
+    const std::string cmd = "gcc " + std::string{flags} + " -o " + g.root +
+                            guest_path + " " + csrc + " 2>/dev/null";
+    const int rc = std::system(cmd.c_str());
+    std::remove(csrc.c_str());
+    if (rc != 0) {
+        std::printf("%s: skipped (cannot build %s)\n", test_name,
+                    guest_path.c_str());
+        remove_tree(g);
+        return false;
+    }
+    return true;
+}
+
+// Write a file INTO the guest tree (a shell script, a fixture the guest
+// reads). `mode` is applied with chmod, so a script can be made executable.
+inline void write_guest_file(const GuestTree& g, const std::string& guest_path,
+                              const std::string& content,
+                              const char* mode = nullptr) {
+    const std::string host = g.root + guest_path;
+    if (std::FILE* f = std::fopen(host.c_str(), "w")) {
+        std::fwrite(content.data(), 1, content.size(), f);
+        std::fclose(f);
+    }
+    if (mode) std::system(("chmod " + std::string{mode} + " " + host).c_str());
+}
+
 // Run the compiled guest under the ptrace backend, with the rootfs mounted
 // (over an overlay upper when `g.upper` is set) and /proc synthesized.
 //

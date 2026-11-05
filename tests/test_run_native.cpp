@@ -34,8 +34,17 @@ int main() {
       std::fputs(kSrc, f); std::fclose(f); }
     int rc = std::system("gcc -static -O2 -o /tmp/lx_run_native "
                          "/tmp/lx_run_native.c 2>/dev/null");
-    if (rc != 0) { std::puts("run_native: skipped (no static glibc / gcc)"); return 0; }
+    if (rc != 0) {
+        std::puts("run_native: skipped (no static glibc / gcc)");
+        std::remove("/tmp/lx_run_native.c");
+        return 0;
+    }
 
+    // Deliberately NOT on guest_harness.hpp: this test runs a host binary with
+    // NO rootfs and NO mounts -- not even /proc -- because the thing it proves
+    // is that a real static glibc program reaches main() with nothing
+    // virtualized but identity. Giving it the harness's rootfs and procfs
+    // would change what it tests.
     host::PosixHost hw;
     kernel::Kernel<host::PosixHost> k{hw};
     runtime::PtraceTrap trap{"/tmp/lx_run_native", {"/tmp/lx_run_native"}};

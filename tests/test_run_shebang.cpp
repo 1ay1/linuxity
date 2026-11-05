@@ -8,6 +8,8 @@
 // the IN-GUEST execve path is exercised end to end, and asserts the script's
 // interpreter runs and its exit code flows through. Skips gracefully off
 // Linux/x86-64 or without gcc/ptrace.
+#include "guest_harness.hpp"
+
 #include "linuxity/host/posix_host.hpp"
 #include "linuxity/kernel/kernel.hpp"
 #include "linuxity/runtime/linux/ptrace_trap.hpp"
@@ -41,50 +43,26 @@ int main() {
     std::puts("run_shebang: skipped (needs Linux/x86-64 host)");
     return 0;
 #else
-    const std::string root = "/tmp/lx_shebang_root";
-    std::system(("rm -rf " + root + " && mkdir -p " + root + "/bin").c_str());
-
-    { std::FILE* f = std::fopen("/tmp/lx_shebang_l.c", "w");
-      if (!f) { std::puts("run_shebang: skipped (no /tmp)"); return 0; }
-      std::fputs(kLauncherSrc, f); std::fclose(f); }
-    { std::FILE* f = std::fopen("/tmp/lx_shebang_i.c", "w");
-      std::fputs(kInterpSrc, f); std::fclose(f); }
-
-    int rc1 = std::system(("gcc -static -O2 -o " + root +
-                           "/bin/launch /tmp/lx_shebang_l.c 2>/dev/null").c_str());
+    const auto tree = lxtest::make_tree("shebang", /*overlay=*/false, "",
+                                        "/bin/launch");
+    if (!lxtest::compile_guest("run_shebang", tree, kLauncherSrc)) return 0;
     // The interpreter is STATIC too: this mini-rootfs has no ld.so/libc, so a
     // dynamic interpreter couldn't load. The dynamic-interpreter ld.so chain
     // is proven separately by the real pacman-hook run; here we exercise the
     // shebang DETECTION + rewrite (path_exec) and the static-interpreter path.
-    int rc2 = std::system(("gcc -static -O2 -o " + root +
-                           "/bin/mysh /tmp/lx_shebang_i.c 2>/dev/null").c_str());
-    std::remove("/tmp/lx_shebang_l.c");
-    std::remove("/tmp/lx_shebang_i.c");
-    if (rc1 != 0 || rc2 != 0) {
-        std::puts("run_shebang: skipped (no static/dynamic gcc)");
-        std::system(("rm -rf " + root).c_str());
+    if (!lxtest::compile_extra("run_shebang", tree, "/bin/mysh", kInterpSrc))
         return 0;
-    }
 
-    // The #! script: interpreter is /bin/mysh (dynamic).
-    { std::FILE* f = std::fopen((root + "/bin/hook").c_str(), "w");
-      std::fputs("#!/bin/mysh\n# a scriptlet\n", f); std::fclose(f); }
-    std::system(("chmod +x " + root + "/bin/hook").c_str());
-
-    host::PosixHost hw;
-    kernel::Kernel<host::PosixHost> k{hw};
-    k.files().mount_host("/", root);
-    k.files().mount_virtual("/proc", vfs::make_procfs(k.procs(), k.machine()));
-    k.files().mount_virtual("/dev", vfs::make_devfs());
+    // The #! script, naming /bin/mysh as its interpreter.
+    lxtest::write_guest_file(tree, "/bin/hook", "#!/bin/mysh\n# a scriptlet\n",
+                             "+x");
 
     // Run the static launcher; it execve's the #! script, which path_exec
-    // rewrites into the ld.so -> mysh(guest) -> hook(guest) chain.
-    std::string exec = root + "/bin/launch";
-    runtime::PtraceTrap trap{exec, {"/bin/launch"}, {}, {}};
-    runtime::Cpu cpu{trap, k, trap, abi::Arch::x86_64};
-
-    auto r = cpu.run(uaddr(0), uaddr(0));
-    std::system(("rm -rf " + root).c_str());
+    // rewrites into the mysh(guest) -> hook(guest) chain.
+    auto r = lxtest::run_guest(tree, [](auto& k) {
+        k.files().mount_virtual("/dev", vfs::make_devfs());
+    });
+    lxtest::remove_tree(tree);
 
     if (!r) { std::puts("run_shebang: skipped (ptrace unavailable)"); return 0; }
     if (*r == 7) {

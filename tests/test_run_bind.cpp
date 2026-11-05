@@ -11,6 +11,8 @@
 //
 // A second case binds to the SAME guest path as an existing rootfs dir and
 // asserts the bind shadows it (longest-prefix / later-registration wins).
+#include "guest_harness.hpp"
+
 #include "linuxity/host/posix_host.hpp"
 #include "linuxity/kernel/kernel.hpp"
 #include "linuxity/runtime/linux/ptrace_trap.hpp"
@@ -36,63 +38,55 @@ static const char* kProbe =
     "  return (unsigned char)c;\n"
     "}\n";
 
-static int run(const std::string& root,
-               const std::vector<std::pair<std::string,std::string>>& binds,
-               const std::vector<std::string>& argv) {
-    host::PosixHost hw;
-    kernel::Kernel<host::PosixHost> k{hw};
-    k.files().mount_host("/", root);
-    k.files().mount_virtual("/proc", vfs::make_procfs(k.procs(), k.machine()));
-    // Bind mounts registered AFTER the rootfs — exactly what main.cpp does.
-    for (auto& [h, g] : binds) k.files().mount_host(g, h);
-    { kernel::ProcInfo init; init.pid = 1; init.cmdline = argv.empty()?"":argv[0];
-      k.procs().upsert(init); }
-    std::string exec = root + argv[0];
-    // A non-empty environment: a static glibc program's startup reads the
-    // env/auxv block, and an entirely empty one can perturb its early I/O.
-    std::vector<std::string> env{"PATH=/bin:/usr/bin", "HOME=/root"};
-    runtime::PtraceTrap trap{exec, argv, env, {}};
-    runtime::Cpu cpu{trap, k, trap, abi::Arch::x86_64};
-    auto r = cpu.run(uaddr(0), uaddr(0));
-    return r ? *r : -1;
-}
-
 int main() {
 #if !defined(__linux__) || !defined(__x86_64__)
     std::puts("run_bind: skipped (needs Linux/x86-64 host)");
     return 0;
 #else
-    const std::string root = "/tmp/lx_bind_root";
     const std::string data = "/tmp/lx_bind_data";     // bound at /data
     const std::string shadow = "/tmp/lx_bind_shadow";  // bound over rootfs /etc
-    std::system(("rm -rf " + root + " " + data + " " + shadow +
-                 " && mkdir -p " + root + "/bin " + root + "/etc " +
-                 data + " " + shadow).c_str());
-    // marker in the BOUND host dir: byte 'A' (0x41 = 65).
-    { std::FILE* f = std::fopen((data + "/marker").c_str(), "w");
-      if (f) { std::fputc('A', f); std::fclose(f); } }
-    // rootfs /etc/id says 'R' (0x52 = 82); the shadow bind's /etc/id says 'S'.
-    { std::FILE* f = std::fopen((root + "/etc/id").c_str(), "w");
-      if (f) { std::fputc('R', f); std::fclose(f); } }
-    { std::FILE* f = std::fopen((shadow + "/id").c_str(), "w");
-      if (f) { std::fputc('S', f); std::fclose(f); } }
+    // The bound dirs live OUTSIDE the guest tree -- that is the point: they
+    // are host directories exposed at a guest prefix. marker='A' in the bound
+    // dir; rootfs /etc/id='R' and the shadow bind's /etc/id='S', so which byte
+    // comes back says which mount won.
+    const auto tree = lxtest::make_tree("bind", /*overlay=*/false,
+        "mkdir -p /tmp/lx_bind_root/etc /tmp/lx_bind_data /tmp/lx_bind_shadow"
+        " && printf A > /tmp/lx_bind_data/marker"
+        " && printf R > /tmp/lx_bind_root/etc/id"
+        " && printf S > /tmp/lx_bind_shadow/id",
+        "/bin/bprobe");
+    if (!lxtest::compile_guest("run_bind", tree, kProbe)) {
+        // The bound dirs live OUTSIDE the tree, so remove_tree cannot
+        // reach them -- a skip must still not leave them behind.
+        std::system(("rm -rf " + data + " " + shadow).c_str());
+        return 0;
+    }
 
-    { std::FILE* f = std::fopen("/tmp/lx_bind.c", "w");
-      if (!f) { std::puts("run_bind: skipped (no /tmp)"); return 0; }
-      std::fputs(kProbe, f); std::fclose(f); }
-    int rc = std::system(("gcc -static -O2 -o " + root +
-                          "/bin/bprobe /tmp/lx_bind.c 2>/dev/null").c_str());
-    if (rc != 0) { std::puts("run_bind: skipped (no static gcc)"); return 0; }
+    // Bind mounts are registered AFTER the rootfs -- exactly what main.cpp
+    // does, and the ordering is what makes a bind shadow the rootfs.
+    // A non-empty environment: a static glibc startup reads the env/auxv
+    // block, and an entirely empty one can perturb its early I/O.
+    using Binds = std::vector<std::pair<std::string, std::string>>;
+    auto run = [&](const Binds& binds, const std::vector<std::string>& argv) {
+        auto r = lxtest::run_guest(tree, [&](auto& k) {
+            for (auto& [h, g] : binds) k.files().mount_host(g, h);
+            kernel::ProcInfo init;
+            init.pid = 1;
+            init.cmdline = argv.empty() ? "" : argv[0];
+            k.procs().upsert(init);
+        }, argv, {"PATH=/bin:/usr/bin", "HOME=/root"});
+        return r ? *r : -1;
+    };
 
     // Case 1: bind an external host dir at a FRESH guest prefix /data.
-    int c1 = run(root, {{data, "/data"}}, {"/bin/bprobe", "/data/marker"});
+    int c1 = run({{data, "/data"}}, {"/bin/bprobe", "/data/marker"});
     // Case 2: without the bind, /etc/id is the rootfs 'R'.
-    int c2 = run(root, {}, {"/bin/bprobe", "/etc/id"});
+    int c2 = run({}, {"/bin/bprobe", "/etc/id"});
     // Case 3: bind SHADOWS the rootfs /etc — now /etc/id is the bind's 'S'.
-    int c3 = run(root, {{shadow, "/etc"}}, {"/bin/bprobe", "/etc/id"});
+    int c3 = run({{shadow, "/etc"}}, {"/bin/bprobe", "/etc/id"});
 
-    std::system(("rm -rf " + root + " " + data + " " + shadow).c_str());
-    std::remove("/tmp/lx_bind.c");
+    lxtest::remove_tree(tree);
+    std::system(("rm -rf " + data + " " + shadow).c_str());
 
     if (c1 == -1) { std::puts("run_bind: skipped (ptrace unavailable)"); return 0; }
     if (c1 != 'A') {
