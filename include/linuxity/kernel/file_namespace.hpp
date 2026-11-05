@@ -665,9 +665,19 @@ private:
             if (up.empty()) { host = std::move(lo); continue; }
             std::string next;
             switch (probe_link(up.c_str(), next)) {
-                case Probe::symlink: host = std::move(up); pre = std::move(next); break;
-                case Probe::present: host = std::move(up); break;
-                case Probe::absent:  host = std::move(lo); break;
+                case Probe::symlink:
+                    host = std::move(up);
+                    pre = std::move(next);
+                    break;
+                case Probe::present:
+                    // The probe already proved this is NOT a symlink, so the
+                    // chase ends here. Looping would spend another readlink
+                    // to be told EINVAL a second time.
+                    return PathClass{Realm2::host_backed, std::move(up),
+                                     Errno::enoent, {}};
+                case Probe::absent:
+                    host = std::move(lo);
+                    break;
             }
         }
         return PathClass{Realm2::host_backed, std::move(host), Errno::enoent, {}};
