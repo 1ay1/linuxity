@@ -31,6 +31,26 @@ else()
         -fno-rtti)
 endif()
 
+# ---- Sanitizers (opt-in: -DLX_SANITIZE=address,undefined) ----------------
+#
+# Off by default because the live guest tests drive ptrace and read another
+# process's memory, which ASan's bookkeeping slows down -- but this codebase
+# is exactly the kind that hides UB. It pokes guest memory through
+# PTRACE_PEEKDATA, writes raw ABI structs into another address space, and
+# hand-manages an fd table and an interval map. A warning flag cannot see any
+# of that; a sanitizer can.
+#
+# `undefined` matters as much as `address` here: abi/wire does a lot of
+# shifting and masking on guest values, and a signed shift or a misaligned
+# load is precisely the fault that works on x86-64 and breaks on aarch64.
+set(LX_SANITIZE "" CACHE STRING
+    "Comma-separated -fsanitize list, e.g. address,undefined")
+if(LX_SANITIZE AND NOT MSVC)
+    message(STATUS "linuxity: sanitizers enabled (${LX_SANITIZE})")
+    add_compile_options(-fsanitize=${LX_SANITIZE} -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=${LX_SANITIZE})
+endif()
+
 # ---- The runtime core: host-agnostic Linux ABI ---------------------------
 add_library(linuxity_core INTERFACE)
 target_include_directories(linuxity_core INTERFACE ${CMAKE_SOURCE_DIR}/include)
