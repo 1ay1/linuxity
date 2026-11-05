@@ -1,0 +1,378 @@
+// linuxity/conform/observation.hpp
+//
+// The algebra of DIFFERENTIAL syscall conformance: what it means for two runs
+// of the same scenario to AGREE.
+//
+// WHY DIFFERENTIAL. A conformance test cannot assert what Linux "should" do:
+// there is no formal spec, and a hand-written belief about the kernel is
+// routinely false. We shipped one -- a test asserted telldir() returns to its
+// saved cookie after a relative lseek; POSIX implies it, the real kernel
+// returns 18 where the test wanted 1. Worse, the old coverage-style
+// conformance test (every syscall decodes, every syscall is handled by name)
+// stayed green through a real bug where lseek on a virtual directory returned
+// an entry index (13) where Linux returns a byte offset (368). Coverage is
+// necessarily true and says nothing about correctness.
+//
+// So the reference is a REAL Linux kernel, and no file in conform/ encodes an
+// opinion about what a syscall does.
+//
+// THE CENTRAL SPLIT. linuxity targets Linux arm64/x86-64, macOS arm64 and
+// Windows x86-64. On the two Linux hosts a Linux kernel is available to be the
+// oracle; on macOS and Windows one does not exist. If "compare against the
+// live kernel" were part of the core contract, the harness would build only on
+// Linux and the other hosts would get a vacuous pass -- the same silent
+// wrong-answer failure runtime/backend.hpp was written to eliminate.
+//
+// So two things that were conflated are separated:
+//
+//   * The LAW -- what agreement MEANS. Host-independent, pure, constexpr.
+//     Compiles and behaves identically on all four targets. Lives here.
+//   * The ORACLE -- where the reference trace COMES FROM. Host-dependent, and
+//     therefore a named capability, not a universal. Lives in oracle.hpp.
+//
+// That is the SSOT: the comparison engine is written once, and every host
+// reuses it whether its reference trace came from a live kernel or a recording.
+//
+// Three types carry the law:
+//
+//     Observation  - a PRODUCT: everything one syscall produced.
+//     Verdict      = Match | Divergence        (a SUM, never a bool)
+//     Law          - a concept: which fields two Observations may differ in.
+//
+// WHY VERDICT IS A SUM. `bool equal(a, b)` discards the only interesting
+// information: WHAT differed. A false says a test failed; a Divergence says
+// "step 1 lseek: native 368, guest 13". The sum makes the explanation
+// mandatory -- Divergence has no default constructor, so a failing verdict
+// cannot be built without naming both sides.
+//
+// WHY LAW IS A CONCEPT. Some results legitimately differ between two runs:
+// pids, timestamps, random bytes, address-space layout. The naive fix is an
+// `if` in the comparator, which buries policy in control flow and makes "why
+// is this field exempt" unanswerable. A Law is a value with a stated reason,
+// so every exemption is declared, greppable and attributable.
+#pragma once
+
+#include <algorithm>
+#include <concepts>
+#include <cstddef>
+#include <cstdint>
+#include <span>
+#include <string>
+#include <string_view>
+#include <tuple>
+#include <utility>
+#include <variant>
+#include <vector>
+
+#include "linuxity/abi/sysno.hpp"
+#include "linuxity/conform/sysno_names.hpp"
+
+namespace lx::conform {
+
+// -- what a syscall returned ----------------------------------------------
+
+// The kernel's return convention is a SUM, not an int: a syscall either
+// yielded a value or failed with an errno. Linux packs both into one register
+// (negative small magnitude means -errno), and the bug classes that follow --
+// treating -EINVAL as a huge positive, negating twice, comparing a packed
+// value against an unpacked one -- all come from leaving them packed. So we
+// unpack once, at the boundary, and the type forbids re-conflating them.
+class Returned {
+public:
+    // Decode the raw register exactly as the kernel encodes it. Linux reserves
+    // only the last page of the range for errors, so a legitimate return (an
+    // mmap address, a large offset) is not mistaken for one.
+    [[nodiscard]] static constexpr Returned from_raw(std::int64_t raw) noexcept {
+        if (raw < 0 && raw >= -4095)
+            return Returned{Err{static_cast<std::int32_t>(-raw)}};
+        return Returned{Ok{raw}};
+    }
+
+    [[nodiscard]] static constexpr Returned ok(std::int64_t v) noexcept {
+        return Returned{Ok{v}};
+    }
+    [[nodiscard]] static constexpr Returned failed(std::int32_t e) noexcept {
+        return Returned{Err{e}};
+    }
+
+    [[nodiscard]] constexpr bool is_ok() const noexcept {
+        return std::holds_alternative<Ok>(v_);
+    }
+
+    // Exhaustive consumption, mirroring abi::Outcome::match.
+    template <class OnOk, class OnErr>
+    [[nodiscard]] constexpr decltype(auto) match(OnOk&& ok_fn,
+                                                 OnErr&& err_fn) const {
+        if (const auto* o = std::get_if<Ok>(&v_))
+            return std::forward<OnOk>(ok_fn)(o->value);
+        return std::forward<OnErr>(err_fn)(std::get<Err>(v_).number);
+    }
+
+    friend constexpr bool operator==(const Returned&, const Returned&) = default;
+
+    [[nodiscard]] std::string describe() const;
+
+private:
+    struct Ok {
+        std::int64_t value;
+        friend constexpr bool operator==(Ok, Ok) = default;
+    };
+    struct Err {
+        std::int32_t number;
+        friend constexpr bool operator==(Err, Err) = default;
+    };
+
+    constexpr explicit Returned(std::variant<Ok, Err> v) noexcept
+        : v_{std::move(v)} {}
+
+    std::variant<Ok, Err> v_;
+};
+
+// A buffer the syscall wrote into guest memory, tagged with the argument whose
+// pointer it came from. Content and provenance travel together, because
+// "buffers differ" is useless without knowing WHICH buffer.
+struct Written {
+    int                    arg;
+    std::vector<std::byte> bytes;
+
+    Written(int a, std::vector<std::byte> b) : arg{a}, bytes{std::move(b)} {}
+
+    friend bool operator==(const Written&, const Written&) = default;
+};
+
+// Everything one syscall produced. A PRODUCT, because these are genuinely
+// independent: a call can succeed writing nothing, fail writing nothing, or
+// succeed writing several buffers. No combination is illegal, so unlike
+// Returned a struct is the honest encoding -- the shape follows the domain.
+struct Observation {
+    abi::Sysno           call;
+    Returned             returned;
+    std::vector<Written> wrote{};
+    // A label for the step, so a report reads "lseek(-102, SEEK_CUR)" rather
+    // than bare "lseek". Carried into the Divergence.
+    std::string          note{};
+
+    Observation(abi::Sysno c, Returned r) : call{c}, returned{r} {}
+
+    // Builder tail-calls, rvalue-qualified so a half-built Observation cannot
+    // be left lying around as an lvalue.
+    [[nodiscard]] Observation&& writing(Written w) && {
+        wrote.push_back(std::move(w));
+        return std::move(*this);
+    }
+    [[nodiscard]] Observation&& labelled(std::string n) && {
+        note = std::move(n);
+        return std::move(*this);
+    }
+};
+
+// One execution of a scenario. ORDER is part of the observation: two runs
+// making the same calls in a different sequence have not agreed.
+struct Trace {
+    std::string              scenario;
+    std::vector<Observation> steps{};
+
+    explicit Trace(std::string s) : scenario{std::move(s)} {}
+};
+
+// -- the verdict -----------------------------------------------------------
+
+// What specifically differed. Step index, field, and both sides are
+// constructor parameters, so an unexplained failure is unrepresentable.
+struct Divergence {
+    enum class Field : std::uint8_t {
+        returned,      // retval or errno differed
+        written,       // a written buffer's contents differed
+        step_count,    // one side made more calls than the other
+        call_identity, // the same index was a different syscall
+    };
+
+    std::size_t index;
+    Field       field;
+    std::string native;  // the oracle's value, rendered
+    std::string guest;   // linuxity's value, rendered
+    std::string note{};
+
+    Divergence(std::size_t i, Field f, std::string n, std::string g)
+        : index{i}, field{f}, native{std::move(n)}, guest{std::move(g)} {}
+
+    [[nodiscard]] static constexpr std::string_view
+    field_name(Field f) noexcept {
+        switch (f) {
+            case Field::returned:      return "return value / errno";
+            case Field::written:       return "written buffer";
+            case Field::step_count:    return "number of syscalls";
+            case Field::call_identity: return "syscall identity";
+        }
+        return "<unknown field>";
+    }
+
+    [[nodiscard]] std::string describe() const;
+};
+
+// Agreement carries no payload on purpose: it has no interesting content, and
+// giving it one would invite code that branches on it.
+struct Match {
+    std::size_t steps_compared{0};
+};
+
+// A SUM. There is deliberately no `operator bool` and no `.ok()`: consumers
+// must match, which hands them the explanation in the failing branch.
+class Verdict {
+public:
+    constexpr Verdict(Match m) noexcept : v_{m} {}
+    Verdict(Divergence d) : v_{std::move(d)} {}
+
+    template <class OnMatch, class OnDiverge>
+    [[nodiscard]] decltype(auto) match(OnMatch&& m, OnDiverge&& d) const {
+        if (const auto* ok = std::get_if<Match>(&v_))
+            return std::forward<OnMatch>(m)(*ok);
+        return std::forward<OnDiverge>(d)(std::get<Divergence>(v_));
+    }
+
+    [[nodiscard]] bool agreed() const noexcept {
+        return std::holds_alternative<Match>(v_);
+    }
+
+private:
+    std::variant<Match, Divergence> v_;
+};
+
+// -- comparison laws -------------------------------------------------------
+
+// A Law decides whether a pair of Observations is exempt from comparison. It
+// is a concept rather than a virtual interface so laws compose at compile time
+// and cost nothing at runtime, and -- the point -- so a law that forgets
+// reason() fails to build instead of exempting things anonymously.
+template <class L>
+concept Law = requires(const L& law, const Observation& n, const Observation& g) {
+    { law.exempt(n, g) } -> std::convertible_to<bool>;
+    { law.reason() }     -> std::convertible_to<std::string_view>;
+};
+
+// Strict agreement: nothing is exempt. The default, because an exemption
+// should be an explicit act.
+struct Strict {
+    [[nodiscard]] static constexpr bool exempt(const Observation&,
+                                               const Observation&) noexcept {
+        return false;
+    }
+    [[nodiscard]] static constexpr std::string_view reason() noexcept {
+        return "strict: every observed field must agree exactly";
+    }
+};
+
+// Exempt one syscall, with a mandatory stated reason. For the handful that
+// cannot agree between two processes by construction: getpid returns different
+// pids, clock_gettime different times, getrandom different bytes.
+class Exempt {
+public:
+    constexpr Exempt(abi::Sysno call, std::string_view why) noexcept
+        : call_{call}, why_{why} {}
+
+    [[nodiscard]] constexpr bool exempt(const Observation& n,
+                                        const Observation& g) const noexcept {
+        return n.call == call_ && g.call == call_;
+    }
+    [[nodiscard]] constexpr std::string_view reason() const noexcept {
+        return why_;
+    }
+    [[nodiscard]] constexpr abi::Sysno call() const noexcept { return call_; }
+
+private:
+    abi::Sysno       call_;
+    std::string_view why_;
+};
+
+// Disjunction: exempt if ANY component exempts, so a policy reads as a list of
+// declared exemptions. Variadic and constexpr-friendly.
+template <Law... Ls>
+class AnyOf {
+public:
+    constexpr explicit AnyOf(Ls... ls) noexcept : laws_{std::move(ls)...} {}
+
+    [[nodiscard]] constexpr bool exempt(const Observation& n,
+                                        const Observation& g) const {
+        return std::apply([&](const Ls&... l) { return (l.exempt(n, g) || ...); },
+                          laws_);
+    }
+    [[nodiscard]] static constexpr std::string_view reason() noexcept {
+        return "any-of: an exemption applied; see the component laws";
+    }
+
+private:
+    std::tuple<Ls...> laws_;
+};
+
+// The exemptions that hold on EVERY host, each with its reason. This is the
+// SSOT for "results that cannot agree between two processes" -- scenarios
+// extend it rather than restating it.
+[[nodiscard]] constexpr auto universal_exemptions() noexcept {
+    return AnyOf{
+        Exempt{abi::Sysno::getpid,        "two processes have different pids"},
+        Exempt{abi::Sysno::gettid,        "two threads have different tids"},
+        Exempt{abi::Sysno::getppid,       "parents differ between runs"},
+        Exempt{abi::Sysno::getrandom,     "randomness is the point"},
+        Exempt{abi::Sysno::clock_gettime, "time advances between runs"},
+        Exempt{abi::Sysno::gettimeofday,  "time advances between runs"},
+        Exempt{abi::Sysno::time,          "time advances between runs"},
+    };
+}
+
+// -- rendering (defined in observation.cpp) --------------------------------
+
+[[nodiscard]] std::string render_buffers(std::span<const Written> bufs);
+
+// -- the comparison --------------------------------------------------------
+
+// Judge a guest trace against a reference trace under a law. Returns the FIRST
+// divergence: later steps are causally downstream of an earlier mismatch, so
+// reporting them all is noise.
+//
+// Host-independent by construction -- it makes no syscalls and touches no
+// platform API, so it is the same code on all four targets.
+template <Law L = Strict>
+[[nodiscard]] Verdict judge(const Trace& reference, const Trace& guest,
+                            const L& law = L{}) {
+    const std::size_t n = std::min(reference.steps.size(), guest.steps.size());
+
+    for (std::size_t i = 0; i < n; ++i) {
+        const Observation& a = reference.steps[i];
+        const Observation& b = guest.steps[i];
+
+        if (a.call != b.call) {
+            Divergence d{i, Divergence::Field::call_identity,
+                         std::string{name_of(a.call)},
+                         std::string{name_of(b.call)}};
+            d.note = a.note;
+            return d;
+        }
+
+        if (law.exempt(a, b)) continue;
+
+        if (!(a.returned == b.returned)) {
+            Divergence d{i, Divergence::Field::returned, a.returned.describe(),
+                         b.returned.describe()};
+            d.note = a.note;
+            return d;
+        }
+
+        if (a.wrote != b.wrote) {
+            Divergence d{i, Divergence::Field::written, render_buffers(a.wrote),
+                         render_buffers(b.wrote)};
+            d.note = a.note;
+            return d;
+        }
+    }
+
+    // Checked after the common prefix, so a report points at the first
+    // behavioural difference rather than at the length.
+    if (reference.steps.size() != guest.steps.size())
+        return Divergence{n, Divergence::Field::step_count,
+                          std::to_string(reference.steps.size()),
+                          std::to_string(guest.steps.size())};
+
+    return Match{n};
+}
+
+} // namespace lx::conform

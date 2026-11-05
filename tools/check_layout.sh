@@ -192,6 +192,41 @@ check_include 'abi::wire::(kOCloexec|kONonblock|kMfdCloexec)' 'abi/wire/fd_flags
 check_include 'abi::wire::errno_from_host'    'abi/wire/errno_map.hpp' 'errno_from_host'
 check_include 'abi::wire::(normalize_path|absolutize_path)' 'abi/wire/path.hpp' 'a wire path helper'
 
+# ---- conform/ must stay host-independent --------------------------------
+#
+# The conformance LAW (what agreement means) is shared by all four hosts;
+# only the ORACLE (where the reference trace comes from) is host-specific,
+# and that lives behind the capability concepts in conform/oracle.hpp. If a
+# platform header creeps into conform/, the law stops compiling on macOS or
+# Windows and those hosts silently lose conformance coverage -- which is the
+# vacuous pass the whole design is arranged to prevent.
+for f in include/linuxity/conform/*.hpp; do
+    [ -e "$f" ] || continue
+    if grep -qE '^[[:space:]]*#[[:space:]]*include[[:space:]]*<(sys/|unistd|fcntl|dirent|pthread|windows|io)' "$f"; then
+        note "$f is in conform/ but includes a platform header; the law must \
+ stay host-independent (put host code behind an Oracle capability)"
+    fi
+    if grep -qE '\b(fork|vfork|execve|execvp|ptrace|CreateProcess)[[:space:]]*\(' "$f"; then
+        note "$f is in conform/ but spawns a process; only an Oracle \
+implementation may do that"
+    fi
+done
+
+# The Sysno name table is generated from the enum, so it cannot drift. If the
+# enum gains a member without the table being regenerated, the static_assert
+# in sysno_names.hpp fires -- but catch it here too, with a clearer message.
+if [ -f include/linuxity/conform/sysno_names.inc ] && \
+   [ -f include/linuxity/abi/sysno.hpp ]; then
+    enum_n=$(sed -n '/enum class Sysno/,/^};/p' include/linuxity/abi/sysno.hpp \
+             | sed 's,//.*,,' | tr ',' '\n' \
+             | grep -cE '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*([[:space:]]*=[^,]*)?[[:space:]]*$')
+    table_n=$(grep -c 'LX_SYSNO_NAME(' include/linuxity/conform/sysno_names.inc)
+    if [ "$enum_n" -ne "$table_n" ]; then
+        note "Sysno has $enum_n members but the name table has $table_n; \
+rerun tools/gen_sysno_names.py"
+    fi
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "runtime layout: all structural invariants hold"
 else
