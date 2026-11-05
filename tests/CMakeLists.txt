@@ -44,6 +44,16 @@ if(NOT WIN32)
              COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/../tools/check_layout.sh)
 endif()
 
+# Every syscall the dispatcher HANDLES must actually be TRAPPED by the seccomp
+# filter, or the handler is dead code and the guest gets the host's answer.
+# This shape has caused four bugs (lseek/rewinddir, fchmodat2, creat,
+# set_tid_address) -- two of them sandbox escapes -- so it is a test, not a
+# convention. Linux-only: the filter is the ptrace backend's.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_test(NAME syscall_coverage
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/../tools/check_syscall_coverage.sh)
+endif()
+
 # The macOS hypervisor backend. Needs the Hypervisor framework and -- because
 # hv_vm_create is entitlement-gated -- an ad-hoc code signature carrying
 # com.apple.security.hypervisor. Without it the test SKIPS rather than fails,

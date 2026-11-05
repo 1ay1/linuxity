@@ -46,16 +46,36 @@ namespace lx::runtime {
 // syscall MISSING here that the dispatcher needs would silently run raw (e.g.
 // an untranslated path hitting the host's /usr); an EXTRA one here only costs
 // a needless stop, never correctness. When in doubt, include it.
+// Deliberately untrapped, each declared with an explicit UNTRAPPED(name,nr)
+// marker that tools/check_syscall_coverage.sh reads. A marker rather than
+// prose: that check is a security boundary (an untrapped path-bearing syscall
+// is a sandbox escape), and it must not be silenceable by rewording a comment.
+//
+// UNTRAPPED(exit,60) UNTRAPPED(exit_group,231): the task really does exit;
+//   the trap observes the reap instead, so there is nothing to intercept.
+// UNTRAPPED(rt_sigreturn,15): pops a signal frame. Trapping it would corrupt
+//   the very frame it exists to restore.
 inline constexpr int kTrappedX86_64[] = {
     // -- identity & process model ------------------------------------------
     39,   // getpid
     110,  // getppid
-    // gettid(186) is NOT filtered: glibc's raise()/abort() call it, and the
+    // UNTRAPPED(gettid,186): glibc's raise()/abort() call it, and the
     // bootstrap SIGSTOP (raise) must work BEFORE TRACESECCOMP is armed. gettid
     // returns the host tid, which for a single-threaded guest process equals
     // its pid; a monitor reads tid from /proc (already virtualized), so
     // running gettid natively is harmless.
     102, 104, 107, 108,          // getuid/getgid/geteuid/getegid
+    // set_tid_address(218): the dispatcher answers it with the GUEST tid, but
+    // it was never trapped, so the handler was dead and glibc's _start got
+    // the HOST tid instead (measured: 1370571 where the guest's is 1). Found
+    // by tools/check_syscall_coverage.sh, which exists because this
+    // handled-but-untrapped shape has now caused four bugs (lseek/rewinddir,
+    // fchmodat2, creat, this).
+    //
+    // Unlike gettid -- deliberately left native above, since the bootstrap
+    // raise() needs it before TRACESECCOMP is armed -- this one is called
+    // once per thread start and costs nothing to trap.
+    218,                         // set_tid_address
     118, 120,                    // getresuid/getresgid (bash/sudo $UID at init)
     56, 57, 58,                  // clone/fork/vfork      (pid translated)
     435,                         // clone3 (glibc fork/posix_spawn) (pid translated)
@@ -72,7 +92,7 @@ inline constexpr int kTrappedX86_64[] = {
     61,                          // wait4                 (pid translated both ways)
     247,                         // waitid    (id in, siginfo.si_pid out, both xlated)
     62,                          // kill                  (signal to guest pid)
-    // tgkill(234)/tkill(200) are intentionally NOT filtered: glibc's raise()
+    // UNTRAPPED(tgkill,234) UNTRAPPED(tkill,200): glibc's raise()
     // uses tgkill, and the child raises SIGSTOP during bootstrap BEFORE the
     // tracer sets TRACESECCOMP; a filtered tgkill would ENOSYS and abort the
     // launch. A guest tgkill targets a thread that shares the host tgid, so
@@ -133,7 +153,7 @@ inline constexpr int kTrappedX86_64[] = {
     188, 189, 190,               // setxattr/lsetxattr/fsetxattr
     194, 195, 196,               // listxattr/llistxattr/flistxattr
     197, 198, 199,               // removexattr/lremovexattr/fremovexattr
-    // close(3) is intentionally NOT filtered: it fires constantly (every fd
+    // UNTRAPPED(close,3): it fires constantly (every fd
     // teardown) and linuxity only uses it for fd->path bookkeeping, which is
     // non-essential (readlink recovers paths lazily). Trapping it would also
     // fire during bootstrap before TRACESECCOMP is set. Left native.
