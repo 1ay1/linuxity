@@ -28,6 +28,8 @@
 #endif
 #include <windows.h>
 
+#include "linuxity/host/entropy.hpp"
+
 #include <cstdint>
 #include <type_traits>
 

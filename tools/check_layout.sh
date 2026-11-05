@@ -152,6 +152,39 @@ for f in $hits; do
         && note "guest mmap constants defined outside abi/wire/: $f"
 done
 
+# 10. A file that USES a shared symbol must INCLUDE the header defining it.
+#     This is the single most common way a cross-platform edit breaks: on a
+#     Linux host, a backend header for macOS or Windows is never compiled, so
+#     a missing include is invisible until CI builds that platform. It cost
+#     three CI round-trips -- darwin/timer.hpp aliased abi::wire::Timespec
+#     without including time.hpp, windows/api.hpp called host::random_bytes
+#     without entropy.hpp, and three more files were one build away from the
+#     same failure.
+#
+#     So check it HERE, where every file is visible regardless of host, rather
+#     than discovering it one platform at a time.
+check_include() {   # <symbol-regex> <required-header>
+    for f in $(grep -rlE "$1" include/linuxity src --include=*.hpp --include=*.cpp 2>/dev/null); do
+        case "$f" in *"$2") continue;; esac      # the definition itself
+        grep -q "$2" "$f" || note "$f uses ${3:-$1} without including $2"
+    done
+}
+
+check_include 'host::random_bytes'            'host/entropy.hpp'    'host::random_bytes'
+check_include 'abi::wire::(Timespec|Timeval|Itimerval|Itimerspec|kNsecPerSec|to_millis_ceil)' \
+              'abi/wire/time.hpp'   'a wire time type'
+check_include 'abi::wire::(Iovec|kIovMax)'    'abi/wire/iovec.hpp'  'wire::Iovec'
+check_include 'abi::wire::(DType|dirent_reclen|encode_dirent64|dtype_from_mode)' \
+              'abi/wire/dirent64.hpp' 'a wire dirent symbol'
+check_include 'abi::wire::(OpenFlag|writable)' 'abi/wire/open_flags.hpp' 'wire::OpenFlag'
+check_include 'abi::wire::(MapFlag|is_anonymous|wants_fixed)' 'abi/wire/mmap.hpp' 'wire::MapFlag'
+check_include 'abi::wire::(AtFlag|kAtFdCwd|has_at)' 'abi/wire/at_flags.hpp' 'wire::AtFlag'
+check_include 'abi::wire::(FileType|kPermMask|kFileTypeMask|stat_layout|kStat)' \
+              'abi/wire/stat.hpp'   'a wire stat symbol'
+check_include 'abi::wire::(kOCloexec|kONonblock|kMfdCloexec)' 'abi/wire/fd_flags.hpp' 'a wire fd flag'
+check_include 'abi::wire::errno_from_host'    'abi/wire/errno_map.hpp' 'errno_from_host'
+check_include 'abi::wire::(normalize_path|absolutize_path)' 'abi/wire/path.hpp' 'a wire path helper'
+
 if [ "$fail" -eq 0 ]; then
     echo "runtime layout: all structural invariants hold"
 else
