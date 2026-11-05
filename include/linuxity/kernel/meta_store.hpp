@@ -35,6 +35,7 @@
 #pragma once
 
 #include <sys/stat.h>
+#include "linuxity/abi/wire/stat.hpp"
 #include "linuxity/host/win_posix.hpp"
 
 #include <cstdint>
@@ -86,7 +87,7 @@ public:
                     for (const std::string& base : host_bases_) {
                         if (::lstat((base + it->first).c_str(), &st) == 0) { ok = true; break; }
                     }
-                    if (ok && (S_ISLNK(st.st_mode) || (st.st_mode & 07777u) == r.mode))
+                    if (ok && (S_ISLNK(st.st_mode) || (st.st_mode & abi::wire::kPermMask) == r.mode))
                         r.have &= static_cast<std::uint8_t>(~MetaRecord::kMode);
                 }
                 if (is_redundant(r)) { it = table_.erase(it); ++pruned; }
@@ -121,7 +122,7 @@ public:
     // chmods from package installs (13k of them here) all land in this case.
     void set_mode(const std::string& guest_path, std::uint32_t mode,
                   std::uint32_t host_mode = 0xffffffffu) {
-        if (host_mode != 0xffffffffu && (host_mode & 07777u) == (mode & 07777u)) {
+        if (host_mode != 0xffffffffu && (host_mode & abi::wire::kPermMask) == (mode & abi::wire::kPermMask)) {
             auto it = table_.find(guest_path);
             if (it == table_.end()) return;
             it->second.have &= static_cast<std::uint8_t>(~MetaRecord::kMode);
@@ -130,7 +131,7 @@ public:
             return;
         }
         auto& r = table_[guest_path];
-        r.mode = mode & 07777u;
+        r.mode = mode & abi::wire::kPermMask;
         r.have |= MetaRecord::kMode;
         append(guest_path, r);
     }
@@ -204,7 +205,7 @@ public:
                                                       const MetaRecord& r) {
         if (!(r.have & MetaRecord::kMode)) return host_mode;
         // Keep the host's file-type; take the guest's permission+special bits.
-        return (host_mode & S_IFMT) | (r.mode & 07777u);
+        return (host_mode & abi::wire::kFileTypeMask) | (r.mode & abi::wire::kPermMask);
     }
 
 private:

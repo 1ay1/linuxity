@@ -248,7 +248,7 @@ public:
                 // S_IFLNK, not its target's type. git probes symlink support
                 // via fstatat(...,AT_SYMLINK_NOFOLLOW) + S_ISLNK; following the
                 // link made it see a regular file and disable symlinks.
-                bool nofollow = (r.arg[3] & 0x100) != 0;
+                bool nofollow = wire::has_at(r.arg[3], wire::AtFlag::symlink_nofollow);
                 return path_stat(r, 1, true, !nofollow);
             }
             case Sysno::statx:       return path_statx(r);
@@ -886,7 +886,7 @@ private:
             // the empty path, which would wrongly stat the cwd/root).
             return fwd();
         }
-        bool nofollow = (flags & 0x100) != 0;
+        bool nofollow = wire::has_at(flags, wire::AtFlag::symlink_nofollow);
         std::string abs = resolve_arg(r, 1, true, /*follow_leaf=*/!nofollow);
         // Honor AT_SYMLINK_NOFOLLOW (0x100): coreutils `stat`/`ls -la` statx a
         // symlink with this flag and expect S_IFLNK; following it reported the
@@ -1470,7 +1470,7 @@ private:
             // apply; the shadow store still presents the intended mode at stat
             // time. Only chmod a REGULAR file/dir we own in the upper.
             if (!wc.host_path.empty() && !is_symlink(wc.host_path.c_str()) &&
-                ::chmod(wc.host_path.c_str(), mode & 07777) == 0) {
+                ::chmod(wc.host_path.c_str(), mode & wire::kPermMask) == 0) {
                 std::uint32_t got = 0;
                 if (hostcompat::host_mode_of(wc.host_path.c_str(), got))
                     landed = got;
@@ -1493,7 +1493,7 @@ private:
             auto wc = k_.files().classify(std::string{gp}, /*for_write=*/true,
                                           /*follow=*/false, Wi::copy_leaf);
             std::uint32_t landed = 0xffffffffu;
-            if (!wc.host_path.empty() && ::chmod(wc.host_path.c_str(), mode & 07777) == 0) {
+            if (!wc.host_path.empty() && ::chmod(wc.host_path.c_str(), mode & wire::kPermMask) == 0) {
                 std::uint32_t got = 0;
                 if (hostcompat::host_mode_of(wc.host_path.c_str(), got))
                     landed = got;

@@ -446,6 +446,36 @@ int main() {
               "FD_CLOEXEC must NOT be unified onto O_CLOEXEC");
     }
 
+    // -- the permission mask -----------------------------------------------
+    // `07777` was spelled at four sites (two chmod paths in syscall.hpp, four
+    // in meta_store). The digit that matters is the top one.
+    {
+        using namespace lx::abi::wire;
+        check(kPermMask == 07777, "the perm mask is 07777");
+        check(kPermMask == 0xfff, "...which is 0xfff");
+
+        // 07777, NOT 0777. The top digit carries setuid/setgid/sticky, and
+        // masking with 0777 silently strips setuid from every file the shadow
+        // store remembers -- that's how su and sudo lose their privilege bits
+        // across a run.
+        check(kPermMask != 0777, "0777 would drop the set-id bits");
+        check((kPermMask & 04000) == 04000, "setuid is inside the mask");
+        check((kPermMask & 02000) == 02000, "setgid is inside the mask");
+        check((kPermMask & 01000) == 01000, "sticky is inside the mask");
+        check((0777u & 04000u) == 0, "...and 0777 really would miss setuid");
+
+        // Perm and type must be disjoint, or a chmod changes a file's TYPE.
+        check((kPermMask & kFileTypeMask) == 0, "perm and type are disjoint");
+        // And together they cover the low 16 bits with no gap -- a bit in
+        // neither mask would be dropped by every chmod path.
+        check((kPermMask | kFileTypeMask) == 0177777u, "no gap between them");
+
+        // A realistic round-trip: setuid-root 4755 on a regular file.
+        const std::uint32_t m = bits(FileType::regular) | 04755u;
+        check((m & kPermMask) == 04755u, "4755 survives the perm mask");
+        check(is_type(m, FileType::regular), "...and it is still a regular file");
+    }
+
     if (failures == 0) std::puts("wire: all checks passed");
     return failures == 0 ? 0 : 1;
 }

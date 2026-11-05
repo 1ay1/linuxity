@@ -136,4 +136,28 @@ static_assert(bits(FileType::regular) != bits(FileType::symlink));
 static_assert(is_type(bits(FileType::dir) | 0755u, FileType::dir));
 static_assert(!is_type(bits(FileType::regular) | 0755u, FileType::dir));
 
+// The permission and set-id bits of st_mode -- everything OUTSIDE the type
+// mask. Spelled `07777` at four sites (two in syscall.hpp's chmod paths, two
+// in meta_store); it is the complement of kFileTypeMask and the two must stay
+// disjoint, or a chmod would change a file's type.
+//
+// Note it is 07777, not 0777: the top digit carries setuid (04000), setgid
+// (02000) and sticky (01000). Masking with 0777 silently strips setuid from
+// every file the shadow store remembers, which is how `su` and `sudo` lose
+// their privilege bits across a run.
+inline constexpr std::uint32_t kPermMask = 07777;
+
+static_assert(kPermMask == 0xfff);
+static_assert((kPermMask & kFileTypeMask) == 0,
+              "the permission and type masks must be disjoint");
+// Together they cover exactly the low 16 bits of st_mode, with no gap: a bit
+// that is in neither mask would be silently dropped by every chmod path.
+static_assert((kPermMask | kFileTypeMask) == 0177777u);
+// The set-id bits live in kPermMask, not outside it.
+static_assert((kPermMask & 04000) == 04000, "setuid is inside the perm mask");
+static_assert((kPermMask & 02000) == 02000, "setgid is inside the perm mask");
+static_assert((kPermMask & 01000) == 01000, "sticky is inside the perm mask");
+static_assert(kPermMask != 0777,
+              "0777 would strip setuid/setgid/sticky -- use 07777");
+
 } // namespace lx::abi::wire
