@@ -215,6 +215,64 @@ struct Machine {
     }
 };
 
+// The guest inherits the Mac terminal's TERM, but a distro rootfs only ships
+// the common entries -- kitty, ghostty, wezterm, alacritty bring their own
+// (`kitty-terminfo` etc.), so ncurses programs (vim, cmatrix, htop, less)
+// died with "cannot initialize terminal type". The compiled terminfo format
+// is OS-independent, and the host already knows this terminal, so compile
+// its description into a guest-visible directory and point TERMINFO_DIRS at
+// it. The rootfs is never touched; the rootfs's own entry wins when present.
+// Returns the GUEST directory, or "" if nothing was needed or possible.
+[[nodiscard]] std::string host_terminfo_bridge(const std::string& root, const char* term) {
+    if (!term || !*term || std::strchr(term, '/') || root.empty()) return {};
+    const std::string sub = std::string(1, term[0]) + "/" + term;
+    char hex[8];
+    std::snprintf(hex, sizeof hex, "%02x", static_cast<unsigned char>(term[0]));
+    for (const std::string& d : {root + "/usr/share/terminfo/" + sub,
+                                 root + "/usr/share/terminfo/" + hex + "/" + term,
+                                 root + "/usr/lib/terminfo/" + sub,
+                                 root + "/etc/terminfo/" + sub})
+        if (::access(d.c_str(), R_OK) == 0) return {};     // rootfs has it
+
+    // Guest /tmp is host /tmp through the overlay (see mount_host), so a
+    // host directory under /tmp is visible at the same path in the guest.
+    const std::string dir = "/tmp/linuxity-terminfo-" + std::to_string(::getuid());
+    const std::string want = dir + "/" + sub;
+    if (::access(want.c_str(), R_OK) == 0) return dir;     // already bridged
+    (void)::mkdir(dir.c_str(), 0755);
+    // `infocmp -x TERM | tic -x -o DIR -` with the host's ncurses. Plain
+    // fork/exec with fixed argv: no shell, TERM was validated above.
+    int pfd[2];
+    if (::pipe(pfd) != 0) return {};
+    const pid_t a = ::fork();
+    if (a == 0) {
+        ::dup2(pfd[1], 1); ::close(pfd[0]); ::close(pfd[1]);
+        const int dn = ::open("/dev/null", O_WRONLY); if (dn >= 0) ::dup2(dn, 2);
+        ::execlp("infocmp", "infocmp", "-x", term, static_cast<char*>(nullptr));
+        ::_exit(127);
+    }
+    const pid_t b = ::fork();
+    if (b == 0) {
+        ::dup2(pfd[0], 0); ::close(pfd[0]); ::close(pfd[1]);
+        const int dn = ::open("/dev/null", O_WRONLY); if (dn >= 0) { ::dup2(dn, 1); ::dup2(dn, 2); }
+        ::execlp("tic", "tic", "-x", "-o", dir.c_str(), "-", static_cast<char*>(nullptr));
+        ::_exit(127);
+    }
+    ::close(pfd[0]); ::close(pfd[1]);
+    int st = 0;
+    if (a > 0) ::waitpid(a, &st, 0);
+    if (b > 0) ::waitpid(b, &st, 0);
+    // tic on macOS may write the hashed ("78/") layout; ncurses on Linux
+    // reads both, but check the letter layout and fall back to hex.
+    if (::access(want.c_str(), R_OK) == 0) return dir;
+    if (::access((dir + "/" + hex + "/" + term).c_str(), R_OK) == 0) {
+        (void)::mkdir((dir + "/" + std::string(1, term[0])).c_str(), 0755);
+        (void)::symlink((std::string("../") + hex + "/" + term).c_str(), want.c_str());
+        return dir;
+    }
+    return {};
+}
+
 [[nodiscard]] std::string self_exe() {
     char buf[4096];
     std::uint32_t n = sizeof buf;
@@ -241,7 +299,10 @@ public:
             std::fprintf(stderr, "[fork %d] %-10s %7lld us\n", ::getpid(), what,
                          static_cast<long long>(us));
         };
-        img.namespace_state = machine_wrap_.k.files().export_process_state();
+        {
+            std::lock_guard l{machine_wrap_.k.mutex()};
+            img.namespace_state = machine_wrap_.k.files().export_process_state();
+        }
 
         // One host fd per distinct open file, placed at 3, 4, 5... in the child.
         //
@@ -419,8 +480,14 @@ void run_guest_thread(ThreadContext& ctx, runtime::HvfTrap::ThreadStart start);
 // Install the hooks a trap needs to create more tasks. Shared by the initial
 // thread and every thread it spawns, so a thread can itself fork or spawn.
 void wire_spawners(runtime::HvfTrap& trap, ThreadContext& ctx) {
-    trap.set_resolver([&ctx](const std::string& g) { return ctx.machine_wrap.resolve(g); });
-    trap.set_unresolver([&ctx](const std::string& h) { return ctx.machine_wrap.unresolve(h); });
+    trap.set_resolver([&ctx](const std::string& g) {
+        std::lock_guard l{ctx.machine_wrap.k.mutex()};
+        return ctx.machine_wrap.resolve(g);
+    });
+    trap.set_unresolver([&ctx](const std::string& h) {
+        std::lock_guard l{ctx.machine_wrap.k.mutex()};
+        return ctx.machine_wrap.unresolve(h);
+    });
     trap.set_fork_spawner([&ctx](runtime::HvfTrap::ForkImage& img) {
         return ctx.forker(img);
     });
@@ -609,7 +676,13 @@ int main(int argc, char** argv) {
         "HOME=/root", "USER=root", "LOGNAME=root", "SHELL=/bin/bash",
         "LANG=C.UTF-8",
     };
-    if (const char* t = std::getenv("TERM")) env.push_back(std::string{"TERM="} + t);
+    if (const char* t = std::getenv("TERM")) {
+        env.push_back(std::string{"TERM="} + t);
+        if (auto dir = host_terminfo_bridge(o.root, t); !dir.empty())
+            env.push_back("TERMINFO_DIRS=" + dir + ":/usr/share/terminfo");
+    }
+    for (const char* keep : {"COLORTERM", "TERM_PROGRAM", "KITTY_WINDOW_ID"})
+        if (const char* v = std::getenv(keep)) env.push_back(std::string{keep} + "=" + v);
 
     std::vector<std::string> gargv(argv + i, argv + argc);
     auto ex = runtime::hvf_exec(machine, [&m](const std::string& g) { return m.resolve(g); },

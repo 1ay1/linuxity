@@ -63,8 +63,37 @@ struct HvfLayout {
     [[nodiscard]] static constexpr std::uint64_t n_l2(std::uint64_t ram) noexcept {
         return (ram + gib - 1) / gib;
     }
+    // The classic NON-PIE (ET_EXEC) load address. An ET_EXEC program's
+    // p_vaddr is absolute -- it cannot be relocated -- and the aarch64
+    // toolchain default is 0x400000. gcc and anything built -no-pie land
+    // there, so the EL1-only private area must stay clear of it.
+    static constexpr std::uint64_t nonpie_base = 0x40'0000;      // 4 MiB
+    // Room for a large fixed-address image (text+data+bss) above that.
+    // Up to 128 MiB: big toolchain binaries are non-PIE too (cc1plus is a
+    // 42 MiB fixed image at 0x400000), and 28 MiB was not enough.
+    static constexpr std::uint64_t nonpie_size = 0x7c0'0000;      // 124 MiB
+
+    // The L3 array (one page per 2 MiB of RAM) starts ABOVE the reserved
+    // non-PIE window rather than immediately after the L2 pages. Putting it
+    // low made priv_end ~0x600000 at 2 GiB, which covered 0x400000: loading
+    // gcc then failed ENOMEM (ram().at() refuses the private span) -- the
+    // package installed fine and every `gcc` exec died with errno 12.
+    //
+    // It must stay a single ascending run, because build_page_tables()
+    // assigns these pages sequentially as it walks RAM from 0 upward.
+    //
+    // The floor only applies when RAM can afford it. A tiny VM (the 2 MiB
+    // capability probe) has no room to reserve 32 MiB, and forcing it there
+    // put priv_end past the end of RAM -- the program base then pointed
+    // outside memory and the loader walked off the mapping.
     [[nodiscard]] static constexpr std::uint64_t l3_tables(std::uint64_t ram) noexcept {
-        return l2_tables + n_l2(ram) * page;
+        const std::uint64_t after_l2 = l2_tables + n_l2(ram) * page;
+        const std::uint64_t floor    = nonpie_base + nonpie_size;
+        // Need the window itself plus the table array plus a block to spare.
+        // Below 1 GiB keep the compact layout (tests, probes): reserving a
+        // 128 MiB hole there would squeeze the PIE/interp/mmap arena.
+        if (ram < gib || ram < floor + (ram / block) * page + block) return after_l2;
+        return after_l2 > floor ? after_l2 : floor;
     }
     // First guest-owned address: past the tables, rounded to a 2 MiB block so
     // the private area is whole L3 tables (no shared page between EL1-only
@@ -72,6 +101,22 @@ struct HvfLayout {
     [[nodiscard]] static constexpr std::uint64_t priv_end(std::uint64_t ram) noexcept {
         const std::uint64_t end = l3_tables(ram) + (ram / block) * page;
         return (end + block - 1) & ~(block - 1);
+    }
+
+    // The guest-owned hole below the table array that a fixed-address
+    // ET_EXEC image loads into. Empty unless the floor actually applied
+    // (see l3_tables): on a tiny VM there is no reserved window.
+    [[nodiscard]] static constexpr bool has_nonpie_window(std::uint64_t ram) noexcept {
+        return l3_tables(ram) >= nonpie_base + nonpie_size;
+    }
+    // The EL1-only table range that sits ABOVE the window, i.e. inside what
+    // a non-PIE program's brk/mmap arena would otherwise cover. Callers
+    // reserve it in the VMA map so the heap can never grow into it.
+    [[nodiscard]] static constexpr std::uint64_t tables_lo(std::uint64_t ram) noexcept {
+        return has_nonpie_window(ram) ? nonpie_base + nonpie_size : priv_end(ram);
+    }
+    [[nodiscard]] static constexpr bool is_nonpie_window(std::uint64_t a) noexcept {
+        return a >= nonpie_base && a < nonpie_base + nonpie_size;
     }
 
     // The stack sits at the TOP of guest RAM (VA == GPA, so there is no
@@ -113,6 +158,7 @@ inline void build_page_tables(std::byte* mem, std::uint64_t ram) {
     constexpr std::uint64_t kTable = 3, kPage = 3;
     constexpr std::uint64_t kAf = 1ull << 10, kSh = 3ull << 8;
     const std::uint64_t priv = HvfLayout::priv_end(ram);
+    const bool nonpie_win    = HvfLayout::has_nonpie_window(ram);
 
     // L1: one entry per GiB -> that GiB's L2 table.
     for (std::uint64_t g = 0; g < HvfLayout::n_l2(ram); ++g)
@@ -127,7 +173,12 @@ inline void build_page_tables(std::byte* mem, std::uint64_t ram) {
         put64(HvfLayout::l2_tables + g * HvfLayout::page + l2i * 8, l3 | kTable);
         for (std::uint64_t off = 0; off < HvfLayout::block; off += HvfLayout::page) {
             const std::uint64_t pa = base + off;
-            const std::uint64_t ap = pa < priv ? 0ull : 1ull;
+            // EL1-only below priv_end, EXCEPT the non-PIE window: that hole
+            // sits below the table array but belongs to the guest, so a
+            // fixed-address ET_EXEC image can both load and execute there.
+            const std::uint64_t ap =
+                (pa < priv && !(nonpie_win && HvfLayout::is_nonpie_window(pa)))
+                    ? 0ull : 1ull;
             put64(l3 + (off >> 12) * 8, pa | kAf | kSh | (ap << 6) | kPage);
         }
         l3 += HvfLayout::page;
@@ -192,7 +243,10 @@ public:
 
     // -- Memory -----------------------------------------------------------
     [[nodiscard]] GuestRam ram() const noexcept {
-        return GuestRam{base_, size_, HvfLayout::priv_end(size_)};
+        const bool win = HvfLayout::has_nonpie_window(size_);
+        return GuestRam{base_, size_, HvfLayout::priv_end(size_),
+                        win ? HvfLayout::nonpie_base : 0,
+                        win ? HvfLayout::nonpie_base + HvfLayout::nonpie_size : 0};
     }
     [[nodiscard]] std::uint64_t mem_size() const noexcept { return size_; }
     [[nodiscard]] std::byte* raw_base() const noexcept { return base_; }

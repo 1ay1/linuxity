@@ -215,6 +215,27 @@ struct LinuxSiginfo {               // 128 bytes; we fill the common prefix
 };
 static_assert(sizeof(LinuxSiginfo) == 128);
 
+// The SAME 128 bytes as seen by a FAULT handler. For the synchronous
+// signals (SIGSEGV/SIGBUS/SIGILL/SIGFPE) the kernel's _sigfault union puts
+// the offending address where kill()'s sender pid/uid would be, so a
+// handler reads si_addr at offset 16 -- not si_pid. gpg's secmem probe and
+// every JIT/GC that recovers from a guarded access reads exactly this.
+struct LinuxSigfault {
+    std::int32_t  si_signo, si_errno, si_code, pad_;
+    std::uint64_t si_addr;          // SIGSEGV/SIGBUS: the faulting address
+    std::uint8_t  rest[104];
+};
+static_assert(sizeof(LinuxSigfault) == 128);
+static_assert(offsetof(LinuxSigfault, si_addr) == 16);
+
+// si_code values for the fault signals (asm-generic/siginfo.h).
+namespace sicode {
+inline constexpr std::int32_t kSegvMaperr = 1;   // address not mapped
+inline constexpr std::int32_t kSegvAccerr = 2;   // no permission for access
+inline constexpr std::int32_t kBusAdraln  = 1;   // invalid alignment
+inline constexpr std::int32_t kIllIllopc  = 1;   // illegal opcode
+}
+
 struct LinuxStack { std::uint64_t ss_sp; std::int32_t ss_flags, pad_; std::uint64_t ss_size; };
 
 struct FpsimdContext {             // the first record in __reserved

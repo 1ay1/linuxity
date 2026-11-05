@@ -787,12 +787,21 @@ private:
             // and serve THAT from getdents64 on the resulting fd — otherwise a
             // freshly-created (empty) upper would hide the whole rootfs, and
             // `ls /` would show nothing. Non-overlay dirs enumerate natively.
+            //
+            // Computing that union costs two readdir sweeps plus a hash map,
+            // so do it LAZILY: record the path and let the first getdents64
+            // build it. Opens vastly outnumber directory reads (every *at
+            // base dirfd, every O_PATH handle, every library probe), and
+            // doing it eagerly made open O(directory size) — it was 96% of
+            // host CPU on `pacman -S python`. Skip even the marker when the
+            // open plainly cannot be a directory read: O_WRONLY/O_RDWR can't
+            // getdents (EISDIR/EBADF), and any open carrying O_CREAT/O_TRUNC
+            // names a file. The marker is cheap and self-cancelling — if the
+            // path turns out not to be an overlaid directory, the union comes
+            // back empty and getdents64 falls through to the real fd.
             if (!for_write) {
-                auto merged = k_.files().overlay_dir_union(abs);
-                if (!merged.empty()) {
-                    pending_dir_ = true;
-                    pending_entries_ = std::move(merged);
-                }
+                pending_dir_   = true;
+                pending_lazy_  = abs;
             }
             return o;
         }
@@ -1942,6 +1951,7 @@ private:
     Arch arch_;
     std::string pending_open_;   // guest path awaiting fd assignment by trap
     bool pending_dir_{false};    // the pending open is a virtual directory
+    std::string pending_lazy_;   // overlaid host dir: union built on 1st getdents
     std::vector<kernel::VirtualDirent> pending_entries_;
 public:
     // The trap calls this after a redirect/inject syscall returns a real fd,
@@ -1950,11 +1960,21 @@ public:
     void note_opened_fd(std::int64_t fd) {
         if (fd >= 0 && !pending_open_.empty()) {
             k_.files().bind_fd(static_cast<int>(fd), pending_open_);
-            if (pending_dir_)
-                k_.files().bind_dir(static_cast<int>(fd), std::move(pending_entries_));
+            if (pending_dir_) {
+                // An overlaid host directory defers its union to the first
+                // getdents64; a virtual (procfs/sysfs) directory already has
+                // its entries synthesized.
+                if (!pending_lazy_.empty())
+                    k_.files().bind_lazy_dir(static_cast<int>(fd),
+                                             std::move(pending_lazy_));
+                else
+                    k_.files().bind_dir(static_cast<int>(fd),
+                                        std::move(pending_entries_));
+            }
         }
         pending_open_.clear();
         pending_dir_ = false;
+        pending_lazy_.clear();
         pending_entries_.clear();
     }
 

@@ -173,7 +173,7 @@ public:
         cur_pid_ = pid;
         if (cwds_.find(pid) == cwds_.end()) {
             auto it = cwds_.find(ppid);
-            cwds_[pid] = (it != cwds_.end()) ? it->second : std::string{"/"};
+            cwds_[pid] = (it != cwds_.end()) ? it->second : inherited_cwd_;
         }
     }
     // On fork/clone the child inherits a COPY of the parent's cwd.
@@ -375,7 +375,7 @@ public:
         if (auto it = fd_paths_.find(from); it != fd_paths_.end())
             fd_paths_[to] = it->second;
         if (auto it = dir_streams_.find(from); it != dir_streams_.end())
-            dir_streams_[to] = DirStream{it->second.entries, 0};
+            dir_streams_[to] = DirStream{it->second.entries, 0, it->second.lazy};
     }
     [[nodiscard]] std::string_view path_of_fd(int fd) const {
         auto it = fd_paths_.find(fd);
@@ -419,7 +419,15 @@ public:
             at += n;
             return s;
         };
-        set_cwd(str());
+        // The fork child is a FRESH host process: its cwd table holds no
+        // record for its own pid or its parent's, so its first syscall's
+        // set_current_pid() would fall back to "/". (Storing via set_cwd()
+        // here filed it under the default cur_pid_ 1 instead -- every
+        // relative path in a forked child, e.g. `g++ hey.cpp` -> cc1,
+        // resolved against "/".) Make the parent's cwd the fallback.
+        inherited_cwd_ = normalize(str());
+        if (inherited_cwd_.empty()) inherited_cwd_ = "/";
+        cwds_.clear();
         fd_paths_.clear();
         for (std::uint32_t i = 0, n = u32(); i < n && at < in.size(); ++i) {
             int fd = 0;
@@ -433,16 +441,46 @@ public:
     // When the guest opens a VIRTUAL directory (procfs/sysfs), we bind its
     // synthesized entries to the fd so getdents64 can enumerate them (the
     // real backing fd is an empty temp file; enumeration is fully virtual).
-    struct DirStream { std::vector<VirtualDirent> entries; std::size_t pos{0}; };
+    // `lazy` holds the guest path of an OVERLAID host directory whose union
+    // has not been computed yet: enumerating it costs two readdir sweeps plus
+    // a hash map, and the overwhelming majority of opened directories are
+    // never read (openat(O_PATH|O_DIRECTORY) as an *at base, a dirfd kept for
+    // fchdir, libalpm's per-package parent handles). Paying that at open time
+    // made every open O(directory size) and dominated the profile -- a single
+    // `pacman -S python` spent 96% of its host CPU in overlay_dir_union. So
+    // record the intent and materialize on the FIRST getdents64 instead.
+    struct DirStream {
+        std::vector<VirtualDirent> entries;
+        std::size_t pos{0};
+        std::string lazy;                      // non-empty => not yet built
+    };
     void bind_dir(int fd, std::vector<VirtualDirent> entries) {
-        dir_streams_[fd] = DirStream{std::move(entries), 0};
+        dir_streams_[fd] = DirStream{std::move(entries), 0, {}};
+    }
+    // Bind an overlaid host directory whose union is computed on demand.
+    void bind_lazy_dir(int fd, std::string abs) {
+        dir_streams_[fd] = DirStream{{}, 0, std::move(abs)};
     }
     [[nodiscard]] bool is_virtual_dir_fd(int fd) const {
         return dir_streams_.count(fd) != 0;
     }
     [[nodiscard]] DirStream* dir_stream(int fd) {
         auto it = dir_streams_.find(fd);
-        return it == dir_streams_.end() ? nullptr : &it->second;
+        if (it == dir_streams_.end()) return nullptr;
+        // First read of a lazily-bound overlay directory: build the union now.
+        // If the union comes back empty the directory is not actually overlaid
+        // (it vanished, or the mount changed), so drop the stream and let the
+        // caller enumerate the real fd natively.
+        if (!it->second.lazy.empty()) {
+            std::string abs = std::move(it->second.lazy);
+            it->second.lazy.clear();
+            it->second.entries = overlay_dir_union(abs);
+            if (it->second.entries.empty()) {
+                dir_streams_.erase(it);
+                return nullptr;
+            }
+        }
+        return &it->second;
     }
 
     // Normalize an absolute path: collapse "//", resolve "." and "..", drop a
@@ -727,6 +765,9 @@ private:
     // is mutable so a const cwd()/absolutize path can select the active pid.
     mutable std::unordered_map<std::int32_t, std::string> cwds_{};
     mutable std::int32_t cur_pid_{1};   // root/init
+    // cwd for a pid with no record and no recorded parent: "/" for the root
+    // process, the parent's cwd in a forked child (import_process_state).
+    std::string inherited_cwd_{"/"};
     std::unordered_map<int, std::string> fd_paths_;
     std::unordered_map<int, DirStream> dir_streams_;
     MetaStore meta_{};

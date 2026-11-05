@@ -16,6 +16,7 @@
 #include "linuxity/kernel/process_table.hpp"
 #include "linuxity/kernel/subsystem.hpp"
 
+#include <mutex>
 #include <unordered_map>
 
 namespace lx::kernel {
@@ -55,6 +56,16 @@ public:
     // table). The syscall dispatcher routes every path syscall through here.
     [[nodiscard]] FileNamespace& files() noexcept { return files_; }
     [[nodiscard]] const FileNamespace& files() const noexcept { return files_; }
+
+    // ONE lock over all mutable kernel state (namespace maps, cwd table,
+    // overlay whiteouts/metadata, process table). Every guest THREAD runs its
+    // own dispatch loop against this one Kernel, and those containers are
+    // plain unordered_maps: two threads opening/closing fds at once corrupted
+    // fd_paths_' buckets and crashed linuxity itself (agentty, a
+    // many-threaded TUI, died with SIGSEGV inside __hash_table). Recursive,
+    // because resolver hooks re-enter from inside a locked dispatch.
+    // Held only around bookkeeping -- never across a blocking host syscall.
+    [[nodiscard]] std::recursive_mutex& mutex() const noexcept { return mu_; }
 
     // The virtual process table /proc is synthesized from. The runtime keeps
     // it in sync as it traces the guest tree.
@@ -147,6 +158,7 @@ private:
     FileNamespace files_{};
     ProcessTable procs_{};
     std::unordered_map<UAddr, std::size_t> maps_;
+    mutable std::recursive_mutex mu_;
 };
 
 } // namespace lx::kernel

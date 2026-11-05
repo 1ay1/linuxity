@@ -106,12 +106,21 @@ public:
         // An existing watch on the same path is UPDATED and keeps its wd,
         // which is what inotify_add_watch promises.
         for (Watch& w : watches_)
-            if (w.path == path) { w.mask = mask; return w.wd; }
+            if (w.path == path) {
+                w.mask = mask;
+                struct ::kevent ev{};
+                EV_SET(&ev, w.fd, EVFILT_VNODE, EV_ADD | EV_CLEAR,
+                       notes_for(mask, w.is_dir), 0,
+                       reinterpret_cast<void*>(static_cast<std::intptr_t>(w.wd)));
+                (void)::kevent(kq_, &ev, 1, nullptr, 0, nullptr);
+                return w.wd;
+            }
         const int fd = ::open(path.c_str(), O_EVTONLY | O_CLOEXEC);
         if (fd < 0) return -static_cast<std::int64_t>(errno == ENOENT ? 2 : 13);
+        struct ::stat st{};
+        const bool is_dir = ::fstat(fd, &st) == 0 && S_ISDIR(st.st_mode);
         struct ::kevent ev{};
-        const std::uint32_t fflags = NOTE_WRITE | NOTE_DELETE | NOTE_RENAME
-                                   | NOTE_ATTRIB | NOTE_EXTEND | NOTE_LINK;
+        const std::uint32_t fflags = notes_for(mask, is_dir);
         const int wd = next_wd_++;
         EV_SET(&ev, fd, EVFILT_VNODE, EV_ADD | EV_CLEAR, fflags, 0,
                reinterpret_cast<void*>(static_cast<std::intptr_t>(wd)));
@@ -119,7 +128,7 @@ public:
             ::close(fd);
             return -static_cast<std::int64_t>(errno);
         }
-        watches_.push_back({wd, fd, mask, path});
+        watches_.push_back({wd, fd, mask, path, is_dir});
         return wd;
     }
 
@@ -142,19 +151,41 @@ public:
         std::size_t used = 0;
         for (int i = 0; i < n; ++i) {
             const int wd = static_cast<int>(reinterpret_cast<std::intptr_t>(evs[i].udata));
+            const Watch* w = nullptr;
+            for (const Watch& x : watches_) if (x.wd == wd) { w = &x; break; }
+            if (!w) continue;                        // removed since queued
             std::uint32_t mask = 0;
             const auto f = evs[i].fflags;
-            if (f & (NOTE_WRITE | NOTE_EXTEND)) mask |= inotify_bit::modify;
-            if (f & NOTE_ATTRIB) mask |= inotify_bit::attrib;
-            if (f & NOTE_DELETE) mask |= inotify_bit::delete_self;
-            if (f & NOTE_RENAME) mask |= inotify_bit::move_self;
-            if (f & NOTE_LINK)   mask |= inotify_bit::create;
+            if (w->is_dir) {
+                // kqueue says only "this directory's contents changed". The
+                // honest inotify rendering is an event about the DIRECTORY
+                // with no name, which watchers treat as "rescan". Never turn
+                // it into DELETE_SELF/MOVE_SELF of a child: gpg-agent
+                // watches its homedir's parent and shuts down ("homedir has
+                // been removed") on any such event.
+                //
+                // Report it with whichever entry-level bits the watcher ASKED
+                // for: notes_for() only registered NOTE_WRITE because of
+                // them, so dropping it would leave a readable fd that
+                // read() blocks on forever. (gpg-agent watches its socket
+                // dir for IN_DELETE alone; filtering to modify|create here
+                // hung it inside read() and wedged `pacman-key --init`.)
+                // With len=0 there is no name, so name-matching watchers
+                // correctly conclude "not my file" and rescan.
+                constexpr std::uint32_t kEntry = inotify_bit::create | inotify_bit::delete_
+                    | inotify_bit::moved_from | inotify_bit::moved_to
+                    | inotify_bit::modify | inotify_bit::close_write;
+                if (f & (NOTE_WRITE | NOTE_EXTEND | NOTE_LINK))
+                    mask |= w->mask & kEntry;
+            } else {
+                if (f & (NOTE_WRITE | NOTE_EXTEND))
+                    mask |= w->mask & (inotify_bit::modify | inotify_bit::close_write);
+            }
+            if (f & NOTE_ATTRIB) mask |= w->mask & inotify_bit::attrib;
+            // These really are about the watched object itself.
+            if (f & (NOTE_DELETE | NOTE_REVOKE)) mask |= inotify_bit::delete_self;   // always reported
+            if (f & NOTE_RENAME) mask |= w->mask & inotify_bit::move_self;
             if (!mask) continue;
-            // A directory NOTE_WRITE means "something inside changed";
-            // inotify would name the entry, but kqueue does not tell us
-            // which, so report the directory itself modified. Watchers
-            // rescan on any event, which is why this is sufficient in
-            // practice (it is also what every kqueue-based inotify shim does).
             if (used + sizeof(LinuxInotifyEvent) > out.size()) break;
             const LinuxInotifyEvent e{wd, mask, 0, 0};
             std::memcpy(out.data() + used, &e, sizeof e);
@@ -164,7 +195,31 @@ public:
     }
 
 private:
-    struct Watch { int wd; int fd; std::uint32_t mask; std::string path; };
+    // Ask kqueue ONLY for what the inotify mask can report. The inotify fd
+    // IS the kqueue, so any queued kevent makes it poll-readable -- even one
+    // drain() then filters away. gpg-agent watches its homedir for
+    // IN_DELETE_SELF alone and treats "select says readable" as "homedir
+    // removed": with every note registered, the agent's own socket creation
+    // and key writes woke it, and it shut down mid `pacman-key --init`
+    // ("can't connect to the gpg-agent: End of file").
+    [[nodiscard]] static std::uint32_t notes_for(std::uint32_t m, bool is_dir) noexcept {
+        using namespace inotify_bit;
+        std::uint32_t n = 0;
+        if (m & (delete_self | 0x2000 /*IN_UNMOUNT*/)) n |= NOTE_DELETE | NOTE_REVOKE;
+        if (m & move_self) n |= NOTE_RENAME;
+        if (m & attrib)    n |= NOTE_ATTRIB;
+        if (is_dir) {
+            // Entry-level events (create/delete/move inside) surface as a
+            // directory write; kqueue cannot name the entry.
+            if (m & (create | delete_ | moved_from | moved_to | modify | close_write))
+                n |= NOTE_WRITE | NOTE_LINK;
+        } else if (m & (modify | close_write)) {
+            n |= NOTE_WRITE | NOTE_EXTEND;
+        }
+        return n;
+    }
+
+    struct Watch { int wd; int fd; std::uint32_t mask; std::string path; bool is_dir; };
     int kq_;
     int next_wd_{1};
     std::vector<Watch> watches_;

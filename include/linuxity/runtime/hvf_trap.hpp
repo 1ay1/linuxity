@@ -143,6 +143,17 @@ public:
 
     void set_arena(std::uint64_t image_end, std::uint64_t stack_floor) {
         proc_.with_space([&](AddressSpace& t) { return t.reset(image_end, stack_floor); });
+        // A non-PIE image sits in the low window BELOW the page tables, so
+        // its arena [image_end, ...) spans them. Reserve the table range as
+        // a no-access VMA: brk stops at it (ceiling_above) and mmap's gap
+        // search skips it, instead of handing the guest EL1-only memory.
+        const std::uint64_t ram = machine_.mem_size();
+        const std::uint64_t lo = HvfLayout::tables_lo(ram), hi = HvfLayout::priv_end(ram);
+        if (image_end < hi && lo < hi)
+            proc_.with_space([&](AddressSpace& t) {
+                t.adopt(Vma{lo, hi, GuestProt::none, false});
+                return 0;
+            });
     }
 
     // Record a region the LOADER mapped directly into guest RAM (ELF
@@ -193,7 +204,16 @@ public:
                 return err<bool>(regs.error());
             }
             regs_ = *regs;
-            if (regs_.ec() != kEcSvc64) return ok(report_fault());
+            if (regs_.ec() != kEcSvc64) {
+                // A fault the guest HANDLES (handler frame now loaded into
+                // the vCPU) must simply resume. Returning true here would
+                // tell the caller "a syscall trapped": it would dispatch a
+                // stale frame, write -EINVAL into x0 and reset PC to the
+                // faulting instruction -- clobbering the handler entry, so
+                // the fault recurred with x0=-22 and the program died.
+                if (report_fault()) continue;
+                return ok(false);
+            }
             // aarch64 Linux: nr in x8, args x0..x5.
             f.regs.nr = regs_.nr();
             for (std::size_t i = 0; i < 6; ++i) f.regs.arg[i] = regs_.arg(i);
@@ -408,31 +428,128 @@ private:
         return ok(rc);
     }
 
-    // A non-SVC exception is a genuine guest fault. On Linux this would be a
-    // SIGSEGV/SIGILL delivered to the guest; until signal delivery exists,
-    // end the run with the shell's 128+signal convention and say why --
-    // resuming would spin forever on the faulting instruction.
+    // A non-SVC exception is a genuine guest fault. Linux turns these into a
+    // SYNCHRONOUS signal at the faulting instruction -- SIGSEGV for a bad
+    // address, SIGBUS for misalignment, SIGILL for a bad opcode -- and a
+    // handler that longjmps out, remaps the page, or just prints a backtrace
+    // resumes normally. Tearing down the VM instead broke real programs:
+    // gpg probes memory to size its secure heap and expects to CATCH the
+    // SIGSEGV, so `pacman-key` failed the whole transaction with "no secret
+    // key available" on what Linux treats as a routine recoverable fault.
+    //
+    // Returns true to keep running (a handler was entered, or the signal is
+    // ignored and the instruction will be retried), false to stop.
     [[nodiscard]] bool report_fault() {
         const char* kind = "exception";
         int sig = 11;                                  // SIGSEGV
+        std::int32_t code = sicode::kSegvMaperr;
         switch (regs_.ec()) {
             case 0x24: case 0x25: kind = "data abort";        break;
             case 0x20: case 0x21: kind = "instruction abort"; break;
-            case 0x26: kind = "SP alignment fault";           break;
-            case 0x0e: kind = "illegal execution state"; sig = 4; break;
-            case 0x00: kind = "undefined instruction";   sig = 4; break;
+            case 0x26: kind = "SP alignment fault";
+                sig = 7; code = sicode::kBusAdraln; break;     // SIGBUS
+            case 0x0e: kind = "illegal execution state";
+                sig = 4;  code = sicode::kIllIllopc; break;    // SIGILL
+            case 0x00: kind = "undefined instruction";
+                sig = 4;  code = sicode::kIllIllopc; break;
             default: break;
         }
+        // A fault inside a MAPPED range is a permission problem (ACCERR);
+        // outside any VMA it is an unmapped address (MAPERR). That
+        // distinction is what a guard-page handler keys on.
         const Vma* v = proc_.with_space([&](AddressSpace& t) { return t.find(regs_.far); });
+        if (sig == 11 && v) code = sicode::kSegvAccerr;
+
+        // If the guest installed a handler, deliver the fault to it. The
+        // frame must capture the FAULTING instruction (pc unchanged, not
+        // advanced past it) so that returning from the handler retries the
+        // access -- that is how a demand-paging or guard-page handler works.
+        const LinuxSigaction act =
+            proc_.with_signals([&](SignalDispositions& t) { return t.get(sig); });
+        if (act.handler > 1 && !(task_.sig_mask & sigbit(sig))) {
+            if (deliver_fault(sig, code, regs_.far)) return true;
+        }
+
+        // No handler (or the signal is blocked, which Linux treats as fatal
+        // for a synchronous fault): die by the signal, and say where, because
+        // an unexplained 139 is the least actionable thing we could print.
         std::fprintf(stderr,
             "linuxity: guest %s at pc=%#llx addr=%#llx (%s) esr=%#llx\n",
             kind, static_cast<unsigned long long>(regs_.elr),
             static_cast<unsigned long long>(regs_.far),
             v ? "mapped" : "UNMAPPED",
             static_cast<unsigned long long>(regs_.esr));
+        std::fflush(nullptr);
         exited_ = true;
         code_ = 128 + sig;
         return false;
+    }
+
+    // Build an rt_sigframe for a SYNCHRONOUS fault and enter the handler.
+    // Shares the layout rules with deliver_pending() but differs in two ways
+    // that matter: siginfo carries si_addr (not a sender pid), and the saved
+    // PC is the faulting instruction itself.
+    [[nodiscard]] bool deliver_fault(int s, std::int32_t code, std::uint64_t addr) {
+        const LinuxSigaction act =
+            proc_.with_signals([&](SignalDispositions& t) { return t.get(s); });
+        const HvfCpu::CpuState cpu = cpu_.save();
+        std::uint64_t sp = cpu.sp_el0;
+        // SIGSEGV from stack overflow can only be handled on an ALTERNATE
+        // stack -- the normal one is what overflowed. This is the whole
+        // reason sigaltstack exists.
+        if ((act.flags & sigflag::kOnstack) && task_.alt_stack.ss_size &&
+            !(sp > task_.alt_stack.ss_sp && sp <= task_.alt_stack.ss_sp + task_.alt_stack.ss_size))
+            sp = task_.alt_stack.ss_sp + task_.alt_stack.ss_size;
+
+        std::uint64_t ret = act.restorer;
+        if (!(act.flags & sigflag::kRestorer) || !ret) {
+            sp -= 16;
+            if (!machine_.ram().put(sp, kSigreturnTrampoline)) return false;
+            machine_.publish_code(sp, 8);
+            ret = sp;
+        }
+        sp = (sp - sizeof(RtSigframe)) & ~std::uint64_t{15};
+        const std::uint64_t frame_at = sp;
+
+        RtSigframe frame{};
+        LinuxSigfault fi{};
+        fi.si_signo = s;
+        fi.si_code  = code;
+        fi.si_addr  = addr;
+        std::memcpy(&frame.info, &fi, sizeof fi);
+        frame.uc.uc_stack   = task_.alt_stack;
+        frame.uc.uc_sigmask = task_.sig_mask;
+        auto& mc = frame.uc.uc_mcontext;
+        std::memcpy(mc.regs, cpu.x, sizeof mc.regs);
+        mc.sp     = cpu.sp_el0;
+        mc.pc     = regs_.elr;        // the FAULTING instruction, not past it
+        // The exception was taken to our EL1 vector, so the live CPSR is the
+        // stub's EL1h state; the interrupted EL0 PSTATE is in SPSR_EL1.
+        mc.pstate = regs_.spsr;
+        FpsimdContext fp{};
+        fp.fpsr = static_cast<std::uint32_t>(cpu.fpsr);
+        fp.fpcr = static_cast<std::uint32_t>(cpu.fpcr);
+        std::memcpy(fp.vregs, cpu.q, sizeof fp.vregs);
+        std::memcpy(mc.reserved, &fp, sizeof fp);
+
+        // If the frame itself cannot be written the stack is unusable; let
+        // the caller fall through to the fatal path rather than looping.
+        if (!machine_.ram().put(frame_at, frame)) return false;
+
+        HvfCpu::CpuState h = cpu;
+        h.x[0]   = static_cast<std::uint64_t>(s);
+        h.x[1]   = frame_at + offsetof(RtSigframe, info);
+        h.x[2]   = frame_at + offsetof(RtSigframe, uc);
+        h.x[30]  = ret;
+        h.sp_el0 = sp;
+        h.pc     = act.handler;
+        h.cpsr   = 0;
+        cpu_.load(h);
+
+        task_.sig_mask |= act.mask;
+        if (!(act.flags & sigflag::kNodefer)) task_.sig_mask |= sigbit(s);
+        if (act.flags & sigflag::kResethand) route_host_signal(s, false);
+        return true;
     }
 
     // -- The Darwin service routine ---------------------------------------
@@ -584,6 +701,43 @@ private:
             case S::getsockopt: {
                 const int h = host_fd(gfd);
                 if (h < 0) return -9;
+                // SO_PEERCRED (SOL_SOCKET=1, 17): struct ucred {pid,uid,gid}.
+                // Darwin has no such option, so the generic path said
+                // ENOPROTOOPT and libassuan's get_peercred failed -- the
+                // agent then dropped every client, gpg reported "can't
+                // connect to the gpg-agent: End of file" and pacman-key
+                // could not generate its master key. Build it from
+                // LOCAL_PEERPID (host pid -> guest pid) and the guest's
+                // single identity (root).
+                if (a1 == 1 && a2 == 17) {
+                    std::uint32_t want = 0;
+                    if (!ram.get(a4, want)) return -14;
+                    pid_t hpid = 0;
+                    socklen_t pl = sizeof hpid;
+                    // LOCAL_PEERPID can fail (ENOTCONN) on an accepted socket
+                    // once the peer has written and the connect side's PCB
+                    // detached, and on socketpair ends; the CREDENTIALS are
+                    // still what the guest is asking about. Fall back to
+                    // getpeereid(), and finally to "same process". Linux
+                    // never fails SO_PEERCRED on a connected AF_UNIX socket,
+                    // and libassuan treats any failure as a dead client.
+                    if (::getsockopt(h, SOL_LOCAL, LOCAL_PEERPID, &hpid, &pl) < 0) {
+                        uid_t u; gid_t gg;
+                        int typ = 0; socklen_t tl = sizeof typ;
+                        if (::getpeereid(h, &u, &gg) < 0 &&
+                            ::getsockopt(h, SOL_SOCKET, SO_TYPE, &typ, &tl) < 0)
+                            return darwin::fail();
+                        hpid = ::getpid();
+                    }
+                    const std::int32_t g = pids_.guest_of(hpid);
+                    const std::int32_t gpid = g > 0 ? g : 1;
+                    const std::int32_t cred[3] = {gpid, 0, 0};
+                    const std::uint32_t n = std::min<std::uint32_t>(want, sizeof cred);
+                    auto val = ram.at(a3, n);
+                    if (val.empty() && n) return -14;
+                    std::memcpy(val.data(), cred, n);
+                    return ram.put(a4, n) ? 0 : -14;
+                }
                 const auto opt = net::opt_to_darwin(static_cast<int>(a1),
                                                     static_cast<int>(a2));
                 if (!opt) return -92;                                // ENOPROTOOPT
@@ -2934,6 +3088,23 @@ private:
                 if (!need_fd()) return -9;                          // EBADF
                 auto win = ram.clamp(a1, a2);
                 if (win.empty() && a2) return -14;                  // EFAULT
+                // An inotify fd is a kqueue on Darwin, and read(2) on a kqueue
+                // is ENXIO -- which gpg-agent (it watches its socket dir) took
+                // as fatal, so every `pacman-key` agent died and signing
+                // failed with "no secret key". Translate kevents into
+                // inotify_event records instead; block like Linux unless the
+                // fd is nonblocking.
+                if (auto it = inotifies_.find(gfd); it != inotifies_.end()) {
+                    if (win.size() < sizeof(LinuxInotifyEvent)) return -22;   // EINVAL
+                    const bool nb = (::fcntl(*hfd, F_GETFL) & O_NONBLOCK) != 0;
+                    for (int round = 0;; ++round) {
+                        const std::size_t n = it->second->drain(win);
+                        if (n) return static_cast<std::int64_t>(n);
+                        if (nb) return -11;                                    // EAGAIN
+                        pollfd p{*hfd, POLLIN, 0};
+                        if (::poll(&p, 1, -1) < 0 && errno == EINTR) return -4;
+                    }
+                }
                 auto n = ::read(*hfd, win.data(), win.size());
                 return n < 0 ? darwin::fail() : n;
             }
@@ -3530,9 +3701,20 @@ private:
     // Move up to `len` bytes between two host fds, honouring explicit
     // offsets (-1 = use the fd's own position). Shared by sendfile, splice
     // and copy_file_range -- all three promise only that the bytes move.
+    // Move up to `len` bytes, Linux-style: block only until SOME data is
+    // available, then return what was moved. Looping until `len` (or EOF)
+    // deadlocked pipelines: GNU cat splices 128 KiB from a pipe, got the
+    // writer's few bytes, then blocked in read() again for the rest -- so it
+    // never returned to write them out or notice the writer's exit, and
+    // `echo x | cat` (and every `cmd | cat` / `| less`) hung forever. Only a
+    // positional (pread) regular-file source keeps going, because a file
+    // read never blocks and sendfile on a file is expected to move it all.
     [[nodiscard]] std::int64_t copy_between(int in, int out, std::int64_t& in_off,
                                             std::int64_t out_off, std::uint64_t len) {
         std::vector<std::byte> buf(std::min<std::uint64_t>(len, 1u << 20));
+        struct ::stat st{};
+        const bool stream = in_off < 0 &&
+            (::fstat(in, &st) != 0 || !S_ISREG(st.st_mode));
         std::uint64_t done = 0;
         while (done < len) {
             const auto want = std::min<std::uint64_t>(len - done, buf.size());
@@ -3549,6 +3731,7 @@ private:
             done += static_cast<std::uint64_t>(put);
             if (in_off >= 0) in_off += put;
             if (put < got) break;
+            if (stream) break;          // pipe/socket/tty: one transfer, like Linux
         }
         return static_cast<std::int64_t>(done);
     }

@@ -35,6 +35,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <unistd.h>
@@ -89,17 +90,33 @@ public:
     // Run a loaded process to completion; returns its exit code.
     [[nodiscard]] Result<int> run(UAddr entry, UAddr sp) {
         abi::Syscalls sys{kernel_, mem_, arch_};
+        // Kernel state is shared by every guest thread's loop; lock it for
+        // BOOKKEEPING only. The host syscall itself (forward/redirect, which
+        // may block in read/wait4/open-a-FIFO) runs unlocked, or one blocked
+        // thread would freeze every other thread's dispatch.
+        auto locked = [this](auto&& fn) -> decltype(auto) {
+            if constexpr (requires { kernel_.mutex(); }) {
+                std::lock_guard g{kernel_.mutex()};
+                return fn();
+            } else {
+                return fn();
+            }
+        };
+        static const char* const trace_env = [] {
+            const char* t = std::getenv("LINUXITY_TRACE");
+            return (t && *t) ? t : nullptr;
+        }();
         LX_TRY(trap_.start(entry, sp));
         for (;;) {
             TrapFrame f;
             bool still_running = LX_TRY(trap_.next(f));
-            apply_proc_events();
+            locked([&] { apply_proc_events(); });
             if (!still_running) { cleanup_temps(); return ok(trap_.exit_code()); }
 
             // The dispatcher classifies the trapped syscall: service it from
             // our subsystems, forward it to the host kernel, or exit.
-            abi::Outcome o = sys.dispatch(f.regs);
-            if (const char* t = std::getenv("LINUXITY_TRACE"); t && *t) {
+            abi::Outcome o = locked([&] { return sys.dispatch(f.regs); });
+            if (const char* t = trace_env) {
                 std::fprintf(trace_out(t), "[lx] nr=%llu -> %s%s%s%s%s%s%s ret=%lld %s%s%s\n",
                     static_cast<unsigned long long>(f.regs.nr),
                     o.inject?"INJECT ":"", o.redirect?"REDIRECT ":"",
@@ -127,7 +144,7 @@ public:
                 auto fdr = trap_.redirect(o.path_arg, tmp);
                 if (!fdr) { LX_TRY(recover_syscall(fdr.error())); continue; }
                 if (!tmp.empty()) temps_.push_back(std::move(tmp));
-                sys.note_opened_fd(*fdr);
+                locked([&] { sys.note_opened_fd(*fdr); });
             } else if (o.redirect) {
                 // Host-backed path: rewrite the arg to the real host path and
                 // let the kernel run it in the child (real fd for mmap). A
@@ -146,10 +163,10 @@ public:
                 }
                 auto retr = trap_.redirect(
                     o.path_arg, o.host_path,
-                    [&](std::int64_t rc) { if (rc == 0) sys.scrub_ids(o); },
+                    [&](std::int64_t rc) { if (rc == 0) locked([&] { sys.scrub_ids(o); }); },
                     o.path_arg2, o.host_path2);
                 if (!retr) { LX_TRY(recover_syscall(retr.error())); continue; }
-                sys.note_opened_fd(*retr);
+                locked([&] { sys.note_opened_fd(*retr); });
             } else if (o.sock_rewrite) {
                 // AF_UNIX bind/connect: create the socket's parent chain in
                 // the overlay upper, then poke the translated host path into
@@ -203,8 +220,10 @@ public:
                     int from = o.dup_from, closed = o.dup_close;
                     auto fr = trap_.forward_sync([&](std::int64_t ret) {
                         if (ret < 0) return;
-                        if (closed >= 0 && closed != from) sys.on_fd_closed(closed);
-                        sys.on_fd_dup(from, static_cast<int>(ret));
+                        locked([&] {
+                            if (closed >= 0 && closed != from) sys.on_fd_closed(closed);
+                            sys.on_fd_dup(from, static_cast<int>(ret));
+                        });
                     });
                     if (!fr) { LX_TRY(recover_syscall(fr.error())); continue; }
                 } else {

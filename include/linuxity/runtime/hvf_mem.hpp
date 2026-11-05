@@ -30,13 +30,28 @@ public:
     GuestRam() = default;
     GuestRam(std::byte* base, std::uint64_t size, std::uint64_t floor) noexcept
         : base_{base}, size_{size}, floor_{floor} {}
+    // `hole` is a guest-owned range that lies BELOW floor_ (the non-PIE
+    // window: the table array sits above it, so a fixed-address ET_EXEC
+    // image loads there). Without it, loading gcc hit floor_ and failed
+    // ENOMEM.
+    GuestRam(std::byte* base, std::uint64_t size, std::uint64_t floor,
+             std::uint64_t hole_beg, std::uint64_t hole_end) noexcept
+        : base_{base}, size_{size}, floor_{floor},
+          hole_beg_{hole_beg}, hole_end_{hole_end} {}
+
+    // Is [gpa, gpa+n) guest-accessible? Either wholly at/above floor_, or
+    // wholly inside the carve-out hole. Subtraction order avoids overflow.
+    [[nodiscard]] bool permits(std::uint64_t gpa, std::size_t n) const noexcept {
+        if (gpa >= size_ || n > size_ - gpa) return false;
+        if (gpa >= floor_) return true;
+        return gpa >= hole_beg_ && n <= hole_end_ - gpa;
+    }
 
     // The guest-visible range, or an empty span if [gpa, gpa+n) escapes it.
     // Note the subtraction order: `n > size_ - gpa` cannot overflow, whereas
     // the obvious `gpa + n > size_` can wrap for a hostile gpa.
     [[nodiscard]] std::span<std::byte> at(std::uint64_t gpa, std::size_t n) const noexcept {
-        if (gpa < floor_ || gpa >= size_) return {};
-        if (n > size_ - gpa) return {};
+        if (!permits(gpa, n)) return {};
         return {base_ + gpa, n};
     }
 
@@ -44,8 +59,13 @@ public:
     // runs off the end of RAM transfers what fits, which is what a real
     // kernel does for a partially valid iovec (short count, not EFAULT).
     [[nodiscard]] std::span<std::byte> clamp(std::uint64_t gpa, std::size_t n) const noexcept {
-        if (gpa < floor_ || gpa >= size_) return {};
-        return {base_ + gpa, std::min<std::uint64_t>(n, size_ - gpa)};
+        if (gpa >= size_) return {};
+        std::uint64_t top = size_;
+        if (gpa < floor_) {
+            if (gpa < hole_beg_ || gpa >= hole_end_) return {};
+            top = hole_end_;                    // clamp within the hole
+        }
+        return {base_ + gpa, std::min<std::uint64_t>(n, top - gpa)};
     }
 
     [[nodiscard]] bool valid() const noexcept { return base_ != nullptr; }
@@ -82,7 +102,10 @@ public:
 private:
     std::byte* base_{nullptr};
     std::uint64_t size_{0};
-    std::uint64_t floor_{0};   // first guest-accessible gpa
+    std::uint64_t floor_{0};       // first guest-accessible gpa
+    // A guest-owned carve-out BELOW floor_ (empty when hole_beg_==hole_end_).
+    std::uint64_t hole_beg_{0};
+    std::uint64_t hole_end_{0};
 };
 
 // A guest iovec, as the Linux ABI lays it out.

@@ -71,6 +71,7 @@ struct HvfImage {
     // dereferences it while locating its own dynamic segment and dies in a
     // null-pointer write long before main.
     img.phdr_addr = img.load_bias + eh.e_phoff;
+    bool have_pt_phdr = false;
 
     for (std::uint16_t i = 0; i < eh.e_phnum; ++i) {
         loader::Phdr ph{};
@@ -79,10 +80,20 @@ struct HvfImage {
             return err<HvfImage>(Errno::enoexec);
         if (std::fread(&ph, 1, sizeof ph, f) != sizeof ph)
             return err<HvfImage>(Errno::enoexec);
-        if (static_cast<loader::PType>(ph.p_type) == loader::PType::phdr)
+        if (static_cast<loader::PType>(ph.p_type) == loader::PType::phdr) {
             img.phdr_addr = img.load_bias + ph.p_vaddr;
+            have_pt_phdr = true;
+        }
         if (static_cast<loader::PType>(ph.p_type) != loader::PType::load)
             continue;
+        // No PT_PHDR: locate the headers by FILE OFFSET inside this LOAD and
+        // translate to its vaddr. bias + e_phoff is only right when the first
+        // LOAD maps offset 0 at vaddr 0 (a PIE); a static ET_EXEC at 0x400000
+        // got AT_PHDR=0x40, and its libc walked the phdrs through address
+        // 0x40 -- agentty died with a SIGSEGV at addr=0x40 before main.
+        if (!have_pt_phdr && eh.e_phoff >= ph.p_offset &&
+            eh.e_phoff < ph.p_offset + ph.p_filesz)
+            img.phdr_addr = img.load_bias + ph.p_vaddr + (eh.e_phoff - ph.p_offset);
 
         std::uint64_t va = img.load_bias + ph.p_vaddr;
         // Zero the whole [filesz, memsz) span first so .bss reads as zero,
