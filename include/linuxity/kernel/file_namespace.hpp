@@ -351,14 +351,21 @@ public:
         while (!rel.empty() && rel.front() == '/') rel.remove_prefix(1);
         std::string lo = join_host(m->host_base, rel);
         std::string up = join_host(m->upper, rel);
-        if (!is_dir(lo.c_str()) && !is_dir(up.c_str())) return out;
-        std::unordered_map<std::string, DType> seen;   // name -> type
-        merge_dir(up, seen);   // upper first (wins)
-        merge_dir(lo, seen);
+        // No is_dir() probes here: opendir inside merge_dir already answers
+        // "does this directory exist and can I read it", so stat'ing both
+        // layers first was two wasted host syscalls per enumerated directory
+        // -- and `ls -lR` enumerates thousands.
+        NameMap seen;                                  // name -> type
+        const bool had_up = merge_dir(up, seen);       // upper first (wins)
+        const bool had_lo = merge_dir(lo, seen);
+        if (!had_up && !had_lo) return out;            // neither layer exists
         // The shadow-metadata journal is an implementation file in the upper
         // layer, not part of the guest tree — never let it show up in a listing.
-        seen.erase(std::string{MetaStore::journal_leaf()});
-        seen.erase(".linuxity-whiteout");
+        // Erase via find(): transparent erase(K&&) is C++23, but a transparent
+        // find() plus erase(iterator) is C++20 and allocates nothing either.
+        for (std::string_view hide : {MetaStore::journal_leaf(),
+                                      std::string_view{".linuxity-whiteout"}})
+            if (auto it = seen.find(hide); it != seen.end()) seen.erase(it);
         // Drop names whited-out from the lower layer (removed in the overlay
         // view but still present on the pristine rootfs) unless the upper has
         // re-created them (merge_dir(up) already recorded those, so a name
@@ -367,11 +374,26 @@ public:
         if (!whiteouts_.empty()) {
             std::string dir{abs};
             if (dir != "/" && dir.back() == '/') dir.pop_back();
-            std::string up_dir = up;
+            // Build both candidate paths by TRUNCATING a reused buffer rather
+            // than concatenating fresh strings per entry: this loop runs over
+            // every name in every enumerated directory, and the old form made
+            // two allocations each time just to ask a set-membership question.
+            std::string child = (dir == "/" ? std::string{"/"} : dir + "/");
+            const std::size_t child_base = child.size();
+            std::string up_child = up;
+            up_child += '/';
+            const std::size_t up_base = up_child.size();
             for (auto it = seen.begin(); it != seen.end();) {
-                std::string child = (dir == "/" ? "/" : dir + "/") + it->first;
-                if (is_whiteout(child) &&
-                    !exists((up_dir + "/" + it->first).c_str()))
+                child.resize(child_base);
+                child += it->first;
+                // is_whiteout is an in-memory set probe; exists() is a host
+                // syscall. Test the cheap one first and let && skip the stat
+                // for the overwhelming majority of entries, which are not
+                // whited out at all.
+                if (!is_whiteout(child)) { ++it; continue; }
+                up_child.resize(up_base);
+                up_child += it->first;
+                if (!exists(up_child.c_str()))
                     it = seen.erase(it);
                 else
                     ++it;
@@ -682,20 +704,46 @@ private:
         return ::stat(path, &st) == 0 && S_ISDIR(st.st_mode);
     }
 
+    // Transparent hash/equality so a directory-union map can be probed with a
+    // std::string_view. A readdir name is a char* into the DIR buffer, and the
+    // default unordered_map<std::string,...> has to materialize a std::string
+    // for every lookup just to throw it away -- one malloc/free per duplicate
+    // entry on a union of two populated directories.
+    struct SvHash {
+        using is_transparent = void;
+        [[nodiscard]] std::size_t operator()(std::string_view s) const noexcept {
+            return std::hash<std::string_view>{}(s);
+        }
+    };
+    struct SvEq {
+        using is_transparent = void;
+        [[nodiscard]] bool operator()(std::string_view a,
+                                      std::string_view b) const noexcept {
+            return a == b;
+        }
+    };
+    using NameMap = std::unordered_map<std::string, DType, SvHash, SvEq>;
+
     // Read a real host directory's entries into `seen` (name -> type),
     // skipping "."/".." and not overwriting a name already present (so the
     // caller can merge upper before lower and have upper win). Symlink type is
     // captured (via d_type or an lstat that does NOT follow the link) so the
     // overlay listing reports DT_LNK -- git and other tools probe symlink
     // support by lstat-checking S_ISLNK on a listed entry.
-    static void merge_dir(const std::string& host_dir,
-                          std::unordered_map<std::string, DType>& seen) {
+    // Returns true if the directory existed and was enumerated. The caller
+    // uses that instead of a separate is_dir() probe: opendir already tells
+    // us everything a stat would, so stat'ing first is a wasted syscall.
+    static bool merge_dir(const std::string& host_dir, NameMap& seen) {
         ::DIR* d = ::opendir(host_dir.c_str());
-        if (!d) return;
+        if (!d) return false;
         while (::dirent* e = ::readdir(d)) {
-            std::string name = e->d_name;
+            const std::string_view name{e->d_name};
             if (name == "." || name == "..") continue;
-            if (seen.count(name)) continue;
+            // Look up by string_view (C++20 heterogeneous lookup) so a name
+            // already recorded by the upper layer costs no allocation at
+            // all -- on a union of two full directories that is one skipped
+            // malloc/free pair per duplicate entry.
+            if (seen.find(name) != seen.end()) continue;
             DType t;
             const auto dt = dirent_type(e);
             if      (dt == DT_LNK) t = DType::symlink;
@@ -703,16 +751,20 @@ private:
             else if (dt == DT_REG) t = DType::regular;
             else {                                   // DT_UNKNOWN: lstat it
                 struct ::stat ls{};
-                if (::lstat((host_dir + "/" + name).c_str(), &ls) == 0)
+                std::string full = host_dir;
+                full += '/';
+                full.append(name);
+                if (::lstat(full.c_str(), &ls) == 0)
                     t = S_ISLNK(ls.st_mode) ? DType::symlink
                       : S_ISDIR(ls.st_mode) ? DType::dir
                                             : DType::regular;
                 else
                     t = DType::regular;
             }
-            seen.emplace(std::move(name), t);
+            seen.emplace(name, t);
         }
         ::closedir(d);
+        return true;
     }
 
     // Manager-layer repair of a durable pacman DB in the overlay upper, run
