@@ -61,8 +61,8 @@ namespace lx::runtime {
 struct HvfLayout {
     static constexpr std::uint64_t page       = 0x1000;
     static constexpr std::uint64_t vectors    = 0x0000;   // VBAR_EL1 (2 KiB-aligned)
-    // 512 syscall numbers x {value, live} -- see hvf_fastcall.hpp.
-    static constexpr std::uint64_t fastcall_bytes = 512 * 16;
+    // 512 syscall numbers x {value, live}, plus the handler's scratch.
+    static constexpr std::uint64_t fastcall_bytes = 512 * 16 + 64;
     // The in-guest syscall table (hvf_fastcall.hpp). It sits right after the
     // L2 tables, inside the EL1-only private area, so a guest can neither
     // read it nor forge an entry.
@@ -165,8 +165,9 @@ inline void write_vector_stub(std::byte* mem, std::uint64_t ram) {
                     &hvc, 4);
     }
     auto* v8 = reinterpret_cast<std::uint32_t*>(mem + HvfLayout::vectors + 8 * 0x80);
-    (void)fastcall::emit_handler(v8, HvfLayout::fastcall(ram), 8);
-    std::memset(mem + HvfLayout::fastcall(ram), 0, HvfLayout::fastcall_bytes);
+    const std::uint64_t tbl = HvfLayout::fastcall(ram);
+    (void)fastcall::emit_handler(v8, tbl);
+    std::memset(mem + tbl, 0, HvfLayout::fastcall_bytes);
 }
 
 // Build a 3-level, 4 KiB-granule identity map of [0, ram). The private area
@@ -299,6 +300,20 @@ public:
     }
     void clear_all_fastcalls() noexcept {
         if (base_) std::memset(base_ + HvfLayout::fastcall(size_), 0, HvfLayout::fastcall_bytes);
+    }
+    // The handler's private scratch (the live signal mask).
+    [[nodiscard]] fastcall::Scratch* fastcall_scratch() const noexcept {
+        if (!base_) return nullptr;
+        return reinterpret_cast<fastcall::Scratch*>(
+            base_ + HvfLayout::fastcall(size_) + fastcall::kScratchOff);
+    }
+    // Let rt_sigprocmask run in-guest against that scratch word.
+    void enable_sigprocmask_fastcall(int nr) noexcept {
+        if (nr < 0 || static_cast<std::size_t>(nr) >= fastcall::kMaxNr || !base_) return;
+        auto* t = reinterpret_cast<fastcall::Entry*>(base_ + HvfLayout::fastcall(size_));
+        t[nr].value = HvfLayout::fastcall(size_) + fastcall::kScratchOff;
+        std::atomic_thread_fence(std::memory_order_release);
+        t[nr].live = fastcall::kSigprocmask;
     }
 
     [[nodiscard]] std::uint64_t mem_size() const noexcept { return size_; }
