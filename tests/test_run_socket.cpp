@@ -17,6 +17,8 @@
 // socket at an ABSOLUTE guest path, and returns 42 on success. The harness
 // then asserts the socket node materialized INSIDE the mounted root (host
 // translation worked) and NOT at the literal host path.
+#include "guest_harness.hpp"
+
 #include "linuxity/host/posix_host.hpp"
 #include "linuxity/kernel/kernel.hpp"
 #include "linuxity/runtime/linux/ptrace_trap.hpp"
@@ -54,46 +56,31 @@ int main() {
     std::puts("run_socket: skipped (needs Linux/x86-64 host)");
     return 0;
 #else
-    const std::string root = "/tmp/lx_sock_root";
-    std::system(("rm -rf " + root + " && mkdir -p " + root + "/bin " +
-                 root + "/run").c_str());
-
-    { std::FILE* f = std::fopen("/tmp/lx_sock_src.c", "w");
-      if (!f) { std::puts("run_socket: skipped (no /tmp)"); return 0; }
-      std::fputs(kSrc, f); std::fclose(f); }
-    int rc = std::system(("gcc -static -O2 -o " + root +
-                          "/bin/prog /tmp/lx_sock_src.c 2>/dev/null").c_str());
-    if (rc != 0) { std::puts("run_socket: skipped (no static glibc / gcc)"); return 0; }
+    auto tree = lxtest::make_tree("sock", /*overlay=*/false);
+    // No /proc on purpose: this test checks behaviour that must not
+    // depend on procfs being mounted.
+    tree.with_procfs = false;
+    if (!lxtest::compile_guest("run_socket", tree, kSrc)) return 0;
 
     // Ensure no leftover HOST socket at the literal path could mask a leak.
     (void)::unlink("/run/test.sock");
 
-    host::PosixHost hw;
-    kernel::Kernel<host::PosixHost> k{hw};
-    k.files().mount_host("/", root);
-
-    std::string exec = root + "/bin/prog";
-    runtime::PtraceTrap trap{exec, {"/bin/prog"}, {}, {}};
-    runtime::Cpu cpu{trap, k, trap, abi::Arch::x86_64};
-
-    auto r = cpu.run(uaddr(0), uaddr(0));
+    auto r = lxtest::run_guest(tree);
 
     if (!r) {
         std::puts("run_socket: skipped (ptrace unavailable)");
-        std::system(("rm -rf " + root).c_str());
-        std::remove("/tmp/lx_sock_src.c");
+        lxtest::remove_tree(tree);
         return 0;
     }
 
     bool guest_ok   = (*r == 42);
     // The socket must exist INSIDE the mounted root, not at the host path.
     struct ::stat st{};
-    bool in_root    = (::stat((root + "/run/test.sock").c_str(), &st) == 0)
+    bool in_root    = (::stat((tree.root + "/run/test.sock").c_str(), &st) == 0)
                       && S_ISSOCK(st.st_mode);
     bool host_leak  = (::stat("/run/test.sock", &st) == 0);
 
-    std::system(("rm -rf " + root).c_str());
-    std::remove("/tmp/lx_sock_src.c");
+    lxtest::remove_tree(tree);
 
     if (!guest_ok) {
         std::printf("run_socket: FAIL guest exit=%d (expected 42; bind failed "

@@ -43,6 +43,11 @@ struct GuestTree {
     std::string root;    // the read-only lower rootfs
     std::string upper;   // the writable overlay upper ("" = no overlay)
     std::string exec;    // guest path of the program, e.g. "/bin/prog"
+    // Mount a synthesized /proc? True for almost every test, but run_daemon
+    // and run_socket deliberately run WITHOUT one -- they check behaviour
+    // that must not depend on procfs being present, so quietly mounting it
+    // would weaken them.
+    bool with_procfs{true};
 };
 
 // Build a scratch rootfs under /tmp. Creates <root>/bin and, when `overlay`
@@ -134,8 +139,9 @@ template <class Setup>
     lx::kernel::Kernel<lx::host::PosixHost> k{hw};
     if (g.upper.empty()) k.files().mount_host("/", g.root);
     else                 k.files().mount_host("/", g.root, g.upper);
-    k.files().mount_virtual("/proc",
-                            lx::vfs::make_procfs(k.procs(), k.machine()));
+    if (g.with_procfs)
+        k.files().mount_virtual("/proc",
+                                lx::vfs::make_procfs(k.procs(), k.machine()));
     // Whatever else this particular test needs mounted or bound.
     extra_setup(k);
 

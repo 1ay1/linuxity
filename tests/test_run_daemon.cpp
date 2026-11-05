@@ -21,6 +21,8 @@
 // The guest: writes "A", double-forks a daemon that setsid()s and then sleeps
 // far longer than the harness alarm, writes "B", and exits 42. Success = the
 // runtime returns 42 PROMPTLY (well under the daemon's sleep) with both marks.
+#include "guest_harness.hpp"
+
 #include "linuxity/host/posix_host.hpp"
 #include "linuxity/kernel/kernel.hpp"
 #include "linuxity/runtime/linux/ptrace_trap.hpp"
@@ -61,43 +63,31 @@ int main() {
     std::puts("run_daemon: skipped (needs Linux/x86-64 host)");
     return 0;
 #else
-    const std::string root = "/tmp/lx_daemon_root";
-    std::system(("rm -rf " + root + " && mkdir -p " + root + "/bin").c_str());
+    auto tree = lxtest::make_tree("daemon", /*overlay=*/false);
+    // No /proc on purpose: this test checks behaviour that must not
+    // depend on procfs being mounted.
+    tree.with_procfs = false;
+    if (!lxtest::compile_guest("run_daemon", tree, kSrc)) return 0;
 
-    { std::FILE* f = std::fopen("/tmp/lx_daemon_src.c", "w");
-      if (!f) { std::puts("run_daemon: skipped (no /tmp)"); return 0; }
-      std::fputs(kSrc, f); std::fclose(f); }
-    int rc = std::system(("gcc -static -O2 -o " + root +
-                          "/bin/prog /tmp/lx_daemon_src.c 2>/dev/null").c_str());
-    if (rc != 0) { std::puts("run_daemon: skipped (no static glibc / gcc)"); return 0; }
-
-    host::PosixHost hw;
-    kernel::Kernel<host::PosixHost> k{hw};
-    k.files().mount_host("/", root);
-
-    std::string exec = root + "/bin/prog";
-    runtime::PtraceTrap trap{exec, {"/bin/prog"}, {}, {}};
-    runtime::Cpu cpu{trap, k, trap, abi::Arch::x86_64};
-
+    // The point of this test: the root's exit must return PROMPTLY even with a
+    // detached daemon still alive, so the elapsed time is the assertion.
     std::time_t t0 = std::time(nullptr);
-    auto r = cpu.run(uaddr(0), uaddr(0));
+    auto r = lxtest::run_guest(tree);
     std::time_t elapsed = std::time(nullptr) - t0;
 
     if (!r) {
         std::puts("run_daemon: skipped (ptrace unavailable)");
-        std::system(("rm -rf " + root).c_str());
-        std::remove("/tmp/lx_daemon_src.c");
+        lxtest::remove_tree(tree);
         return 0;
     }
 
     // Read the progress marks the guest wrote into the mounted root.
     std::string marks;
-    { std::FILE* mf = std::fopen((root + "/marks").c_str(), "rb");
+    { std::FILE* mf = std::fopen((tree.root + "/marks").c_str(), "rb");
       if (mf) { int c; while ((c = std::fgetc(mf)) != EOF) marks.push_back((char)c);
                 std::fclose(mf); } }
 
-    std::system(("rm -rf " + root).c_str());
-    std::remove("/tmp/lx_daemon_src.c");
+    lxtest::remove_tree(tree);
 
     if (elapsed >= 30) {
         std::printf("run_daemon: FAIL runtime blocked ~%llds waiting on the "
