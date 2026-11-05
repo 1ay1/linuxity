@@ -190,3 +190,44 @@ Every one was a consequence of the duplication, not a coincidence:
 | every host error collapsed to `EIO` | unifying the errno table | fixed |
 | Windows `getpid`/`gettid`/`getppid` hardcoded to 1 | reading the second dispatcher | step 5 |
 | `rewinddir()` returns 0 entries on a merged dir | running Arch | open |
+
+## Open bug: `_dl_get_origin` abort during pacman extraction
+
+Found after the `lseek`/`d_ino` fixes, and worth writing down precisely
+because it is a PRE-EXISTING bug those fixes merely made REACHABLE.
+
+```
+installing jq...
+Fatal glibc error: dl-origin.c:42 (_dl_get_origin): assertion failed: linkval[0] == '/'
+error: command terminated by signal 11: Segmentation fault
+```
+
+Verified against `9b63deb` (before any of this work): the original code aborts
+the transaction EARLIER, with `could not create directory
+/var/lib/pacman/local/<pkg>/: File exists`, so it never reaches this point.
+Same commit sees **0** packages from `pacman -Q`; current HEAD sees **141**. So
+this is strictly forward progress that uncovered a deeper fault, not a
+regression.
+
+What is ruled out, each tested directly under linuxity:
+
+* `readlink("/proc/self/exe")` is correct and absolute — in the main process,
+  in a `fork`+`exec` child, and from a `#!` script.
+* `/proc/self/cwd` and `/proc/self/root` are correct and absolute.
+* Relative symlink targets (`/bin -> usr/bin`, `/usr/bin/awk -> gawk`) are
+  correct: real symlinks genuinely are relative, and glibc only asserts on the
+  `/proc/self/exe` result.
+* Every hook `Exec` runs clean standalone (`ldconfig -r .`, `locale-gen`,
+  `iconvconfig`, `update-ca-trust`, `systemd-sysusers`).
+* `chroot("/")` + `chdir("/")` then readlink is still absolute.
+* Not pacman's sandbox: `--disable-sandbox` aborts identically.
+* Not the hooks at all — `--debug` shows the abort BEFORE any `running hook`
+  line, i.e. during libalpm's own extraction.
+
+So the failing `readlink` happens inside libalpm's extraction child, in a state
+the above probes do not reproduce. The next step is to catch the actual
+`readlink` argument and return value at the moment of the abort (trace the
+path string, not just the fate), rather than guessing which path it is.
+
+Not a blocker for the syscall-layer work, and tracked here so it is not
+rediscovered from scratch.
