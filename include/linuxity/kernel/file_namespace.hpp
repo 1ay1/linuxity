@@ -447,7 +447,7 @@ public:
         if (auto it = fd_paths_.find(from); it != fd_paths_.end())
             fd_paths_[to] = it->second;
         if (auto it = dir_streams_.find(from); it != dir_streams_.end())
-            dir_streams_[to] = DirStream{it->second.entries, 0, it->second.lazy};
+            dir_streams_[to] = DirStream{it->second.entries, 0, it->second.lazy, 0};
     }
     [[nodiscard]] std::string_view path_of_fd(int fd) const {
         auto it = fd_paths_.find(fd);
@@ -526,13 +526,16 @@ public:
         std::vector<VirtualDirent> entries;
         std::size_t pos{0};
         std::string lazy;                      // non-empty => not yet built
+        // Byte position of the cursor, the unit d_off and lseek both use.
+        // Kept alongside pos so a seek can map a cookie back to an index.
+        std::uint64_t byte_off{0};
     };
     void bind_dir(int fd, std::vector<VirtualDirent> entries) {
-        dir_streams_[fd] = DirStream{std::move(entries), 0, {}};
+        dir_streams_[fd] = DirStream{std::move(entries), 0, {}, 0};
     }
     // Bind an overlaid host directory whose union is computed on demand.
     void bind_lazy_dir(int fd, std::string abs) {
-        dir_streams_[fd] = DirStream{{}, 0, std::move(abs)};
+        dir_streams_[fd] = DirStream{{}, 0, std::move(abs), 0};
     }
     [[nodiscard]] bool is_virtual_dir_fd(int fd) const {
         return dir_streams_.count(fd) != 0;

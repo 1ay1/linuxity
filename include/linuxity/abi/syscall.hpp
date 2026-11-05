@@ -302,19 +302,29 @@ public:
                 // Cost: a regular-file seek is one hash lookup that misses,
                 // then fwd(). Measured at ~3% on `ls -lR /usr` and in the
                 // noise on seek-heavy work, which is worth a correct rewind.
-                // Position = entry index (d_off is the index of the next
-                // entry, see getdents64).
+                // Position is a BYTE cookie matching the d_off getdents64
+                // hands out, so seek arithmetic on those values works. Map
+                // the target back to an entry by walking record lengths.
                 const int fd = static_cast<int>(r.arg[0]);
                 if (auto* ds = k_.files().dir_stream(fd)) {
                     const auto off = static_cast<std::int64_t>(r.arg[1]);
                     const int whence = static_cast<int>(r.arg[2]);
-                    std::int64_t np = whence == 0 ? off
-                                    : whence == 1 ? static_cast<std::int64_t>(ds->pos) + off
-                                    : -1;
-                    if (np < 0) return eno(Errno::einval);
-                    ds->pos = static_cast<std::size_t>(
-                        std::min<std::int64_t>(np, static_cast<std::int64_t>(ds->entries.size())));
-                    return val(static_cast<std::int64_t>(ds->pos));
+                    std::int64_t target =
+                        whence == 0 ? off
+                      : whence == 1 ? static_cast<std::int64_t>(ds->byte_off) + off
+                      : -1;
+                    if (target < 0) return eno(Errno::einval);
+                    // Walk to the entry whose record starts at `target`. A
+                    // cookie past the last record is end-of-directory.
+                    std::uint64_t cur = 0;
+                    std::size_t idx = 0;
+                    for (; idx < ds->entries.size(); ++idx) {
+                        if (cur >= static_cast<std::uint64_t>(target)) break;
+                        cur += wire::dirent_reclen(ds->entries[idx].name.size());
+                    }
+                    ds->pos      = idx;
+                    ds->byte_off = cur;
+                    return val(static_cast<std::int64_t>(ds->byte_off));
                 }
                 return fwd();
             }
@@ -1813,9 +1823,12 @@ private:
             // intact DB. The merge records the real host inode; 0 means a
             // purely synthesized node (procfs/sysfs) with no host file
             // behind it, where a positional value is all we have.
+            // d_off is a cumulative BYTE cookie, the same unit lseek uses --
+            // callers do arithmetic on it (fish seeks by `saved - current`),
+            // so an entry index here gave EINVAL on the resulting seek.
             const wire::Dirent de{
                 e.ino ? e.ino : ds->pos + 1,
-                static_cast<std::int64_t>(ds->pos + 1),
+                static_cast<std::int64_t>(ds->byte_off + reclen),
                 e.is_symlink() ? wire::DType::symlink
                                : e.is_dir() ? wire::DType::dir
                                             : wire::DType::regular,
@@ -1824,6 +1837,7 @@ private:
             const std::size_t n =
                 wire::encode_dirent64(std::span{out}.subspan(base), de);
             if (n == 0) { out.resize(base); break; }          // did not fit
+            ds->byte_off += reclen;
             ++ds->pos;
         }
         if (out.empty()) {

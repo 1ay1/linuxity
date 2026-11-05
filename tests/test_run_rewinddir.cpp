@@ -36,6 +36,8 @@ static const char* kSrc =
     "#include <stdio.h>\n"
     "#include <string.h>\n"
     "#include <dirent.h>\n"
+    "#include <errno.h>\n"
+    "#include <sys/types.h>\n"
     "#include <unistd.h>\n"
     "static int count(DIR* d){\n"
     "  int n = 0; struct dirent* e;\n"
@@ -71,6 +73,31 @@ static const char* kSrc =
     "  struct dirent* again = readdir(d2);\n"
     "  if (!again) return 4;              /* seekdir left us at EOF */\n"
     "  closedir(d2);\n"
+    // Callers do arithmetic on telldir() cookies -- fish seeks by
+    // `saved - current` -- so cookies and lseek must share one unit. With
+    // d_off an entry index and lseek counting bytes, that difference
+    // underflowed and lseek returned EINVAL.
+    "  DIR* d3 = opendir(\"/db\");\n"
+    "  if (!d3) return 5;\n"
+    "  if (!readdir(d3)) return 5;\n"
+    "  long c1 = telldir(d3);\n"
+    "  if (!readdir(d3)) return 5;\n"
+    "  long c2 = telldir(d3);\n"
+    "  if (c2 <= c1) return 8;            /* cookies must advance */\n"
+    // The cookies must be BYTE offsets, not entry indices: a 4-entry dir
+    // yields indices 1..4 but byte offsets in the hundreds. Checking the
+    // magnitude is what distinguishes the two, and it's the reason fish's
+    // lseek(dirfd, -102, SEEK_CUR) used to return EINVAL -- with indices,
+    // 102 was past the start of the stream.
+    "  if (c2 < 24) return 10;            /* a dirent record is >= 24 bytes */\n"
+    "  errno = 0;\n"
+    // Seek back over a whole record by its byte length. With an index
+    // cursor this underflowed to EINVAL.
+    "  if (lseek(dirfd(d3), c1 - c2, SEEK_CUR) == -1) return 9;\n"
+    // And the absolute form fish actually used.
+    "  errno = 0;\n"
+    "  if (lseek(dirfd(d3), c2, SEEK_SET) != c2) return 11;\n"
+    "  closedir(d3);\n"
     "  return 99;\n}\n";
 
 int main() {
@@ -119,12 +146,36 @@ int main() {
                   "left the stream at EOF (non-zero lseek offset ignored)");
         return 1;
     }
+    if (code == 8) {
+        std::puts("run_rewinddir: FAIL telldir() cookies did not advance between "
+                  "entries -- d_off must be a growing byte offset");
+        return 1;
+    }
+    if (code == 9) {
+        std::puts("run_rewinddir: FAIL lseek(dirfd, c1 - c2, SEEK_CUR) returned "
+                  "EINVAL. telldir() cookies and lseek disagree on units: d_off "
+                  "is bytes, so the dir cursor must count bytes too, not "
+                  "entries. This is the fish 'lseek: Invalid argument' bug.");
+        return 1;
+    }
+    if (code == 10) {
+        std::puts("run_rewinddir: FAIL telldir() cookies are too small to be "
+                  "byte offsets -- d_off is still an entry index, so any "
+                  "caller doing arithmetic on cookies hits EINVAL");
+        return 1;
+    }
+    if (code == 11) {
+        std::puts("run_rewinddir: FAIL lseek(dirfd, cookie, SEEK_SET) did not "
+                  "return the cookie it was given");
+        return 1;
+    }
     if (code != 99) {
         std::printf("run_rewinddir: FAIL guest exit=%d (expected 99)\n", code);
         return 1;
     }
     std::puts("run_rewinddir: rewinddir/seekdir reset the merged dir cursor; "
-              "three passes over a lower+upper union all see 4 entries, exit=99");
+              "three passes over a lower+upper union all see 4 entries, and "
+              "seeking by a telldir() cookie difference works, exit=99");
     return 0;
 #endif
 }
