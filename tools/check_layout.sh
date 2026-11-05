@@ -118,12 +118,12 @@ done
 #    (LinuxStat differs between x86-64 and asm-generic) as long as it
 #    static_asserts against abi/wire -- rule 5's authority check covers that.
 #    What this rule forbids is re-declaring a shape that does NOT vary.
-for s in Timespec Timeval Itimerval Itimerspec; do
-    hits=$(grep -rlE "^(struct|using)[[:space:]]+(Linux)?$s[[:space:]]*[{=]" \
+for s in Timespec Timeval Itimerval Itimerspec Iovec; do
+    hits=$(grep -rlE "^(struct|using)[[:space:]]+(Linux|Guest)?$s[[:space:]]*[{=]" \
            include/linuxity src 2>/dev/null \
            | grep -v '^include/linuxity/abi/wire/' || true)
     for f in $hits; do
-        grep -qE "^using[[:space:]]+(Linux)?$s[[:space:]]*=" "$f" \
+        grep -qE "^using[[:space:]]+(Linux|Guest)?$s[[:space:]]*=" "$f" \
             || note "$f re-declares guest ABI struct $s; alias abi/wire instead"
     done
 done

@@ -12,6 +12,7 @@
 
 #if defined(__APPLE__) && defined(__aarch64__)
 
+#include "linuxity/abi/wire/iovec.hpp"
 #include "linuxity/abi/result.hpp"
 
 #include <cstddef>
@@ -109,11 +110,9 @@ private:
 };
 
 // A guest iovec, as the Linux ABI lays it out.
-struct GuestIovec {
-    std::uint64_t base{};
-    std::uint64_t len{};
-};
-static_assert(sizeof(GuestIovec) == 16);
+// struct iovec as the guest lays it out. Declared ONCE in
+// abi/wire/iovec.hpp -- the shape is ABI and was identical in both backends.
+using GuestIovec = abi::wire::Iovec;
 
 } // namespace lx::runtime
 
