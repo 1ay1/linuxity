@@ -66,6 +66,12 @@ export PATH="$LTP/testcases/bin:$PATH"
 run_one() {
     _bin=$1; _mode=$2
     _tmp=$(mktemp -d /tmp/ltpd.XXXXXX)
+    # POSIX shm names live in a FLAT namespace shared with the host, and a
+    # test killed on the deadline leaves its segment behind. The next run then
+    # hits EEXIST on O_CREAT|O_EXCL and reports a bug that is really our own
+    # litter -- pipe13 looked broken for several rounds because of it. Clear
+    # this test's segments before each run.
+    rm -f "/dev/shm/ltp_$(basename "$_bin")"_* 2>/dev/null
     if [ "$_mode" = native ]; then
         ( cd "$_tmp" && TMPDIR="$_tmp" timeout -s KILL "$DEADLINE" "$_bin" ) \
             >/dev/null 2>&1
