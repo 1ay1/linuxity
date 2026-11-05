@@ -2066,6 +2066,12 @@ private:
         constexpr std::uint64_t kTIOCSPGRP = 0x5410;  // set fg process group
         constexpr std::uint64_t kTIOCGSID  = 0x5429;  // get session id
         const std::uint64_t request = r.arg[1];
+        // A backend that models real process groups (HVF) also owns the
+        // terminal's foreground group: forward, so tcsetpgrp actually moves
+        // ^C/^Z delivery to the job and the shell survives ^Z.
+        if constexpr (requires { mem_.models_process_groups(); })
+            if (request == kTIOCGPGRP || request == kTIOCSPGRP || request == kTIOCGSID)
+                return fwd();
         switch (request) {
             // Report the caller's OWN pgrp as the terminal's foreground group
             // (and its own sid as the session): the guest owns its tty, so the

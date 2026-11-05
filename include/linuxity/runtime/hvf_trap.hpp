@@ -866,6 +866,54 @@ private:
             hm.msg_namelen = sizeof ss;
         }
 
+        // -- Ancillary data: SCM_RIGHTS (fd passing) ----------------------
+        // tmux's client sends its terminal to the server this way; so do
+        // sshd's privsep, systemd-style socket activation, dbus, podman.
+        // Dropping cmsgs made the tmux server "open terminal failed: not a
+        // terminal". Linux cmsghdr is {u64 len; i32 level; i32 type} with
+        // 8-byte alignment; Darwin's is {u32 len; i32 level; i32 type}, 4-
+        // byte aligned -- re-encode, translating guest fds <-> host fds.
+        // SOL_SOCKET is 1 on Linux, 0xffff on Darwin; SCM_RIGHTS is 1 on both.
+        struct LinuxCmsg { std::uint64_t len; std::int32_t level, type; };
+        constexpr std::size_t kLHdr = sizeof(LinuxCmsg);
+        auto lalign = [](std::size_t n) { return (n + 7) & ~std::size_t{7}; };
+        std::vector<std::byte> hctl;
+        std::vector<int> fds_out;                // guest fds being sent
+        if (sending && m.control && m.controllen >= kLHdr) {
+            auto ctl = ram.at(m.control, m.controllen);
+            if (ctl.empty()) return -14;
+            for (std::size_t off = 0; off + kLHdr <= ctl.size();) {
+                LinuxCmsg c{};
+                std::memcpy(&c, ctl.data() + off, kLHdr);
+                if (c.len < kLHdr || off + c.len > ctl.size()) break;
+                if (c.level == 1 && c.type == 1) {
+                    const std::size_t n = (c.len - kLHdr) / sizeof(std::int32_t);
+                    for (std::size_t i = 0; i < n; ++i) {
+                        std::int32_t gfdx = 0;
+                        std::memcpy(&gfdx, ctl.data() + off + kLHdr + i * 4, 4);
+                        const int hx = host_fd(gfdx);
+                        if (hx < 0) return -9;
+                        fds_out.push_back(hx);
+                    }
+                }
+                off += lalign(c.len);
+            }
+            if (!fds_out.empty()) {
+                hctl.resize(CMSG_SPACE(fds_out.size() * sizeof(int)));
+                auto* hc = reinterpret_cast<::cmsghdr*>(hctl.data());
+                hc->cmsg_len = CMSG_LEN(fds_out.size() * sizeof(int));
+                hc->cmsg_level = SOL_SOCKET;
+                hc->cmsg_type = SCM_RIGHTS;
+                std::memcpy(CMSG_DATA(hc), fds_out.data(), fds_out.size() * sizeof(int));
+                hm.msg_control = hctl.data();
+                hm.msg_controllen = static_cast<socklen_t>(hctl.size());
+            }
+        } else if (!sending && m.control && m.controllen >= kLHdr) {
+            hctl.resize(CMSG_SPACE(64 * sizeof(int)));
+            hm.msg_control = hctl.data();
+            hm.msg_controllen = static_cast<socklen_t>(hctl.size());
+        }
+
         const auto n = sending
             ? ::sendmsg(h, &hm, net::msg_flags_to_darwin(flags))
             : ::recvmsg(h, &hm, net::msg_flags_to_darwin(flags));
@@ -873,8 +921,40 @@ private:
         if (!sending) {
             if (m.name && !write_sockaddr(ss, m.name, msg_at + offsetof(LinuxMsghdr, namelen)))
                 return -14;
-            m.controllen = 0;                  // no ancillary data passed through
-            m.flags = 0;
+            // Re-encode received SCM_RIGHTS into the guest's control buffer,
+            // installing each received host fd as a new guest fd.
+            std::vector<std::byte> lctl;
+            const bool cloexec = (flags & 0x40000000) != 0;   // MSG_CMSG_CLOEXEC
+            if (hm.msg_controllen > 0) {
+                for (::cmsghdr* hc = CMSG_FIRSTHDR(&hm); hc; hc = CMSG_NXTHDR(&hm, hc)) {
+                    if (hc->cmsg_level != SOL_SOCKET || hc->cmsg_type != SCM_RIGHTS) continue;
+                    const std::size_t cnt = (hc->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+                    std::vector<std::int32_t> g(cnt);
+                    for (std::size_t i = 0; i < cnt; ++i) {
+                        int hx = -1;
+                        std::memcpy(&hx, CMSG_DATA(hc) + i * sizeof(int), sizeof(int));
+                        ::fcntl(hx, F_SETFD, FD_CLOEXEC);      // host side is always private
+                        const int gx = proc_.with_fds([&](FdTable& t) { return t.install(hx, cloexec); });
+                        if (gx < 0) { ::close(hx); g[i] = -1; } else g[i] = gx;
+                    }
+                    const std::size_t len = kLHdr + cnt * 4;
+                    const std::size_t at = lctl.size();
+                    lctl.resize(at + lalign(len));
+                    LinuxCmsg c{len, 1, 1};
+                    std::memcpy(lctl.data() + at, &c, kLHdr);
+                    std::memcpy(lctl.data() + at + kLHdr, g.data(), cnt * 4);
+                }
+            }
+            std::int32_t mflags = 0;
+            if (lctl.size() > m.controllen) { lctl.resize(m.controllen); mflags |= 0x8; }  // MSG_CTRUNC
+            if (!lctl.empty()) {
+                auto dst = ram.at(m.control, lctl.size());
+                if (dst.empty()) return -14;
+                std::memcpy(dst.data(), lctl.data(), lctl.size());
+            }
+            if (hm.msg_flags & MSG_TRUNC) mflags |= 0x20;
+            m.controllen = lctl.size();
+            m.flags = mflags;
             (void)ram.put(msg_at, m);
         }
         return n;
@@ -1426,6 +1506,16 @@ private:
                 const std::int32_t pgid = a1 ? static_cast<std::int32_t>(a1) : pid;
                 if (!pids_.host_of(pid) && pid != task_.tid) return -3;   // ESRCH
                 pids_.set_pgid(pid, pgid);
+                // Mirror it in the HOST process groups. The terminal driver
+                // (the real one, on the Mac) delivers ^C/^Z/^\ to the
+                // terminal's foreground HOST group, and stops background
+                // HOST groups that read it. With every guest process in
+                // linuxity's single host group, ^Z stopped the shell along
+                // with its job -- the session froze -- and ^C hit every
+                // process. Best effort: the guest's model stays authoritative.
+                const auto hp = pid == task_.tid ? std::optional<pid_t>{::getpid()} : pids_.host_of(pid);
+                const auto hg = pgid == task_.tid ? std::optional<pid_t>{::getpid()} : pids_.host_of(pgid);
+                if (hp && hg) (void)::setpgid(*hp, *hg);
                 return 0;
             }
             case S::getpgid: {
@@ -1443,6 +1533,7 @@ private:
                     return -1;                                       // EPERM
                 pids_.set_sid(task_.tid, task_.tid);
                 pids_.set_pgid(task_.tid, task_.tid);
+                (void)::setsid();                    // mirror on the host (see setpgid)
                 return task_.tid;
             case S::getsid: {
                 const std::int32_t pid = a0 ? static_cast<std::int32_t>(a0) : task_.tid;
@@ -3641,6 +3732,81 @@ private:
                            ? darwin::fail() : 0;
             case L_TCXONC: case L_TIOCSCTTY: case L_TIOCNOTTY:
                 return 0;
+            // -- Job control: tcgetpgrp/tcsetpgrp/tcgetsid -----------------
+            // The terminal's foreground process group, in GUEST pids. bash
+            // hands each foreground job the terminal (tcsetpgrp) and takes
+            // it back; with ENOTTY job control silently degraded, and
+            // Ctrl-C/Ctrl-Z reached the wrong group. Translate through the
+            // shared pid space (a process group id is its leader's pid).
+            case L_TIOCGPGRP: {
+                const pid_t h = ::tcgetpgrp(hfd);
+                if (h < 0) return darwin::fail();
+                const std::int32_t g = pids_.guest_of(h);
+                return ram.put(arg, g > 0 ? g : std::int32_t{1}) ? 0 : -14;
+            }
+            case L_TIOCSPGRP: {
+                std::int32_t g = 0;
+                if (!ram.get(arg, g)) return -14;
+                const auto h = pids_.host_of(g);
+                if (!h) return -3;                                   // ESRCH
+                // POSIX: tcsetpgrp from a BACKGROUND group raises SIGTTOU
+                // unless the caller blocks/ignores it -- and bash does, in
+                // the GUEST's mask. The host kernel only sees our host mask,
+                // so the forked job stopped itself the instant it took the
+                // terminal (^Z then froze the session; `cat` showed as
+                // Stopped). Honour the guest's disposition on the host for
+                // the duration of the call.
+                const LinuxSigaction ttou =
+                    proc_.with_signals([&](SignalDispositions& t) { return t.get(22); });
+                const bool guest_shields = (task_.sig_mask & sigbit(22)) || ttou.handler == 1;
+                sigset_t blk, old;
+                sigemptyset(&blk); sigaddset(&blk, SIGTTOU);
+                if (guest_shields) ::pthread_sigmask(SIG_BLOCK, &blk, &old);
+                const int rc = ::tcsetpgrp(hfd, *h);
+                const int e = errno;
+                if (guest_shields) ::pthread_sigmask(SIG_SETMASK, &old, nullptr);
+                errno = e;
+                return rc < 0 ? darwin::fail() : 0;
+            }
+            case L_TIOCGSID: {
+                const pid_t h = ::tcgetsid(hfd);
+                if (h < 0) return darwin::fail();
+                const std::int32_t g = pids_.guest_of(h);
+                return ram.put(arg, g > 0 ? g : std::int32_t{1}) ? 0 : -14;
+            }
+            // -- Guest-created ptys (tmux, script, expect, Python's pty) ----
+            // glibc's posix_openpt opens /dev/ptmx (the host's), then
+            // unlockpt = TIOCSPTLCK(0) and ptsname = TIOCGPTN, and opens
+            // "/dev/pts/<N>". Darwin has the same master but names the
+            // slave /dev/ttysNNN, so: unlock with the host call, report the
+            // number N from the host ptsname, and devfs maps /dev/pts/N to
+            // /dev/ttysNNN. Without these, ENOTTY made every guest program
+            // that needs its own terminal fail ("out of pty devices").
+            case L_TIOCSPTLCK: {
+                std::int32_t lock = 0;
+                if (!ram.get(arg, lock)) return -14;
+                if (lock) return 0;                      // relocking: harmless no-op
+                return (::grantpt(hfd) < 0 || ::unlockpt(hfd) < 0) ? darwin::fail() : 0;
+            }
+            case L_TIOCGPTN: {
+                char name[128];
+                if (::ptsname_r(hfd, name, sizeof name) != 0) return -25;
+                // "/dev/ttys012" -> 12
+                const char* d = name + std::strlen(name);
+                while (d > name && d[-1] >= '0' && d[-1] <= '9') --d;
+                if (!*d) return -25;
+                return ram.put(arg, static_cast<std::uint32_t>(std::atoi(d))) ? 0 : -14;
+            }
+            case L_TIOCGPTPEER: {
+                // Open the slave of this master directly (O_NOCTTY etc. in arg).
+                char name[128];
+                if (::ptsname_r(hfd, name, sizeof name) != 0) return -25;
+                const int s = ::open(name, O_RDWR | O_NOCTTY | O_CLOEXEC);
+                if (s < 0) return darwin::fail();
+                const int g = proc_.with_fds([&](FdTable& t) { return t.install(s, (arg & 02000000) != 0); });
+                if (g < 0) { ::close(s); return -24; }
+                return g;
+            }
             default:
                 return -25;                                          // ENOTTY
         }
@@ -3833,7 +3999,20 @@ private:
     //   a file      -> the host path, reverse-mapped into the guest tree.
     [[nodiscard]] std::string describe_fd(int hfd) const {
         if (::isatty(hfd)) {
-            if (const char* n = ::ttyname(hfd)) return n;
+            if (const char* n = ::ttyname(hfd)) {
+                // A pty slave is /dev/ttysNNN on Darwin but /dev/pts/N on
+                // Linux, and glibc's ttyname() readlinks /proc/self/fd/N then
+                // stat-compares the result: a Darwin name doesn't exist in
+                // the guest, so `tty` printed "not a tty" inside script(1)
+                // and tmux. Report the Linux name; devfs maps it back.
+                std::string_view s{n};
+                if (s.starts_with("/dev/ttys")) {
+                    const std::string_view num = s.substr(9);
+                    if (!num.empty() && num.find_first_not_of("0123456789") == std::string_view::npos)
+                        return "/dev/pts/" + std::to_string(std::atoi(std::string{num}.c_str()));
+                }
+                return n;
+            }
         }
         struct ::stat st{};
         if (::fstat(hfd, &st) == 0) {

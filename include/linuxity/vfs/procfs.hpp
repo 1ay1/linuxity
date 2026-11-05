@@ -18,7 +18,10 @@
 #include "linuxity/kernel/machine.hpp"
 #include "linuxity/kernel/process_table.hpp"
 
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <string_view>
 
@@ -234,10 +237,32 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                 "tmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n"));
         }
         if (abs == "/proc/sys" || abs == "/proc/sys/kernel")
-            return ok(dir_file({}));
+            return ok(dir_file({{"kernel",true},{"osrelease",false},{"hostname",false},
+                                {"pid_max",false},{"random",true}}));
         if (abs == "/proc/sys/kernel/osrelease") return ok(text_file(release + "\n"));
         if (abs == "/proc/sys/kernel/hostname")  return ok(text_file(nodename + "\n"));
         if (abs == "/proc/sys/kernel/pid_max")   return ok(text_file("32768\n"));
+        // random/: login profiles, systemd tools and Python's uuid read these.
+        // uuid is a fresh v4 per read; boot_id is fixed for this boot.
+        if (abs == "/proc/sys/kernel/random")
+            return ok(dir_file({{"uuid",false},{"boot_id",false},{"entropy_avail",false},
+                                {"poolsize",false}}));
+        if (abs == "/proc/sys/kernel/random/uuid" || abs == "/proc/sys/kernel/random/boot_id") {
+            std::uint8_t b[16];
+            static std::uint8_t boot[16];
+            static const bool seeded = [] { ::arc4random_buf(boot, sizeof boot); return true; }();
+            (void)seeded;
+            if (abs.ends_with("uuid")) ::arc4random_buf(b, sizeof b);
+            else std::memcpy(b, boot, sizeof b);
+            b[6] = static_cast<std::uint8_t>((b[6] & 0x0f) | 0x40);   // version 4
+            b[8] = static_cast<std::uint8_t>((b[8] & 0x3f) | 0x80);   // RFC 4122 variant
+            char s[40];
+            std::snprintf(s, sizeof s, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x\n",
+                          b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]);
+            return ok(text_file(s));
+        }
+        if (abs == "/proc/sys/kernel/random/entropy_avail") return ok(text_file("256\n"));
+        if (abs == "/proc/sys/kernel/random/poolsize")      return ok(text_file("256\n"));
 
         // ---- per-process /proc/<pid>/* ----------------------------------
         auto [pid, tail] = detail::split_pid(p);

@@ -26,6 +26,8 @@
 #include "linuxity/kernel/file_namespace.hpp"
 
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 
@@ -101,6 +103,20 @@ namespace lx::vfs {
                 else           vf.redirect_host  = std::string{l.target};
                 return ok(std::move(vf));
             }
+        }
+
+        // /dev/pts/N -> the host slave /dev/ttysNNN (Darwin's naming; the
+        // number is the one TIOCGPTN reported). Every guest-created pty --
+        // tmux, script, expect, python pty, ssh -- opens its slave here.
+        if (abs.starts_with("/dev/pts/")) {
+            const std::string_view n = abs.substr(std::string_view{"/dev/pts/"}.size());
+            if (n.empty() || n.find_first_not_of("0123456789") != std::string_view::npos)
+                return err<kernel::VirtualFile>(Errno::enoent);
+            char name[32];
+            std::snprintf(name, sizeof name, "/dev/ttys%03d", std::atoi(std::string{n}.c_str()));
+            kernel::VirtualFile vf;
+            vf.redirect_host = name;
+            return ok(std::move(vf));
         }
 
         // Subdirectories (empty, but real).

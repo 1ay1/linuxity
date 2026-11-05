@@ -39,7 +39,7 @@ enum Req : std::uint64_t {
     L_TIOCGWINSZ = 0x5413, L_TIOCSWINSZ = 0x5414, L_FIONREAD = 0x541B,
     L_TIOCNOTTY = 0x5422, L_TIOCGSID = 0x5429, L_FIONBIO = 0x5421,
     L_FIOCLEX = 0x5451, L_FIONCLEX = 0x5450, L_TCFLSH = 0x540B, L_TCXONC = 0x540A,
-    L_TIOCGPTN = 0x80045430,
+    L_TIOCGPTN = 0x80045430, L_TIOCSPTLCK = 0x40045431, L_TIOCGPTPEER = 0x5441,
     // termios2 (glibc >= 2.42 uses these instead of TCGETS/TCSETS*): the
     // same leading fields as struct termios, plus explicit input/output
     // speeds. _IOR/_IOW('T', 0x2A..0x2D, struct termios2[44]).

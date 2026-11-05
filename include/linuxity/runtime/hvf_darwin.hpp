@@ -103,6 +103,42 @@ static_assert(offsetof(LinuxStat, st_blocks) == 64);
 // Darwin stat -> Linux stat. uid/gid are forced to root because linuxity
 // presents a root-owned world; this is the same rule the ptrace backend
 // applies with scrub_ids, kept here so the two backends agree.
+// Linux's device numbers for the standard character devices. Programs check
+// them: glibc's daemon() refuses /dev/null unless st_rdev == makedev(1,3)
+// (ENODEV, "daemon failed") -- which broke tmux's server, sshd, and every
+// daemon -- and tools test makedev(5,0) for /dev/tty. Darwin numbers them
+// differently (null is 3,2), so map by the host device's IDENTITY.
+[[nodiscard]] inline std::uint64_t linux_makedev(std::uint32_t maj, std::uint32_t min) noexcept {
+    return (static_cast<std::uint64_t>(maj & 0xfffff000u) << 32) |
+           (static_cast<std::uint64_t>(maj & 0xfffu) << 8) |
+           (static_cast<std::uint64_t>(min & 0xffffff00u) << 12) | (min & 0xffu);
+}
+[[nodiscard]] inline std::uint64_t rdev_to_linux(dev_t host) noexcept {
+    if (host == 0) return 0;
+    auto rdev_of = [](const char* p) {
+        struct ::stat s{};
+        return ::stat(p, &s) == 0 ? s.st_rdev : static_cast<dev_t>(-1);
+    };
+    struct Map { dev_t dev; std::uint64_t lin; };
+    static const Map table[] = {
+        {rdev_of("/dev/null"), linux_makedev(1, 3)},   {rdev_of("/dev/zero"), linux_makedev(1, 5)},
+        {rdev_of("/dev/random"), linux_makedev(1, 8)}, {rdev_of("/dev/urandom"), linux_makedev(1, 9)},
+        {rdev_of("/dev/tty"), linux_makedev(5, 0)},    {rdev_of("/dev/ptmx"), linux_makedev(5, 2)},
+    };
+    for (const Map& k : table)
+        if (k.dev != static_cast<dev_t>(-1) && k.dev == host) return k.lin;
+    // A pty slave: Darwin's ttys major; Linux's is 136 + n/256, minor n%256.
+    static const int pts_major = [] {
+        struct ::stat s{};
+        return ::stat("/dev/ttys000", &s) == 0 ? static_cast<int>(major(s.st_rdev)) : -1;
+    }();
+    if (pts_major >= 0 && static_cast<int>(major(host)) == pts_major) {
+        const auto n = static_cast<std::uint32_t>(minor(host));
+        return linux_makedev(136 + n / 256, n % 256);
+    }
+    return static_cast<std::uint64_t>(host);
+}
+
 [[nodiscard]] inline LinuxStat to_linux(const struct ::stat& s) noexcept {
     LinuxStat o{};
     o.st_dev    = static_cast<std::uint64_t>(s.st_dev);
@@ -111,7 +147,7 @@ static_assert(offsetof(LinuxStat, st_blocks) == 64);
     o.st_nlink  = s.st_nlink;
     o.st_uid    = 0;
     o.st_gid    = 0;
-    o.st_rdev   = static_cast<std::uint64_t>(s.st_rdev);
+    o.st_rdev   = rdev_to_linux(s.st_rdev);
     o.st_size   = s.st_size;
     o.st_blksize = s.st_blksize;
     o.st_blocks  = s.st_blocks;
@@ -262,8 +298,11 @@ inline constexpr std::uint32_t kStatxBasicStats = 0x7ff;
     x.stx_ctime   = {s.st_ctimespec.tv_sec, static_cast<std::uint32_t>(s.st_ctimespec.tv_nsec), 0};
     x.stx_btime   = {s.st_birthtimespec.tv_sec,
                      static_cast<std::uint32_t>(s.st_birthtimespec.tv_nsec), 0};
-    x.stx_rdev_major = static_cast<std::uint32_t>((s.st_rdev >> 24) & 0xff);
-    x.stx_rdev_minor = static_cast<std::uint32_t>(s.st_rdev & 0xffffff);
+    {
+        const std::uint64_t r = rdev_to_linux(s.st_rdev);
+        x.stx_rdev_major = static_cast<std::uint32_t>(((r >> 8) & 0xfff) | ((r >> 32) & ~0xfffu));
+        x.stx_rdev_minor = static_cast<std::uint32_t>((r & 0xff) | ((r >> 12) & ~0xffu));
+    }
     x.stx_dev_major  = static_cast<std::uint32_t>((s.st_dev >> 24) & 0xff);
     x.stx_dev_minor  = static_cast<std::uint32_t>(s.st_dev & 0xffffff);
     return x;
