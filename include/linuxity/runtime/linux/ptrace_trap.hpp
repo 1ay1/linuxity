@@ -849,22 +849,73 @@ public:
         // caller's handler ran and the target never saw it. LTP's kill10
         // caught this; it drives process groups with kill(-pid, SIGUSR1).
         //
-        // We do not model groups as first-class objects, but we do not need
-        // to: a guest group leader's pid IS the group id, so -pid names a
-        // task we already track. Deliver to that task's host tid.
-        ::pid_t tid;
-        if (gpid == 0 || gpid == -1) {
-            // The caller's own group, or "everything we may signal". Our
-            // namespace is small enough that the caller is the right target
-            // for both -- and this is the form timeout(1) uses on itself.
-            tid = cur_;
-        } else if (gpid < -1) {
-            // Group (-gpid). The leader's guest pid IS the group id.
-            tid = host_tid_of(-gpid);
-        } else {
-            tid = host_tid_of(gpid);
+        // We do not model process GROUPS on Linux: setpgid is accepted and
+        // discarded (abi/syscall.hpp's flat model, since only the Darwin
+        // backend declares models_process_groups), so the host pgid of every
+        // traced task is the same and cannot distinguish one group from
+        // another. Filtering on it signalled EVERY task, which leaked across
+        // groups -- kill10 saw "unexpected signal 10".
+        //
+        // What we DO track is the guest process TREE (gppid_). A group leader
+        // plus its descendants is a sound approximation: it is exactly right
+        // for the shape programs actually use (fork children, setpgid the
+        // leader, signal the group), and it is bounded -- unlike signalling
+        // everything. Reaching only the leader was the other extreme, and
+        // kill10's handshake hung waiting for acks that never came.
+        if (gpid < -1 || gpid == 0 || gpid == -1) {
+            const std::int32_t leader =
+                (gpid < -1) ? -gpid : gpid_of(cur_);
+
+            std::vector<::pid_t> targets;
+            // Collect FIRST: deliver_to_tid calls gpid_of, which can insert
+            // into gpid_ and invalidate an iterator we were holding.
+            for (const auto& [tid, gp] : gpid_)
+                if (gp == leader || descends_from(gp, leader))
+                    targets.push_back(tid);
+
+            // The implicit forms (0 and -1) always include the caller, which
+            // may not be in gpid_ (the root task is tracked separately). An
+            // explicit -pgid must NOT add the caller unless it is in that
+            // tree -- doing so unconditionally made the sender signal itself,
+            // which native does not.
+            const bool implicit = (gpid == 0 || gpid == -1);
+            if (implicit &&
+                std::find(targets.begin(), targets.end(), cur_) == targets.end())
+                targets.push_back(cur_);
+
+            int delivered = 0;
+            std::int64_t first_err = 0;
+            for (const ::pid_t tid : targets) {
+                const std::int64_t rc = deliver_to_tid(tid, signum);
+                if (rc == 0) ++delivered;
+                else if (first_err == 0) first_err = rc;
+            }
+            if (delivered == 0)
+                return first_err != 0 ? first_err
+                                      : -static_cast<std::int64_t>(Errno::esrch);
+            return 0;
         }
+
+        const ::pid_t tid = host_tid_of(gpid);
         if (tid < 0) return -static_cast<std::int64_t>(Errno::esrch);
+        return deliver_to_tid(tid, signum);
+    }
+
+    // Is guest pid `p` a descendant of `root`? Walks gppid_ with a bounded
+    // depth so a cycle (which should not happen, but a stale entry could
+    // create one) cannot spin.
+    [[nodiscard]] bool descends_from(std::int32_t p, std::int32_t root) const {
+        for (int hops = 0; hops < 64 && p > 1; ++hops) {
+            const auto it = gppid_.find(p);
+            if (it == gppid_.end()) return false;
+            p = it->second;
+            if (p == root) return true;
+        }
+        return false;
+    }
+
+    // Deliver one signal to one host tid, with the guest sender in si_pid.
+    [[nodiscard]] std::int64_t deliver_to_tid(::pid_t tid, std::int32_t signum) {
 
         // WHO the signal came from. The supervisor is the one issuing the
         // delivery, so a plain tgkill puts the SUPERVISOR's host pid in

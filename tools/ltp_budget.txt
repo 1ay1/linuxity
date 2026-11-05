@@ -15,8 +15,11 @@
 # harness deadline. These are a throughput artifact, not wrong behaviour.
 #
 #   open04   exhausts the fd table, then checks EMFILE
-#   kill10   forks 2 process groups x 10 procs and cross-signals them;
-#            native does it in 1.0s, we exceed 30s
+#
+# kill10 USED to be here and no longer is: it was not a throughput problem at
+# all. kill(-pgid) was reaching 1 of 5 group members, so its three-tier
+# handshake waited forever for acks that never came. Fixed by fanning the
+# signal out across the leader's process tree; the kill family is 100% now.
 #
 # Also in this class but only seen at tighter deadlines: dup06, fcntl12,
 # fork09, epoll_create03, epoll_wait08. All verified by hand to print TPASS
@@ -26,4 +29,4 @@
 # The real fix is making fd-heavy paths cheaper, not a bigger deadline; until
 # then they sit in the budget rather than being silently excluded, so the
 # count stays honest.
-2
+1
