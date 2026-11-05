@@ -119,8 +119,40 @@ namespace lx::vfs {
             return ok(std::move(vf));
         }
 
-        // Subdirectories (empty, but real).
-        if (leaf == "shm" || leaf == "pts") {
+        // /dev/shm/NAME -> the same name on the host's tmpfs. The producer is
+        // called with the FULL path, so children need their own arm (as
+        // /dev/pts/N does above): redirecting only the directory let stat see
+        // the right mode while every create still failed ENOENT.
+        if (abs.starts_with("/dev/shm/")) {
+            const std::string_view n = abs.substr(std::string_view{"/dev/shm/"}.size());
+            // No traversal out of the directory, and no nested paths: POSIX
+            // shm names are a single component by definition.
+            if (n.empty() || n.find('/') != std::string_view::npos ||
+                n == "." || n == "..")
+                return err<kernel::VirtualFile>(Errno::enoent);
+            kernel::VirtualFile vf;
+            vf.redirect_host = "/dev/shm/" + std::string{n};
+            return ok(std::move(vf));
+        }
+
+        // /dev/shm must be WRITABLE: it is the backing store for POSIX shared
+        // memory (shm_open), which glibc, LTP and anything using sem_open or
+        // shm_open depends on. It used to be a synthesized empty directory
+        // with no storage behind it, so every create in it failed ENOENT --
+        // LTP's whole suite TBROK'd on open(/dev/shm/...) before running a
+        // single assertion. Redirect to the host's tmpfs, which is
+        // world-writable (drwxrwxrwt) so this needs no privilege.
+        if (leaf == "shm") {
+            kernel::VirtualFile vf;
+            vf.is_dir = true;
+            vf.redirect_host = "/dev/shm";
+            return ok(std::move(vf));
+        }
+
+        // /dev/pts stays synthesized: a pty allocation goes through ptmx,
+        // which is handled above, and handing the guest the host's pts tree
+        // would let it reach terminals outside its namespace.
+        if (leaf == "pts") {
             kernel::VirtualFile vf; vf.is_dir = true;
             return ok(std::move(vf));
         }

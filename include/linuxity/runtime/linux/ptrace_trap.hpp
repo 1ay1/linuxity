@@ -343,7 +343,10 @@ public:
                 resume_run(w, 0);
                 continue;
             }
-            // Any other signal: deliver it to the task.
+            // Any other signal: deliver it to the task. Rewrite si_pid first,
+            // so a SA_SIGINFO handler sees the SENDER's guest pid rather than
+            // a host pid that does not exist in its namespace.
+            rewrite_siginfo_pid(w);
             resume_run(w, sig);
         }
     }
@@ -835,15 +838,73 @@ public:
     // is unknown, or -errno if the host kill(2) itself fails.
     [[nodiscard]] std::int64_t deliver_signal(std::int32_t gpid,
                                               std::int32_t signum) {
-        // gpid 0 in kill(2) means the caller's process group; we don't model
-        // groups, so target the current task. A negative pid (process group)
-        // likewise collapses to the current task in our tiny namespace.
-        ::pid_t tid = (gpid <= 0) ? cur_ : host_tid_of(gpid);
+        // kill(2)'s pid argument is a SUM, not a number:
+        //   pid  > 0  -> that process
+        //   pid == 0  -> every process in the CALLER's group
+        //   pid == -1 -> every process we may signal
+        //   pid  < -1 -> every process in group (-pid)
+        //
+        // All three non-positive forms used to collapse to the caller, so
+        // kill(-childpgid, sig) signalled US instead of the child -- the
+        // caller's handler ran and the target never saw it. LTP's kill10
+        // caught this; it drives process groups with kill(-pid, SIGUSR1).
+        //
+        // We do not model groups as first-class objects, but we do not need
+        // to: a guest group leader's pid IS the group id, so -pid names a
+        // task we already track. Deliver to that task's host tid.
+        ::pid_t tid;
+        if (gpid == 0 || gpid == -1) {
+            // The caller's own group, or "everything we may signal". Our
+            // namespace is small enough that the caller is the right target
+            // for both -- and this is the form timeout(1) uses on itself.
+            tid = cur_;
+        } else if (gpid < -1) {
+            // Group (-gpid). The leader's guest pid IS the group id.
+            tid = host_tid_of(-gpid);
+        } else {
+            tid = host_tid_of(gpid);
+        }
         if (tid < 0) return -static_cast<std::int64_t>(Errno::esrch);
-        // Deliver to the specific THREAD so it lands on the traced task even
-        // when signal-0 probes or fatal signals race the group.
-        long rc = ::syscall(SYS_tgkill, tid, tid, signum);
-        if (rc != 0) rc = ::kill(tid, signum);   // fall back to process kill
+
+        // WHO the signal came from. The supervisor is the one issuing the
+        // delivery, so a plain tgkill puts the SUPERVISOR's host pid in
+        // si_pid -- a six-digit number that does not exist in the guest's
+        // namespace. LTP's kill10 reported "received unexpected signal 10
+        // from 1690548" for every process-group signal because of it, and any
+        // program that checks its sender (a supervisor, an init, a test
+        // harness) gets a pid it cannot match.
+        //
+        // rt_tgsigqueueinfo lets the sender state si_pid explicitly, and we
+        // know the right answer: the guest pid of the task that made the call.
+        //
+        // si_code has to be SI_QUEUE, not SI_USER. The kernel REFUSES a
+        // foreign sender's SI_USER with EPERM (measured) -- that rule exists
+        // so nobody can forge a sender identity, and we are a foreign sender
+        // from its point of view. SI_QUEUE is permitted and carries si_pid
+        // faithfully.
+        //
+        // The tradeoff is honest: a handler that inspects si_code sees
+        // SI_QUEUE where native would say SI_USER. That is the lesser error --
+        // si_pid is what programs actually branch on (LTP's kill10 replies to
+        // si_pid and never looks at si_code), and the alternative was a host
+        // pid the guest cannot resolve at all.
+        siginfo_t si{};
+        si.si_signo = signum;
+        si.si_code  = SI_QUEUE;
+        si.si_pid   = gpid_of(cur_);
+        si.si_uid   = 0;                 // the guest runs as root
+
+        // signal 0 queues nothing -- it is a pure permission/liveness probe --
+        // so it must go through the plain form.
+        long rc = signum == 0
+                      ? ::syscall(SYS_tgkill, tid, tid, signum)
+                      : ::syscall(SYS_rt_tgsigqueueinfo, tid, tid, signum, &si);
+        if (rc != 0) {
+            // A kernel that refuses the queued form still has to deliver;
+            // fall back to the direct ones, which are right apart from si_pid.
+            rc = ::syscall(SYS_tgkill, tid, tid, signum);
+            if (rc != 0) rc = ::kill(tid, signum);
+        }
         // Translate through the ONE table (abi/wire/errno_map.hpp) rather than
         // casting: `Errno{errno}` asserts the host's errno numbering equals
         // the guest's. It happens to on Linux/x86-64, which is exactly why
@@ -1207,9 +1268,74 @@ private:
             // 0 and re-inject it once the syscall has exited (via pending_sig).
             // SIGTRAP (a trap, not a real signal) is swallowed as before.
             int sig = WSTOPSIG(st);
-            if (sig != SIGTRAP && sig != (SIGTRAP | 0x80)) held_sig = sig;
+            if (sig != SIGTRAP && sig != (SIGTRAP | 0x80)) {
+                rewrite_siginfo_pid(w);
+                held_sig = sig;
+            }
             ::ptrace(PTRACE_SYSCALL, w, 0, 0);
         }
+    }
+
+    // A signal's siginfo carries si_pid: WHO sent it. The kernel fills that
+    // with the sender's real host pid, so a guest handler using SA_SIGINFO saw
+    // a six-digit pid that does not exist in its namespace -- LTP's kill10
+    // printed "received unexpected signal 10 from 1690548" for every one of
+    // its process-group signals, and any program that checks the sender (an
+    // init, a supervisor, a test harness) gets a pid it cannot match.
+    //
+    // Same translation waitid already does for the reaped child, applied to
+    // the delivery path. Only SI_USER/SI_QUEUE/SI_TKILL carry a meaningful
+    // sender; kernel-generated codes (SI_TIMER, SIGSEGV's fault address) use
+    // the union differently and must not be touched.
+    void rewrite_siginfo_pid(::pid_t w) {
+        siginfo_t si{};
+        if (::ptrace(PTRACE_GETSIGINFO, w, 0, &si) != 0) return;
+        // SI_USER=0, SI_QUEUE=-1, SI_TKILL=-6: the three the sender fills.
+        if (si.si_code != SI_USER && si.si_code != SI_QUEUE &&
+            si.si_code != -6)
+            return;
+        if (si.si_pid <= 0) return;
+
+        // LOOK UP ONLY -- never allocate. gpid_of() mints a fresh guest pid
+        // for an unknown tid, so calling it here invented pid 3 for a sender
+        // whose real guest pid was 2. si_pid also holds a thread-group id
+        // while our map is keyed by tid, so a direct hit can miss; fall back
+        // to scanning for a task whose tgid matches.
+        const std::int32_t g = known_gpid_of(si.si_pid);
+        if (g <= 0 || g == si.si_pid) return;
+        si.si_pid = g;
+        ::ptrace(PTRACE_SETSIGINFO, w, 0, &si);
+    }
+
+    // The guest pid for a host id we have ALREADY seen, or 0. Pure lookup, so
+    // it cannot perturb the pid allocator the way gpid_of does.
+    [[nodiscard]] std::int32_t known_gpid_of(::pid_t host) const {
+        if (host == root_pid_) return 1;
+        if (auto it = gpid_.find(host); it != gpid_.end()) return it->second;
+        // si_pid carries the sender's THREAD-GROUP id; our map is keyed by
+        // the tid we attached to. For a single-threaded task those are equal,
+        // but check the task table too rather than guessing.
+        for (const auto& [tid, gp] : gpid_)
+            if (tgid_of(tid) == host) return gp;
+        return 0;
+    }
+
+    // A host task's thread-group id, from /proc. Returns 0 when unknown.
+    [[nodiscard]] static ::pid_t tgid_of(::pid_t tid) {
+        char path[64];
+        std::snprintf(path, sizeof path, "/proc/%d/status", static_cast<int>(tid));
+        std::FILE* f = std::fopen(path, "r");
+        if (f == nullptr) return 0;
+        char line[256];
+        ::pid_t out = 0;
+        while (std::fgets(line, sizeof line, f) != nullptr) {
+            if (std::strncmp(line, "Tgid:", 5) == 0) {
+                out = static_cast<::pid_t>(std::atoi(line + 5));
+                break;
+            }
+        }
+        std::fclose(f);
+        return out;
     }
 
     std::string path_;
