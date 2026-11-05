@@ -1,12 +1,17 @@
 #!/bin/sh
 # Run a command with a HARD deadline and no inherited stdin, so nothing can
-# block on input or outlive its welcome. Output goes to a file and is echoed.
+# block on input or outlive its welcome.
 #
 #   tools/t.sh [SECS] <command...>
 #
-# Defaults to 10s. Always returns: 124 means it was killed on the deadline.
-# Use this for ANY command that touches a guest, a tracer, or a pty -- those
-# are the ones that hang, and a hung command burns the whole turn.
+# Defaults to 10s. Returns 124 if it was killed on the deadline.
+#
+# CAVEAT: do NOT wrap a guest that itself runs timeout(1) or otherwise manages
+# its own process group -- this script puts the command in a new session and
+# kills the whole group, which collides with the inner timeout's own group
+# handling and reports a false 124. (It did: `timeout 1 sleep 5` under
+# linuxity looked hung for an afternoon and was actually finishing in 1.005s
+# vs 1.003s native.) For those, run the command directly and time it.
 set -u
 
 DEADLINE=10
