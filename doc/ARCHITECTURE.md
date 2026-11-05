@@ -93,6 +93,7 @@ Consequences of this design:
 | `abi/result.hpp` | `Result<T> = std::expected<T, Errno>`, the `Errno` enum. |
 | `abi/types.hpp` | Strong newtypes: `UAddr`, `Id<Tag>`, `Regs`, `Arch`. |
 | `abi/sysno.hpp` | Per-arch syscall number → canonical `Sysno` decode. |
+| `abi/outcome.hpp` | **The syscall fate**: a sum type, one arm per outcome, consumed by an exhaustive `match`. |
 | `abi/syscall.hpp` | **The dispatcher.** Classifies every syscall into a fate. |
 | `kernel/subsystem.hpp` | The `Vfs` / `Process` / `Memory` concepts; `IsKernel`. |
 | `kernel/kernel.hpp` | The production `Kernel` — the product of subsystems. |
@@ -105,9 +106,12 @@ Consequences of this design:
 | `vfs/{tmpfs,hostfs,procfs,sysfs,devfs,vfs,inode}.hpp` | Filesystem backends + synthesizers. |
 | `loader/{elf,loader,interp,stack}.hpp` | ELF64 reader, PT_INTERP/shebang inspection, stack/auxv. |
 | `mm/address_space.hpp` | Typed guest address space. |
-| `runtime/trap.hpp` | The generic `Cpu` loop + the `SyscallTrap` concept. |
-| `runtime/ptrace_trap.hpp` | The real Linux `ptrace` multi-process backend. |
-| `runtime/seccomp_filter.hpp` | The BPF filter (`kTrappedX86_64`, `install_trap_filter`). |
+| `runtime/backend.hpp` | **The trap-backend contract**: core `SyscallTrap` + the named optional capabilities. |
+| `runtime/trap.hpp` | The generic `Cpu` loop, written once against that contract. |
+| `runtime/shared/` | Host-agnostic backend logic (the VMA interval map). |
+| `runtime/linux/ptrace_trap.hpp` | The real Linux `ptrace` multi-process backend. |
+| `runtime/linux/seccomp_filter.hpp` | The BPF filter (`kTrappedX86_64`, `install_trap_filter`). |
+| `runtime/darwin/`, `runtime/windows/` | The kernel-less hypervisor backends. See `runtime/README.md`. |
 | `runtime/resource_governor.hpp` | cgroup v2 / setrlimit enforcement. |
 | `host/{host,posix_host}.hpp` | The `Host` concept and its POSIX backend. |
 | `src/main.cpp` | The wiring / entry point. |
@@ -137,7 +141,7 @@ JIT-backed kernel — all with zero vtables.
 
 ## 5. The trap backend (native execution)
 
-`runtime/ptrace_trap.hpp` is the Linux backend. The child executes its own
+`runtime/linux/ptrace_trap.hpp` is the Linux backend. The child executes its own
 instructions on the CPU; each syscall stops back into the tracer at syscall
 entry, where the tracer picks a fate.
 
@@ -177,8 +181,8 @@ How the syscall is actually trapped is the per-host crux:
 
 | host | file | mechanism |
 |---|---|---|
-| macOS arm64 | `runtime/hvf_trap.hpp` | `svc #0` traps to EL2; HVF hands it over. |
-| Windows x86-64 | `runtime/whp_trap.hpp` | `IA32_EFER.SCE = 0` makes `syscall` raise `#UD`; WHP's `ExceptionExitBitmap` routes vector 6 to the host. |
+| macOS arm64 | `runtime/darwin/trap.hpp` | `svc #0` traps to EL2; HVF hands it over. |
+| Windows x86-64 | `runtime/windows/trap.hpp` | `IA32_EFER.SCE = 0` makes `syscall` raise `#UD`; WHP's `ExceptionExitBitmap` routes vector 6 to the host. |
 
 **The Windows trick is worth dwelling on.** WHP has no "syscall exit" reason,
 so the obvious design is to leave SCE enabled, point `LSTAR` at a ring-0 stub
@@ -200,7 +204,7 @@ wrong silently:
    whatever happened to be in `rax`.
 
 The Windows backend also needs real paging, which the arm64 one does not:
-64-bit long mode *requires* `CR0.PG`, so `runtime/whp_mem.hpp` carries a
+64-bit long mode *requires* `CR0.PG`, so `runtime/windows/mem.hpp` carries a
 GVA→GPA walker (honoring 1 GiB/2 MiB leaves) and stitches buffers that straddle
 non-contiguous pages. The vCPU is placed directly into long mode at CPL 3 by
 setting `CR0`/`CR3`/`CR4`/`EFER` and the segment registers — a hypervisor lets
@@ -208,7 +212,7 @@ us assert the architectural state a boot sequence would have reached, so there
 is no real-mode bootstrap.
 
 Finally, `WinHvPlatform.dll` is resolved with `LoadLibrary` at runtime
-(`runtime/whp_api.hpp`) rather than linked. WHP is an optional Windows feature;
+(`runtime/windows/api.hpp`) rather than linked. WHP is an optional Windows feature;
 linking it would make the binary fail in the loader with `0xC0000135` on a
 machine where it is off, instead of printing a diagnostic. `linuxity --check`
 reports exactly which prerequisite is missing, and on a capable machine proves
@@ -237,7 +241,7 @@ canonical `Sysno`, and the switch is on that identity.
 ## 7. The seccomp fast path
 
 Trapping *every* syscall via `PTRACE_SYSCALL` is slow. Instead
-(`runtime/seccomp_filter.hpp`), linuxity installs a classic-BPF seccomp filter
+(`runtime/linux/seccomp_filter.hpp`), linuxity installs a classic-BPF seccomp filter
 in the guest that returns:
 
 - `SECCOMP_RET_TRACE` **only** for the ~90 syscall numbers in `kTrappedX86_64`
@@ -451,7 +455,7 @@ inherits it.
 1. Add a `case Sysno::foo:` in `abi/syscall.hpp::dispatch()` returning the
    appropriate `Outcome`.
 2. If `foo` needs interception, add its number to `kTrappedX86_64` in
-   `runtime/seccomp_filter.hpp` (and confirm the `sysno.hpp` decode).
+   `runtime/linux/seccomp_filter.hpp` (and confirm the `sysno.hpp` decode).
 3. Add a regression test under `tests/` and wire it into `tests/CMakeLists.txt`.
 
 **Add a virtual file/dir:** extend the relevant producer in `vfs/procfs.hpp`,

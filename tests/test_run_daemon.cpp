@@ -23,7 +23,7 @@
 // runtime returns 42 PROMPTLY (well under the daemon's sleep) with both marks.
 #include "linuxity/host/posix_host.hpp"
 #include "linuxity/kernel/kernel.hpp"
-#include "linuxity/runtime/ptrace_trap.hpp"
+#include "linuxity/runtime/linux/ptrace_trap.hpp"
 #include "linuxity/runtime/trap.hpp"
 
 #include <cstdio>

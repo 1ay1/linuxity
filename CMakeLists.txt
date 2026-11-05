@@ -60,7 +60,7 @@ elseif(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
     # IA32_EFER.SCE (so `syscall` raises #UD) and routing vector 6 to the host
     # through the partition's ExceptionExitBitmap -- no guest kernel needed.
     #
-    # WinHvPlatform.dll is resolved at RUNTIME (see runtime/whp_api.hpp), NOT
+    # WinHvPlatform.dll is resolved at RUNTIME (see runtime/windows/api.hpp), NOT
     # linked, so the binary still starts on a machine where the "Windows
     # Hypervisor Platform" feature is off and can print a real diagnostic
     # instead of dying in the loader with 0xC0000135.

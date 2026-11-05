@@ -3,7 +3,7 @@
 # Windows) — they are the contract that keeps the core portable.
 set(LX_PORTABLE_TESTS
     core authority vfs interp file_namespace sysfs_proctree
-    resources hvf_vma sysno conformance outcome)
+    resources address_space sysno conformance outcome)
 
 # Tests that instantiate PosixHost. These exercise the POSIX *host backend*
 # (mmap/dirent/pread), not the portable core, so they are POSIX-only: the
@@ -34,6 +34,15 @@ foreach(t IN LISTS LX_TESTS)
     target_link_libraries(test_${t} PRIVATE linuxity_core)
     add_test(NAME ${t} COMMAND test_${t})
 endforeach()
+
+# The runtime/ layering invariants (no cross-backend includes, portable
+# headers free of backend deps, shared/ free of platform APIs, every backend
+# asserting the contract). A shell check rather than a C++ test because it is
+# a statement about the FILE TREE, which no translation unit can observe.
+if(NOT WIN32)
+    add_test(NAME runtime_layout
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/../tools/check_layout.sh)
+endif()
 
 # The macOS hypervisor backend. Needs the Hypervisor framework and -- because
 # hv_vm_create is entitlement-gated -- an ad-hoc code signature carrying

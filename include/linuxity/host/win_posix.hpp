@@ -14,7 +14,7 @@
 //                      default, which is what O_CLOEXEC asks for.
 //   O_DIRECTORY, O_NOFOLLOW, O_PATH, O_NONBLOCK
 //                      No equivalent in the CRT's open(); the real Win32
-//                      mapping lives in runtime/whp_win32.hpp, which uses
+//                      mapping lives in runtime/windows/win32.hpp, which uses
 //                      CreateFileW directly.
 //
 // Rather than sprinkle #ifdef _WIN32 through the core -- which is how a

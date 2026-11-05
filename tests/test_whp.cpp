@@ -13,12 +13,12 @@
 //   LIVE checks need a real partition, so they SKIP cleanly when WHP is
 //   unavailable rather than failing the suite. A developer without Hyper-V
 //   enabled must still get a green build.
-#include "linuxity/runtime/whp_api.hpp"
-#include "linuxity/runtime/whp_mem.hpp"
-#include "linuxity/runtime/whp_regs.hpp"
-#include "linuxity/runtime/whp_trap.hpp"
-#include "linuxity/runtime/whp_vm.hpp"
-#include "linuxity/runtime/whp_win32.hpp"
+#include "linuxity/runtime/windows/api.hpp"
+#include "linuxity/runtime/windows/mem.hpp"
+#include "linuxity/runtime/windows/regs.hpp"
+#include "linuxity/runtime/windows/trap.hpp"
+#include "linuxity/runtime/windows/vm.hpp"
+#include "linuxity/runtime/windows/win32.hpp"
 
 #include <cstdio>
 #include <cstdlib>

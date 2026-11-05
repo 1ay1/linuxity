@@ -170,13 +170,24 @@ public:
                     //
                     // The two backends finish differently (see backend.hpp):
                     // ptrace resumes asynchronously and yields a Status, hvf
-                    // completes the syscall and yields its value. Both are
-                    // named capabilities, so neither can be reached by accident.
+                    // completes the syscall and yields its value.
                     make_host_parents(sr.host_path);
-                    auto rr = trap_.rewrite_sockaddr(sr.path_addr, sr.host_path,
-                                                     sr.len_arg, sr.new_len);
-                    if (!rr) return recover(rr.error());
-                    return Step::next;
+                    if constexpr (runtime::TranslatesSockets<T>) {
+                        auto rr = trap_.rewrite_sockaddr(
+                            sr.path_addr, sr.host_path, sr.len_arg, sr.new_len);
+                        if (!rr) return recover(rr.error());
+                        return Step::next;
+                    } else {
+                        // The backend cannot translate sun_path. Fail the call
+                        // rather than forwarding the UNTRANSLATED guest path,
+                        // which is what the old silent fallback did -- that put
+                        // the guest's socket on the HOST filesystem. ENOTSUP is
+                        // a truthful answer; a leaked host socket is not.
+                        auto st = trap_.resume(
+                            -static_cast<std::int64_t>(Errno::enotsup));
+                        if (!st) return Step::fail;
+                        return Step::next;
+                    }
                 },
 
                 [&](abi::Raise k) {
@@ -184,8 +195,11 @@ public:
                     // to that task's host tid, then hand the caller the result.
                     // The target's death, if fatal, is observed as a normal reap
                     // by next() on a later iteration.
-                    auto st = trap_.resume(trap_.deliver_signal(k.guest_pid,
-                                                               k.signum));
+                    std::int64_t ret =
+                        -static_cast<std::int64_t>(Errno::eperm);
+                    if constexpr (runtime::DeliversSignals<T>)
+                        ret = trap_.deliver_signal(k.guest_pid, k.signum);
+                    auto st = trap_.resume(ret);
                     if (!st) return Step::fail;
                     return Step::next;
                 },
@@ -194,11 +208,21 @@ public:
                     // A dynamic guest execve: rewrite it to run through the
                     // real interpreter. The image is replaced on success and
                     // observed as an EXEC event.
-                    auto er = trap_.exec_through_interp(
-                        ei.path_arg, ei.interp_host, ei.prog_guest,
-                        ei.prefix, ei.extra_args);
-                    if (!er) return recover(er.error());
-                    return Step::next;
+                    if constexpr (runtime::ExecsThroughInterp<T>) {
+                        auto er = trap_.exec_through_interp(
+                            ei.path_arg, ei.interp_host, ei.prog_guest,
+                            ei.prefix, ei.extra_args);
+                        if (!er) return recover(er.error());
+                        return Step::next;
+                    } else {
+                        // Without argv rewriting a dynamic exec cannot work:
+                        // the host would resolve PT_INTERP against the HOST
+                        // root. ENOEXEC says exactly that.
+                        auto st = trap_.resume(
+                            -static_cast<std::int64_t>(Errno::enoexec));
+                        if (!st) return Step::fail;
+                        return Step::next;
+                    }
                 },
 
                 [&](const abi::Forward& fo) {
@@ -208,21 +232,26 @@ public:
                     // getdents on the dup must resolve the same path and
                     // entries). dup2/dup3 first close their explicit target, so
                     // drop its stale binding.
-                    if (fo.mirror) {
-                        const int from   = fo.mirror->from;
-                        const int closed = fo.mirror->close_first;
-                        auto fr = trap_.forward_sync([&](std::int64_t ret) {
-                            if (ret < 0) return;
-                            locked([&] {
-                                if (closed >= 0 && closed != from)
-                                    sys.on_fd_closed(closed);
-                                sys.on_fd_dup(from, static_cast<int>(ret));
+                    if constexpr (runtime::ForwardsSynchronously<T>) {
+                        if (fo.mirror) {
+                            const int from   = fo.mirror->from;
+                            const int closed = fo.mirror->close_first;
+                            auto fr = trap_.forward_sync([&](std::int64_t ret) {
+                                if (ret < 0) return;
+                                locked([&] {
+                                    if (closed >= 0 && closed != from)
+                                        sys.on_fd_closed(closed);
+                                    sys.on_fd_dup(from, static_cast<int>(ret));
+                                });
                             });
-                        });
-                        if (!fr) return recover(fr.error());
-                        return Step::next;
+                            if (!fr) return recover(fr.error());
+                            return Step::next;
+                        }
                     }
                     // Let the host kernel run it IN the guest (mmap/brk/...).
+                    // A backend without forward_sync still dups correctly; it
+                    // just can't mirror the binding, so *at calls through the
+                    // new fd fall back to plain path resolution.
                     auto fr = trap_.forward();
                     if (!fr) return recover(fr.error());
                     return Step::next;

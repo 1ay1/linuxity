@@ -15,10 +15,10 @@
 //
 // Split like test_whp.cpp: the ELF-parsing half runs anywhere (it is pure
 // file logic), the execution half SKIPs without a hypervisor.
-#include "linuxity/runtime/whp_api.hpp"
-#include "linuxity/runtime/whp_load.hpp"
-#include "linuxity/runtime/whp_trap.hpp"
-#include "linuxity/runtime/whp_vm.hpp"
+#include "linuxity/runtime/windows/api.hpp"
+#include "linuxity/runtime/windows/load.hpp"
+#include "linuxity/runtime/windows/trap.hpp"
+#include "linuxity/runtime/windows/vm.hpp"
 
 #include <cstdio>
 #include <cstdlib>

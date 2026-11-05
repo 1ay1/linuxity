@@ -13,7 +13,7 @@
 // asserts the bind shadows it (longest-prefix / later-registration wins).
 #include "linuxity/host/posix_host.hpp"
 #include "linuxity/kernel/kernel.hpp"
-#include "linuxity/runtime/ptrace_trap.hpp"
+#include "linuxity/runtime/linux/ptrace_trap.hpp"
 #include "linuxity/runtime/trap.hpp"
 #include "linuxity/vfs/procfs.hpp"
 

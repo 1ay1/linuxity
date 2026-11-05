@@ -441,7 +441,7 @@ public:
 
     // -- Per-process state that a fork must carry to the child --------------
     // A backend that forks by spawning a FRESH process (macOS: see
-    // runtime/hvf_fork.hpp) rebuilds the mounts from the same command line,
+    // runtime/darwin/fork.hpp) rebuilds the mounts from the same command line,
     // but the dynamic state -- this process's cwd and which guest path each
     // fd names -- exists only in the parent. These two functions are the
     // complete list; a length-prefixed byte format keeps them trivially

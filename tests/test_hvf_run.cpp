@@ -21,9 +21,9 @@ int main() { std::puts("hvf_run: skipped (not macOS/arm64)"); return 0; }
 
 #include "linuxity/host/posix_host.hpp"
 #include "linuxity/kernel/kernel.hpp"
-#include "linuxity/runtime/hvf_exec.hpp"
-#include "linuxity/runtime/hvf_load.hpp"
-#include "linuxity/runtime/hvf_trap.hpp"
+#include "linuxity/runtime/darwin/exec.hpp"
+#include "linuxity/runtime/darwin/load.hpp"
+#include "linuxity/runtime/darwin/trap.hpp"
 #include "linuxity/runtime/trap.hpp"
 #include "linuxity/vfs/devfs.hpp"
 #include "linuxity/vfs/procfs.hpp"

@@ -10,7 +10,7 @@
 #include "linuxity/kernel/kernel.hpp"
 #include "linuxity/kernel/resources.hpp"
 #include "linuxity/loader/interp.hpp"
-#include "linuxity/runtime/ptrace_trap.hpp"
+#include "linuxity/runtime/linux/ptrace_trap.hpp"
 #include "linuxity/runtime/resource_governor.hpp"
 #include "linuxity/runtime/trap.hpp"
 #include "linuxity/vfs/devfs.hpp"

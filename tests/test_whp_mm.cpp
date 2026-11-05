@@ -16,12 +16,12 @@
 //
 // So each of those is asserted directly. The allocator and fd checks need no
 // hypervisor; the mapping checks SKIP without one.
-#include "linuxity/runtime/whp_api.hpp"
-#include "linuxity/runtime/whp_fd.hpp"
-#include "linuxity/runtime/whp_load.hpp"
-#include "linuxity/runtime/whp_mm.hpp"
-#include "linuxity/runtime/whp_sys.hpp"
-#include "linuxity/runtime/whp_vm.hpp"
+#include "linuxity/runtime/windows/api.hpp"
+#include "linuxity/runtime/windows/fd.hpp"
+#include "linuxity/runtime/windows/load.hpp"
+#include "linuxity/runtime/windows/mm.hpp"
+#include "linuxity/runtime/windows/sys.hpp"
+#include "linuxity/runtime/windows/vm.hpp"
 
 #include <cstdio>
 #include <cstring>

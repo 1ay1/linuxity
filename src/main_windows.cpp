@@ -24,7 +24,7 @@
 //         => every guest syscall becomes a VM exit, delivered here, with the
 //            guest stopped on the instruction and no guest kernel in sight.
 //
-// See runtime/whp_vm.hpp for the mechanism and runtime/whp_trap.hpp for the
+// See runtime/windows/vm.hpp for the mechanism and runtime/windows/trap.hpp for the
 // trap loop.
 //
 // STATUS
@@ -40,12 +40,12 @@
 // honestly rather than pretending to run a shell.
 #include "linuxity/host/win_posix.hpp"
 #include "linuxity/kernel/kernel.hpp"
-#include "linuxity/runtime/whp_api.hpp"
-#include "linuxity/runtime/whp_load.hpp"
-#include "linuxity/runtime/whp_sys.hpp"
-#include "linuxity/runtime/whp_trap.hpp"
-#include "linuxity/runtime/whp_vm.hpp"
-#include "linuxity/runtime/whp_win32.hpp"
+#include "linuxity/runtime/windows/api.hpp"
+#include "linuxity/runtime/windows/load.hpp"
+#include "linuxity/runtime/windows/sys.hpp"
+#include "linuxity/runtime/windows/trap.hpp"
+#include "linuxity/runtime/windows/vm.hpp"
+#include "linuxity/runtime/windows/win32.hpp"
 
 #include <cstdio>
 #include <cstdlib>
