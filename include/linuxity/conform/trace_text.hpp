@@ -128,9 +128,11 @@ parse_int(std::string_view s) noexcept {
 // interpret it. Comments are ignored on parse, so the header is free.
 [[nodiscard]] inline std::string render_trace(const Trace& t,
                                               std::string_view provenance = {},
-                                              std::string_view kernel = {}) {
+                                              std::string_view kernel = {},
+                                              std::string_view arch = {}) {
     std::string s = "# linuxity conformance trace\n";
     s += "# scenario: " + t.scenario + "\n";
+    if (!arch.empty())       s += "# arch: " + std::string{arch} + "\n";
     if (!provenance.empty()) s += "# recorded-by: " + std::string{provenance} + "\n";
     if (!kernel.empty())     s += "# kernel: " + std::string{kernel} + "\n";
     for (const Observation& o : t.steps) s += render_line(o) + "\n";

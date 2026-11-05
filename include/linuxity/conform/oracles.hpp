@@ -30,6 +30,7 @@
 #include <utility>
 #include <vector>
 
+#include "linuxity/conform/arch.hpp"
 #include "linuxity/conform/observation.hpp"
 #include "linuxity/conform/oracle.hpp"
 #include "linuxity/conform/probe_runner.hpp"
@@ -41,17 +42,29 @@ namespace lx::conform {
 // Where probe binaries and goldens live. Paths are POLICY -- the same layout
 // on every host -- so they are computed here, once, rather than in each
 // runner.
+//
+// WHY THE ARCH IS IN THE PATH. A golden is only a valid reference for the ABI
+// it was recorded on, and the two Linux ABIs are NOT interchangeable: 56
+// syscalls exist on x86-64 and not on aarch64 (open, fork, stat, lstat --
+// aarch64 has only openat, clone, newfstatat). Without the arch in the
+// filename, adding a Linux arm64 CI job would have it overwrite the x86-64
+// goldens, and macOS arm64 would then replay whichever job finished last --
+// comparing against a trace that cannot occur on its ABI. So the arch is part
+// of a golden's IDENTITY, not metadata inside it.
 struct OraclePaths {
     std::string probe_dir;   // built probe binaries
     std::string golden_dir;  // checked-in reference traces
+    abi::Arch   arch{host_arch()};
 
     [[nodiscard]] std::string probe(std::string_view name) const {
         return probe_dir + "/" + std::string{name};
     }
-    // Derived from the scenario KEY, never stored, so a renamed scenario
-    // cannot keep matching an old recording.
+    // Derived from the scenario KEY and the arch, never stored, so neither a
+    // renamed scenario nor a different ABI can keep matching an old
+    // recording.
     [[nodiscard]] std::string golden(const Scenario& s) const {
-        return golden_dir + "/" + s.key() + ".trace";
+        return golden_dir + "/" + std::string{arch_name(arch)} + "/" +
+               s.key() + ".trace";
     }
 };
 
@@ -111,8 +124,9 @@ public:
                 // A golden that failed to write must not be reported as a
                 // successful recording: the next host would find no
                 // reference and we would have lost the reason why.
-                if (!runner_->write_file(path,
-                                         render_trace(t, provenance(), kernel)))
+                if (!runner_->write_file(
+                        path, render_trace(t, provenance(), kernel,
+                                           arch_name(paths_.arch))))
                     return Unavailable{Unavailable::Cause::probe_failed,
                                        "could not write golden " + path};
                 return t;
@@ -221,9 +235,20 @@ private:
     // A recording whose syscalls no longer match what the scenario claims to
     // exercise is stale, not a divergence. Reporting those apart is the
     // difference between "regenerate the golden" and "linuxity has a bug".
-    [[nodiscard]] static const char* stale_reason(const Scenario& s,
-                                                  const Trace& t) {
+    [[nodiscard]] const char* stale_reason(const Scenario& s,
+                                           const Trace& t) const {
         if (t.steps.empty()) return "golden has no steps";
+
+        // A golden naming a syscall this ABI does not have was recorded for
+        // the other one. The path carries the arch, so this should be
+        // unreachable -- but a hand-edited or wrongly-committed golden would
+        // otherwise be judged as truth, reporting ABI differences as linuxity
+        // bugs. Cheap check, and it fails in the right direction.
+        for (const Observation& o : t.steps)
+            if (!arch_has(paths_.arch, o.call))
+                return "golden names a syscall this ABI lacks (recorded for "
+                       "the other arch?)";
+
         for (const abi::Sysno want : s.expects) {
             bool seen = false;
             for (const Observation& o : t.steps)

@@ -204,6 +204,7 @@ for f in include/linuxity/conform/*.hpp; do
     [ -e "$f" ] || continue
     case "$(basename "$f")" in
         runner_*.hpp|host.hpp) continue ;;   # the sanctioned host seam
+        arch.hpp) continue ;;                # the sanctioned guest-ABI seam
     esac
     if grep -qE '^[[:space:]]*#[[:space:]]*include[[:space:]]*<(sys/|unistd|fcntl|dirent|pthread|windows|spawn|signal)' "$f"; then
         note "$f includes a platform header; only conform/runner_*.hpp may \

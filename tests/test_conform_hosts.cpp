@@ -82,6 +82,13 @@ static_assert(!ProbeRunner<TypoRunner>,
 
 OraclePaths paths() { return OraclePaths{"/probes", "/goldens"}; }
 
+// The scenario a test means, by name.
+[[nodiscard]] std::optional<Scenario> find(std::string_view name) {
+    for (const Scenario& s : all_scenarios())
+        if (s.name == name) return s;
+    return std::nullopt;
+}
+
 // -- the trace format ------------------------------------------------------
 
 void a_trace_round_trips() {
@@ -284,6 +291,88 @@ void a_stale_golden_is_distinguished_from_a_divergence() {
                });
 }
 
+// -- the guest-ABI axis ----------------------------------------------------
+//
+// Orthogonal to the host axis: a macOS arm64 host replays an aarch64 golden
+// while Linux x86-64 records an x86-64 one. These tests cover the failure
+// that adding a Linux arm64 job would otherwise cause.
+
+void goldens_are_per_arch() {
+    const Scenario s = *find("dirseek-proc");
+
+    const OraclePaths x{"/probes", "/goldens", abi::Arch::x86_64};
+    const OraclePaths a{"/probes", "/goldens", abi::Arch::aarch64};
+
+    // THE bug this prevents: without the arch in the path, a Linux arm64 CI
+    // job overwrites the x86-64 goldens and macOS replays whichever ran last.
+    check(x.golden(s) != a.golden(s),
+          "an x86-64 and an aarch64 golden must not share a path");
+    check(x.golden(s).find("x86_64") != std::string::npos,
+          "the x86-64 golden path names its arch");
+    check(a.golden(s).find("aarch64") != std::string::npos,
+          "the aarch64 golden path names its arch");
+}
+
+// Adding Linux arm64 must need NO new conformance code: it is the same POSIX
+// runner and the same live oracle, with only the arch tag differing.
+void adding_linux_arm64_needs_no_new_code() {
+    FakeRunner arm;           // a Linux host, as arm64 would be
+    arm.probe_stdout = "getdents64 = 384\nlseek = 368\n";
+
+    const OraclePaths p{"/probes", "/goldens", abi::Arch::aarch64};
+    const LiveOracle<FakeRunner> live{arm, p};   // same template, no new type
+
+    check(live.usable(), "a Linux arm64 host has a live oracle");
+    check(live.record("dirseek-proc").available(), "and can record goldens");
+
+    // The recording lands under its own arch, so both Linux jobs coexist.
+    bool under_aarch64 = false;
+    for (const auto& [path, _] : arm.files)
+        if (path.find("aarch64") != std::string::npos) under_aarch64 = true;
+    check(under_aarch64, "an arm64 recording is stored under aarch64/");
+
+    // And the stamped header records the ABI, so a reader can tell.
+    for (const auto& [_, body] : arm.files)
+        check(body.find("# arch: aarch64") != std::string::npos,
+              "the golden header states the ABI it was recorded for");
+}
+
+// A golden from the wrong ABI must be rejected, not judged. 56 syscalls exist
+// on x86-64 and not on aarch64, so judging one against the other would report
+// ABI differences as linuxity bugs.
+void a_cross_arch_golden_is_rejected() {
+    const Scenario s = *find("dirseek-proc");
+    FakeRunner r;
+
+    // An x86-64 trace (it uses `open`, which aarch64 does not have) placed
+    // where the aarch64 oracle will look.
+    const OraclePaths a{"/probes", "/goldens", abi::Arch::aarch64};
+    r.files[a.golden(s)] = "open = 3\ngetdents64 = 384\nlseek = 368\n";
+
+    const RecordedOracle<FakeRunner> o{r, a};
+    o.reference_for("dirseek-proc")
+        .match([](const Trace&) {
+                   check(false, "a golden using x86-64-only syscalls must not "
+                                "be judged on aarch64");
+               },
+               [](const Unavailable& u) {
+                   check(u.cause == Unavailable::Cause::stale_recording,
+                         "a cross-arch golden is reported as stale");
+               });
+}
+
+// The ABI difference is real, not hypothetical -- asserted here as a value so
+// the motivation for all of the above stays visible.
+void the_two_linux_abis_genuinely_differ() {
+    check(arch_has(abi::Arch::x86_64, abi::Sysno::open),
+          "x86-64 has open");
+    check(!arch_has(abi::Arch::aarch64, abi::Sysno::open),
+          "aarch64 has openat only");
+    check(arch_has(abi::Arch::x86_64, abi::Sysno::lseek) &&
+              arch_has(abi::Arch::aarch64, abi::Sysno::lseek),
+          "lseek exists on both, so dirseek is valid on either");
+}
+
 // -- the host selection ----------------------------------------------------
 
 void this_host_states_what_it_verifies() {
@@ -317,6 +406,10 @@ int main() {
     linux_records_and_another_host_replays();
     a_missing_golden_is_not_a_pass();
     a_stale_golden_is_distinguished_from_a_divergence();
+    goldens_are_per_arch();
+    adding_linux_arm64_needs_no_new_code();
+    a_cross_arch_golden_is_rejected();
+    the_two_linux_abis_genuinely_differ();
     this_host_states_what_it_verifies();
 
     if (failures == 0)
