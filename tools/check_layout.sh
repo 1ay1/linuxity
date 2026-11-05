@@ -192,23 +192,29 @@ check_include 'abi::wire::(kOCloexec|kONonblock|kMfdCloexec)' 'abi/wire/fd_flags
 check_include 'abi::wire::errno_from_host'    'abi/wire/errno_map.hpp' 'errno_from_host'
 check_include 'abi::wire::(normalize_path|absolutize_path)' 'abi/wire/path.hpp' 'a wire path helper'
 
-# ---- conform/ must stay host-independent --------------------------------
+# ---- conform/ must keep the law host-independent -------------------------
 #
-# The conformance LAW (what agreement means) is shared by all four hosts;
-# only the ORACLE (where the reference trace comes from) is host-specific,
-# and that lives behind the capability concepts in conform/oracle.hpp. If a
-# platform header creeps into conform/, the law stops compiling on macOS or
-# Windows and those hosts silently lose conformance coverage -- which is the
-# vacuous pass the whole design is arranged to prevent.
+# The conformance LAW (what agreement means), the trace format, both oracles
+# and the scenario registry are shared by all four hosts. Only the
+# ProbeRunner implementations may touch a platform API, and only host.hpp may
+# choose between them. If a platform header creeps anywhere else, the law
+# stops compiling on macOS or Windows and those hosts silently lose
+# conformance coverage -- the vacuous pass this design exists to prevent.
 for f in include/linuxity/conform/*.hpp; do
     [ -e "$f" ] || continue
-    if grep -qE '^[[:space:]]*#[[:space:]]*include[[:space:]]*<(sys/|unistd|fcntl|dirent|pthread|windows|io)' "$f"; then
-        note "$f is in conform/ but includes a platform header; the law must \
- stay host-independent (put host code behind an Oracle capability)"
+    case "$(basename "$f")" in
+        runner_*.hpp|host.hpp) continue ;;   # the sanctioned host seam
+    esac
+    if grep -qE '^[[:space:]]*#[[:space:]]*include[[:space:]]*<(sys/|unistd|fcntl|dirent|pthread|windows|spawn|signal)' "$f"; then
+        note "$f includes a platform header; only conform/runner_*.hpp may \
+(put host code behind the ProbeRunner concept)"
     fi
-    if grep -qE '\b(fork|vfork|execve|execvp|ptrace|CreateProcess)[[:space:]]*\(' "$f"; then
-        note "$f is in conform/ but spawns a process; only an Oracle \
-implementation may do that"
+    if grep -qE '^[[:space:]]*#[[:space:]]*(if|ifdef|ifndef).*(_WIN32|__linux__|__APPLE__)' "$f"; then
+        note "$f branches on the host with a preprocessor test; conform/ \
+selects a host ONCE in host.hpp"
+    fi
+    if grep -qE '\b(fork|vfork|execve|execvp|ptrace|posix_spawn|CreateProcess)[[:space:]]*\(' "$f"; then
+        note "$f spawns a process; only a ProbeRunner implementation may"
     fi
 done
 
