@@ -325,6 +325,28 @@ public:
             case Sysno::readlinkat:  return do_readlink(r, 1, true);
             case Sysno::getcwd:      return do_getcwd(r);
             case Sysno::getdents64:  return do_getdents64(r);
+            case Sysno::lseek: {
+                // rewinddir()/seekdir() on a VIRTUAL or overlay-union
+                // directory: our stream keeps its own position, so a real
+                // lseek on the backing fd left it at the end. The second
+                // readdir pass then returned stale bytes -- lscpu counted
+                // nodes, rewound, and parsed "node138688924" out of garbage,
+                // then asserted on a NULL cpuset. Position = entry index
+                // (d_off is the index of the next entry, see getdents64).
+                const int fd = static_cast<int>(r.arg[0]);
+                if (auto* ds = k_.files().dir_stream(fd)) {
+                    const auto off = static_cast<std::int64_t>(r.arg[1]);
+                    const int whence = static_cast<int>(r.arg[2]);
+                    std::int64_t np = whence == 0 ? off
+                                    : whence == 1 ? static_cast<std::int64_t>(ds->pos) + off
+                                    : -1;
+                    if (np < 0) return eno(Errno::einval);
+                    ds->pos = static_cast<std::size_t>(
+                        std::min<std::int64_t>(np, static_cast<std::int64_t>(ds->entries.size())));
+                    return val(static_cast<std::int64_t>(ds->pos));
+                }
+                return fwd();
+            }
 
             // -- statfs(path, buf): translate the path and REDIRECT so the
             //    host reports the overlay filesystem's stats. fstatfs acts on
@@ -699,11 +721,33 @@ private:
     }
 
     // Resolve arg-carried path to an absolute, normalized guest path.
-    [[nodiscard]] std::string resolve_arg(const Regs& r, int path_arg, bool at) {
+    //
+    // /proc/<pid>/{exe,cwd,root} are magic links: the kernel FOLLOWS them in
+    // path walk, so `/proc/self/cwd/foo` is foo in the cwd and opening
+    // `/proc/self/exe` opens the binary. Expand them here, for every path
+    // syscall, unless the link is the LEAF and the caller asked not to follow
+    // it (readlink, lstat, AT_SYMLINK_NOFOLLOW) -- those see the link itself.
+    [[nodiscard]] std::string resolve_arg(const Regs& r, int path_arg, bool at,
+                                          bool follow_leaf = true) {
         std::string raw = read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)]));
         std::string_view dir = at ? dir_of(static_cast<std::int64_t>(r.arg[0]))
                                   : std::string_view{};
-        return k_.files().absolutize(raw, dir);
+        std::string abs = k_.files().absolutize(raw, dir);
+        return expand_proc_links(std::move(abs), follow_leaf);
+    }
+    [[nodiscard]] std::string expand_proc_links(std::string abs, bool follow_leaf) {
+        if (!abs.starts_with("/proc/")) return abs;
+        // /proc/<who>/<leaf>[/rest]
+        const auto s1 = abs.find('/', 6);
+        if (s1 == std::string::npos) return abs;
+        const auto s2 = abs.find('/', s1 + 1);
+        const std::string link = abs.substr(0, s2);
+        if (!proc_is_link(link)) return abs;
+        if (s2 == std::string::npos && !follow_leaf) return abs;
+        std::string tgt = proc_symlink_target(link);
+        if (tgt.empty() || tgt.front() != '/') return abs;
+        if (s2 != std::string::npos) tgt += abs.substr(s2);
+        return kernel::FileNamespace::normalize(tgt);
     }
 
     // open/openat: translate to a host-backed path (REDIRECT) or synthesize a
@@ -831,7 +875,7 @@ private:
     // virtual files synthesize a stat buffer into guest memory ourselves.
     [[nodiscard]] Outcome path_stat(const Regs& r, int path_arg, bool at,
                                     bool follow = true) {
-        std::string abs = resolve_arg(r, path_arg, at);
+        std::string abs = resolve_arg(r, path_arg, at, follow);
         auto pc = k_.files().classify(abs, /*for_write=*/false, follow);
         if (pc.realm == kernel::Realm2::host_backed) {
             Outcome o{};
@@ -848,10 +892,37 @@ private:
         if (pc.realm == kernel::Realm2::virtual_file) {
             const std::string& vp = pc.virtual_path.empty() ? abs : pc.virtual_path;
             auto vf = k_.files().produce(vp);
+            // /proc/<pid>/{exe,cwd,root} are SYMLINKS whose targets only the
+            // dispatcher knows (see proc_symlink_target). procfs itself has
+            // no entry for them, so lstat said ENOENT -- `ls -l
+            // /proc/self/exe` and every `test -L` failed. Synthesize the link,
+            // and for a following stat, stat its target instead.
+            if (vf && vf->symlink_target == "(proc-link)") vf = err<kernel::VirtualFile>(Errno::enoent);
+            if (!vf && proc_is_link(vp)) {
+                const std::string tgt = proc_symlink_target(vp);
+                if (!tgt.empty()) {
+                    if (follow) {
+                        auto tc = k_.files().classify(tgt, false, true);
+                        if (tc.realm == kernel::Realm2::host_backed) {
+                            Outcome o{};
+                            o.redirect = true; o.path_arg = path_arg;
+                            o.host_path = std::move(tc.host_path);
+                            o.scrub = Outcome::ScrubKind::stat;
+                            o.scrub_buf = at ? uaddr(r.arg[2]) : uaddr(r.arg[1]);
+                            o.scrub_guest_path = tgt;
+                            return o;
+                        }
+                    }
+                    kernel::VirtualFile lf;
+                    lf.symlink_target = tgt;
+                    vf = ok(std::move(lf));
+                }
+            }
             if (!vf) return eno(vf.error());
-            // statbuf is arg[1] for stat/lstat, arg[2] for newfstatat.
             UAddr sb = at ? uaddr(r.arg[2]) : uaddr(r.arg[1]);
-            return write_statbuf(sb, vf->is_dir, vf->bytes.size());
+            return write_statbuf(sb, vf->is_dir, vf->symlink_target.empty()
+                                     ? vf->bytes.size() : vf->symlink_target.size(),
+                                 !vf->symlink_target.empty());
         }
         return eno(pc.error);
     }
@@ -884,11 +955,11 @@ private:
             // the empty path, which would wrongly stat the cwd/root).
             return fwd();
         }
-        std::string abs = resolve_arg(r, 1, true);
+        bool nofollow = (flags & 0x100) != 0;
+        std::string abs = resolve_arg(r, 1, true, /*follow_leaf=*/!nofollow);
         // Honor AT_SYMLINK_NOFOLLOW (0x100): coreutils `stat`/`ls -la` statx a
         // symlink with this flag and expect S_IFLNK; following it reported the
         // target's type ("regular file") and made git's symlink probe fail.
-        bool nofollow = (flags & 0x100) != 0;
         auto pc = k_.files().classify(abs, /*for_write=*/false, /*follow=*/!nofollow);
         if (pc.realm == kernel::Realm2::host_backed) {
             Outcome o{};
@@ -901,8 +972,28 @@ private:
         if (pc.realm == kernel::Realm2::virtual_file) {
             const std::string& vp = pc.virtual_path.empty() ? abs : pc.virtual_path;
             auto vf = k_.files().produce(vp);
+            if (vf && vf->symlink_target == "(proc-link)") vf = err<kernel::VirtualFile>(Errno::enoent);
+            if (!vf && proc_is_link(vp)) {
+                const std::string tgt = proc_symlink_target(vp);
+                if (!tgt.empty()) {
+                    if (!nofollow) {
+                        auto tc = k_.files().classify(tgt, false, true);
+                        if (tc.realm == kernel::Realm2::host_backed) {
+                            Outcome o{};
+                            o.redirect = true; o.path_arg = 1;
+                            o.host_path = std::move(tc.host_path);
+                            o.scrub = Outcome::ScrubKind::statx;
+                            o.scrub_buf = uaddr(r.arg[4]);
+                            o.scrub_guest_path = tgt;
+                            return o;
+                        }
+                    }
+                    return write_statx(uaddr(r.arg[4]), false, tgt.size(), true);
+                }
+            }
             if (!vf) return eno(vf.error());
-            return write_statx(uaddr(r.arg[4]), vf->is_dir, vf->bytes.size());
+            return write_statx(uaddr(r.arg[4]), vf->is_dir, vf->bytes.size(),
+                               !vf->symlink_target.empty());
         }
         return eno(pc.error);
     }
@@ -964,7 +1055,7 @@ private:
         std::string raw0 =
             read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)]));
         if (raw0.empty()) return at ? fwd() : eno(Errno::enoent);
-        std::string abs = resolve_arg(r, path_arg, at);
+        std::string abs = resolve_arg(r, path_arg, at, /*follow_leaf=*/false);
         // The buffer + size follow the path arg: readlink(path,buf,sz) ->
         // arg1/arg2; readlinkat(dirfd,path,buf,sz) -> arg2/arg3.
         std::size_t bi = static_cast<std::size_t>(path_arg) + 1;
@@ -991,12 +1082,32 @@ private:
         return eno(pc.error);
     }
 
+    // Is this a /proc/<pid|self|thread-self>/{exe,cwd,root} link?
+    [[nodiscard]] static bool proc_is_link(std::string_view p) {
+        if (!p.starts_with("/proc/")) return false;
+        const auto slash = p.rfind('/');
+        const auto leaf = p.substr(slash + 1);
+        if (leaf != "exe" && leaf != "cwd" && leaf != "root") return false;
+        const auto who = p.substr(6, slash - 6);
+        if (who == "self" || who == "thread-self") return true;
+        return !who.empty() && who.find_first_not_of("0123456789") == std::string_view::npos;
+    }
+
     // The target of a synthesized /proc symlink, or "" if `abs` is not one.
     // self/<pid> both resolve against the CURRENT task (linuxity runs one
     // guest tree; the monitor asks about its own members).
     [[nodiscard]] std::string proc_symlink_target(const std::string& abs) {
         auto id = ids();
         auto exe_of = [&](std::int32_t pid) -> std::string {
+            // The backend knows what every process in the tree is running
+            // (each guest process is its own host process, so only the
+            // backend's shared table can see across them). Prefer it: the
+            // argv[0] heuristic below fails for anything run by bare name
+            // (`bash` -> "realpath: /proc/2/exe: No such file", which broke
+            // screenfetch's shell detection).
+            if constexpr (requires { mem_.exe_of_pid(pid); }) {
+                if (std::string e = mem_.exe_of_pid(pid); !e.empty()) return e;
+            }
             if (const auto* pi = k_.procs().find(pid)) {
                 // cmdline is space-joined argv; the first token is argv[0].
                 std::string c = pi->cmdline;
@@ -1022,7 +1133,12 @@ private:
                                        ? id.pid : atoi_safe(who);
                 if (pid > 0) {
                     if (tail == "exe")  return exe_of(pid);
-                    if (tail == "cwd")  return std::string{k_.files().cwd()};
+                    if (tail == "cwd") {
+                        if constexpr (requires { mem_.cwd_of_pid(pid); })
+                            if (pid != id.pid)
+                                if (std::string c = mem_.cwd_of_pid(pid); !c.empty()) return c;
+                        return std::string{k_.files().cwd()};
+                    }
                     if (tail == "root") return "/";
                     // /proc/<pid>/fd/N -> the GUEST-namespace path the fd was
                     // opened as. Without this the readlink falls to the host
@@ -1701,7 +1817,8 @@ private:
 
     // Synthesize a `struct statx` (the flat, versioned stat the kernel fills
     // for statx(2)) for a virtual node into the guest buffer.
-    [[nodiscard]] Outcome write_statx(UAddr buf, bool is_dir, std::uint64_t size) {
+    [[nodiscard]] Outcome write_statx(UAddr buf, bool is_dir, std::uint64_t size,
+                                      bool is_link = false) {
         struct Statx {
             std::uint32_t stx_mask, stx_blksize;
             std::uint64_t stx_attributes;
@@ -1715,12 +1832,13 @@ private:
             std::uint64_t __spare3[12];
         } sx{};
         constexpr std::uint32_t kBasicStats = 0x7ff;  // STATX_BASIC_STATS
-        constexpr std::uint16_t kIfDir = 0040000, kIfReg = 0100000;
+        constexpr std::uint16_t kIfDir = 0040000, kIfReg = 0100000, kIfLnk = 0120000;
         sx.stx_mask    = kBasicStats;
         sx.stx_blksize = 4096;
         sx.stx_nlink   = 1;
-        sx.stx_mode    = static_cast<std::uint16_t>(is_dir ? kIfDir | 0555u
-                                                           : kIfReg | 0444u);
+        sx.stx_mode    = static_cast<std::uint16_t>(is_link ? kIfLnk | 0777u
+                                                : is_dir  ? kIfDir | 0555u
+                                                          : kIfReg | 0444u);
         sx.stx_ino     = 1;
         sx.stx_size    = size;
         sx.stx_blocks  = (size + 511) / 512;
@@ -1736,9 +1854,11 @@ private:
     // bytes. Writing the x86-64 struct into an aarch64 guest overruns its
     // buffer by 16 bytes -- glibc's stack protector catches that as "stack
     // smashing detected" the first time anything stats /dev/pts.
-    [[nodiscard]] Outcome write_statbuf(UAddr buf, bool is_dir, std::uint64_t size) {
-        constexpr std::uint32_t kIfDir = 0040000, kIfReg = 0100000;
-        const std::uint32_t mode = is_dir ? kIfDir | 0555u : kIfReg | 0444u;
+    [[nodiscard]] Outcome write_statbuf(UAddr buf, bool is_dir, std::uint64_t size,
+                                        bool is_link = false) {
+        constexpr std::uint32_t kIfDir = 0040000, kIfReg = 0100000, kIfLnk = 0120000;
+        const std::uint32_t mode = is_link ? kIfLnk | 0777u
+                                 : is_dir  ? kIfDir | 0555u : kIfReg | 0444u;
         const auto blocks = static_cast<std::int64_t>((size + 511) / 512);
         if (arch_ == Arch::aarch64) {
             struct StatGeneric {

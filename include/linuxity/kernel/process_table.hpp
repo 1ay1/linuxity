@@ -36,6 +36,7 @@ struct ProcInfo {
     std::uint64_t vsize_bytes{16u << 20}; // virtual size
     std::uint32_t uid{0};
     std::uint32_t gid{0};
+    std::string  exe{};              // guest path of the image (/proc/<pid>/exe)
 };
 
 // The virtual process table. Ordered by pid so /proc enumerates numerically.

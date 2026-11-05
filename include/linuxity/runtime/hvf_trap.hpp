@@ -133,6 +133,10 @@ public:
     [[nodiscard]] TaskIds current_ids() const noexcept {
         return {task_.tid, task_.tid, parent_};
     }
+    // /proc/<pid>/exe for ANY pid in the tree (shared table, set on exec).
+    [[nodiscard]] std::string exe_of_pid(std::int32_t pid) const {
+        return pids_.exe_of(pid);
+    }
 
     // The loader has already written the image and stack into guest RAM, so
     // starting is just placing the entry state. `image_end` seeds the heap.
@@ -1557,6 +1561,7 @@ private:
         // which is what makes a shell's pipeline one killable unit.
         pids_.set_pgid(child, pids_.pgid_of(task_.tid));
         pids_.set_sid(child, pids_.sid_of(task_.tid));
+        pids_.set_exe(child, pids_.exe_of(task_.tid));   // same image until it execs
         if (req.flags & clone_flag::parent_settid)
             (void)machine_.ram().put(req.parent_tid_addr, std::int32_t{child});
         children_.push_back({child, host});
@@ -1779,8 +1784,38 @@ private:
         regs_.spsr = 0;
         cpu_.set_sp(ex->sp);
         execed_ = true;
+        pids_.set_exe(task_.tid, exe_path_of(host_path, guest_path));
         pids_.mark_execed(task_.tid);           // releases a vfork parent
         return 0;
+    }
+
+    // The path /proc/<pid>/exe should name: the real binary, with symlinks
+    // resolved (`/bin/bash` -> `/usr/bin/bash`), as the kernel reports it.
+    // A #! script's exe is its INTERPRETER, which hvf_exec followed for us;
+    // the guest path we have is the script, so resolve via the host image.
+    [[nodiscard]] std::string exe_path_of(const std::string& host,
+                                          const std::string& guest, int depth = 0) const {
+        if (host.empty() || !unresolve_ || depth > 4) return guest;
+        char real[PATH_MAX];
+        if (!::realpath(host.c_str(), real)) return guest;
+        std::string g = unresolve_(real);
+        // A shebang script: report the interpreter, as Linux does.
+        if (FILE* f = std::fopen(real, "rb")) {
+            char hdr[256]{};
+            const std::size_t n = std::fread(hdr, 1, sizeof hdr - 1, f);
+            std::fclose(f);
+            if (n > 2 && hdr[0] == '#' && hdr[1] == '!') {
+                std::string_view l{hdr + 2, n - 2};
+                l = l.substr(0, l.find('\n'));
+                while (!l.empty() && (l.front() == ' ' || l.front() == '\t')) l.remove_prefix(1);
+                l = l.substr(0, l.find_first_of(" \t"));
+                if (!l.empty() && resolve_) {
+                    const std::string ig{l};
+                    return exe_path_of(resolve_(ig), ig, depth + 1);
+                }
+            }
+        }
+        return g.empty() ? guest : g;
     }
 
     [[nodiscard]] Maybe do_process(abi::Sysno sc) {
@@ -4093,6 +4128,9 @@ public:
         if (!trap_) return {1, 1, 0};
         auto t = trap_->current_ids();
         return {t.pid, t.tid, t.ppid};
+    }
+    [[nodiscard]] std::string exe_of_pid(std::int32_t pid) const {
+        return trap_ ? trap_->exe_of_pid(pid) : std::string{};
     }
 
     // Tells the portable core this backend keeps REAL process groups and

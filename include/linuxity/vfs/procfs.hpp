@@ -113,10 +113,30 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
             char mhz[32];
             std::snprintf(mhz, sizeof mhz, "%.3f", mach.cpu_mhz());
             std::string s;
+            if (mach.machine_arch == "aarch64") {
+                // The arm64 kernel's format (arch/arm64/kernel/cpuinfo.c):
+                // no vendor_id/model name/MHz, but Features + the MIDR
+                // fields lscpu decodes. Apple implementer 0x61. We add a
+                // "model name" line too: Asahi and several distros carry it,
+                // and fetch tools (screenfetch, fastfetch) show it.
+                for (long c = 0; c < ncpu; ++c) {
+                    s += "processor\t: " + std::to_string(c) + "\n";
+                    s += "model name\t: " + mach.cpu_model + "\n";
+                    s += "BogoMIPS\t: 48.00\n"
+                         "Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics "
+                         "fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 asimddp "
+                         "sha512 asimdfhm dit uscat ilrcpc flagm ssbs sb paca pacg dcpodp "
+                         "flagm2 frint bf16 i8mm bti ecv afp\n"
+                         "CPU implementer\t: 0x61\nCPU architecture: 8\n"
+                         "CPU variant\t: 0x0\nCPU part\t: 0x" + mach.cpu_part + "\n"
+                         "CPU revision\t: 0\n\n";
+                }
+                return ok(text_file(std::move(s)));
+            }
             for (long c = 0; c < ncpu; ++c) {
                 s += "processor\t: " + std::to_string(c) + "\n";
                 s += "vendor_id\t: LinuxityVirtual\n"
-                     "cpu family\t: 6\nmodel\t\t: 1\nmodel name\t: linuxity native CPU\n";
+                     "cpu family\t: 6\nmodel\t\t: 1\nmodel name\t: " + mach.cpu_model + "\n";
                 s += "cpu MHz\t\t: " + std::string{mhz} + "\ncache size\t: 8192 KB\n";
                 s += "physical id\t: 0\nsiblings\t: " + std::to_string(ncpu) +
                      "\ncore id\t\t: " + std::to_string(c) +
@@ -177,7 +197,7 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                 s += "cpu" + std::to_string(c) + " " + core_line(c) + "\n";
             s += "intr " + std::to_string(total * 20) + "\n";
             s += "ctxt " + std::to_string(total * 8) + "\n";
-            s += "btime " + std::to_string(mach.boot_wall) + "\n";
+            s += "btime " + std::to_string(mach.boot_epoch()) + "\n";
             s += "processes " + std::to_string(nproc + 10) + "\n";
             s += "procs_running 1\nprocs_blocked 0\n";
             return ok(text_file(std::move(s)));
@@ -321,7 +341,15 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
             if (tail == "oom_score") return ok(text_file("0\n"));
             if (tail == "maps")      return ok(text_file(""));
             if (tail == "fd")        return ok(dir_file({{"0",false},{"1",false},{"2",false}}));
-            if (tail == "cwd" || tail == "root") return ok(dir_file({}));
+            if (tail == "cwd" || tail == "root" || tail == "exe") {
+                // Symlinks whose targets only the dispatcher knows (it has
+                // the live task and the backend's exe table). Mark them so
+                // classify() reports virtual_file instead of absent, and
+                // let syscall.hpp substitute the real target.
+                kernel::VirtualFile vf;
+                vf.symlink_target = "(proc-link)";
+                return ok(std::move(vf));
+            }
             return err<kernel::VirtualFile>(Errno::enoent);
         }
 

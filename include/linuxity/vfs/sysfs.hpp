@@ -134,20 +134,59 @@ make_sysfs(const kernel::MachineSpec& mach) {
                 long pol = index_after(head, "policy");
 
                 if (cpu >= 0 && cpu < ncpu) {
+                    // Kernel cpumask format: comma-separated 32-bit hex words,
+                    // most significant first. lscpu parses these and asserts
+                    // on a malformed one ("print_cpuset: Assertion `set'").
+                    auto mask = [&](auto&& in) {
+                        std::string out;
+                        const long words = (ncpu + 31) / 32;
+                        for (long w = words - 1; w >= 0; --w) {
+                            std::uint32_t v = 0;
+                            for (long b = 0; b < 32; ++b)
+                                if (in(w * 32 + b)) v |= 1u << b;
+                            char buf[16];
+                            std::snprintf(buf, sizeof buf, "%08x", v);
+                            out += buf;
+                            if (w) out += ',';
+                        }
+                        return out + "\n";
+                    };
+                    const auto self = [&](long c) { return c == cpu; };
+                    const auto all  = [&](long c) { return c < ncpu; };
+                    const std::string one = std::to_string(cpu) + "\n";
                     if (tail.empty())
                         return D({{"topology",true},{"cache",true},
                                  {"cpufreq",true},{"online",false}});
-                    if (tail == "online") return T(cpu == 0 ? "1\n" : "1\n");
+                    if (tail == "online") return T("1\n");
                     if (tail == "topology")
                         return D({{"core_id",false},{"physical_package_id",false},
-                                 {"core_siblings_list",false},{"thread_siblings_list",false},
-                                 {"core_siblings",false},{"thread_siblings",false}});
-                    if (tail == "topology/core_id")             return T(std::to_string(cpu) + "\n");
-                    if (tail == "topology/physical_package_id") return T("0\n");
-                    if (tail == "topology/core_siblings_list")  return T(cpu_range + "\n");
-                    if (tail == "topology/thread_siblings_list")return T(std::to_string(cpu) + "\n");
-                    if (tail == "topology/core_siblings")       return T("1\n");
-                    if (tail == "topology/thread_siblings")     return T("1\n");
+                                 {"cluster_id",false},{"die_id",false},
+                                 {"core_cpus",false},{"core_cpus_list",false},
+                                 {"thread_siblings",false},{"thread_siblings_list",false},
+                                 {"core_siblings",false},{"core_siblings_list",false},
+                                 {"package_cpus",false},{"package_cpus_list",false},
+                                 {"cluster_cpus",false},{"cluster_cpus_list",false},
+                                 {"die_cpus",false},{"die_cpus_list",false}});
+                    if (tail == "topology/core_id")             return T(one);
+                    if (tail == "topology/physical_package_id" ||
+                        tail == "topology/cluster_id" || tail == "topology/die_id")
+                        return T("0\n");
+                    // One thread per core (Apple Silicon has no SMT).
+                    if (tail == "topology/core_cpus_list" ||
+                        tail == "topology/thread_siblings_list") return T(one);
+                    if (tail == "topology/core_cpus" ||
+                        tail == "topology/thread_siblings")      return T(mask(self));
+                    if (tail == "topology/core_siblings_list" || tail == "topology/package_cpus_list" ||
+                        tail == "topology/cluster_cpus_list"  || tail == "topology/die_cpus_list")
+                        return T(cpu_range + "\n");
+                    if (tail == "topology/core_siblings" || tail == "topology/package_cpus" ||
+                        tail == "topology/cluster_cpus"  || tail == "topology/die_cpus")
+                        return T(mask(all));
+                    // cpuN/cpufreq is the same policy as cpufreq/policyN.
+                    if (tail == "cpufreq" || tail.starts_with("cpufreq/")) {
+                        pol = cpu;
+                        tail = tail == "cpufreq" ? std::string_view{} : tail.substr(8);
+                    }
                 }
                 if (pol >= 0 && pol < ncpu) {
                     if (tail.empty())
@@ -179,10 +218,25 @@ make_sysfs(const kernel::MachineSpec& mach) {
             return D({{"cpulist",false},{"cpumap",false},{"meminfo",false},
                      {"distance",false}});
         if (abs == "/sys/devices/system/node/node0/cpulist") return T(cpu_range + "\n");
+        if (abs == "/sys/devices/system/node/node0/cpumap") {
+            // Hex cpumask (32-bit words, MSW first). lscpu reads it into the
+            // NUMA map and asserts on NULL when it is missing.
+            std::string out;
+            const long words = (ncpu + 31) / 32;
+            for (long w = words - 1; w >= 0; --w) {
+                std::uint32_t v = 0;
+                for (long b = 0; b < 32 && w * 32 + b < ncpu; ++b) v |= 1u << b;
+                char buf[16];
+                std::snprintf(buf, sizeof buf, "%08x", v);
+                out += buf;
+                if (w) out += ',';
+            }
+            return T(out + "\n");
+        }
         if (abs == "/sys/devices/system/node/node0/distance") return T("10\n");
         if (abs == "/sys/devices/system/node/node0/meminfo")
-            return T("Node 0 MemTotal:        2097152 kB\n"
-                     "Node 0 MemFree:         1048576 kB\n");
+            return T("Node 0 MemTotal:       " + std::to_string(mach.mem_total_kb()) + " kB\n"
+                     "Node 0 MemFree:        " + std::to_string(mach.mem_free() >> 10) + " kB\n");
 
         // ---- memory block size (btop reads this for hotplug memory) ------
         if (abs == "/sys/devices/system/memory")

@@ -126,7 +126,25 @@ public:
         return g > 0 && g < kMax && shared_->execed[g].load(std::memory_order_acquire);
     }
     void release(std::int32_t g) noexcept {
-        if (g > 1 && g < kMax) shared_->host[g].store(0, std::memory_order_relaxed);
+        if (g > 1 && g < kMax) {
+            shared_->exe[g][0] = '\0';
+            shared_->host[g].store(0, std::memory_order_relaxed);
+        }
+    }
+
+    // /proc/<pid>/exe for any guest pid. Children inherit until they exec.
+    void set_exe(std::int32_t g, std::string_view path) noexcept {
+        if (g <= 0 || g >= kMax || !shared_) return;
+        const std::size_t n = std::min(path.size(), kExe - 1);
+        std::memcpy(shared_->exe[g], path.data(), n);
+        shared_->exe[g][n] = '\0';
+    }
+    [[nodiscard]] std::string exe_of(std::int32_t g) const {
+        if (g <= 0 || g >= kMax || !shared_) return {};
+        char buf[kExe];
+        std::memcpy(buf, shared_->exe[g], kExe);
+        buf[kExe - 1] = '\0';
+        return buf;
     }
 
     [[nodiscard]] std::optional<pid_t> host_of(std::int32_t g) const noexcept {
@@ -147,6 +165,7 @@ private:
         shared_ = p == MAP_FAILED ? nullptr : static_cast<Shared*>(p);
     }
     static constexpr pid_t kReserved = -1;
+    static constexpr std::size_t kExe = 256;
     struct Shared {
         std::atomic<int> next{2};
         std::atomic<pid_t> host[kMax]{};
@@ -154,6 +173,13 @@ private:
         // Process-group and session leader per pid; 0 means "itself".
         std::atomic<std::int32_t> pgid[kMax]{};
         std::atomic<std::int32_t> sid[kMax]{};
+        // Guest path of each process's current image, for /proc/<pid>/exe.
+        // Every guest process is its own HOST process, so only this shared
+        // page can answer "what is pid N running" for a pid other than us.
+        // Written by the process itself on exec; a seqlock-free best effort
+        // (a torn read can only produce a wrong name, never a crash: the
+        // buffer is always NUL-terminated at kExe-1).
+        char exe[kMax][kExe]{};
     };
     Shared* shared_{nullptr};
     int fd_{-1};

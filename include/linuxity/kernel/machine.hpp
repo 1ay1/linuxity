@@ -14,9 +14,16 @@
 // (bytes <-> kB, Hz <-> kHz), so no caller repeats a unit conversion either.
 #pragma once
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <ctime>
 #include <string>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <unistd.h>
+#endif
 
 namespace lx::kernel {
 
@@ -34,19 +41,49 @@ public:
     std::string   release{"6.6.0-linuxity"};   // uname -r, /proc/version
     std::string   nodename{"linuxity"};        // hostname
     std::string   machine_arch{"x86_64"};      // uname -m
+    std::string   cpu_model{"linuxity native CPU"};   // /proc/cpuinfo model name
+    std::string   cpu_part{"000"};             // arm64 MIDR part number (hex)
 
     // -- Time --------------------------------------------------------------
     // Wall-clock at boot (for /proc/stat btime); fixed so it is stable across
     // reads within a run. Uptime is measured live from a monotonic origin.
     std::int64_t  boot_wall{1'700'000'000};
 
-    // Seconds of virtual uptime since the runtime started. ONE monotonic
-    // origin (captured on first call) feeds /proc/uptime, /proc/stat jiffies,
-    // and sysinfo(2).uptime — so every clock a monitor reads agrees.
+    // Seconds since the HOST booted -- this machine's real uptime, which is
+    // what `uptime`, /proc/uptime and screenfetch report on Linux. (Counting
+    // from linuxity's own start showed "Uptime: 0m" on every run.) One
+    // monotonic origin, captured once, still feeds /proc/uptime, /proc/stat
+    // jiffies and sysinfo(2).uptime, so every clock a monitor reads agrees.
     [[nodiscard]] double uptime_seconds() const {
+        static const double host_up_at_start = host_uptime_now();
         static const auto boot = std::chrono::steady_clock::now();
-        return std::chrono::duration<double>(
+        return host_up_at_start + std::chrono::duration<double>(
                    std::chrono::steady_clock::now() - boot).count();
+    }
+    [[nodiscard]] static double host_uptime_now() {
+#if defined(__APPLE__)
+        // CLOCK_MONOTONIC on Darwin includes sleep and starts at boot.
+        timespec ts{};
+        if (::clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+            return static_cast<double>(ts.tv_sec) + ts.tv_nsec / 1e9;
+#elif defined(__linux__)
+        timespec ts{};
+        if (::clock_gettime(CLOCK_BOOTTIME, &ts) == 0)
+            return static_cast<double>(ts.tv_sec) + ts.tv_nsec / 1e9;
+#endif
+        return 0.0;
+    }
+
+    // Wall-clock second the host booted: now - uptime, fixed at first use so
+    // /proc/stat btime is stable across reads and agrees with /proc/uptime.
+    [[nodiscard]] std::int64_t boot_epoch() const {
+        static const std::int64_t b = [this] {
+            const auto now = std::chrono::system_clock::now().time_since_epoch();
+            const double s = std::chrono::duration<double>(now).count();
+            const double up = host_uptime_now();
+            return up > 0 ? static_cast<std::int64_t>(s - up) : boot_wall;
+        }();
+        return b;
     }
 
     // -- Derived views (so no caller repeats a unit conversion) ------------
@@ -54,11 +91,42 @@ public:
     [[nodiscard]] double        cpu_mhz()      const { return static_cast<double>(cpu_hz) / 1e6; }
     [[nodiscard]] std::uint64_t mem_total_kb() const { return mem_total >> 10; }
     [[nodiscard]] std::uint64_t swap_total_kb()const { return swap_total >> 10; }
-    // A plausible free/available split so /proc/meminfo and sysinfo agree.
-    [[nodiscard]] std::uint64_t mem_free()     const { return mem_total / 2; }
-    [[nodiscard]] std::uint64_t mem_available()const { return mem_total * 3 / 4; }
-    [[nodiscard]] std::uint64_t mem_cached()   const { return mem_total / 4; }
-    [[nodiscard]] std::uint64_t mem_buffers()  const { return mem_total / 64; }
+    // Free/available follow the HOST's real memory pressure, scaled to the
+    // guest's size: the guest is a slice of this Mac, so it is as loaded as
+    // the Mac is. (A fixed 50% never moved; capping host-free at mem_total
+    // reported 0 used on any Mac with more free RAM than the guest's size.)
+    // Cached for a second: monitors poll.
+    [[nodiscard]] std::uint64_t mem_available()const {
+        const double f = host_free_fraction();
+        return static_cast<std::uint64_t>(static_cast<double>(mem_total) * f);
+    }
+    [[nodiscard]] std::uint64_t mem_free()     const { return mem_available() * 2 / 3; }
+    [[nodiscard]] std::uint64_t mem_cached()   const { return (mem_available() - mem_free()) * 3 / 4; }
+    [[nodiscard]] std::uint64_t mem_buffers()  const { return mem_total / 128; }
+    [[nodiscard]] double host_free_fraction() const {
+        using clk = std::chrono::steady_clock;
+        static std::atomic<double> cached{-1.0};
+        static std::atomic<clk::rep> at{0};
+        const auto now = clk::now().time_since_epoch().count();
+        if (cached.load() >= 0 && now - at.load() < std::chrono::duration_cast<clk::duration>(
+                std::chrono::seconds(1)).count())
+            return cached.load();
+        double v = 0.5;
+#if defined(__APPLE__)
+        vm_statistics64_data_t st{};
+        mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
+        if (::host_statistics64(::mach_host_self(), HOST_VM_INFO64,
+                                reinterpret_cast<host_info64_t>(&st), &cnt) == KERN_SUCCESS) {
+            const double avail = static_cast<double>(st.free_count) + st.inactive_count
+                               + st.purgeable_count + st.speculative_count;
+            const double total = avail + st.active_count + st.wire_count
+                               + st.compressor_page_count;
+            if (total > 0) v = std::clamp(avail / total, 0.05, 0.95);
+        }
+#endif
+        cached.store(v); at.store(now);
+        return v;
+    }
 
     // "0-3"-style inclusive CPU range for /sys and cpuset listings.
     [[nodiscard]] std::string cpu_range() const {

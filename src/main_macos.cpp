@@ -31,6 +31,7 @@
 #include <chrono>
 #include <mutex>
 #include <thread>
+#include <sys/sysctl.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -136,6 +137,24 @@ struct Machine {
         spec.release = "6.6.0-linuxity";
         spec.nodename = "linuxity";
         spec.machine_arch = "aarch64";
+        {
+            // The real CPU: "Apple M3 Pro", not a made-up name, for
+            // /proc/cpuinfo and the fetch tools that print it.
+            char brand[128]{};
+            std::size_t bl = sizeof brand - 1;
+            if (::sysctlbyname("machdep.cpu.brand_string", brand, &bl, nullptr, 0) == 0 && brand[0])
+                spec.cpu_model = brand;
+            // Apple Silicon hides its clock from sysctl; hw.cpufrequency is
+            // absent. Use the P-core max from the published tables when we
+            // can recognise the family, else keep the spec default.
+            const std::string_view b{spec.cpu_model};
+            struct F { const char* tag; std::uint64_t hz; const char* part; };
+            for (const F& f : {F{"M4", 4'400'000'000ull, "049"}, F{"M3", 4'050'000'000ull, "039"},
+                               F{"M2", 3'490'000'000ull, "033"}, F{"M1", 3'200'000'000ull, "023"}})
+                if (b.find(f.tag) != std::string_view::npos) {
+                    spec.cpu_hz = f.hz; spec.cpu_part = f.part; break;
+                }
+        }
         k.set_machine(std::move(spec));
 
         // Stack a WRITABLE upper layer over the read-only rootfs. The core
@@ -170,6 +189,10 @@ struct Machine {
                 k.files().mount_host(n, n);
         k.files().mount_host("/dev/tty", "/dev/tty");
         root_ = o.root;
+        real_root_ = canonical(root_);
+        real_upper_ = canonical(upper_);
+        if (real_root_ == root_) real_root_.clear();
+        if (real_upper_ == upper_) real_upper_.clear();
     }
 
     // host path -> guest path: the inverse of resolve(). With an overlay a
@@ -177,16 +200,29 @@ struct Machine {
     // readlink("/proc/self/fd/N") must report the guest name whichever layer
     // the fd actually came from.
     [[nodiscard]] std::string unresolve(const std::string& host) const {
-        for (const std::string& base : {upper_, root_}) {
-            if (base.empty()) continue;
-            if (host.size() > base.size() && host.starts_with(base) &&
-                host[base.size()] == '/')
-                return host.substr(base.size());
+        // Match both the layer roots as given AND their canonical forms: on
+        // macOS /tmp is a symlink to /private/tmp, so a realpath()'d or
+        // F_GETPATH host path ("/private/tmp/hvx/persist/usr/bin/bash")
+        // never prefix-matched "/tmp/hvx/persist" and leaked out verbatim --
+        // /proc/<pid>/exe then named a path that does not exist in the guest
+        // ("realpath: /proc/1/exe: No such file", empty Shell in screenfetch).
+        for (const std::string* base : {&upper_, &real_upper_, &root_, &real_root_}) {
+            if (base->empty()) continue;
+            if (host.size() > base->size() && host.starts_with(*base) &&
+                host[base->size()] == '/')
+                return host.substr(base->size());
+            if (host == *base) return "/";
         }
         return host;
     }
+    [[nodiscard]] static std::string canonical(const std::string& p) {
+        char buf[PATH_MAX];
+        return (!p.empty() && ::realpath(p.c_str(), buf)) ? std::string{buf} : std::string{};
+    }
     std::string root_;
     std::string upper_;
+    std::string real_root_;     // canonical(root_), e.g. /private/tmp/archarm
+    std::string real_upper_;
 
     // The per-RUN scratch upper. The root process picks it and exports it in
     // the environment; fork children are spawned with that environment, so
@@ -698,6 +734,14 @@ int main(int argc, char** argv) {
     runtime::TaskState task;
     task.tid = 1;                      // the initial thread IS the process
     runtime::HvfTrap trap{machine, cpu, proc, task, pids};
+    {
+        // /proc/1/exe: the real image, symlinks resolved (as the kernel does).
+        std::string exe = gargv[0];
+        char real[PATH_MAX];
+        if (const std::string h = m.resolve(gargv[0]); !h.empty() && ::realpath(h.c_str(), real))
+            exe = m.unresolve(real);
+        pids.set_exe(1, exe);
+    }
     // Only the ROOT process reserves the low fds: a fork child inherits its
     // parent's whole table (reservations included) through the handoff.
     proc.with_fds([](runtime::FdTable& t) { t.reserve_low_fds(); });
