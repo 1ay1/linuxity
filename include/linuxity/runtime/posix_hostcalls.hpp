@@ -18,6 +18,7 @@
 #include "linuxity/abi/types.hpp"
 #include "linuxity/abi/wire/errno_map.hpp"
 #include "linuxity/abi/wire/time.hpp"
+#include "linuxity/host/entropy.hpp"
 #include "linuxity/runtime/hostcalls.hpp"
 
 #include <algorithm>
@@ -101,19 +102,10 @@ public:
 
     // -- entropy -----------------------------------------------------------
     [[nodiscard]] Result<std::size_t> random_bytes(std::span<std::byte> out) {
-        std::size_t filled = 0;
-        while (filled < out.size()) {
-            // getentropy() caps at 256 bytes per call and is the portable
-            // spelling available on both glibc and musl.
-            const std::size_t chunk =
-                std::min<std::size_t>(256, out.size() - filled);
-            if (::getentropy(out.data() + filled, chunk) != 0) {
-                if (errno == EINTR) continue;
-                return err<std::size_t>(abi::wire::errno_from_host(errno));
-            }
-            filled += chunk;
-        }
-        return ok(filled);
+        // per-host primitive choice; this is the HostCalls face of it.
+        if (!lx::host::random_bytes(out.data(), out.size()))
+            return err<std::size_t>(Errno::eio);
+        return ok(out.size());
     }
 
 private:

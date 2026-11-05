@@ -46,6 +46,7 @@
 
 #if defined(__APPLE__) && defined(__aarch64__)
 
+#include "linuxity/host/entropy.hpp"
 #include "linuxity/abi/result.hpp"
 #include "linuxity/abi/syscall.hpp"
 #include "linuxity/abi/wire/at_flags.hpp"
@@ -2053,7 +2054,7 @@ private:
             case S::getrandom: {
                 auto win = ram.clamp(a0, a1);
                 if (win.empty()) return -14;
-                ::arc4random_buf(win.data(), win.size());
+                (void)host::random_bytes(win.data(), win.size());
                 return static_cast<std::int64_t>(win.size());
             }
 

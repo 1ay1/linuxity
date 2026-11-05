@@ -14,6 +14,7 @@
 // process monitor walks.
 #pragma once
 
+#include "linuxity/host/entropy.hpp"
 #include "linuxity/kernel/file_namespace.hpp"
 #include "linuxity/kernel/machine.hpp"
 #include "linuxity/kernel/process_table.hpp"
@@ -250,10 +251,19 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
         if (abs == "/proc/sys/kernel/random/uuid" || abs == "/proc/sys/kernel/random/boot_id") {
             std::uint8_t b[16];
             static std::uint8_t boot[16];
-            static const bool seeded = [] { ::arc4random_buf(boot, sizeof boot); return true; }();
+            // host::random_bytes, not arc4random_buf: this is a PORTABLE
+            // header, and arc4random_buf is BSD/glibc-only -- mingw has no
+            // such symbol, so this file could not compile on Windows at all.
+            static const bool seeded = [] {
+                return host::random_bytes(boot, sizeof boot);
+            }();
             (void)seeded;
-            if (abs.ends_with("uuid")) ::arc4random_buf(b, sizeof b);
-            else std::memcpy(b, boot, sizeof b);
+            if (abs.ends_with("uuid")) {
+                if (!host::random_bytes(b, sizeof b))
+                    return err<kernel::VirtualFile>(Errno::eio);
+            } else {
+                std::memcpy(b, boot, sizeof b);
+            }
             b[6] = static_cast<std::uint8_t>((b[6] & 0x0f) | 0x40);   // version 4
             b[8] = static_cast<std::uint8_t>((b[8] & 0x3f) | 0x80);   // RFC 4122 variant
             char s[40];

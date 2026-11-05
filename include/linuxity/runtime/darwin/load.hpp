@@ -10,6 +10,7 @@
 
 #if defined(__APPLE__) && defined(__aarch64__)
 
+#include "linuxity/host/entropy.hpp"
 #include "linuxity/abi/result.hpp"
 #include "linuxity/loader/elf.hpp"
 #include "linuxity/runtime/darwin/vm.hpp"
@@ -158,7 +159,7 @@ struct HvfImage {
     // AT_RANDOM: 16 bytes seeding glibc's stack protector and pointer guard.
     // Real entropy -- a fixed value would make every guest's canary equal.
     unsigned char rnd[16];
-    ::arc4random_buf(rnd, sizeof rnd);
+    (void)host::random_bytes(rnd, sizeof rnd);
     std::uint64_t rnd_addr = push_bytes(rnd, sizeof rnd);
 
     // The vector itself, built bottom-up then pushed as one block so the
