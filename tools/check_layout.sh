@@ -15,12 +15,17 @@ fail=0
 
 note() { printf '  FAIL: %s\n' "$1"; fail=1; }
 
+# An #include of a given path, as a grep pattern. Only real includes count:
+# a comment that NAMES a file ("see runtime/windows/sys.hpp") is documentation,
+# not a dependency, and matching it made this check fire on its own prose.
+inc_of() { printf '^[[:space:]]*#[[:space:]]*include.*%s' "$1"; }
+
 # 1. No backend may include another backend's headers. Each is compiled only
 #    on its own host, so a cross-include is either dead or a layering bug.
 for a in linux darwin windows; do
     for b in linux darwin windows; do
         [ "$a" = "$b" ] && continue
-        hits=$(grep -rl "runtime/$b/" "$R/$a/" 2>/dev/null || true)
+        hits=$(grep -rlE "$(inc_of "runtime/$b/")" "$R/$a/" 2>/dev/null || true)
         [ -n "$hits" ] && note "$a includes $b: $hits"
     done
 done
@@ -28,12 +33,12 @@ done
 # 2. Portable headers (runtime/*.hpp) must not depend on any backend. They are
 #    the contract and the loop; if they reach into a backend they stop being
 #    portable and the concept stops meaning anything.
-hits=$(grep -lE 'runtime/(linux|darwin|windows)/' "$R"/*.hpp 2>/dev/null || true)
+hits=$(grep -lE "$(inc_of 'runtime/(linux|darwin|windows)/')" "$R"/*.hpp 2>/dev/null || true)
 [ -n "$hits" ] && note "portable header depends on a backend: $hits"
 
 # 3. shared/ is for host-agnostic logic, so it must not touch a platform API
 #    or a backend. This is what hvf_vma.hpp violated by being named for one.
-hits=$(grep -lE 'runtime/(linux|darwin|windows)/' "$R"/shared/*.hpp 2>/dev/null || true)
+hits=$(grep -lE "$(inc_of 'runtime/(linux|darwin|windows)/')" "$R"/shared/*.hpp 2>/dev/null || true)
 [ -n "$hits" ] && note "shared/ depends on a backend: $hits"
 hits=$(grep -lE '\bhv_[a-z]|WHvRun|PTRACE_|__APPLE__|_WIN32' "$R"/shared/*.hpp 2>/dev/null || true)
 [ -n "$hits" ] && note "shared/ uses a platform API: $hits"

@@ -10,7 +10,7 @@ set(LX_PORTABLE_TESTS
 # Win32 CRT has no <sys/mman.h>. Keeping them out of LX_PORTABLE_TESTS is
 # what lets the portable set be a real cross-host contract rather than one
 # that quietly means "POSIX".
-set(LX_POSIX_HOST_TESTS hostfs loader)
+set(LX_POSIX_HOST_TESTS hostfs loader hostcalls)
 
 # Live tests: run real guest ELF binaries through a trap backend. Today the
 # only complete backend is ptrace (Linux), so they are Linux-only until the

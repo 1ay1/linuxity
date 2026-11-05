@@ -1,5 +1,6 @@
 // POSIX host backend (Linux + Darwin/iOS share this).
 #pragma once
+#include "linuxity/abi/wire/errno_map.hpp"
 #include "linuxity/host/host.hpp"
 
 #include <sys/mman.h>
@@ -65,13 +66,13 @@ public:
 
     Result<std::size_t> read(int fd, std::span<std::byte> b) {
         auto n = ::read(fd, b.data(), b.size());
-        if (n < 0) return err<std::size_t>(Errno::eio);
+        if (n < 0) return err<std::size_t>(from_errno(errno));
         return ok(static_cast<std::size_t>(n));
     }
 
     Result<std::size_t> write(int fd, std::span<const std::byte> b) {
         auto n = ::write(fd, b.data(), b.size());
-        if (n < 0) return err<std::size_t>(Errno::eio);
+        if (n < 0) return err<std::size_t>(from_errno(errno));
         return ok(static_cast<std::size_t>(n));
     }
 
@@ -128,16 +129,12 @@ public:
     }
 
 private:
+    // Host errno -> guest Errno. Delegates to the ONE table
+    // (abi/wire/errno_map.hpp): this used to map six values and send
+    // everything else to EIO, so a guest saw "I/O error" for ENOSPC, EPIPE
+    // and EAGAIN -- exactly the errors programs branch on.
     static Errno from_errno(int e) noexcept {
-        switch (e) {
-            case ENOENT:  return Errno::enoent;
-            case EACCES:  return Errno::eacces;
-            case ENOTDIR: return Errno::enotdir;
-            case EISDIR:  return Errno::eisdir;
-            case ENFILE:  return Errno::enfile;
-            case EMFILE:  return Errno::emfile;
-            default:      return Errno::eio;
-        }
+        return abi::wire::errno_from_host(e);
     }
 };
 

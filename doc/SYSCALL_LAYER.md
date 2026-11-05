@@ -146,17 +146,47 @@ Design rules that aren't checked decay. `tools/check_layout.sh` gains:
 
 Each step leaves the tree compiling and green.
 
-1. `abi/wire/dirent64.hpp` — one encoder, three call sites deleted. Fixes
-   the Windows `d_ino` and `DT_UNKNOWN` bugs as a side effect. Provable on
-   Linux today.
-2. `abi/wire/utsname.hpp` — deletes the duplicate `do_uname`.
-3. Layout rules 1 and 3, so the regression can't come back.
-4. `runtime/hostcalls.hpp` + the Linux implementation (forwarding). No
-   behaviour change; this is the seam.
-5. Migrate Windows' 46 duplicated cases onto the portable dispatcher,
-   deleting them from `windows/sys.hpp`.
-6. Rule 2 (no raw syscall numbers outside `abi/`) once step 5 lands.
+1. **DONE** (`2bc7191`) `abi/wire/dirent64.hpp` — one encoder, three call
+   sites deleted. Fixed the Windows `d_ino` and `DT_UNKNOWN` bugs as a side
+   effect. Darwin's duplicate `DType`/`dirent_reclen`/`dtype_from_mode` folded
+   in. Layout rules added for both.
 
-Steps 1-4 are verifiable on this host. Steps 5-6 touch Windows-only code
-that cannot be compiled here, so they need a Windows build before being
-trusted — the static_asserts will catch shape errors, not behaviour.
+2. **DONE** `abi/wire/errno_map.hpp` — one host-errno table. This found a
+   second live bug: `PosixHost::read`/`write` returned `EIO` for *every*
+   failure, and `from_errno` mapped six values and sent the rest to `EIO`. A
+   guest saw "I/O error" for a full disk (`ENOSPC`), a closed pipe (`EPIPE`)
+   and a would-block (`EAGAIN`) — precisely the errors programs branch on.
+
+3. **DONE** `runtime/hostcalls.hpp` + `runtime/posix_hostcalls.hpp` — the
+   seam, with its reference implementation. `HostCalls` has no capability
+   tier on purpose: a host that cannot read an fd cannot run a guest, so
+   every member is required and a gap is a build error. `HostMemory` is
+   separate because Linux forwards `mmap` to the real kernel and has no use
+   for it. `test_hostcalls` pins the contract (including a negative test that
+   a partial host FAILS it) and the errno regressions.
+
+4. **NEXT** Migrate the portable dispatcher's host-touching paths onto
+   `HostCalls`, with Linux's implementation forwarding as it does today. This
+   is the behaviour-neutral step that makes 5 possible.
+
+5. Migrate Windows' 46 duplicated cases onto the portable dispatcher,
+   deleting them from `windows/sys.hpp`. This is where the `getpid`-returns-1
+   class of bug dies.
+
+6. No raw syscall numbers outside `abi/` — as a layout rule — once 5 lands.
+
+Steps 1-4 are verifiable on this host. Steps 5-6 touch Windows-only code that
+cannot be compiled here, so they need a Windows build before being trusted:
+the static_asserts catch shape errors, not behaviour.
+
+## Bugs this has found so far
+
+Every one was a consequence of the duplication, not a coincidence:
+
+| bug | found by | status |
+|---|---|---|
+| `pacman -Q` lists 0 of 139 packages (positional `d_ino`) | running Arch | fixed |
+| Windows `d_type` always `DT_UNKNOWN` | unifying the encoder | fixed |
+| every host error collapsed to `EIO` | unifying the errno table | fixed |
+| Windows `getpid`/`gettid`/`getppid` hardcoded to 1 | reading the second dispatcher | step 5 |
+| `rewinddir()` returns 0 entries on a merged dir | running Arch | open |
