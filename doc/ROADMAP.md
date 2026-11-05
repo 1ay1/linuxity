@@ -127,8 +127,14 @@ every `syscall` into a VM exit.
       path classification now does ONE readlink where it used to do two
       lstats plus a readlink, directory unions skip a stat per layer and
       allocate nothing per entry, and path normalization allocates nothing
-      at all. `ls -lR /usr` is 26% faster as a result; `find`, `grep -r`,
-      `stat` and interpreter startup all improved with no regression.
+      at all. The size of that win depends on how much the overlay's upper
+      layer holds, because what was removed is per-layer and per-entry work:
+      `ls -lR /usr` x5 is 24% faster over an upper carrying ~57k copied-up
+      files (5.63s -> 4.35s) and ~3.5% faster over an empty one
+      (2.42s -> 2.34s). `find`, `grep -r`, `stat` and interpreter startup
+      all improved too, with no workload regressing.
+      (Both figures are interleaved A/B means, not one run against a number
+      from earlier: single-shot timings here swing ~0.15s.)
       Overlay directory unions are built lazily, on first getdents:
       `pacman -S python` takes 4.4 s, down from 2m41s.
       Remaining: `mprotect` is tracked in the VMA map but not enforced in
