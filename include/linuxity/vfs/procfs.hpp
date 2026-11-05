@@ -151,18 +151,44 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
             return ok(text_file(std::move(s)));
         }
         if (abs == "/proc/meminfo") {
-            auto kb = [](std::uint64_t b){ return std::to_string(b >> 10); };
+            // The kernel's own format is `"%-15s %8lu kB\n"` -- label padded
+            // LEFT to 15 columns, value RIGHT-aligned in 8. This file used
+            // hardcoded runs of spaces instead, which happened to look right
+            // for one magnitude of number and drifted for any other.
+            //
+            // That is not cosmetic. procps-ng parses meminfo by matching a
+            // field name and then reading the value, and `ps -eo %mem` died
+            // with SIGFPE ("Signal 8 (FPE) caught by ps") because it could
+            // not recover MemTotal and divided by zero. `free` and `top` read
+            // the same file. Matching the kernel byte-for-byte is the only
+            // version that is safe against every consumer's parser.
+            auto row = [](const char* label, std::uint64_t bytes) {
+                char line[64];
+                std::snprintf(line, sizeof line, "%-15s %8llu kB\n", label,
+                              static_cast<unsigned long long>(bytes >> 10));
+                return std::string{line};
+            };
             std::string s;
-            s += "MemTotal:        " + kb(mach.mem_total)     + " kB\n";
-            s += "MemFree:         " + kb(mach.mem_free())    + " kB\n";
-            s += "MemAvailable:    " + kb(mach.mem_available())+ " kB\n";
-            s += "Buffers:         " + kb(mach.mem_buffers()) + " kB\n";
-            s += "Cached:          " + kb(mach.mem_cached())  + " kB\n";
-            s += "SwapCached:            0 kB\n";
-            s += "SwapTotal:       " + kb(mach.swap_total)    + " kB\n";
-            s += "SwapFree:        " + kb(mach.swap_total)    + " kB\n";
-            s += "Dirty:                 0 kB\nWriteback:             0 kB\n"
-                 "Shmem:             16384 kB\nSlab:              65536 kB\n";
+            s += row("MemTotal:",     mach.mem_total);
+            s += row("MemFree:",      mach.mem_free());
+            s += row("MemAvailable:", mach.mem_available());
+            s += row("Buffers:",      mach.mem_buffers());
+            s += row("Cached:",       mach.mem_cached());
+            s += row("SwapCached:",   0);
+            s += row("Active:",       mach.mem_cached());
+            s += row("Inactive:",     mach.mem_buffers());
+            s += row("SwapTotal:",    mach.swap_total);
+            s += row("SwapFree:",     mach.swap_total);
+            s += row("Dirty:",        0);
+            s += row("Writeback:",    0);
+            s += row("AnonPages:",    mach.mem_total - mach.mem_free());
+            s += row("Mapped:",       mach.mem_cached());
+            s += row("Shmem:",        16384ull << 10);
+            // SReclaimable is read by `free` to split cache from slab; without
+            // it the cache column reads low.
+            s += row("Slab:",          65536ull << 10);
+            s += row("SReclaimable:",  32768ull << 10);
+            s += row("SUnreclaim:",    32768ull << 10);
             return ok(text_file(std::move(s)));
         }
         if (abs == "/proc/stat") {

@@ -21,6 +21,7 @@
 #pragma once
 
 #include "linuxity/abi/syscall.hpp"
+#include "linuxity/abi/wire/errno_map.hpp"
 #include "linuxity/runtime/trap.hpp"
 #include "linuxity/runtime/linux/seccomp_filter.hpp"
 
@@ -781,7 +782,12 @@ public:
         // when signal-0 probes or fatal signals race the group.
         long rc = ::syscall(SYS_tgkill, tid, tid, signum);
         if (rc != 0) rc = ::kill(tid, signum);   // fall back to process kill
-        return (rc == 0) ? 0 : -static_cast<std::int64_t>(Errno{errno});
+        // Translate through the ONE table (abi/wire/errno_map.hpp) rather than
+        // casting: `Errno{errno}` asserts the host's errno numbering equals
+        // the guest's. It happens to on Linux/x86-64, which is exactly why
+        // the bug would survive here and surface on an ABI where it doesn't.
+        if (rc == 0) return 0;
+        return -static_cast<std::int64_t>(abi::wire::errno_from_host(errno));
     }
 
     // Reverse of gpid_of: a guest pid -> its host tid. pid 1 is the root task.
