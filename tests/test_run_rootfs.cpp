@@ -4,6 +4,8 @@
 // the guest "/". Assert the guest reads the ROOTFS file, not the host's —
 // proving unprivileged path translation at the syscall boundary (no chroot,
 // no VM). Skips gracefully off Linux/x86-64, without gcc, or without ptrace.
+#include "guest_harness.hpp"
+
 #include "linuxity/host/posix_host.hpp"
 #include "linuxity/kernel/kernel.hpp"
 #include "linuxity/runtime/linux/ptrace_trap.hpp"
@@ -34,37 +36,20 @@ int main() {
     std::puts("run_rootfs: skipped (needs Linux/x86-64 host)");
     return 0;
 #else
-    const std::string root = "/tmp/lx_rootfs_test";
-    std::system(("rm -rf " + root + " && mkdir -p " + root + "/bin " + root + "/etc").c_str());
-
-    // The rootfs os-release carries a marker string the HOST's cannot have.
-    { std::FILE* f = std::fopen((root + "/etc/os-release").c_str(), "w");
-      if (!f) { std::puts("run_rootfs: skipped (no /tmp)"); return 0; }
-      std::fputs("ID=linuxity-rootfs-marker\n", f); std::fclose(f); }
-
-    { std::FILE* f = std::fopen("/tmp/lx_rootfs_src.c", "w");
-      if (!f) { std::puts("run_rootfs: skipped (no /tmp)"); return 0; }
-      std::fputs(kSrc, f); std::fclose(f); }
-    int rc = std::system(("gcc -static -O2 -o " + root +
-                          "/bin/reader /tmp/lx_rootfs_src.c 2>/dev/null").c_str());
-    if (rc != 0) { std::puts("run_rootfs: skipped (no static glibc / gcc)"); return 0; }
-
-    host::PosixHost hw;
-    kernel::Kernel<host::PosixHost> k{hw};
-    k.files().mount_host("/", root);
-    k.files().mount_virtual("/proc", vfs::make_procfs(k.procs(), k.machine()));
-
-    // Translate the guest program path to its real host location under the
-    // rootfs (the exec target is the one path the host kernel resolves).
-    std::string exec = root + "/bin/reader";
-    runtime::PtraceTrap trap{exec, {"/bin/reader"}, {}, {}};
-    runtime::Cpu cpu{trap, k, trap, abi::Arch::x86_64};
+    // The rootfs os-release carries a marker string the HOST's cannot have,
+    // which is how we prove the guest read the ROOTFS file and not the host's.
+    const auto tree = lxtest::make_tree("rootfs", /*overlay=*/false,
+        "mkdir -p /tmp/lx_rootfs_root/etc"
+        " && printf 'ID=linuxity-rootfs-marker\\n' > /tmp/lx_rootfs_root/etc/os-release",
+        "/bin/reader");
+    if (!lxtest::compile_guest("run_rootfs", tree, kSrc)) return 0;
+    const std::string root = tree.root;
 
     // Capture stdout to verify the guest read the rootfs file.
     std::fflush(stdout);
     std::FILE* cap = std::freopen("/tmp/lx_rootfs_out.txt", "w", stdout);
     (void)cap;
-    auto r = cpu.run(uaddr(0), uaddr(0));
+    auto r = lxtest::run_guest(tree);
     std::fflush(stdout);
     std::freopen("/dev/tty", "w", stdout);  // best-effort restore
 
@@ -73,8 +58,7 @@ int main() {
       if (f) { char b[512]; std::size_t n = std::fread(b, 1, sizeof b, f);
                out.assign(b, n); std::fclose(f); } }
 
-    std::system(("rm -rf " + root).c_str());
-    std::remove("/tmp/lx_rootfs_src.c");
+    lxtest::remove_tree(tree);
     std::remove("/tmp/lx_rootfs_out.txt");
 
     if (!r) { std::puts("run_rootfs: skipped (ptrace unavailable)"); return 0; }

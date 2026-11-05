@@ -57,11 +57,12 @@ struct GuestTree {
 // otherwise leave files that silently change what this run observes.
 [[nodiscard]] inline GuestTree make_tree(const std::string& name,
                                           bool overlay = false,
-                                          const std::string& seed = "") {
+                                          const std::string& seed = "",
+                                          const std::string& exec = "/bin/prog") {
     GuestTree g;
     g.root  = "/tmp/lx_" + name + "_root";
     g.upper = overlay ? "/tmp/lx_" + name + "_upper" : std::string{};
-    g.exec  = "/bin/prog";
+    g.exec  = exec;
     std::string cmd = "rm -rf " + g.root;
     if (overlay) cmd += " " + g.upper;
     cmd += " && mkdir -p " + g.root + "/bin";

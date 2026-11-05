@@ -13,6 +13,8 @@
 // That broke every rewinddir-driven walk. Concretely: libalpm rewinds
 // /var/lib/pacman/local before loading the package cache, so `pacman -Q`
 // reported 0 packages on a database with 139 of them.
+#include "guest_harness.hpp"
+
 #include "linuxity/host/posix_host.hpp"
 #include "linuxity/kernel/kernel.hpp"
 #include "linuxity/runtime/linux/ptrace_trap.hpp"
@@ -76,41 +78,17 @@ int main() {
     std::puts("run_rewinddir: skipped (needs Linux/x86-64 host)");
     return 0;
 #else
-    const std::string root  = "/tmp/lx_rewind_root";
-    const std::string upper = "/tmp/lx_rewind_upper";
     // /db is a union: two entries in the pristine lower, two in the upper.
     // Neither layer alone has all four, so a rewind that replays the host fd
     // instead of our stream produces the wrong count (or zero).
-    std::system(("rm -rf " + root + " " + upper +
-                 " && mkdir -p " + root + "/bin " + root + "/db " +
-                 upper + "/db" +
-                 " && touch " + root + "/db/lower_a " + root + "/db/lower_b" +
-                 " && touch " + upper + "/db/upper_a " + upper + "/db/upper_b")
-                .c_str());
+    const auto tree = lxtest::make_tree("rewind", /*overlay=*/true,
+        "mkdir -p /tmp/lx_rewind_root/db /tmp/lx_rewind_upper/db"
+        " && touch /tmp/lx_rewind_root/db/lower_a /tmp/lx_rewind_root/db/lower_b"
+        " && touch /tmp/lx_rewind_upper/db/upper_a /tmp/lx_rewind_upper/db/upper_b");
+    if (!lxtest::compile_guest("run_rewinddir", tree, kSrc)) return 0;
 
-    { std::FILE* f = std::fopen("/tmp/lx_rewind_src.c", "w");
-      if (!f) { std::puts("run_rewinddir: skipped (no /tmp)"); return 0; }
-      std::fputs(kSrc, f); std::fclose(f); }
-    int rc = std::system(("gcc -static -O2 -o " + root +
-                          "/bin/prog /tmp/lx_rewind_src.c 2>/dev/null").c_str());
-    if (rc != 0) {
-        std::puts("run_rewinddir: skipped (no static glibc / gcc)");
-        return 0;
-    }
-
-    host::PosixHost hw;
-    kernel::Kernel<host::PosixHost> k{hw};
-    k.files().mount_host("/", root, upper);            // overlay: lower + upper
-    k.files().mount_virtual("/proc", vfs::make_procfs(k.procs(), k.machine()));
-
-    std::string exec = root + "/bin/prog";
-    runtime::PtraceTrap trap{exec, {"/bin/prog"}, {}, {}};
-    runtime::Cpu cpu{trap, k, trap, abi::Arch::x86_64};
-
-    auto r = cpu.run(uaddr(0), uaddr(0));
-
-    std::system(("rm -rf " + root + " " + upper).c_str());
-    std::remove("/tmp/lx_rewind_src.c");
+    auto r = lxtest::run_guest(tree);
+    lxtest::remove_tree(tree);
 
     if (!r) { std::puts("run_rewinddir: skipped (ptrace unavailable)"); return 0; }
     const int code = *r;
