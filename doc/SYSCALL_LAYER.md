@@ -307,3 +307,58 @@ Checked, and left alone on purpose:
 * Five single-use literals (`MSG_CMSG_CLOEXEC`, `CSIZE`, `makedev`'s field
   split, and `cpsr`'s NZCV mask — which is a CPU register, not guest ABI).
   One use is not duplication, and a header per literal is ceremony.
+
+## The fd table: shared, but not yet adopted
+
+`runtime/darwin/fd.hpp` (250 lines) and `runtime/windows/fd.hpp` (279) each
+carry a full `FdTable`, and the overlapping half is line-for-line identical:
+
+```
+install()          lowest-free-slot scan, grow, EMFILE at the cap
+close()            drop the slot, EBADF if unknown
+dup()/dup2()       share the same file via shared_ptr
+cloexec/set_cloexec
+on_exec()          drop every slot whose cloexec bit is set
+```
+
+Only two things genuinely differ: the handle type (`int` vs `HANDLE`) and the
+per-slot extra state (Darwin tracks an eventfd `peer`; Windows tracks append
+mode, tty-ness, the guest path, a `DirCursor`).
+
+`runtime/shared/fd_slots.hpp` is that logic as a template over exactly those
+two axes — `FdSlots<File, Extra>` — with `test_fd_slots` covering it: lowest-free
+allocation, hole filling, dup sharing the file by reference, dup carrying the
+extra payload, `dup2(fd,fd)` not clearing cloexec, the EMFILE cap, and
+`on_exec` dropping exactly the right slots.
+
+**It is not wired into either backend yet, and that is deliberate.** Adoption
+means rewriting 33 `slots_` sites in `darwin/fd.hpp` and 34 in
+`windows/fd.hpp` — 67 edits in two files that **cannot be compiled on a Linux
+host**. The shared header is written, compiled and tested; substituting it
+blind would trade a verified duplication for an unverified rewrite of the fd
+layer, which is the subsystem where a mistake shows up as a guest reading the
+wrong file much later.
+
+Writing it first was still worth it: the test immediately caught a real bug in
+my own `reserve_low_fds`, which resized the table to 3 instead of installing
+entries. An empty slot is still *free*, so the lowest-free scan would have
+handed out fd 0 and a guest's `open()` would have returned 1 — writing its
+data into stdout. That function is now deliberately absent from the shared
+layer, because both backends reserve the low fds by **opening real host
+descriptors** (`/dev/null` for 0..8), which is a host operation.
+
+### Adoption checklist, for a host that can build it
+
+1. On macOS: make `darwin::FdTable` hold `FdSlots<HostFd, DarwinExtra>` where
+   `DarwinExtra { std::shared_ptr<HostFd> peer; }`. Keep `export_table` /
+   `import_table` (the fork handoff) in the backend — they serialize host
+   state. Build and run the `hvf_run` test.
+2. On Windows: `FdSlots<WinFd, WinExtra>` with
+   `WinExtra { bool append, is_tty; std::string path; std::unique_ptr<DirCursor> dir; }`.
+   The move-only `dir` is already handled: `dup()`/`dup_to()` take the new
+   slot's `Extra` by value rather than copying the source's, so a move-only
+   `Extra` instantiates (verified by compiling exactly that shape). That also
+   forces the right answer for directory fds — a dup'd dir fd needs its OWN
+   cursor, since a shared one would let two fds consume each other's entries.
+   Pass the path binding through explicitly; let the cursor default to fresh.
+3. Delete the duplicated halves; `test_fd_slots` already covers the behaviour.
