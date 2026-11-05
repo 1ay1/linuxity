@@ -484,20 +484,29 @@ void run_guest_thread(ThreadContext& ctx, runtime::HvfTrap::ThreadStart start) {
     runtime::Cpu loop{trap, m.k, mem, abi::Arch::aarch64};
     auto rc = loop.run(uaddr(0), uaddr(0));
 
-    // The process exits when the INITIAL thread's loop ends. Threads still
-    // running are told to stop (exit_group semantics) and joined, so no
-    // thread touches guest RAM after it is unmapped.
+    // The process ends when the initial thread's loop ends (exit_group, or
+    // the last thread). Linux does NOT wait for sibling threads here: the
+    // kernel tears them down wherever they are. We must match that, because
+    // a sibling blocked inside a HOST call (futex, poll, sigsuspend) is not
+    // in hv_vcpu_run, so no kick can reach it -- and joining it hangs the
+    // process forever.
+    //
+    // That hang was the real `pacman -Sy` failure: the download sandbox
+    // child called _Exit(1) with worker threads parked in futex waits,
+    // linuxity sat in join(), pacman's watchdog saw a child that would not
+    // die, sent it SIGTERM, and then re-raised SIGTERM on itself (dload.c:
+    // `kill(getpid(), childsig)`) -- "Terminated".
+    //
+    // _exit() is exactly the Linux semantics: every thread stops, every fd
+    // closes, the parent's wait sees our status. Guest RAM is a mapping the
+    // kernel reclaims; nothing in it needs unwinding.
     proc.request_group_exit(rc ? *rc : 1);
-    {
-        std::lock_guard g{threads_mu};
-        for (auto& t : threads) if (t.joinable()) t.join();
-    }
-
+    std::fflush(nullptr);
     if (!rc) {
         std::fprintf(stderr, "linuxity: runtime error %d\n", static_cast<int>(rc.error()));
-        return 1;
+        ::_exit(1);
     }
-    return *rc;
+    ::_exit(*rc);
 }
 
 }  // namespace

@@ -255,21 +255,31 @@ public:
             case Sysno::uname:
                 return do_uname(uaddr(r.arg[0]));
 
-            // -- getpgrp: our process group is the caller's own pid.
-            case Sysno::getpgrp: return val(ids().pid);
-
-            // -- process groups & sessions. These read/write PIDs, so
-            //    forwarding would leak host pgids/sids into linuxity's world.
-            //    We model a flat namespace: a task's group and session are
-            //    its own pid (or the argument for get*id of another task).
+            // -- process groups & sessions. A backend that keeps a REAL group
+            //    model (the macOS backend does, in its shared pid table)
+            //    advertises it and gets these forwarded; the flat fallback
+            //    -- every task its own leader -- is only for backends that
+            //    don't. The flat model is wrong for anything that treats a
+            //    group as a unit: `timeout` calls setpgid(0,0) and then
+            //    signals its group, and under the flat model that group
+            //    silently included the shell that launched it.
+            case Sysno::getpgrp:
+                if constexpr (requires { mem_.models_process_groups(); }) return fwd();
+                return val(ids().pid);
             case Sysno::getpgid:
+                if constexpr (requires { mem_.models_process_groups(); }) return fwd();
                 return val(r.arg[0] ? static_cast<std::int64_t>(r.arg[0])
                                     : ids().pid);
             case Sysno::getsid:
+                if constexpr (requires { mem_.models_process_groups(); }) return fwd();
                 return val(r.arg[0] ? static_cast<std::int64_t>(r.arg[0])
                                     : ids().pid);
-            case Sysno::setpgid:  return val(0);   // accepted, flat model
-            case Sysno::setsid:   return val(ids().pid);  // new session == pid
+            case Sysno::setpgid:
+                if constexpr (requires { mem_.models_process_groups(); }) return fwd();
+                return val(0);                     // accepted, flat model
+            case Sysno::setsid:
+                if constexpr (requires { mem_.models_process_groups(); }) return fwd();
+                return val(ids().pid);             // new session == pid
             case Sysno::getpriority: return val(0);       // nice 0
             case Sysno::setpriority: return val(0);
 
@@ -471,6 +481,13 @@ public:
             case Sysno::unlinkat:   return path_mut(r, 1, true,  Wi::remove);
             case Sysno::chmod:      return do_chmod(r, 0, false, Wi::copy_leaf);
             case Sysno::fchmodat:   return do_chmod(r, 1, true,  Wi::copy_leaf);
+            // fchmodat2(dirfd, path, mode, flags): fchmodat WITH flags, so
+            // AT_SYMLINK_NOFOLLOW finally works. Same path argument, so the
+            // same translation -- without this it reached the backend
+            // untranslated and every symlink chmod failed ENOENT, which is
+            // what made `pacman -Syu` warn "Can't set permissions to 0777"
+            // for thousands of files.
+            case Sysno::fchmodat2:  return do_chmod(r, 1, true,  Wi::copy_leaf);
             // chown/lchown/fchown/fchownat: linuxity presents a ROOT-OWNED
             // world and the guest runs as our single UNPRIVILEGED host process,
             // so a forwarded chown (even to uid 0) EPERMs and breaks `tar -p`,

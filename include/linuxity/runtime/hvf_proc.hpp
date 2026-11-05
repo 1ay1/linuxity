@@ -25,6 +25,7 @@
 #include <atomic>
 #include <cstdint>
 #include <optional>
+#include <vector>
 
 namespace lx::runtime {
 
@@ -78,6 +79,45 @@ public:
             shared_->host[g].store(host, std::memory_order_release);
         }
     }
+
+    // -- Process groups -----------------------------------------------------
+    // Every guest process belongs to a group, identified by its leader's
+    // guest pid. A group is what `kill(-pgid)` and a terminal's ^C target,
+    // and what a shell puts a pipeline into.
+    //
+    // This has to be REAL rather than "every process is its own group":
+    // pacman asks for its group with getpgrp() and then SIGTERMs it to stop
+    // its download workers. With a flat model that group contains only
+    // pacman, so pacman kills itself -- `pacman -Sy` died with "Terminated"
+    // right after reporting every database up to date.
+    void set_pgid(std::int32_t pid, std::int32_t pgid) noexcept {
+        if (pid > 0 && pid < kMax && pgid > 0 && pgid < kMax)
+            shared_->pgid[pid].store(pgid, std::memory_order_release);
+    }
+    [[nodiscard]] std::int32_t pgid_of(std::int32_t pid) const noexcept {
+        if (pid <= 0 || pid >= kMax) return 0;
+        const std::int32_t g = shared_->pgid[pid].load(std::memory_order_acquire);
+        return g ? g : pid;                 // unset => its own leader
+    }
+    // Every live member of a group, for kill(-pgid) and kill(0).
+    [[nodiscard]] std::vector<std::int32_t> members_of(std::int32_t pgid) const {
+        std::vector<std::int32_t> out;
+        for (std::int32_t p = 1; p < kMax; ++p) {
+            if (!shared_->host[p].load(std::memory_order_relaxed)) continue;
+            if (pgid_of(p) == pgid) out.push_back(p);
+        }
+        return out;
+    }
+    // Sessions, same model: the leader's pid names the session.
+    void set_sid(std::int32_t pid, std::int32_t sid) noexcept {
+        if (pid > 0 && pid < kMax && sid > 0 && sid < kMax)
+            shared_->sid[pid].store(sid, std::memory_order_release);
+    }
+    [[nodiscard]] std::int32_t sid_of(std::int32_t pid) const noexcept {
+        if (pid <= 0 || pid >= kMax) return 0;
+        const std::int32_t s = shared_->sid[pid].load(std::memory_order_acquire);
+        return s ? s : pid;
+    }
     // vfork support: a child announces it has exec'd (its parent may run).
     void mark_execed(std::int32_t g) noexcept {
         if (g > 0 && g < kMax) shared_->execed[g].store(true, std::memory_order_release);
@@ -111,6 +151,9 @@ private:
         std::atomic<int> next{2};
         std::atomic<pid_t> host[kMax]{};
         std::atomic<bool> execed[kMax]{};
+        // Process-group and session leader per pid; 0 means "itself".
+        std::atomic<std::int32_t> pgid[kMax]{};
+        std::atomic<std::int32_t> sid[kMax]{};
     };
     Shared* shared_{nullptr};
     int fd_{-1};

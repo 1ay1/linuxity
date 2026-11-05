@@ -233,23 +233,34 @@ public:
         // tree. Passing 0 or -1 to the host kill(2) would signal linuxity's
         // own host process group -- which is the user's terminal session, so
         // `timeout` sending SIGTERM to its group killed linuxity itself (and
-        // would kill the shell that launched it). Enumerate the guest's
-        // processes from the shared pid table instead.
+        // would kill the shell that launched it).
+        //
+        // The group is looked up in the shared pid table, so `kill(-pgid)`
+        // and `kill(0)` reach exactly the guest processes that are really in
+        // it -- and, crucially, a positive pid that happens to BE a group
+        // leader signals only that one process, as Linux does.
         if (gpid <= 0) {
-            const bool to_self = gpid == 0 || gpid == -1;
+            const std::int32_t pgid = gpid == 0 ? pids_.pgid_of(task_.tid)
+                                                : (gpid == -1 ? 0 : -gpid);
             std::int64_t delivered = 0;
-            if (to_self) {
-                mark_self_pending(sig);
-                delivered = 1;
-            }
-            for (const Child& c : children_) {
-                if (auto h = pids_.host_of(c.guest); h && ::kill(*h, hs) == 0)
+            const auto members = pgid ? pids_.members_of(pgid)
+                                      : pids_.members_of(pids_.pgid_of(task_.tid));
+            for (std::int32_t member : members) {
+                if (member == task_.tid) { mark_self_pending(sig); ++delivered; continue; }
+                if (auto h = pids_.host_of(member); h && (sig == 0 || ::kill(*h, hs) == 0))
                     ++delivered;
             }
+            // kill(-1) means "every process we may signal", which for a
+            // guest is its whole tree, not just its group.
+            if (gpid == -1)
+                for (const Child& c : children_)
+                    if (auto h = pids_.host_of(c.guest); h && ::kill(*h, hs) == 0)
+                        ++delivered;
             return delivered ? 0 : -3;                               // ESRCH
         }
 
         if (gpid == task_.tid) { mark_self_pending(sig); return 0; }
+
         auto h = pids_.host_of(gpid);
         if (!h) return -3;
         if (sig == 0) return ::kill(*h, 0) < 0 ? darwin::fail() : 0;
@@ -261,10 +272,28 @@ public:
     // space, and our trap boundary is that point.
     void mark_self_pending(int sig) {
         if (sig == 0) return;
-        if (sig == 9 || sig == 19) { kill_with(sig); return; }   // unblockable
+        if (sig == 9 || sig == 19) {
+            // SIGKILL/SIGSTOP from INSIDE the namespace cannot touch its init
+            // (only an ancestor namespace can) -- see is_namespace_init().
+            if (is_namespace_init()) return;
+            kill_with(sig);
+            return;
+        }
         g_pending.bits.fetch_or(sigbit(sig), std::memory_order_relaxed);
         g_pending.notify_waiters();
     }
+
+    // linuxity's pid 1 is the init of the guest's pid namespace, and Linux
+    // gives that process SIGNAL_UNKILLABLE: a signal whose disposition is
+    // SIG_DFL is DISCARDED rather than acted on -- whoever sent it, the init
+    // itself included. That is what lets a stray `kill(1, SIGTERM)` be
+    // harmless on every Linux system.
+    //
+    // It matters in practice because `bash -c 'pacman -Sy'` execs pacman as
+    // pid 1, and pacman's cleanup signals a pid list that ends up containing
+    // 1. On Linux that is a no-op against init; without this rule it was
+    // suicide -- "Terminated" right after "aur is up to date".
+    [[nodiscard]] bool is_namespace_init() const noexcept { return task_.tid == 1; }
 
     // The portable dispatcher decides AF_UNIX bind/connect: it translates the
     // socket's filesystem path into the overlay (the writable upper for a
@@ -1059,6 +1088,7 @@ private:
         LinuxSigaction act = proc_.with_signals([&](SignalDispositions& t) { return t.get(s); });
 
         if (act.handler == 1) return false;                      // SIG_IGN
+        if (act.handler == 0 && is_namespace_init()) return false;  // init: SIG_DFL discarded
         if (act.handler == 0) {                                  // SIG_DFL
             switch (default_action(s)) {
                 case Default::ignore: case Default::cont: return false;
@@ -1228,6 +1258,39 @@ private:
 
             case S::getpid: case S::gettid: return task_.tid;
             case S::getppid:                 return parent_;
+
+            // -- Process groups and sessions. The core models a flat world
+            //    (every task its own leader), which is wrong for anything
+            //    that uses a group as a unit -- see deliver_signal. These
+            //    record the real relationships in the shared pid table.
+            case S::setpgid: {
+                const std::int32_t pid = a0 ? static_cast<std::int32_t>(a0) : task_.tid;
+                const std::int32_t pgid = a1 ? static_cast<std::int32_t>(a1) : pid;
+                if (!pids_.host_of(pid) && pid != task_.tid) return -3;   // ESRCH
+                pids_.set_pgid(pid, pgid);
+                return 0;
+            }
+            case S::getpgid: {
+                const std::int32_t pid = a0 ? static_cast<std::int32_t>(a0) : task_.tid;
+                if (!pids_.host_of(pid) && pid != task_.tid) return -3;
+                return pids_.pgid_of(pid);
+            }
+            case S::getpgrp:
+                return pids_.pgid_of(task_.tid);
+            case S::setsid:
+                // A new session, with this process as leader of a new group.
+                // Linux refuses if the caller is ALREADY a group leader.
+                if (pids_.pgid_of(task_.tid) == task_.tid &&
+                    pids_.sid_of(task_.tid) == task_.tid)
+                    return -1;                                       // EPERM
+                pids_.set_sid(task_.tid, task_.tid);
+                pids_.set_pgid(task_.tid, task_.tid);
+                return task_.tid;
+            case S::getsid: {
+                const std::int32_t pid = a0 ? static_cast<std::int32_t>(a0) : task_.tid;
+                if (!pids_.host_of(pid) && pid != task_.tid) return -3;
+                return pids_.sid_of(pid);
+            }
             default:                         return std::nullopt;
         }
     }
@@ -1336,6 +1399,10 @@ private:
         const pid_t host = spawn_(img);
         if (host < 0) { pids_.release(child); return -11; }
         pids_.bind(child, host);
+        // A forked child inherits its parent's process group and session,
+        // which is what makes a shell's pipeline one killable unit.
+        pids_.set_pgid(child, pids_.pgid_of(task_.tid));
+        pids_.set_sid(child, pids_.sid_of(task_.tid));
         if (req.flags & clone_flag::parent_settid)
             (void)machine_.ram().put(req.parent_tid_addr, std::int32_t{child});
         children_.push_back({child, host});
@@ -1584,12 +1651,17 @@ private:
                 thread_exited_ = true;
                 return 0;
             case S::exit_group:
-                // exit_group(2) ends every thread. Mark the group dead and
-                // kick the siblings out of the guest so they observe it.
+                // exit_group(2) ends every thread, NOW -- including ones
+                // blocked in host calls (futex, poll, read) that a vCPU kick
+                // cannot reach. Linux tears them down wherever they stand,
+                // and _exit gives exactly that: all threads stop, all fds
+                // close (so a parent reading our pipes sees EOF), and the
+                // parent's wait sees this status. Waiting for siblings
+                // instead hung pacman's download child -- see run() in
+                // src/main_macos.cpp for the whole story.
                 proc_.request_group_exit(static_cast<int>(a0 & 0xff));
-                exited_ = true;
-                code_ = static_cast<int>(a0 & 0xff);
-                return 0;
+                std::fflush(nullptr);
+                ::_exit(static_cast<int>(a0 & 0xff));
 
             // Thread/signal state libc installs at startup. There is no host
             // task to carry it and nothing reads it back on this backend.
@@ -3839,6 +3911,11 @@ public:
         auto t = trap_->current_ids();
         return {t.pid, t.tid, t.ppid};
     }
+
+    // Tells the portable core this backend keeps REAL process groups and
+    // sessions (the shared pid table), so set/getpgid and friends are
+    // forwarded here instead of answered with the core's flat model.
+    static constexpr void models_process_groups() noexcept {}
 
     [[nodiscard]] Status copy_in(UAddr src, std::span<std::byte> dst) const {
         auto win = machine_.ram().at(value(src), dst.size());
