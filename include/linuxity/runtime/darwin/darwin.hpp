@@ -16,6 +16,8 @@
 
 #if defined(__APPLE__)
 
+#include "linuxity/abi/wire/dirent64.hpp"
+
 #include <cerrno>
 #include <fcntl.h>
 #include <sys/mount.h>
@@ -309,29 +311,13 @@ inline constexpr std::uint32_t kStatxBasicStats = 0x7ff;
 }
 
 // -- linux_dirent64 --------------------------------------------------------
-// getdents64's record: { u64 ino; s64 off; u16 reclen; u8 type; char name[] }
-// 8-byte aligned. Darwin's getdirentries uses a different record entirely, so
-// the backend re-encodes rather than copying bytes through.
-constexpr std::size_t kDirentHeader = 19;
-[[nodiscard]] constexpr std::size_t dirent_reclen(std::size_t namelen) noexcept {
-    return (kDirentHeader + namelen + 1 + 7) & ~std::size_t{7};
-}
-
-enum class DType : std::uint8_t {
-    unknown = 0, fifo = 1, chr = 2, dir = 4, blk = 6, reg = 8, lnk = 10, sock = 12,
-};
-[[nodiscard]] inline DType dtype_from_mode(std::uint32_t mode) noexcept {
-    switch (mode & S_IFMT) {
-        case S_IFDIR:  return DType::dir;
-        case S_IFREG:  return DType::reg;
-        case S_IFLNK:  return DType::lnk;
-        case S_IFCHR:  return DType::chr;
-        case S_IFBLK:  return DType::blk;
-        case S_IFIFO:  return DType::fifo;
-        case S_IFSOCK: return DType::sock;
-        default:       return DType::unknown;
-    }
-}
+// Darwin's getdirentries uses a different record entirely, so the backend
+// re-encodes. The LAYOUT lives in abi/wire/dirent64.hpp -- one encoder for
+// every host -- and these are just local names for it, kept so existing
+// call sites in this backend read naturally.
+using DType = abi::wire::DType;
+using abi::wire::dirent_reclen;
+using abi::wire::dtype_from_mode;
 
 // -- errno -----------------------------------------------------------------
 // 1..34 are identical on both kernels (EPERM..ERANGE). Past that they

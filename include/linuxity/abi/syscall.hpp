@@ -18,6 +18,7 @@
 #include "linuxity/kernel/process_table.hpp"
 #include "linuxity/kernel/subsystem.hpp"
 #include "linuxity/abi/outcome.hpp"
+#include "linuxity/abi/wire/dirent64.hpp"
 #include "linuxity/loader/interp.hpp"
 
 #include <array>
@@ -1659,29 +1660,30 @@ private:
         std::vector<std::byte> out;
         out.reserve(cap < 4096 ? cap : 4096);
 
-        // struct linux_dirent64 { u64 d_ino; s64 d_off; u16 d_reclen;
-        //                         u8 d_type; char d_name[]; } — 8-aligned.
-        constexpr std::uint8_t kDtDir = 4, kDtReg = 8, kDtLnk = 10;
         while (ds->pos < ds->entries.size()) {
             const auto& e = ds->entries[ds->pos];
-            std::size_t namelen = e.name.size() + 1;                 // incl NUL
-            std::size_t reclen  = (19 + namelen + 7) & ~std::size_t{7};
-            if (out.size() + reclen > cap) break;                   // buffer full
-            std::size_t base = out.size();
-            out.resize(base + reclen, std::byte{0});
-            auto put64 = [&](std::size_t off, std::uint64_t v) {
-                for (int i = 0; i < 8; ++i)
-                    out[base + off + static_cast<std::size_t>(i)] =
-                        static_cast<std::byte>((v >> (8 * i)) & 0xff);
+            const std::size_t reclen = wire::dirent_reclen(e.name.size());
+            if (out.size() + reclen > cap) break;             // buffer full
+            const std::size_t base = out.size();
+            out.resize(base + reclen);
+
+            // d_ino must match what a later stat() of this name reports --
+            // libalpm matches st_ino against the d_ino it saw, and a
+            // positional counter made `pacman -Q` report nothing on an
+            // intact DB. The merge records the real host inode; 0 means a
+            // purely synthesized node (procfs/sysfs) with no host file
+            // behind it, where a positional value is all we have.
+            const wire::Dirent de{
+                e.ino ? e.ino : ds->pos + 1,
+                static_cast<std::int64_t>(ds->pos + 1),
+                e.is_symlink() ? wire::DType::symlink
+                               : e.is_dir() ? wire::DType::dir
+                                            : wire::DType::regular,
+                e.name,
             };
-            put64(0, ds->pos + 1);                                  // d_ino
-            put64(8, static_cast<std::uint64_t>(ds->pos + 1));      // d_off
-            out[base + 16] = static_cast<std::byte>(reclen & 0xff); // d_reclen lo
-            out[base + 17] = static_cast<std::byte>((reclen >> 8) & 0xff);
-            out[base + 18] = static_cast<std::byte>(
-                e.is_symlink() ? kDtLnk : e.is_dir() ? kDtDir : kDtReg);
-            for (std::size_t i = 0; i < e.name.size(); ++i)
-                out[base + 19 + i] = static_cast<std::byte>(e.name[i]);
+            const std::size_t n =
+                wire::encode_dirent64(std::span{out}.subspan(base), de);
+            if (n == 0) { out.resize(base); break; }          // did not fit
             ++ds->pos;
         }
         if (out.empty()) {

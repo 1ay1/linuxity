@@ -652,9 +652,15 @@ private:
         return vm_.mem().put(outp, st) ? 0 : -win32::LFAULT;
     }
 
-    // getdents64: enumerate once into the cursor, then stream entries out in
-    // the Linux struct linux_dirent64 layout. The snapshot matters -- a guest
-    // reads a directory across several calls and expects a stable sequence.
+    // getdents64: enumerate once into the cursor, then stream entries out via
+    // the ONE linux_dirent64 encoder (abi/wire/dirent64.hpp). The snapshot
+    // matters -- a guest reads a directory across several calls and expects a
+    // stable sequence.
+    //
+    // This used to hand-roll the record and substitute d_ino = pos + 1 and
+    // d_type = DT_UNKNOWN. Both were bugs: Windows already tells us the real
+    // type and file index, and a positional d_ino breaks any guest that
+    // cross-checks it against a later stat().
     [[nodiscard]] std::int64_t do_getdents(int g, std::uint64_t outp,
                                            std::uint64_t cap) {
         DirCursor* dc = fds_.dir(g);
@@ -666,7 +672,30 @@ private:
             HANDLE fh = ::FindFirstFileW(pattern.c_str(), &fd);
             if (fh != INVALID_HANDLE_VALUE) {
                 do {
-                    dc->names.push_back(win32::from_win_path(fd.cFileName));
+                    DirEntry e;
+                    e.name = win32::from_win_path(fd.cFileName);
+                    // A reparse point is the closest thing to a symlink; a
+                    // directory attribute is exact. Everything else is a
+                    // regular file as far as the guest is concerned.
+                    e.type = (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+                                 ? abi::wire::DType::symlink
+                           : (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                                 ? abi::wire::DType::dir
+                                 : abi::wire::DType::regular;
+                    // d_ino: FindFirstFileW does NOT carry the NTFS file id
+                    // (that needs an open handle and
+                    // GetFileInformationByHandle, i.e. one open per entry --
+                    // too costly to do while enumerating). Leave it 0 so the
+                    // encoder substitutes a positional value.
+                    //
+                    // KNOWN GAP: a guest that cross-checks d_ino against a
+                    // later stat() -- libalpm does -- will still disagree here,
+                    // because stat DOES report the real file id. Closing it
+                    // means resolving the id lazily on the first guest stat,
+                    // or opening each entry during enumeration. Tracked rather
+                    // than silently papered over.
+                    e.ino = 0;
+                    dc->entries.push_back(std::move(e));
                 } while (::FindNextFileW(fh, &fd));
                 ::FindClose(fh);
             }
@@ -675,23 +704,18 @@ private:
 
         auto mem = vm_.mem();
         std::uint64_t off = 0;
-        while (dc->pos < dc->names.size()) {
-            const std::string& nm = dc->names[dc->pos];
-            // struct linux_dirent64: u64 ino, s64 off, u16 reclen, u8 type,
-            // char name[] -- 19 bytes of header, then the NUL-terminated
-            // name, padded to 8.
-            const std::uint64_t reclen = (19 + nm.size() + 1 + 7) & ~std::uint64_t{7};
+        while (dc->pos < dc->entries.size()) {
+            const DirEntry& e = dc->entries[dc->pos];
+            const std::size_t reclen = abi::wire::dirent_reclen(e.name.size());
             if (off + reclen > cap) break;
-            std::vector<std::byte> rec(static_cast<std::size_t>(reclen), std::byte{0});
-            auto* p = reinterpret_cast<unsigned char*>(rec.data());
-            const std::uint64_t ino = dc->pos + 1;
-            const std::int64_t next = std::int64_t(dc->pos + 1);
-            std::memcpy(p + 0, &ino, 8);
-            std::memcpy(p + 8, &next, 8);
-            const std::uint16_t rl = std::uint16_t(reclen);
-            std::memcpy(p + 16, &rl, 2);
-            p[18] = DT_UNKNOWN;   // the guest will stat if it cares
-            std::memcpy(p + 19, nm.c_str(), nm.size() + 1);
+            std::vector<std::byte> rec(reclen);
+            const abi::wire::Dirent de{
+                e.ino ? e.ino : dc->pos + 1,
+                static_cast<std::int64_t>(dc->pos + 1),
+                e.type,
+                e.name,
+            };
+            if (abi::wire::encode_dirent64(rec, de) == 0) break;
             if (mem.copy_out(outp + off, rec) != rec.size()) break;
             off += reclen;
             ++dc->pos;

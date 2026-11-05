@@ -48,6 +48,7 @@
 
 #include "linuxity/abi/result.hpp"
 #include "linuxity/abi/syscall.hpp"
+#include "linuxity/abi/wire/dirent64.hpp"
 #include "linuxity/runtime/backend.hpp"
 #include "linuxity/runtime/darwin/darwin.hpp"
 #include "linuxity/runtime/darwin/epoll.hpp"
@@ -3618,22 +3619,24 @@ private:
                 ds.pending = Entry{e->d_ino, e->d_type, e->d_name};
             }
             const Entry& e = *ds.pending;
-            const std::size_t rec = darwin::dirent_reclen(e.name.size());
+            const std::size_t rec = abi::wire::dirent_reclen(e.name.size());
             if (used + rec > out.size()) {
                 if (used == 0) return -22;           // EINVAL: buffer too small
                 break;
             }
-            std::byte* p = out.data() + used;
-            std::memset(p, 0, rec);
-            const std::uint64_t ino = e.ino;
-            const std::int64_t off = static_cast<std::int64_t>(++ds.index);
-            const auto reclen = static_cast<std::uint16_t>(rec);
-            std::memcpy(p, &ino, 8);
-            std::memcpy(p + 8, &off, 8);
-            std::memcpy(p + 16, &reclen, 2);
-            p[18] = static_cast<std::byte>(e.type);   // DT_* values agree
-            std::memcpy(p + 19, e.name.data(), e.name.size());
-            used += rec;
+            // One encoder for every host (abi/wire/dirent64.hpp): d_ino and
+            // d_type come straight from readdir, so this backend supplies
+            // values and never touches the layout.
+            const abi::wire::Dirent de{
+                e.ino,
+                static_cast<std::int64_t>(++ds.index),
+                static_cast<abi::wire::DType>(e.type),   // DT_* values agree
+                e.name,
+            };
+            const std::size_t n = abi::wire::encode_dirent64(
+                std::span{out}.subspan(used, rec), de);
+            if (n == 0) { if (used == 0) return -22; break; }
+            used += n;
             ds.pending.reset();
         }
         return static_cast<std::int64_t>(used);

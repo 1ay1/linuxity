@@ -47,6 +47,29 @@ for f in "$R"/linux/ptrace_trap.hpp "$R"/darwin/trap.hpp "$R"/windows/trap.hpp; 
         || note "$f does not assert SyscallTrap"
 done
 
+# 5. Kernel ABI structs are encoded in ONE place: include/linuxity/abi/wire/.
+#    linux_dirent64 was hand-rolled in THREE files that drifted into three
+#    behaviours -- the Windows copy wrote d_ino = position and d_type =
+#    DT_UNKNOWN, which made `pacman -Q` report zero packages on an intact
+#    database (libalpm matches d_ino against a later stat's st_ino).
+#
+#    The violation is WRITING a GUEST dirent's bytes. Reading a HOST dirent
+#    (e->d_ino from readdir) is fine and unavoidable, and so are comments. So
+#    look for the byte-poking signature: an offset-19 name copy, or an
+#    explicit d_reclen store. Both spellings of the length field are covered,
+#    since the portable copy said `d_reclen` and darwin's said `reclen`.
+hits=$(grep -rlE '(memcpy|memset)\([[:alnum:]_]+ \+ (16|18|19)|\+ base \+ 1[6-9]\]|d_reclen (lo|hi)' \
+       include/linuxity src 2>/dev/null \
+       | grep -v '^include/linuxity/abi/wire/' || true)
+[ -n "$hits" ] && note "guest dirent bytes written outside abi/wire/: $hits"
+
+# 6. abi/wire/ is pure ABI: values in, bytes out. No platform headers, no
+#    backend includes -- that is what makes one encoder serve every host.
+#    Only #include lines count, so prose in a comment can't trip it.
+hits=$(grep -lE '^[[:space:]]*#[[:space:]]*include.*(<windows|<sys/|<dirent|runtime/(linux|darwin|windows)/)' \
+       include/linuxity/abi/wire/*.hpp 2>/dev/null || true)
+[ -n "$hits" ] && note "abi/wire/ depends on a platform or backend: $hits"
+
 if [ "$fail" -eq 0 ]; then
     echo "runtime layout: all structural invariants hold"
 else

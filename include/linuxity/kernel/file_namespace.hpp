@@ -73,12 +73,25 @@ enum class DType : std::uint8_t { regular, dir, symlink };
 struct VirtualDirent {
     std::string name;
     DType type{DType::regular};
+    // The REAL host inode, when this entry came from a host directory.
+    //
+    // getdents64 must report the same d_ino that a later stat() of the same
+    // name reports: libalpm reads the package DB by enumerating
+    // /var/lib/pacman/local, then stats each entry and matches st_ino against
+    // the d_ino it saw. A synthesized counter makes every comparison fail, so
+    // `pacman -Q` lists nothing even though the DB is intact.
+    //
+    // 0 means "no host inode" -- a purely synthesized entry (procfs, sysfs, a
+    // virtual dir) where the dispatcher falls back to a positional value.
+    std::uint64_t ino{0};
     // Back-compat helpers so existing `{name, true/false}` sites and .is_dir
     // reads keep working while carrying the richer symlink type.
     VirtualDirent() = default;
     VirtualDirent(std::string n, bool dir)
         : name(std::move(n)), type(dir ? DType::dir : DType::regular) {}
     VirtualDirent(std::string n, DType t) : name(std::move(n)), type(t) {}
+    VirtualDirent(std::string n, DType t, std::uint64_t i)
+        : name(std::move(n)), type(t), ino(i) {}
     [[nodiscard]] bool is_dir() const noexcept { return type == DType::dir; }
     [[nodiscard]] bool is_symlink() const noexcept { return type == DType::symlink; }
 };
@@ -410,7 +423,8 @@ public:
         out.reserve(seen.size() + 2);
         out.push_back({".",  DType::dir});
         out.push_back({"..", DType::dir});
-        for (auto& [name, type] : seen) out.push_back({name, type});
+        for (auto& [name, info] : seen)
+            out.push_back({name, info.type, info.ino});
         return out;
     }
 
@@ -750,7 +764,13 @@ private:
             return a == b;
         }
     };
-    using NameMap = std::unordered_map<std::string, DType, SvHash, SvEq>;
+    // What a merged listing remembers per name: its type, and the real host
+    // inode so getdents64 can report a d_ino that matches a later stat().
+    struct DirEntryInfo {
+        DType         type{DType::regular};
+        std::uint64_t ino{0};
+    };
+    using NameMap = std::unordered_map<std::string, DirEntryInfo, SvHash, SvEq>;
 
     // Read a real host directory's entries into `seen` (name -> type),
     // skipping "."/".." and not overwriting a name already present (so the
@@ -761,6 +781,8 @@ private:
     // Returns true if the directory existed and was enumerated. The caller
     // uses that instead of a separate is_dir() probe: opendir already tells
     // us everything a stat would, so stat'ing first is a wasted syscall.
+    // name -> (type, real host inode). The inode rides along so the merged
+    // listing can report the same d_ino a later stat() will return.
     static bool merge_dir(const std::string& host_dir, NameMap& seen) {
         ::DIR* d = ::opendir(host_dir.c_str());
         if (!d) return false;
@@ -773,6 +795,8 @@ private:
             // malloc/free pair per duplicate entry.
             if (seen.find(name) != seen.end()) continue;
             DType t;
+            // readdir already carries the inode, so recording it is free.
+            std::uint64_t ino = static_cast<std::uint64_t>(e->d_ino);
             const auto dt = dirent_type(e);
             if      (dt == DT_LNK) t = DType::symlink;
             else if (dt == DT_DIR) t = DType::dir;
@@ -782,14 +806,16 @@ private:
                 std::string full = host_dir;
                 full += '/';
                 full.append(name);
-                if (::lstat(full.c_str(), &ls) == 0)
+                if (::lstat(full.c_str(), &ls) == 0) {
                     t = S_ISLNK(ls.st_mode) ? DType::symlink
                       : S_ISDIR(ls.st_mode) ? DType::dir
                                             : DType::regular;
-                else
+                    ino = static_cast<std::uint64_t>(ls.st_ino);
+                } else {
                     t = DType::regular;
+                }
             }
-            seen.emplace(name, t);
+            seen.emplace(name, DirEntryInfo{t, ino});
         }
         ::closedir(d);
         return true;

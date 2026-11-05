@@ -41,6 +41,7 @@
 
 #if defined(_WIN32)
 
+#include "linuxity/abi/wire/dirent64.hpp"
 #include "linuxity/runtime/windows/win32.hpp"
 
 #include <algorithm>
@@ -73,8 +74,21 @@ private:
 // O_NONBLOCK in the open file description (shared), but the directory
 // enumeration cursor is ours and must not be shared, or two guest fds reading
 // the same directory would consume each other's entries.
+// One directory's entries, snapshotted at the first getdents64 so a guest
+// reading across several calls sees a stable sequence.
+//
+// The snapshot keeps the TYPE and INODE, not just the name: FindFirstFileW
+// hands us both for free, and dropping them used to force d_type to
+// DT_UNKNOWN and d_ino to a positional counter. A counter breaks any guest
+// that cross-checks d_ino against a later stat() -- libalpm does exactly
+// that, which made `pacman -Q` report zero packages on an intact database.
+struct DirEntry {
+    std::string   name;
+    std::uint64_t ino{0};             // 0 => unknown, caller substitutes
+    abi::wire::DType type{abi::wire::DType::unknown};
+};
 struct DirCursor {
-    std::vector<std::string> names;   // snapshot taken at first getdents
+    std::vector<DirEntry> entries;    // snapshot taken at first getdents
     std::size_t pos{0};
     bool loaded{false};
 };
