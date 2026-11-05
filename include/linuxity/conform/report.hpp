@@ -195,6 +195,23 @@ inline std::string Scenario::key() const {
                     .exercising(abi::Sysno::kill)
                     .on(DirFlavour::virtualised));
 
+    // Filesystem MUTATION through the overlay. Every write has to land in the
+    // UPPER layer, copying up from the read-only lower first, and that
+    // machinery (classify for_write, WriteIntent, whiteouts) is linuxity's own
+    // code. It is where a wrong errno or a write to the wrong layer hides:
+    // mkdir was behaving like `mkdir -p`, and chmod on a missing file reported
+    // success. Both found here.
+    v.push_back(Scenario{"fsmutate", "fsmutate"}
+                    .exercising(abi::Sysno::mkdirat)
+                    .exercising(abi::Sysno::linkat)
+                    .exercising(abi::Sysno::symlinkat)
+                    .exercising(abi::Sysno::renameat)
+                    .exercising(abi::Sysno::fchmodat)
+                    .exercising(abi::Sysno::fchownat)
+                    .exercising(abi::Sysno::truncate)
+                    .exercising(abi::Sysno::utimensat)
+                    .on(DirFlavour::host_backed));
+
     return v;
 }
 

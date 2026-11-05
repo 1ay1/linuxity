@@ -59,7 +59,7 @@ constexpr int kInterceptedHandlers = 139;
 // The verified floor. RAISE this as scenarios are added; never lower it.
 // A drop means a scenario was deleted or a syscall silently stopped being
 // exercised, which is exactly the regression this test exists to catch.
-constexpr std::size_t kVerifiedFloor = 28;
+constexpr std::size_t kVerifiedFloor = 36;
 
 } // namespace
 

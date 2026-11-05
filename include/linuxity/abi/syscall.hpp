@@ -506,10 +506,10 @@ public:
             //    arg0 and the path in arg1; the legacy forms carry the path in
             //    arg0. mkdir/mknod CREATE, so make_parents; rmdir/unlink
             //    remove; chmod/chown/truncate/utimensat retarget metadata.
-            case Sysno::mkdir:      return path_mut(r, 0, false, Wi::parents_only);
-            case Sysno::mkdirat:    return path_mut(r, 1, true,  Wi::parents_only);
-            case Sysno::mknod:      return path_mut(r, 0, false, Wi::parents_only);
-            case Sysno::mknodat:    return path_mut(r, 1, true,  Wi::parents_only);
+            case Sysno::mkdir:      return path_mut(r, 0, false, Wi::parents_only, true);
+            case Sysno::mkdirat:    return path_mut(r, 1, true,  Wi::parents_only, true);
+            case Sysno::mknod:      return path_mut(r, 0, false, Wi::parents_only, true);
+            case Sysno::mknodat:    return path_mut(r, 1, true,  Wi::parents_only, true);
             case Sysno::rmdir:      return path_mut(r, 0, false, Wi::remove);
             case Sysno::unlink:     return path_mut(r, 0, false, Wi::remove);
             case Sysno::unlinkat:   return path_mut(r, 1, true,  Wi::remove);
@@ -1633,7 +1633,10 @@ private:
     // resolve for removal). A virtual path (procfs/sysfs) is read-only —
     // refuse with EROFS; an absent target yields its errno.
     using Wi = kernel::FileNamespace::WriteIntent;
-    [[nodiscard]] Outcome path_mut(const Regs& r, int path_arg, bool at, Wi wi) {
+    // strict_parent: mkdir/mknod must FAIL when the parent is missing, so they
+    // opt out of pre-creating the chain and let the host kernel apply the rule.
+    [[nodiscard]] Outcome path_mut(const Regs& r, int path_arg, bool at, Wi wi,
+                                   bool strict_parent = false) {
         std::string abs = resolve_arg(r, path_arg, at);
         auto pc = k_.files().classify(abs, /*for_write=*/true, /*follow=*/false, wi);
         if (pc.realm == kernel::Realm2::virtual_file)
@@ -1655,7 +1658,15 @@ private:
         // Only creates need their parent chain pre-built by the trap; the
         // parents_only classify already mirrored them, so this is belt-and-
         // suspenders for the deep-create case.
-        if (wi == Wi::parents_only) o.make_parents = true;
+        //
+        // But make_parents must NOT invent a parent the guest cannot see. It
+        // exists so an overlay UPPER layer can mirror a directory chain that
+        // already exists in the read-only lower -- not so mkdir behaves like
+        // `mkdir -p`. mkdir("/d/a/b") with no /d/a succeeded and created the
+        // whole chain where Linux returns ENOENT, so mkdir/mknod opt out and
+        // let the host kernel apply the rule against the translated path.
+        // Found by the differential harness.
+        if (wi == Wi::parents_only) o.make_parents = !strict_parent;
         return o;
     }
 
@@ -1706,11 +1717,21 @@ private:
             // fixed at 0777 and ignored by the kernel, so there is nothing to
             // apply; the shadow store still presents the intended mode at stat
             // time. Only chmod a REGULAR file/dir we own in the upper.
-            if (!wc.host_path.empty() && !is_symlink(wc.host_path.c_str()) &&
-                ::chmod(wc.host_path.c_str(), mode & wire::kPermMask) == 0) {
-                std::uint32_t got = 0;
-                if (hostcompat::host_mode_of(wc.host_path.c_str(), got))
-                    landed = got;
+            if (!wc.host_path.empty() && !is_symlink(wc.host_path.c_str())) {
+                errno = 0;
+                if (::chmod(wc.host_path.c_str(), mode & wire::kPermMask) == 0) {
+                    std::uint32_t got = 0;
+                    if (hostcompat::host_mode_of(wc.host_path.c_str(), got))
+                        landed = got;
+                } else if (errno == ENOENT || errno == ENOTDIR) {
+                    // Recording-only (see above) must still refuse a path that
+                    // does not exist: chmod on a missing file reported success
+                    // where Linux returns ENOENT, and the shadow store then
+                    // held a mode for a file that was never there. EPERM and
+                    // friends stay swallowed -- that is the whole point of
+                    // recording. Found by the differential harness.
+                    return eno(errno == ENOENT ? Errno::enoent : Errno::enotdir);
+                }
             }
         }
         k_.files().meta().set_mode(abs, mode, landed);
