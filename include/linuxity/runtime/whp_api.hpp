@@ -387,6 +387,22 @@ inline const WhpApi& whp() noexcept {
     return written >= sizeof(UINT64) && cap.ExtendedVmExits.ExceptionExit != 0;
 }
 
+// Cryptographic random bytes, for AT_RANDOM (the guest's stack-protector and
+// pointer-guard seed). RtlGenRandom (exposed as SystemFunction036) is the
+// CSPRNG the Windows CRT uses underneath and needs no CryptoAPI handle; a
+// fixed or rand()-derived value here would make every guest's canary
+// identical, silently destroying the mitigation the guest believes it has.
+[[nodiscard]] inline bool whp_random_bytes(void* buf, unsigned len) noexcept {
+    using RtlGenRandomFn = BOOLEAN(WINAPI*)(PVOID, ULONG);
+    static const RtlGenRandomFn gen = [] {
+        HMODULE m = ::LoadLibraryW(L"advapi32.dll");
+        return m ? reinterpret_cast<RtlGenRandomFn>(reinterpret_cast<void*>(
+                       ::GetProcAddress(m, "SystemFunction036")))
+                 : nullptr;
+    }();
+    return gen && gen(buf, len) != FALSE;
+}
+
 [[nodiscard]] inline const char* whp_unavailable_reason() noexcept {
     if (!whp().ok()) return whp().why;
     if (!hypervisor_present())

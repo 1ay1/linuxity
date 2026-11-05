@@ -154,14 +154,25 @@ every `syscall` into a VM exit.
           `runtime::Cpu` loop drives it. Distinguishes our syscall trap from
           a GENUINE `#UD` by checking the faulting bytes are `0F 05`, so a
           guest crash becomes SIGILL instead of a wild syscall dispatch.
+        * `runtime/whp_load.hpp` — the ELF loader and SysV startup stack.
+          Maps each PT_LOAD at 4KiB granularity with its declared
+          permissions, so W^X is REAL (a read-only segment is genuinely
+          unwritable); builds argc/argv/envp/auxv with AT_PHDR resolved via
+          PT_PHDR or the file-offset fallback, and AT_RANDOM from
+          RtlGenRandom.
         * `host/win_posix.hpp` — the POSIX corners the Win32 CRT lacks
           (`mkdir` arity, `S_ISLNK`, `O_CLOEXEC`, `d_type`), confined to one
           header so the core stays free of `#ifdef`s.
 
+      **Statically linked x86-64 binaries run end to end today** — a real
+      static ELF prints via `write(2)` and exits with its own `argc`
+      (`tools/make_test_elf.py` generates one; `tests/test_whp_load.cpp`
+      asserts it).
+
       Remaining before `--root` runs a shell: the Win32 fd table on NT
-      handles, the ELF loader into guest-physical memory, and guest
-      fork/exec as NT processes (the analogues of `hvf_fd` / `hvf_load` /
-      `hvf_fork`).
+      handles, the `mmap`/`brk` service, loading `ld.so` for DYNAMICALLY
+      linked programs, and guest fork/exec as NT processes (the analogues of
+      `hvf_fd` / `hvf_mem` / `hvf_fork`).
 - [ ] **M7 (optional): foreign arch.** x86-64 rootfs on arm64 via FEX.
 
 ## Non-goals

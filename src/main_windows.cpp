@@ -41,6 +41,7 @@
 #include "linuxity/host/win_posix.hpp"
 #include "linuxity/kernel/kernel.hpp"
 #include "linuxity/runtime/whp_api.hpp"
+#include "linuxity/runtime/whp_load.hpp"
 #include "linuxity/runtime/whp_trap.hpp"
 #include "linuxity/runtime/whp_vm.hpp"
 #include "linuxity/runtime/whp_win32.hpp"
@@ -196,18 +197,177 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // The CPU, memory and trap layers are ready; the Win32 fd/loader/exec
-    // layers are not. Say exactly that -- a misleading partial run would be
-    // worse than a clear message.
-    std::fprintf(stderr,
-        "linuxity: the WHP backend's CPU/memory/trap layers are in place\n"
-        "          (verify with 'linuxity --check'), but executing a rootfs\n"
-        "          program additionally needs the Win32 fd table, the ELF\n"
-        "          loader into guest-physical memory, and guest fork/exec as\n"
-        "          NT processes. Those are not implemented yet.\n"
-        "\n"
-        "          requested: program=%.*s root=%s memory=%u MiB\n",
-        int(args[i].size()), args[i].data(),
-        root.empty() ? "(none)" : root.c_str(), memory_mib);
-    return 69;  // EX_UNAVAILABLE
+    // Translate the guest program path through the rootfs, if one was given.
+    // This is the minimal stand-in for the file namespace: enough to load an
+    // image out of a rootfs, but NOT the full path-translation the syscall
+    // layer needs (that is the fd-table work still outstanding).
+    const std::string program{args[i]};
+    std::string host_path = program;
+    if (!root.empty()) {
+        host_path = root;
+        if (!host_path.empty() && host_path.back() != '/' &&
+            host_path.back() != '\\')
+            host_path += '/';
+        host_path += program.front() == '/' ? program.substr(1) : program;
+    }
+
+    std::vector<std::string> argv_guest{program};
+    for (std::size_t a = i + 1; a < args.size(); ++a)
+        argv_guest.emplace_back(args[a]);
+
+    std::uint64_t ram = std::uint64_t(memory_mib) << 20;
+    if (ram < WhpLayout::min_ram) {
+        std::fprintf(stderr,
+            "linuxity: --memory %u MiB is below the %llu MiB minimum this\n"
+            "          backend's address-space layout needs\n",
+            memory_mib,
+            (unsigned long long)(WhpLayout::min_ram >> 20));
+        return 2;
+    }
+
+    WhpMachine vm;
+    if (auto st = vm.create(ram, 1); !st) {
+        std::fprintf(stderr, "linuxity: could not create a %u MiB partition\n",
+                     memory_mib);
+        return 1;
+    }
+
+    auto img = whp_load_elf(vm, host_path, WhpLayout::pie_base(ram));
+    if (!img) {
+        std::fprintf(stderr, "linuxity: cannot load '%s'", host_path.c_str());
+        if (img.error() == Errno::enoent)      std::fprintf(stderr, ": not found\n");
+        else if (img.error() == Errno::enoexec) std::fprintf(stderr,
+            ": not a native x86-64 Linux ELF\n"
+            "          (this backend executes guest code on the host CPU, so\n"
+            "          there is no cross-architecture emulation)\n");
+        else std::fprintf(stderr, ": load failed\n");
+        return 1;
+    }
+
+    // A dynamically linked program needs its interpreter loaded too, and
+    // control must enter LD.SO, not the program -- ld.so relocates the image
+    // and only then jumps to its entry. Reporting this rather than silently
+    // entering the program (which would fault on its first PLT call) is the
+    // difference between a clear limitation and a mystery crash.
+    auto interp = whp_read_interp(host_path);
+    if (interp && !interp->empty()) {
+        std::fprintf(stderr,
+            "linuxity: '%s' is dynamically linked (PT_INTERP=%s).\n"
+            "          Loading the interpreter needs the guest fd table and\n"
+            "          mmap service, which are not implemented yet; only\n"
+            "          statically linked binaries run today.\n",
+            program.c_str(), interp->c_str());
+        return 69;
+    }
+
+    std::vector<std::string> envp{
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "HOME=/root",
+        "TERM=dumb",
+        "LINUXITY=1",
+    };
+
+    auto sp = whp_build_stack(vm, *img, argv_guest, envp, 0, program);
+    if (!sp) {
+        std::fprintf(stderr, "linuxity: could not build the startup stack\n");
+        return 1;
+    }
+
+    WhpCpu cpu;
+    if (auto st = cpu.create(vm, 0); !st) {
+        std::fprintf(stderr, "linuxity: could not create a vcpu\n");
+        return 1;
+    }
+
+    WhpTrap trap{vm, cpu};
+    if (auto st = trap.start(UAddr(img->entry), UAddr(*sp)); !st) {
+        std::fprintf(stderr, "linuxity: could not enter long mode\n");
+        return 1;
+    }
+
+    // The trap loop. The full runtime drives this through runtime::Cpu against
+    // the portable kernel; here we service only the handful of syscalls that
+    // need no fd table, so a static binary can actually run and report its
+    // status. Anything else gets ENOSYS and is NAMED, so the next gap to
+    // close is obvious rather than guessed at.
+    TrapFrame f{};
+    for (;;) {
+        auto got = trap.next(f);
+        if (!got) {
+            switch (trap.stop_reason()) {
+                case WhpStop::illegal:
+                    std::fprintf(stderr, "linuxity: guest executed an illegal "
+                                         "instruction (SIGILL)\n");
+                    return 132;
+                case WhpStop::fault:
+                    std::fprintf(stderr, "linuxity: guest faulted at 0x%llx "
+                                         "(SIGSEGV)\n",
+                                 (unsigned long long)trap.fault_addr());
+                    return 139;
+                default:
+                    std::fprintf(stderr, "linuxity: guest stopped "
+                                         "unexpectedly (reason %d)\n",
+                                 int(trap.stop_reason()));
+                    return 1;
+            }
+        }
+        if (!*got) break;   // exited
+
+        const std::uint64_t nr = f.regs.nr;
+        std::int64_t ret = -win32::LNOSYS;
+
+        switch (nr) {
+            case 60:    // exit
+            case 231: { // exit_group
+                return int(f.regs.arg[0] & 0xff);
+            }
+            case 1: {   // write(fd, buf, len) -- stdout/stderr only
+                const std::uint64_t fd = f.regs.arg[0];
+                const std::uint64_t buf = f.regs.arg[1];
+                const std::uint64_t len = f.regs.arg[2];
+                if (fd != 1 && fd != 2) { ret = -win32::LBADF; break; }
+                std::vector<std::byte> tmp(static_cast<std::size_t>(len));
+                const std::size_t n = vm.mem().copy_in(buf, tmp);
+                if (n == 0 && len != 0) { ret = -win32::LFAULT; break; }
+                std::fwrite(tmp.data(), 1, n, fd == 1 ? stdout : stderr);
+                ret = std::int64_t(n);
+                break;
+            }
+            case 20: {  // writev(fd, iov, cnt)
+                const std::uint64_t fd = f.regs.arg[0];
+                if (fd != 1 && fd != 2) { ret = -win32::LBADF; break; }
+                std::int64_t total = 0;
+                for (std::uint64_t k = 0; k < f.regs.arg[2]; ++k) {
+                    GuestIovec iov{};
+                    if (!vm.mem().get(f.regs.arg[1] + k * sizeof(GuestIovec), iov))
+                        break;
+                    if (iov.len == 0) continue;
+                    std::vector<std::byte> tmp(static_cast<std::size_t>(iov.len));
+                    const std::size_t n = vm.mem().copy_in(iov.base, tmp);
+                    std::fwrite(tmp.data(), 1, n, fd == 1 ? stdout : stderr);
+                    total += std::int64_t(n);
+                }
+                ret = total;
+                break;
+            }
+            case 39:  ret = 1; break;            // getpid
+            case 102: case 104: case 107: case 108:
+                ret = 0; break;                  // getuid/getgid/geteuid/getegid
+            case 158: ret = -win32::LINVAL; break;   // arch_prctl
+            default:
+                std::fprintf(stderr,
+                    "linuxity: unimplemented syscall %llu "
+                    "(needs the Win32 fd/mm layer)\n",
+                    (unsigned long long)nr);
+                ret = -win32::LNOSYS;
+                break;
+        }
+
+        if (auto st = trap.resume(ret); !st) {
+            std::fprintf(stderr, "linuxity: could not resume the guest\n");
+            return 1;
+        }
+    }
+
+    return trap.exit_code();
 }

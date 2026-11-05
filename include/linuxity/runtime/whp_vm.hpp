@@ -272,13 +272,24 @@ private:
             const std::uint64_t idx = (gva >> shift) & 0x1ff;
             std::uint64_t e = 0;
             if (!read_entry(table, idx, e)) return err(Errno::efault);
+
             if ((e & kPtePresent) && (e & kPtePageSize)) {
-                // A large leaf already covers this VA (the bootstrap identity
-                // window). Splitting it would be needed to give this page
-                // different permissions; for the identity window the 2MiB
-                // leaf's permissions already permit RWX, so accept it.
-                return ok();
+                // A LARGE LEAF already covers this VA -- the bootstrap 2MiB
+                // identity window, which is RWX so the loader can write the
+                // image it is about to map.
+                //
+                // It must be SPLIT, not accepted. Accepting it silently
+                // leaves the page RWX, so a read-only PT_LOAD mapped below
+                // 1GiB (which is where a conventional ET_EXEC at 0x400000
+                // lands) would stay writable and executable, and the W^X the
+                // ELF asked for would be a no-op. That is a protection that
+                // LOOKS present in the page tables and is not -- exactly the
+                // kind of silent hole this backend must not ship.
+                if (auto st = split_large_leaf(table, idx, e, shift); !st)
+                    return st;
+                if (!read_entry(table, idx, e)) return err(Errno::efault);
             }
+
             if (!(e & kPtePresent)) {
                 const std::uint64_t fresh = alloc_table();
                 if (!fresh) return err(Errno::enomem);
@@ -292,6 +303,41 @@ private:
         if (writable) leaf |= kPteWrite;
         if (!executable) leaf |= kPteNx;
         return write_entry(table, idx, leaf) ? ok() : err(Errno::efault);
+    }
+
+    // Replace a large leaf (2MiB at level 2, 1GiB at level 3) with a full
+    // next-level table that maps the SAME memory with the SAME permissions,
+    // so the split is semantically invisible to the guest -- only the
+    // granularity changes, letting individual 4KiB pages be re-protected
+    // afterwards.
+    [[nodiscard]] Status split_large_leaf(std::uint64_t parent_table,
+                                          std::uint64_t parent_idx,
+                                          std::uint64_t leaf,
+                                          unsigned leaf_shift) {
+        const std::uint64_t fresh = alloc_table();
+        if (!fresh) return err(Errno::enomem);
+
+        const std::uint64_t leaf_size = 1ull << leaf_shift;
+        const std::uint64_t base = leaf & kPteAddrMask & ~(leaf_size - 1);
+        // Inherit every permission/attribute bit except PS, which is what
+        // made it a leaf in the first place.
+        const std::uint64_t attrs = leaf & (kPtePresent | kPteWrite | kPteUser |
+                                            kPteNx);
+        const unsigned child_shift = leaf_shift - 9;
+        const std::uint64_t child_size = 1ull << child_shift;
+        const bool child_is_leaf = child_shift == kPageShift;
+
+        for (std::uint64_t i = 0; i < 512; ++i) {
+            std::uint64_t e = (base + i * child_size) | attrs;
+            // A 1GiB leaf splits into 2MiB leaves, which still need PS; a
+            // 2MiB leaf splits into 4KiB PTEs, which must not have it.
+            if (!child_is_leaf) e |= kPtePageSize;
+            if (!write_entry(fresh, i, e)) return err(Errno::efault);
+        }
+
+        const std::uint64_t link = fresh | kPtePresent | kPteWrite | kPteUser;
+        return write_entry(parent_table, parent_idx, link) ? ok()
+                                                           : err(Errno::efault);
     }
 
     // Page-table pages come from a bump allocator at the TOP of guest RAM,

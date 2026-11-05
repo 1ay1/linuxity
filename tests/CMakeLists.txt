@@ -63,4 +63,12 @@ if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
     add_executable(test_whp test_whp.cpp)
     target_link_libraries(test_whp PRIVATE linuxity_core)
     add_test(NAME whp COMMAND test_whp)
+
+    # The ELF loader + SysV startup stack. Synthesizes real static x86-64
+    # ELFs on disk, loads them, and (with a hypervisor) RUNS them -- the
+    # guest reads argc off its own stack and exits with it, so a wrong stack
+    # layout fails loudly instead of passing by luck.
+    add_executable(test_whp_load test_whp_load.cpp)
+    target_link_libraries(test_whp_load PRIVATE linuxity_core)
+    add_test(NAME whp_load COMMAND test_whp_load)
 endif()

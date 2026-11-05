@@ -127,10 +127,21 @@ linuxity WHP backend check
   syscall trap      : nr=60 arg0=42  (guest ran natively, #UD routed here)
 ```
 
-Status: the CPU, memory, register and trap layers are implemented and tested.
-Running a full rootfs additionally needs the Win32 fd table, the ELF loader
-into guest-physical memory, and guest fork/exec as NT processes — see
-`doc/ROADMAP.md` (M6).
+**Statically linked x86-64 Linux binaries run today.** `tools/make_test_elf.py`
+writes a real static ELF (no cross-toolchain needed) if you want to try it:
+
+```bat
+python tools\make_test_elf.py hello.elf
+linuxity.exe hello.elf one two
+:: -> hello from a real linux elf      (guest write(2), serviced by linuxity)
+:: -> exit code 3                      (the guest read argc off its own stack)
+```
+
+Status: CPU, memory, registers, the trap loop, the ELF loader and the SysV
+startup stack are implemented and tested. Still outstanding before a full
+rootfs shell: the Win32 fd table (so `open`/`read` work on real files), the
+`mmap`/`brk` service, loading `ld.so` for **dynamically** linked programs,
+and guest fork/exec as NT processes — see `doc/ROADMAP.md` (M6).
 
 Requires a C++23 compiler (`std::expected`, concepts). Tested with GCC 16.
 Native execution uses a `ptrace` trap backend on Linux/x86-64: the guest runs
