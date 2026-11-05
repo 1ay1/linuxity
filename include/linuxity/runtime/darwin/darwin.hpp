@@ -17,6 +17,7 @@
 #if defined(__APPLE__)
 
 #include "linuxity/abi/wire/dirent64.hpp"
+#include "linuxity/abi/wire/stat.hpp"
 
 #include <cerrno>
 #include <fcntl.h>
@@ -99,6 +100,14 @@ struct LinuxStat {
 static_assert(sizeof(LinuxStat) == 128);
 static_assert(offsetof(LinuxStat, st_mode) == 16);
 static_assert(offsetof(LinuxStat, st_uid) == 24);
+// ...and against the ONE layout authority (abi/wire/stat.hpp), so this struct
+// and the offsets the portable dispatcher pokes can never disagree. aarch64
+// uses the asm-generic layout, where st_nlink is u32 and follows st_mode.
+static_assert(sizeof(LinuxStat) == abi::wire::kStatGeneric.size);
+static_assert(offsetof(LinuxStat, st_mode) == abi::wire::kStatGeneric.mode);
+static_assert(offsetof(LinuxStat, st_uid)  == abi::wire::kStatGeneric.uid);
+static_assert(offsetof(LinuxStat, st_gid)  == abi::wire::kStatGeneric.gid);
+static_assert(sizeof(LinuxStat::st_mode) == abi::wire::kStatGeneric.mode_width);
 static_assert(offsetof(LinuxStat, st_size) == 48);
 static_assert(offsetof(LinuxStat, st_blocks) == 64);
 
@@ -275,6 +284,14 @@ struct LinuxStatx {
 // different field by the guest, which is far worse than an error.
 static_assert(sizeof(LinuxStatx) == 256);
 static_assert(offsetof(LinuxStatx, stx_mode) == 28);
+// statx is ONE layout on both ABIs (it was designed versioned and fixed), so
+// this is checked against the same authority the dispatcher's scrub uses.
+// Note stx_mode is u16, not u32 like struct stat's -- reading 4 bytes there
+// would pick up the following pad.
+static_assert(offsetof(LinuxStatx, stx_mode) == abi::wire::kStatx.mode);
+static_assert(offsetof(LinuxStatx, stx_uid)  == abi::wire::kStatx.uid);
+static_assert(offsetof(LinuxStatx, stx_gid)  == abi::wire::kStatx.gid);
+static_assert(sizeof(LinuxStatx::stx_mode) == abi::wire::kStatx.mode_width);
 static_assert(offsetof(LinuxStatx, stx_ino) == 32);
 static_assert(offsetof(LinuxStatx, stx_size) == 40);
 static_assert(offsetof(LinuxStatx, stx_atime) == 64);

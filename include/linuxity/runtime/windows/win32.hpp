@@ -34,6 +34,7 @@
 #include <windows.h>
 
 #include "linuxity/abi/result.hpp"
+#include "linuxity/abi/wire/stat.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -165,6 +166,16 @@ struct LinuxStat {
     std::int64_t  __unused[3];
 };
 static_assert(sizeof(LinuxStat) == 144);
+// ...and against the ONE layout authority (abi/wire/stat.hpp), so this struct
+// and the offsets the portable dispatcher pokes can never disagree. x86-64
+// puts st_nlink BEFORE st_mode, which is why this layout differs from
+// darwin's -- both are correct, and that is exactly why they need a shared
+// definition to be checked against.
+static_assert(sizeof(LinuxStat) == abi::wire::kStatX86_64.size);
+static_assert(offsetof(LinuxStat, st_mode) == abi::wire::kStatX86_64.mode);
+static_assert(offsetof(LinuxStat, st_uid)  == abi::wire::kStatX86_64.uid);
+static_assert(offsetof(LinuxStat, st_gid)  == abi::wire::kStatX86_64.gid);
+static_assert(sizeof(LinuxStat::st_mode) == abi::wire::kStatX86_64.mode_width);
 static_assert(offsetof(LinuxStat, st_mode) == 24,
               "st_mode offset is the ABI; 24 on x86-64 Linux");
 static_assert(offsetof(LinuxStat, st_uid) == 28);

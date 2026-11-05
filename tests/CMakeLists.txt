@@ -3,7 +3,7 @@
 # Windows) — they are the contract that keeps the core portable.
 set(LX_PORTABLE_TESTS
     core authority vfs interp file_namespace sysfs_proctree
-    resources address_space sysno conformance outcome dirent64)
+    resources address_space sysno conformance outcome wire)
 
 # Tests that instantiate PosixHost. These exercise the POSIX *host backend*
 # (mmap/dirent/pread), not the portable core, so they are POSIX-only: the

@@ -19,6 +19,7 @@
 #include "linuxity/kernel/subsystem.hpp"
 #include "linuxity/abi/outcome.hpp"
 #include "linuxity/abi/wire/dirent64.hpp"
+#include "linuxity/abi/wire/stat.hpp"
 #include "linuxity/loader/interp.hpp"
 
 #include <array>
@@ -2023,15 +2024,22 @@ public:
     // "none" case to test for: the caller's `if (r.scrub)` is the only check.
     void scrub_ids(const Scrub& s) {
         const bool is_statx = s.layout == Scrub::Layout::statx;
-        // Field offsets differ per ABI:
+        // Field offsets differ per ABI, and the definition lives in ONE place
+        // (abi/wire/stat.hpp) that both backends' LinuxStat/LinuxStatx structs
+        // static_assert against. They used to be computed inline here as a
+        // third independent copy -- all three correct, which is precisely the
+        // danger: a drift in any one reports a plausible WRONG mode (0644 for
+        // a 0755 file) or reads st_uid out of padding.
+        //
         //   struct stat x86-64  : st_mode u32 @24, st_uid @28, st_gid @32.
         //   struct stat aarch64 : st_mode u32 @16, st_uid @24, st_gid @28
         //                         (asm-generic: nlink is u32 and AFTER mode).
         //   struct statx (both) : stx_mode u16 @28, stx_uid @20, stx_gid @24.
-        const bool generic = arch_ == Arch::aarch64;
-        const std::size_t mode_off = is_statx ? 28 : (generic ? 16 : 24);
-        const std::size_t uid_off  = is_statx ? 20 : (generic ? 24 : 28);
-        const std::size_t gid_off  = is_statx ? 24 : (generic ? 28 : 32);
+        const wire::StatLayout& L =
+            is_statx ? wire::kStatx : wire::stat_layout(arch_);
+        const std::size_t mode_off = L.mode;
+        const std::size_t uid_off  = L.uid;
+        const std::size_t gid_off  = L.gid;
         const std::uint64_t base = value(s.buf);
 
         // The shadow record for this guest path, if the guest ever chmod/chown'd

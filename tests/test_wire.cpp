@@ -1,6 +1,7 @@
-// The one linux_dirent64 encoder. Every assertion here is about the FROZEN
+// The abi/wire layer: kernel ABI structs encoded in exactly one place.
 // kernel ABI, so it holds on every host and needs no VM to check.
 #include "linuxity/abi/wire/dirent64.hpp"
+#include "linuxity/abi/wire/stat.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -154,6 +155,32 @@ int main() {
         check(pos == off, "no gaps: sum of reclens == bytes written");
     }
 
-    if (failures == 0) std::puts("dirent64: all checks passed");
+    // -- struct stat layout, the OTHER thing abi/wire owns ----------------
+    // x86-64 and asm-generic genuinely disagree about struct stat, which is
+    // why three independent copies of these offsets was dangerous: every copy
+    // was correct, so a drift in one reports a plausible WRONG mode rather
+    // than failing. Both backends' LinuxStat structs static_assert against
+    // these, and the dispatcher's scrub reads them.
+    {
+        using namespace lx::abi;
+        check(wire::stat_layout(lx::abi::Arch::x86_64).mode == 24, "x86-64 st_mode @24");
+        check(wire::stat_layout(lx::abi::Arch::x86_64).uid == 28,  "x86-64 st_uid @28");
+        check(wire::stat_layout(lx::abi::Arch::x86_64).size == 144, "x86-64 stat is 144");
+        // aarch64 puts st_nlink AFTER st_mode, so everything shifts.
+        check(wire::stat_layout(lx::abi::Arch::aarch64).mode == 16, "aarch64 st_mode @16");
+        check(wire::stat_layout(lx::abi::Arch::aarch64).uid == 24,  "aarch64 st_uid @24");
+        check(wire::stat_layout(lx::abi::Arch::aarch64).size == 128, "aarch64 stat is 128");
+        // The two MUST differ -- if they ever agree, one is wrong.
+        check(wire::stat_layout(lx::abi::Arch::x86_64).mode !=
+              wire::stat_layout(lx::abi::Arch::aarch64).mode,
+              "the two stat layouts are genuinely different");
+        // statx is one fixed layout, with a NARROWER mode field. Reading 4
+        // bytes at stx_mode would pick up the following pad.
+        check(wire::kStatx.mode == 28, "statx stx_mode @28");
+        check(wire::kStatx.mode_width == 2, "statx mode is u16, not u32");
+        check(wire::kStatX86_64.mode_width == 4, "stat mode is u32");
+    }
+
+    if (failures == 0) std::puts("wire: all checks passed");
     return failures == 0 ? 0 : 1;
 }
