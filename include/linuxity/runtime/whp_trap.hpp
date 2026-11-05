@@ -184,13 +184,40 @@ public:
         cpu_.kick();
     }
 
-    // The faulting guest address of the last memory fault, for the SIGSEGV
-    // si_addr the guest's handler will read.
+    // The faulting guest address of the last memory fault.
+    //
+    // For an intercepted #PF, WHP reports the address in the exception
+    // context's ExceptionParameter. CR2 is the architectural home for it,
+    // but on an INTERCEPTED exception the hypervisor delivers the fault to us
+    // before the guest's CR2 is architecturally visible, so reading CR2 can
+    // return 0 -- which looks exactly like a null dereference and sends a
+    // perfectly good lazy-allocation fault to SIGSEGV. So trust the exception
+    // context first and treat CR2 only as a fallback.
     [[nodiscard]] std::uint64_t fault_addr() const noexcept {
         const auto& e = cpu_.last_exit();
         if (e.ExitReason == WHvRunVpExitReasonMemoryAccess)
             return e.MemoryAccess.Gva;
+        if (e.ExitReason == WHvRunVpExitReasonException) {
+            if (e.VpException.ExceptionParameter)
+                return e.VpException.ExceptionParameter;
+            if (std::uint64_t cr2 = 0; cpu_.read_cr2(cr2) && cr2) return cr2;
+        }
         return 0;
+    }
+
+    // Was the last fault a WRITE to a present page? That is a protection
+    // violation (writing read-only memory), not a missing page -- so it must
+    // become SIGSEGV rather than being "fixed" by backing a page that is
+    // already there, which would loop forever.
+    [[nodiscard]] bool fault_was_protection() const noexcept {
+        const auto& e = cpu_.last_exit();
+        if (e.ExitReason != WHvRunVpExitReasonException) return false;
+        if (e.VpException.ExceptionType !=
+            unsigned(WHvX64ExceptionTypePageFault))
+            return false;
+        // #PF error code bit 0 = P: the fault was caused by a protection
+        // violation on a PRESENT page (as opposed to a not-present page).
+        return (e.VpException.ErrorCode & 1u) != 0;
     }
 
 private:
@@ -208,6 +235,9 @@ private:
         switch (e.ExitReason) {
             case WHvRunVpExitReasonException:
                 if (cpu_.exit_is_syscall()) return WhpStop::syscall;
+                if (e.VpException.ExceptionType ==
+                    unsigned(WHvX64ExceptionTypePageFault))
+                    return WhpStop::fault;
                 if (e.VpException.ExceptionType ==
                     unsigned(WHvX64ExceptionTypeInvalidOpcodeFault))
                     return WhpStop::illegal;

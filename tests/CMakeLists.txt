@@ -71,4 +71,12 @@ if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
     add_executable(test_whp_load test_whp_load.cpp)
     target_link_libraries(test_whp_load PRIVATE linuxity_core)
     add_test(NAME whp_load COMMAND test_whp_load)
+
+    # The memory manager and fd table: the frame allocator's uniqueness and
+    # arena containment, the fd table's stdio duplication and refcounting,
+    # rootfs path containment, and -- the important one -- that the fault
+    # arbiter can tell lazy memory from a genuine SIGSEGV.
+    add_executable(test_whp_mm test_whp_mm.cpp)
+    target_link_libraries(test_whp_mm PRIVATE linuxity_core)
+    add_test(NAME whp_mm COMMAND test_whp_mm)
 endif()

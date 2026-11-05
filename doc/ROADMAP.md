@@ -160,19 +160,53 @@ every `syscall` into a VM exit.
           unwritable); builds argc/argv/envp/auxv with AT_PHDR resolved via
           PT_PHDR or the file-offset fallback, and AT_RANDOM from
           RtlGenRandom.
+        * `runtime/whp_fd.hpp` — the guest fd table over Win32 HANDLEs.
+          stdio is DUPLICATED (a guest closing fd 1 must not close
+          linuxity's stdout) and fds 3..8 are reserved so the guest's own
+          descriptors start at 9, matching a real login session — the
+          collision this prevents corrupted a database on the macOS backend.
+          dup() shares the handle, so the file position is shared as Linux's
+          open-file-description semantics require.
+        * `runtime/whp_mm.hpp` — mmap/munmap/mprotect/brk. A bitmap frame
+          allocator supplies guest-physical pages; the VIRTUAL bookkeeping
+          reuses `hvf_vma.hpp`'s `AddressSpace` rather than reimplementing
+          interval splitting. Anonymous memory is LAZY (overcommit), so a
+          libc that maps a large arena and touches a fraction works on a
+          small guest.
+        * `runtime/whp_sys.hpp` — ~70 syscalls served against Win32: file
+          I/O, stat, getdents64, directories, descriptors, time, identity,
+          and `arch_prctl(ARCH_SET_FS)` (without which no TLS access, errno
+          included, works). Rootfs paths resolve ".." LEXICALLY and clamp at
+          the root, so a guest cannot escape the rootfs.
         * `host/win_posix.hpp` — the POSIX corners the Win32 CRT lacks
           (`mkdir` arity, `S_ISLNK`, `O_CLOEXEC`, `d_type`), confined to one
           header so the core stays free of `#ifdef`s.
 
-      **Statically linked x86-64 binaries run end to end today** — a real
-      static ELF prints via `write(2)` and exits with its own `argc`
-      (`tools/make_test_elf.py` generates one; `tests/test_whp_load.cpp`
-      asserts it).
+      **The second half of the interception trick: `#PF` is intercepted too.**
+      `WHvRunVpExitReasonMemoryAccess` reports only NESTED paging failures
+      (a guest-physical page absent from the partition). A fault in the
+      GUEST'S OWN page tables is an architectural `#PF` the guest must
+      handle — and a guest with no kernel, IDT or handler escalates it
+      `#PF -> #DF -> triple fault`, arriving as
+      `UnrecoverableException` with no address. So vector 14 goes into the
+      same `ExceptionExitBitmap` as `#UD`, making linuxity the guest's
+      page-fault handler. That is what makes lazy mmap and a growing heap
+      implementable without a guest kernel. The fault address comes from the
+      exception context (CR2 is not yet architecturally visible on an
+      intercepted exception), and a PROTECTION fault on a present page goes
+      straight to SIGSEGV rather than looping forever trying to back a page
+      that is already there.
 
-      Remaining before `--root` runs a shell: the Win32 fd table on NT
-      handles, the `mmap`/`brk` service, loading `ld.so` for DYNAMICALLY
-      linked programs, and guest fork/exec as NT processes (the analogues of
-      `hvf_fd` / `hvf_mem` / `hvf_fork`).
+      **Statically linked x86-64 binaries run end to end** with a working
+      syscall surface: `tools/make_syscall_elf.py` generates a binary that
+      exercises uname, a growing heap, a 1 MiB anonymous mmap with
+      first/last-page writes, openat+read through the rootfs, and TLS via
+      `%fs` — all six checks pass.
+
+      Remaining: `ld.so` loading is wired (PT_INTERP resolved through the
+      rootfs, AT_BASE set, control entering the interpreter) but needs a
+      real rootfs to verify; then threads (clone), signal delivery, sockets,
+      and fork/exec as NT processes.
 - [ ] **M7 (optional): foreign arch.** x86-64 rootfs on arm64 via FEX.
 
 ## Non-goals

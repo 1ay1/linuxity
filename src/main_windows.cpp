@@ -42,6 +42,7 @@
 #include "linuxity/kernel/kernel.hpp"
 #include "linuxity/runtime/whp_api.hpp"
 #include "linuxity/runtime/whp_load.hpp"
+#include "linuxity/runtime/whp_sys.hpp"
 #include "linuxity/runtime/whp_trap.hpp"
 #include "linuxity/runtime/whp_vm.hpp"
 #include "linuxity/runtime/whp_win32.hpp"
@@ -66,6 +67,7 @@ void usage() {
         "\n"
         "  --root DIR     an extracted distro rootfs to use as the guest '/'\n"
         "  --memory MiB   guest RAM (default 2048)\n"
+        "  --verbose      report every syscall this backend cannot serve yet\n"
         "  --check        report whether this machine can host the backend,\n"
         "                 and what the hypervisor supports, then exit\n"
         "\n"
@@ -130,6 +132,13 @@ int check() {
                                0xbf, 0x2a, 0x00, 0x00, 0x00,
                                0x0f, 0x05};
     const std::uint64_t code = 0x40'0000;
+    const std::uint64_t stack = 0x80'0000;
+    // The partition starts with nothing mapped, so ask for these two pages.
+    if (!m.map_pages(code, 4096, true, true) ||
+        !m.map_pages(stack - 4096, 4096, true, false)) {
+        std::printf("  page tables       : FAILED to map\n");
+        return 1;
+    }
     auto dst = m.ram().at(code, sizeof(prog));
     if (dst.empty()) {
         std::printf("  guest RAM         : FAILED to address\n");
@@ -138,7 +147,7 @@ int check() {
     std::memcpy(dst.data(), prog, sizeof(prog));
 
     WhpTrap trap{m, cpu};
-    if (auto st = trap.start(UAddr(code), UAddr(0x80'0000)); !st) {
+    if (auto st = trap.start(UAddr(code), UAddr(stack)); !st) {
         std::printf("  long mode         : FAILED to enter\n");
         return 1;
     }
@@ -167,11 +176,13 @@ int main(int argc, char** argv) {
 
     std::string root;
     unsigned memory_mib = 2048;
+    bool verbose = false;
     std::size_t i = 0;
     for (; i < args.size(); ++i) {
         auto a = args[i];
         if (a == "--check") return check();
         if (a == "--help" || a == "-h") { usage(); return 0; }
+        if (a == "--verbose" || a == "-v") { verbose = true; continue; }
         if (a == "--root" && i + 1 < args.size()) { root = args[++i]; continue; }
         if (a == "--memory" && i + 1 < args.size()) {
             memory_mib = unsigned(std::strtoul(std::string{args[++i]}.c_str(),
@@ -244,21 +255,49 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // The syscall surface: fd table, memory manager, emulation layer.
+    FdTable fds;
+    // Guest fds start at 9, as they would in a real login session. See
+    // FdTable::reserve_low_fds -- this prevents a descriptor-reuse collision
+    // that corrupted a database on the macOS backend.
+    fds.reserve_low_fds();
+
+    WhpMm mm{vm};
+    WhpSys sys{vm, mm, fds, root};
+
     // A dynamically linked program needs its interpreter loaded too, and
-    // control must enter LD.SO, not the program -- ld.so relocates the image
-    // and only then jumps to its entry. Reporting this rather than silently
-    // entering the program (which would fault on its first PLT call) is the
-    // difference between a clear limitation and a mystery crash.
+    // control must enter LD.SO, not the program: ld.so relocates the image,
+    // maps its libraries, and only then jumps to the program's entry. Enter
+    // the program directly and it faults on its first PLT call.
+    std::uint64_t entry = img->entry;
+    std::uint64_t at_base = 0;
+    std::uint64_t highest_end = img->image_end;
+
     auto interp = whp_read_interp(host_path);
     if (interp && !interp->empty()) {
-        std::fprintf(stderr,
-            "linuxity: '%s' is dynamically linked (PT_INTERP=%s).\n"
-            "          Loading the interpreter needs the guest fd table and\n"
-            "          mmap service, which are not implemented yet; only\n"
-            "          statically linked binaries run today.\n",
-            program.c_str(), interp->c_str());
-        return 69;
+        // PT_INTERP is a GUEST path ("/lib64/ld-linux-x86-64.so.2"), so it
+        // must be resolved through the rootfs like any other.
+        const std::string interp_host = sys.host_path(*interp);
+        auto ld = whp_load_elf(vm, interp_host, WhpLayout::interp_base(ram));
+        if (!ld) {
+            std::fprintf(stderr,
+                "linuxity: cannot load the dynamic linker '%s'\n"
+                "          (resolved to '%s')\n"
+                "          A rootfs containing it is needed: try --root.\n",
+                interp->c_str(), interp_host.c_str());
+            return 1;
+        }
+        // AT_BASE tells ld.so where IT was loaded, so it can relocate
+        // itself; control enters ld.so's entry, not the program's.
+        at_base = ld->load_bias;
+        entry = ld->entry;
+        highest_end = std::max(highest_end, ld->image_end);
     }
+
+    // brk starts above every loaded image; the mmap arena sits below the
+    // stack. Both must be set before the guest runs, since libc calls brk
+    // and mmap during startup.
+    mm.init(highest_end, WhpLayout::mmap_top(ram));
 
     std::vector<std::string> envp{
         "PATH=/usr/local/bin:/usr/bin:/bin",
@@ -267,7 +306,7 @@ int main(int argc, char** argv) {
         "LINUXITY=1",
     };
 
-    auto sp = whp_build_stack(vm, *img, argv_guest, envp, 0, program);
+    auto sp = whp_build_stack(vm, *img, argv_guest, envp, at_base, program);
     if (!sp) {
         std::fprintf(stderr, "linuxity: could not build the startup stack\n");
         return 1;
@@ -280,94 +319,80 @@ int main(int argc, char** argv) {
     }
 
     WhpTrap trap{vm, cpu};
-    if (auto st = trap.start(UAddr(img->entry), UAddr(*sp)); !st) {
+    sys.bind_cpu(&cpu);
+    if (auto st = trap.start(UAddr(entry), UAddr(*sp)); !st) {
         std::fprintf(stderr, "linuxity: could not enter long mode\n");
         return 1;
     }
 
-    // The trap loop. The full runtime drives this through runtime::Cpu against
-    // the portable kernel; here we service only the handful of syscalls that
-    // need no fd table, so a static binary can actually run and report its
-    // status. Anything else gets ENOSYS and is NAMED, so the next gap to
-    // close is obvious rather than guessed at.
     TrapFrame f{};
     for (;;) {
         auto got = trap.next(f);
         if (!got) {
             switch (trap.stop_reason()) {
+                case WhpStop::fault: {
+                    // A fault inside a known VMA is LAZY MEMORY we promised
+                    // and have not backed yet -- fill it and resume. Only a
+                    // fault with no mapping behind it is a real SIGSEGV.
+                    // This is what makes overcommit work, so it is on the hot
+                    // path for every program that touches its heap.
+                    //
+                    // A PROTECTION fault (present page, wrong permission) is
+                    // never fixable by backing a page: the page is already
+                    // there. Trying would spin forever re-faulting on the
+                    // same instruction, so it goes straight to SIGSEGV --
+                    // which is also the correct answer for a guest writing
+                    // its own read-only text.
+                    const std::uint64_t at = trap.fault_addr();
+                    if (!trap.fault_was_protection() && mm.handle_fault(at)) {
+                        // #PF is a FAULT: RIP still points at the faulting
+                        // instruction, which must be RETRIED now that the
+                        // page exists. So resume without touching RIP --
+                        // unlike the syscall path, which steps over `syscall`.
+                        continue;
+                    }
+                    std::fprintf(stderr,
+                        "linuxity: guest faulted at 0x%llx (SIGSEGV)%s\n",
+                        (unsigned long long)at,
+                        trap.fault_was_protection() ? " [protection]" : "");
+                    return 139;
+                }
                 case WhpStop::illegal:
                     std::fprintf(stderr, "linuxity: guest executed an illegal "
                                          "instruction (SIGILL)\n");
                     return 132;
-                case WhpStop::fault:
-                    std::fprintf(stderr, "linuxity: guest faulted at 0x%llx "
-                                         "(SIGSEGV)\n",
-                                 (unsigned long long)trap.fault_addr());
-                    return 139;
                 default:
-                    std::fprintf(stderr, "linuxity: guest stopped "
-                                         "unexpectedly (reason %d)\n",
-                                 int(trap.stop_reason()));
+                    // Surface the RAW WHP exit reason, not just our bucket:
+                    // "reason 5" is useless when debugging, whereas
+                    // MemoryAccess vs UnrecoverableException vs
+                    // InvalidVpRegisterValue each point at a different bug.
+                    std::fprintf(stderr,
+                        "linuxity: guest stopped unexpectedly "
+                        "(WHP exit reason 0x%x, rip=0x%llx)\n",
+                        unsigned(cpu.last_exit().ExitReason),
+                        (unsigned long long)cpu.last_exit().VpContext.Rip);
                     return 1;
             }
         }
         if (!*got) break;   // exited
 
-        const std::uint64_t nr = f.regs.nr;
-        std::int64_t ret = -win32::LNOSYS;
-
-        switch (nr) {
-            case 60:    // exit
-            case 231: { // exit_group
-                return int(f.regs.arg[0] & 0xff);
-            }
-            case 1: {   // write(fd, buf, len) -- stdout/stderr only
-                const std::uint64_t fd = f.regs.arg[0];
-                const std::uint64_t buf = f.regs.arg[1];
-                const std::uint64_t len = f.regs.arg[2];
-                if (fd != 1 && fd != 2) { ret = -win32::LBADF; break; }
-                std::vector<std::byte> tmp(static_cast<std::size_t>(len));
-                const std::size_t n = vm.mem().copy_in(buf, tmp);
-                if (n == 0 && len != 0) { ret = -win32::LFAULT; break; }
-                std::fwrite(tmp.data(), 1, n, fd == 1 ? stdout : stderr);
-                ret = std::int64_t(n);
-                break;
-            }
-            case 20: {  // writev(fd, iov, cnt)
-                const std::uint64_t fd = f.regs.arg[0];
-                if (fd != 1 && fd != 2) { ret = -win32::LBADF; break; }
-                std::int64_t total = 0;
-                for (std::uint64_t k = 0; k < f.regs.arg[2]; ++k) {
-                    GuestIovec iov{};
-                    if (!vm.mem().get(f.regs.arg[1] + k * sizeof(GuestIovec), iov))
-                        break;
-                    if (iov.len == 0) continue;
-                    std::vector<std::byte> tmp(static_cast<std::size_t>(iov.len));
-                    const std::size_t n = vm.mem().copy_in(iov.base, tmp);
-                    std::fwrite(tmp.data(), 1, n, fd == 1 ? stdout : stderr);
-                    total += std::int64_t(n);
-                }
-                ret = total;
-                break;
-            }
-            case 39:  ret = 1; break;            // getpid
-            case 102: case 104: case 107: case 108:
-                ret = 0; break;                  // getuid/getgid/geteuid/getegid
-            case 158: ret = -win32::LINVAL; break;   // arch_prctl
-            default:
-                std::fprintf(stderr,
-                    "linuxity: unimplemented syscall %llu "
-                    "(needs the Win32 fd/mm layer)\n",
-                    (unsigned long long)nr);
-                ret = -win32::LNOSYS;
-                break;
+        // Every syscall goes through the emulation layer. There is no host
+        // Linux kernel to forward to, so this IS the kernel for the guest.
+        const SysResult r = sys.service(f);
+        if (r.exited) {
+            std::fflush(stdout);
+            return r.exit_status;
         }
+        if (verbose && r.ret == -win32::LNOSYS)
+            std::fprintf(stderr, "linuxity: ENOSYS for syscall %llu\n",
+                         (unsigned long long)f.regs.nr);
 
-        if (auto st = trap.resume(ret); !st) {
+        if (auto st = trap.resume(r.ret); !st) {
             std::fprintf(stderr, "linuxity: could not resume the guest\n");
             return 1;
         }
     }
 
+    std::fflush(stdout);
     return trap.exit_code();
 }

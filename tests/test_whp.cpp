@@ -406,7 +406,17 @@ static void test_live_partition() {
     // assertion is the whole backend working end to end: long mode entered at
     // CPL 3, page tables correct, SCE clear, #UD routed to the host, register
     // snapshot decoded.
+    // Nothing is mapped until asked for: the partition starts with an empty
+    // page table so that a mapping exists if and only if something requested
+    // it (which is what makes an unmapped access a real fault). So map the
+    // code and stack explicitly, exactly as the ELF loader does.
     const std::uint64_t code_gva = 0x40'0000;
+    const std::uint64_t stack_gva = 0x80'0000;
+    CHECK(m.map_pages(code_gva, kPageSize, /*writable=*/true,
+                      /*executable=*/true).has_value());
+    CHECK(m.map_pages(stack_gva - kPageSize, kPageSize, /*writable=*/true,
+                      /*executable=*/false).has_value());
+
     const unsigned char prog[]{
         0xb8, 0x3c, 0x00, 0x00, 0x00,       // mov eax, 60
         0xbf, 0x07, 0x00, 0x00, 0x00,       // mov edi, 7
@@ -417,7 +427,6 @@ static void test_live_partition() {
     if (dst.empty()) return;
     std::memcpy(dst.data(), prog, sizeof(prog));
 
-    const std::uint64_t stack_gva = 0x80'0000;
     WhpTrap trap{m, cpu};
     auto start = trap.start(lx::UAddr(code_gva), lx::UAddr(stack_gva));
     if (!start) {

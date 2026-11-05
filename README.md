@@ -127,21 +127,40 @@ linuxity WHP backend check
   syscall trap      : nr=60 arg0=42  (guest ran natively, #UD routed here)
 ```
 
-**Statically linked x86-64 Linux binaries run today.** `tools/make_test_elf.py`
-writes a real static ELF (no cross-toolchain needed) if you want to try it:
+**Statically linked x86-64 Linux binaries run today**, with a working syscall
+surface: file I/O through a real fd table, `mmap`/`brk` with lazy
+(overcommit) page allocation, and TLS via `arch_prctl`.
+`tools/` has two generators that need no cross-toolchain:
 
 ```bat
 python tools\make_test_elf.py hello.elf
 linuxity.exe hello.elf one two
 :: -> hello from a real linux elf      (guest write(2), serviced by linuxity)
 :: -> exit code 3                      (the guest read argc off its own stack)
+
+python tools\make_syscall_elf.py syscalls.elf
+linuxity.exe --root myroot /syscalls.elf
+:: -> [1] uname: Linux
+:: -> [2] brk grew and heap write OK          (lazy page filled on #PF)
+:: -> [3] mmap 1MiB + page writes OK          (overcommit, fault-filled)
+:: -> [4] file read: ...                      (fd table + rootfs paths)
+:: -> [5] TLS via %fs OK                      (arch_prctl ARCH_SET_FS)
 ```
 
-Status: CPU, memory, registers, the trap loop, the ELF loader and the SysV
-startup stack are implemented and tested. Still outstanding before a full
-rootfs shell: the Win32 fd table (so `open`/`read` work on real files), the
-`mmap`/`brk` service, loading `ld.so` for **dynamically** linked programs,
-and guest fork/exec as NT processes — see `doc/ROADMAP.md` (M6).
+How the guest's own page faults get handled is worth knowing, because it is
+the second half of the interception trick: WHP's `MemoryAccess` exit only
+reports *nested* paging failures, so a fault in the guest's own page tables
+would escalate to a triple fault in a guest that has no IDT. So `#PF`
+(vector 14) is routed to the host through the same `ExceptionExitBitmap` as
+`#UD` — **linuxity is the guest's page-fault handler**, which is what makes
+lazy `mmap` and a growing heap implementable without a guest kernel.
+
+Status: CPU, memory, registers, the trap loop, the ELF loader, the SysV
+startup stack, the fd table, the memory manager and ~70 syscalls are
+implemented and tested. Still outstanding before a full rootfs shell:
+loading `ld.so` is wired up but **dynamically linked binaries need a real
+rootfs to be verified**, and threads, signals, sockets and fork/exec are not
+implemented — see `doc/ROADMAP.md` (M6).
 
 Requires a C++23 compiler (`std::expected`, concepts). Tested with GCC 16.
 Native execution uses a `ptrace` trap backend on Linux/x86-64: the guest runs

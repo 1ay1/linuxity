@@ -123,10 +123,28 @@ public:
             return err(Errno::enosys);
         }
 
-        // ...and specifically vector 6, #UD: our syscall trap.
+        // ...and specifically the two vectors this backend lives on:
+        //
+        //   #UD (6)  our syscall trap (EFER.SCE=0 makes `syscall` raise it).
+        //   #PF (14) the guest's own page faults.
+        //
+        // #PF needs explaining. WHvRunVpExitReasonMemoryAccess reports only
+        // NESTED paging failures -- an access whose guest-PHYSICAL page is
+        // not mapped into the partition. A fault in the GUEST'S OWN page
+        // tables (our tables) is an architectural #PF that the guest is
+        // expected to handle; since this guest has no kernel, no IDT and no
+        // handler, it would escalate #PF -> #DF -> triple fault and come back
+        // as WHvRunVpExitReasonUnrecoverableException with no fault address.
+        //
+        // Routing vector 14 to the host instead makes US the page-fault
+        // handler, which is exactly what a kernel-less design needs: it is
+        // what turns "lazy mmap" and "growing heap" into something
+        // implementable, and it gives a real SIGSEGV a precise address
+        // instead of an unrecoverable exception.
         WHV_PARTITION_PROPERTY bitmap{};
         bitmap.ExceptionExitBitmap =
-            1ull << unsigned(WHvX64ExceptionTypeInvalidOpcodeFault);
+            (1ull << unsigned(WHvX64ExceptionTypeInvalidOpcodeFault)) |
+            (1ull << unsigned(WHvX64ExceptionTypePageFault));
         if (FAILED(whp().SetPartitionProperty(
                 part_, WHvPartitionPropertyCodeExceptionExitBitmap,
                 &bitmap, sizeof(bitmap)))) {
@@ -199,38 +217,75 @@ public:
         return ok();
     }
 
+    // Map ONE page at an arbitrary guest-physical frame. Unlike map_pages,
+    // which identity-maps, this is what the memory manager needs: mmap hands
+    // out a VA from the arena and backs it with whatever frame the allocator
+    // produced, so GVA != GPA there.
+    [[nodiscard]] bool map_page_at(std::uint64_t gva, std::uint64_t gpa,
+                                   bool writable, bool executable) {
+        return map_one(gva & ~kPageMask, gpa & ~kPageMask, writable,
+                       executable).has_value();
+    }
+
+    // Drop a page's PTE. The frame itself is the caller's to recycle -- this
+    // only removes the guest's access to it.
+    void unmap_page(std::uint64_t gva) {
+        std::uint64_t table = kPml4Gpa;
+        for (int level = 4; level >= 2; --level) {
+            const unsigned shift = unsigned(12 + 9 * (level - 1));
+            const std::uint64_t idx = (gva >> shift) & 0x1ff;
+            std::uint64_t e = 0;
+            if (!read_entry(table, idx, e)) return;
+            if (!(e & kPtePresent)) return;
+            if (e & kPtePageSize) {
+                // A large leaf covers it; split so we can clear just this
+                // 4KiB page rather than unmapping 2MiB of unrelated memory.
+                if (!split_large_leaf(table, idx, e, shift)) return;
+                if (!read_entry(table, idx, e)) return;
+            }
+            table = e & kPteAddrMask;
+        }
+        (void)write_entry(table, (gva >> 12) & 0x1ff, 0);
+    }
+
+    // The page-table arena: a FIXED region at the top of guest RAM that the
+    // table bump allocator draws from, growing down.
+    //
+    // Fixed rather than "wherever the allocator has reached", because the
+    // frame allocator must reserve it ONCE at init. If the boundary moved as
+    // tables were allocated, a frame handed out early could later be
+    // overwritten by a page table -- silently corrupting the guest's address
+    // space in a way that surfaces as an impossible fault much later.
+    // 2 MiB of tables maps far more guest memory than this backend supports.
+    static constexpr std::uint64_t kTableArenaSize = 2ull << 20;
+
+    [[nodiscard]] std::uint64_t table_arena_base() const noexcept {
+        return ram_bytes_ > kTableArenaSize ? ram_bytes_ - kTableArenaSize : 0;
+    }
+
 private:
-    // Build the minimal 4-level table set plus a GDT. One PML4 entry -> one
-    // PDPT -> one PD of 2MiB leaves covering the low 1GiB. Guest RAM beyond
-    // 1GiB would need more PDs; `map_one` grows the tree on demand for
-    // anything the loader maps explicitly, and this bootstrap covers the
-    // identity window the loader places images in.
+    // Build the minimal page-table root plus a GDT.
+    // Build the root page table and a GDT. Deliberately EMPTY of leaf
+    // mappings: nothing is mapped until the loader or the memory manager asks
+    // for it, page by page, with the permissions the ELF or mmap specified.
+    //
+    // An earlier version pre-mapped the low 1GiB as 2MiB RWX leaves "so the
+    // loader can write the image". That was wrong twice over:
+    //   * Every guest page in that window was writable AND executable, so
+    //     W^X was unenforceable below 1GiB -- including the stack, which a
+    //     blanket window made executable.
+    //   * For RAM <= 1GiB everything was already present, so map_one had
+    //     nothing to do and NO page ever faulted -- which silently disabled
+    //     the lazy-allocation path that mmap overcommit depends on.
+    // Starting empty means a mapping exists if and only if someone asked for
+    // it, which is also what makes a missing mapping a real SIGSEGV.
     [[nodiscard]] Status build_tables() {
         auto zero = [&](std::uint64_t gpa) {
             auto p = ram_.at_table(gpa, kPageSize);
             if (!p.empty()) std::memset(p.data(), 0, kPageSize);
             return !p.empty();
         };
-        if (!zero(kPml4Gpa) || !zero(kPdptGpa) || !zero(kPdGpa) || !zero(kGdtGpa))
-            return err(Errno::enomem);
-
-        // PML4[0] -> PDPT, PDPT[0] -> PD. User-accessible and writable; the
-        // leaf entries carry the real permissions.
-        if (!write_entry(kPml4Gpa, 0, kPdptGpa | kPtePresent | kPteWrite | kPteUser))
-            return err(Errno::enomem);
-        if (!write_entry(kPdptGpa, 0, kPdGpa | kPtePresent | kPteWrite | kPteUser))
-            return err(Errno::enomem);
-
-        // PD: 2MiB leaves identity-mapping the low 1GiB, skipping entry 0 so
-        // the table/GDT region below kGuestFloor is NOT mapped for the guest.
-        // Writable + user; NX is left clear because guest text must execute
-        // and per-segment W^X is enforced by map_one on 4KiB pages.
-        for (std::uint64_t i = 1; i < 512; ++i) {
-            const std::uint64_t leaf = (i << 21) | kPtePresent | kPteWrite |
-                                       kPteUser | kPtePageSize;
-            if (!write_entry(kPdGpa, i, leaf)) return err(Errno::enomem);
-        }
-
+        if (!zero(kPml4Gpa) || !zero(kGdtGpa)) return err(Errno::enomem);
         build_gdt();
         return ok();
     }
@@ -340,16 +395,14 @@ private:
                                                            : err(Errno::efault);
     }
 
-    // Page-table pages come from a bump allocator at the TOP of guest RAM,
-    // growing down. They are above kGuestFloor, so in principle a guest
-    // pointer could reach them -- but they are never MAPPED into the guest's
-    // virtual space, so the guest has no virtual address for them. (The
-    // identity 2MiB window stops at 1GiB; the allocator starts above it for
-    // any RAM larger than that, and below it we only hand out pages the
-    // bootstrap window already covers read-write for the tables' own use.)
+    // Page-table pages come from a bump allocator inside the FIXED arena at
+    // the top of guest RAM, growing down. They are never mapped into the
+    // guest's virtual space, so the guest has no address for them, and the
+    // frame allocator reserves the whole arena so it can never hand one out.
     [[nodiscard]] std::uint64_t alloc_table() {
         if (table_next_ == 0) table_next_ = ram_bytes_;
-        if (table_next_ < kGuestFloor + kPageSize) return 0;
+        const std::uint64_t floor = table_arena_base();
+        if (table_next_ < floor + kPageSize) return 0;   // arena exhausted
         table_next_ -= kPageSize;
         auto p = ram_.at_table(table_next_, kPageSize);
         if (p.empty()) return 0;
@@ -502,6 +555,19 @@ public:
     // of hv_vcpus_exit on Darwin.
     void kick() const noexcept {
         if (live_) (void)whp().CancelRunVirtualProcessor(part_, index_, 0);
+    }
+
+    // CR2 holds the linear address of the last page fault, written by the
+    // CPU when #PF is raised. Needed because the guest has no handler to read
+    // it -- we are the handler.
+    [[nodiscard]] bool read_cr2(std::uint64_t& out) const noexcept {
+        if (!live_) return false;
+        const WHV_REGISTER_NAME n[1]{WHvX64RegisterCr2};
+        WHV_REGISTER_VALUE v[1]{};
+        if (FAILED(whp().GetVirtualProcessorRegisters(part_, index_, n, 1, v)))
+            return false;
+        out = v[0].Reg64;
+        return true;
     }
 
     [[nodiscard]] std::uint32_t index() const noexcept { return index_; }

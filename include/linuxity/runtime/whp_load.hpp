@@ -67,18 +67,31 @@ struct WhpLayout {
         return 0x40'0000;              // 4MiB
     }
 
+    // The top of usable guest RAM: everything above this is the page-table
+    // arena, which the guest must never see. The stack hangs just below it.
+    [[nodiscard]] static constexpr std::uint64_t usable_top(std::uint64_t ram) noexcept {
+        const std::uint64_t arena = WhpMachine::kTableArenaSize;
+        return ram > arena ? ram - arena : 0;
+    }
+
     // The dynamic linker is placed in the upper half of the region between
     // the image and the stack, so neither can grow into the other on any
     // RAM size. (ld.so is ~2MiB mapped; the gap below it is the guest's mmap
     // and brk arena.)
     [[nodiscard]] static constexpr std::uint64_t interp_base(std::uint64_t ram) noexcept {
-        const std::uint64_t stack_bot = ram - stack_guard - stack_size;
+        const std::uint64_t stack_bot = stack_top(ram) - stack_size;
         const std::uint64_t base = stack_bot - (16ull << 20);
         return base & ~(kPageSize - 1);
     }
 
     [[nodiscard]] static constexpr std::uint64_t stack_top(std::uint64_t ram) noexcept {
-        return ram - stack_guard;
+        return usable_top(ram) - stack_guard;
+    }
+
+    // The ceiling of the mmap arena: below the stack, so a growing mmap
+    // region and the stack cannot collide.
+    [[nodiscard]] static constexpr std::uint64_t mmap_top(std::uint64_t ram) noexcept {
+        return (stack_top(ram) - stack_size - (1ull << 20)) & ~(kPageSize - 1);
     }
 
     // The smallest guest RAM this layout is coherent for: the image needs
@@ -263,10 +276,11 @@ struct WhpImage {
         std::uint64_t at_base = 0,
         const std::string& execfn = {}) {
     const std::uint64_t ram = vm.ram().size();
-    if (ram <= WhpLayout::stack_guard + WhpLayout::stack_size)
+    if (ram <= WhpLayout::stack_guard + WhpLayout::stack_size +
+                   WhpMachine::kTableArenaSize)
         return err<std::uint64_t>(Errno::enomem);
 
-    const std::uint64_t stack_top = ram - WhpLayout::stack_guard;
+    const std::uint64_t stack_top = WhpLayout::stack_top(ram);
     const std::uint64_t stack_bot = stack_top - WhpLayout::stack_size;
 
     // The stack must be mapped for the guest: writable, never executable.
