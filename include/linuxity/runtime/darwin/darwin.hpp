@@ -17,6 +17,7 @@
 #if defined(__APPLE__)
 
 #include "linuxity/abi/wire/dirent64.hpp"
+#include "linuxity/abi/wire/open_flags.hpp"
 #include "linuxity/abi/wire/stat.hpp"
 
 #include <cerrno>
@@ -32,14 +33,11 @@ namespace lx::runtime::darwin {
 
 // -- open(2) flags ---------------------------------------------------------
 // Linux aarch64/x86-64 asm-generic values (they agree on both).
-enum class LinuxOpen : std::uint64_t {
-    rdonly = 0, wronly = 1, rdwr = 2, creat = 0100, excl = 0200,
-    noctty = 0400, trunc = 01000, append = 02000, nonblock = 04000,
-    directory = 0200000, nofollow = 0400000, cloexec = 02000000,
-    // Linux-only hints with no Darwin equivalent; dropping them is safe
-    // (they affect caching/atime, never the visible result).
-    directio = 040000, noatime = 01000000, path = 010000000, tmpfile = 020200000,
-};
+// The guest's open(2) flags. Defined ONCE in abi/wire/open_flags.hpp -- these
+// are the numbers the guest's libc puts in a register, and they are NOT
+// Darwin's O_* values (O_CREAT is 0x200 here, 0100 there), which is exactly
+// why open_flags() below has to translate.
+using LinuxOpen = abi::wire::OpenFlag;
 
 [[nodiscard]] inline int open_flags(std::uint64_t lf) noexcept {
     auto bit = [lf](LinuxOpen f) {

@@ -34,6 +34,7 @@
 #include <windows.h>
 
 #include "linuxity/abi/result.hpp"
+#include "linuxity/abi/wire/open_flags.hpp"
 #include "linuxity/abi/wire/stat.hpp"
 
 #include <cstddef>
@@ -46,31 +47,17 @@
 namespace lx::runtime::win32 {
 
 // -- open(2) flags ---------------------------------------------------------
-// Linux x86-64 (asm-generic) values.
-enum class LinuxOpen : std::uint64_t {
-    rdonly    = 0,
-    wronly    = 1,
-    rdwr      = 2,
-    creat     = 0x40,
-    excl      = 0x80,
-    noctty    = 0x100,
-    trunc     = 0x200,
-    append    = 0x400,
-    nonblock  = 0x800,
-    directory = 0x1'0000,
-    nofollow  = 0x2'0000,
-    cloexec   = 0x8'0000,
-    path      = 0x20'0000,
-};
-
-[[nodiscard]] constexpr bool has(std::uint64_t flags, LinuxOpen f) noexcept {
-    return (flags & std::uint64_t(f)) != 0;
-}
+// The guest's open(2) flags. Defined ONCE in abi/wire/open_flags.hpp -- these
+// are the numbers the guest's libc puts in a register. Win32 has no O_* bits
+// at all, which is why WinOpen below translates them into CreateFileW's four
+// orthogonal arguments.
+using LinuxOpen = abi::wire::OpenFlag;
+using abi::wire::has;
 
 // The access mode is the low two bits, not a flag -- testing it with `has`
 // is a classic bug (O_RDONLY is 0, so `has(flags, rdonly)` is always false).
 [[nodiscard]] constexpr std::uint64_t access_mode(std::uint64_t flags) noexcept {
-    return flags & 3;
+    return flags & abi::wire::kAccessMask;
 }
 
 // How a Linux open() maps onto CreateFileW's four orthogonal arguments.

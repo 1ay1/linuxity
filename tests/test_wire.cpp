@@ -1,6 +1,7 @@
 // The abi/wire layer: kernel ABI structs encoded in exactly one place.
 // kernel ABI, so it holds on every host and needs no VM to check.
 #include "linuxity/abi/wire/dirent64.hpp"
+#include "linuxity/abi/wire/open_flags.hpp"
 #include "linuxity/abi/wire/stat.hpp"
 
 #include <cstdio>
@@ -179,6 +180,44 @@ int main() {
         check(wire::kStatx.mode == 28, "statx stx_mode @28");
         check(wire::kStatx.mode_width == 2, "statx mode is u16, not u32");
         check(wire::kStatX86_64.mode_width == 4, "stat mode is u32");
+    }
+
+    // -- open(2) flags, the third thing abi/wire owns ----------------------
+    // These decide whether a path is opened FOR WRITE, which selects the
+    // copy-on-write branch in the overlay. Getting one wrong silently writes
+    // into the pristine lower layer. Values verified against this host's own
+    // <fcntl.h>, then pinned here.
+    {
+        using namespace lx::abi::wire;
+        check(bits(OpenFlag::creat) == 0100, "O_CREAT is 0100");
+        check(bits(OpenFlag::excl) == 0200, "O_EXCL is 0200");
+        check(bits(OpenFlag::trunc) == 01000, "O_TRUNC is 01000");
+        check(bits(OpenFlag::directory) == 0200000, "O_DIRECTORY is 0200000");
+        check(bits(OpenFlag::cloexec) == 02000000, "O_CLOEXEC is 02000000");
+        check(bits(OpenFlag::tmpfile) == 020200000, "O_TMPFILE is 020200000");
+
+        // The access mode is the low two bits, NOT a bitmask: O_RDONLY is 0,
+        // so `flags & O_RDONLY` is always false. This is the classic bug.
+        check(bits(OpenFlag::rdonly) == 0, "O_RDONLY is 0, not a bit");
+        check(!writable(bits(OpenFlag::rdonly)), "a plain read is not a write");
+        check(writable(bits(OpenFlag::wronly)), "O_WRONLY is a write");
+        check(writable(bits(OpenFlag::rdwr)), "O_RDWR is a write");
+
+        // A read-only open that CREATES or TRUNCATES still mutates the tree,
+        // so it must take the copy-up path.
+        check(writable(bits(OpenFlag::rdonly) | bits(OpenFlag::creat)),
+              "O_RDONLY|O_CREAT must count as a write");
+        check(writable(bits(OpenFlag::rdonly) | bits(OpenFlag::trunc)),
+              "O_RDONLY|O_TRUNC must count as a write");
+        // ...but these must NOT make it writable, or every open copies up.
+        check(!writable(bits(OpenFlag::cloexec)), "O_CLOEXEC is not a write");
+        check(!writable(bits(OpenFlag::directory)), "O_DIRECTORY is not a write");
+        check(!writable(bits(OpenFlag::nonblock)), "O_NONBLOCK is not a write");
+
+        // O_TMPFILE contains O_DIRECTORY, so a "is this a directory open"
+        // test must exclude it or it treats a tmpfile create as a dir open.
+        check((bits(OpenFlag::tmpfile) & bits(OpenFlag::directory)) != 0,
+              "O_TMPFILE contains O_DIRECTORY (a real trap)");
     }
 
     if (failures == 0) std::puts("wire: all checks passed");

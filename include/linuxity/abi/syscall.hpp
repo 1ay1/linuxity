@@ -19,6 +19,7 @@
 #include "linuxity/kernel/subsystem.hpp"
 #include "linuxity/abi/outcome.hpp"
 #include "linuxity/abi/wire/dirent64.hpp"
+#include "linuxity/abi/wire/open_flags.hpp"
 #include "linuxity/abi/wire/stat.hpp"
 #include "linuxity/loader/interp.hpp"
 
@@ -739,10 +740,12 @@ private:
         std::string abs = resolve_arg(r, path_arg, at);
         // Write intent (O_WRONLY / O_RDWR / O_CREAT / O_TRUNC) selects the
         // overlay upper layer.
-        constexpr std::uint64_t kWrOnly = 1, kRdWr = 2, kCreat = 0100,
-                                kTrunc = 01000, kExcl = 0200;
-        bool for_write = (flags & 3) == kWrOnly || (flags & 3) == kRdWr ||
-                         (flags & kCreat) || (flags & kTrunc);
+        // Guest open flags come from abi/wire/open_flags.hpp -- the one
+        // definition, shared with both backends. `writable()` is the test
+        // that selects the copy-on-write branch: a create or truncate mutates
+        // the filesystem even when the access mode is O_RDONLY, and the low
+        // two bits are a MODE (O_RDONLY == 0), not a bit you can mask for.
+        const bool for_write = wire::writable(flags);
         // WriteIntent for the overlay copy-up decision. copy_leaf (the
         // default) copies the read-only lower file UP into the writable upper
         // before returning, so an in-place edit (O_WRONLY without O_TRUNC)
@@ -757,7 +760,9 @@ private:
         // whiteout). A lower-only file thus reads as replaced, not duplicated.
         Wi open_wi = Wi::copy_leaf;
         if (for_write &&
-            (((flags & kCreat) && (flags & kExcl)) || (flags & kTrunc)))
+            ((wire::has(flags, wire::OpenFlag::creat) &&
+              wire::has(flags, wire::OpenFlag::excl)) ||
+             wire::has(flags, wire::OpenFlag::trunc)))
             open_wi = Wi::parents_only;
         auto pc = k_.files().classify(abs, for_write, /*follow=*/true, open_wi);
         if (pc.realm == kernel::Realm2::host_backed) {
