@@ -47,6 +47,7 @@
 #if defined(__APPLE__) && defined(__aarch64__)
 
 #include "linuxity/host/entropy.hpp"
+#include "linuxity/abi/identity.hpp"
 #include "linuxity/abi/result.hpp"
 #include "linuxity/abi/syscall.hpp"
 #include "linuxity/abi/wire/at_flags.hpp"
@@ -138,6 +139,12 @@ public:
     //    and /proc/self answer with this process's GUEST pid.
     struct TaskIds { std::int32_t pid, tid, ppid; };
     [[nodiscard]] TaskIds current_ids() const noexcept {
+        return {task_.tid, task_.tid, parent_};
+    }
+    // The same facts in abi/identity.hpp's shape, so the shared answers can
+    // be used by this backend's own service routine too (not just through
+    // the portable dispatcher's current_ids() probe).
+    [[nodiscard]] abi::TaskIdentity task_identity() const noexcept {
         return {task_.tid, task_.tid, parent_};
     }
     // /proc/<pid>/exe for ANY pid in the tree (shared table, set on exec).
@@ -1539,8 +1546,16 @@ private:
                                       static_cast<std::int32_t>(tg ? a2 : a1));
             }
 
-            case S::getpid: case S::gettid: return task_.tid;
-            case S::getppid:                 return parent_;
+            // Identity and credentials come from abi/identity.hpp, shared
+            // with the portable dispatcher -- these are pure policy over
+            // state we already own, and three separate copies was three
+            // chances to disagree (Windows hardcoded pid 1 for everything).
+            case S::getpid: case S::gettid: case S::getppid:
+            case S::getuid: case S::geteuid:
+            case S::getgid: case S::getegid:
+                if (auto a = abi::identity_answer(sc, task_identity()))
+                    return *a;
+                return -38;                                  // ENOSYS
 
             // -- Process groups and sessions. The core models a flat world
             //    (every task its own leader), which is wrong for anything

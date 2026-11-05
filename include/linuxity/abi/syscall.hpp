@@ -17,6 +17,7 @@
 #include "linuxity/kernel/machine.hpp"
 #include "linuxity/kernel/process_table.hpp"
 #include "linuxity/kernel/subsystem.hpp"
+#include "linuxity/abi/identity.hpp"
 #include "linuxity/abi/outcome.hpp"
 #include "linuxity/abi/wire/at_flags.hpp"
 #include "linuxity/abi/wire/dirent64.hpp"
@@ -143,12 +144,20 @@ public:
             //    guest pid/tid/ppid (from the trap's live task map) so every
             //    process sees a coherent identity, not a fixed "pid 1". A
             //    backend without the identity bridge falls back to init.
-            case Sysno::getpid:  return val(ids().pid);
-            case Sysno::gettid:  return val(ids().tid);
-            case Sysno::getppid: return val(ids().ppid);
+            //
+            //    The ANSWERS live in abi/identity.hpp, shared with the
+            //    kernel-less backends: these are pure policy over state we
+            //    already own, so three implementations was three chances to
+            //    be wrong -- and Windows took one, hardcoding pid 1 for every
+            //    process.
+            case Sysno::getpid:  case Sysno::gettid:  case Sysno::getppid:
             case Sysno::getuid:  case Sysno::geteuid:
-            case Sysno::getgid:  case Sysno::getegid:
-                return val(0);
+            case Sysno::getgid:  case Sysno::getegid: {
+                const auto i = ids();
+                if (auto a = identity_answer(sc, {i.pid, i.tid, i.ppid}))
+                    return val(*a);
+                return fwd();
+            }
 
             // -- getresuid(ruid*,euid*,suid*) / getresgid(rgid*,egid*,sgid*):
             //    bash and sudo read these at startup to populate $UID/$EUID.

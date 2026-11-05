@@ -166,11 +166,18 @@ done
 check_include() {   # <symbol-regex> <required-header>
     for f in $(grep -rlE "$1" include/linuxity src --include=*.hpp --include=*.cpp 2>/dev/null); do
         case "$f" in *"$2") continue;; esac      # the definition itself
-        grep -q "$2" "$f" || note "$f uses ${3:-$1} without including $2"
+        # Must be a real #include line. A plain `grep -q "$2"` also matched a
+        # COMMENT naming the header -- which is exactly how darwin/trap.hpp
+        # passed this check while missing the include, since its comment says
+        # "come from abi/identity.hpp".
+        grep -qE "^[[:space:]]*#[[:space:]]*include.*$2" "$f" \
+            || note "$f uses ${3:-$1} without including $2"
     done
 }
 
 check_include 'host::random_bytes'            'host/entropy.hpp'    'host::random_bytes'
+check_include 'abi::(identity_answer|TaskIdentity|flat_session_answer)' \
+              'abi/identity.hpp'    'a shared identity answer'
 check_include 'abi::wire::(Timespec|Timeval|Itimerval|Itimerspec|kNsecPerSec|to_millis_ceil)' \
               'abi/wire/time.hpp'   'a wire time type'
 check_include 'abi::wire::(Iovec|kIovMax)'    'abi/wire/iovec.hpp'  'wire::Iovec'

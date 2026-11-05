@@ -23,7 +23,9 @@
 
 #if defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__))
 
+#include "linuxity/abi/identity.hpp"
 #include "linuxity/abi/wire/at_flags.hpp"
+#include "linuxity/abi/wire/dirent64.hpp"
 #include "linuxity/abi/wire/open_flags.hpp"
 #include "linuxity/abi/wire/path.hpp"
 #include "linuxity/runtime/windows/fd.hpp"
@@ -435,14 +437,27 @@ public:
             }
 
             // -- identity (virtualized: the guest believes it is root) -----
+            //
+            // The ANSWERS come from abi/identity.hpp, shared with the portable
+            // dispatcher and the HVF backend, so the three cannot drift.
+            //
+            // The ids themselves really are {1,1,0} here, and that is correct
+            // rather than a stub: this backend implements no clone/fork and
+            // has no task table, so there is exactly one guest process. If it
+            // ever grows one, THIS is the line that must start reporting real
+            // per-task ids -- the shared helper already does, so only the
+            // identity source changes, not the answers.
             case SYS_getuid: case SYS_geteuid:
             case SYS_getgid: case SYS_getegid:
-                return ret(0);
+            case SYS_getpid: case SYS_getppid: case SYS_gettid:
+                if (auto a = abi::identity_answer(
+                        abi::decode(abi::Arch::x86_64, nr),
+                        abi::TaskIdentity{1, 1, 0}))
+                    return ret(*a);
+                return ret(-win32::LNOSYS);
             case SYS_setuid: case SYS_setgid:
                 return ret(0);               // compatibility shim: say yes
-            case SYS_getpid: case SYS_getppid: case SYS_getpgrp:
-                return ret(1);
-            case SYS_gettid:
+            case SYS_getpgrp:
                 return ret(1);
             case SYS_setpgid: case SYS_setsid:
                 return ret(0);
