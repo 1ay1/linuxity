@@ -16,6 +16,8 @@
 //   * mount(...)           -> accepted as a satisfied no-op (returns 0).
 //
 // Skips gracefully off Linux/x86-64, without gcc/static glibc, or w/o ptrace.
+#include "guest_harness.hpp"
+
 #include "linuxity/host/posix_host.hpp"
 #include "linuxity/kernel/kernel.hpp"
 #include "linuxity/runtime/linux/ptrace_trap.hpp"
@@ -81,32 +83,18 @@ int main() {
     std::puts("run_untranslated: skipped (needs Linux/x86-64 host)");
     return 0;
 #else
-    const std::string root = "/tmp/lx_untrans_test";
-    std::system(("rm -rf " + root + " && mkdir -p " + root + "/bin " + root + "/etc " + root + "/proc").c_str());
+    const auto tree = lxtest::make_tree("untrans", /*overlay=*/false,
+                                        "mkdir -p /tmp/lx_untrans_root/etc /tmp/lx_untrans_root/proc");
+    const std::string root = tree.root;
 
     { std::FILE* f = std::fopen((root + "/etc/marker").c_str(), "w");
       if (!f) { std::puts("run_untranslated: skipped (no /tmp)"); return 0; }
       std::fputs("rootfs\n", f); std::fclose(f); }
 
-    { std::FILE* f = std::fopen("/tmp/lx_untrans_src.c", "w");
-      if (!f) { std::puts("run_untranslated: skipped (no /tmp)"); return 0; }
-      std::fputs(kSrc, f); std::fclose(f); }
-    int rc = std::system(("gcc -static -O2 -o " + root +
-                          "/bin/prog /tmp/lx_untrans_src.c 2>/dev/null").c_str());
-    if (rc != 0) { std::puts("run_untranslated: skipped (no static glibc / gcc / openat2 headers)"); std::system(("rm -rf " + root).c_str()); return 0; }
+    if (!lxtest::compile_guest("run_untranslated", tree, kSrc)) return 0;
 
-    host::PosixHost hw;
-    kernel::Kernel<host::PosixHost> k{hw};
-    k.files().mount_host("/", root);
-    k.files().mount_virtual("/proc", vfs::make_procfs(k.procs(), k.machine()));
-
-    std::string exec = root + "/bin/prog";
-    runtime::PtraceTrap trap{exec, {"/bin/prog"}, {}, {}};
-    runtime::Cpu cpu{trap, k, trap, abi::Arch::x86_64};
-
-    auto r = cpu.run(uaddr(0), uaddr(0));
-    std::system(("rm -rf " + root).c_str());
-    std::remove("/tmp/lx_untrans_src.c");
+    auto r = lxtest::run_guest(tree);
+    lxtest::remove_tree(tree);
 
     if (!r) { std::puts("run_untranslated: skipped (ptrace unavailable)"); return 0; }
     switch (*r) {

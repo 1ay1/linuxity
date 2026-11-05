@@ -5,6 +5,8 @@
 // (owned on disk by the running non-root user) and asserts the guest sees
 // uid==0 && gid==0 — proving the post-redirect scrub. Skips gracefully off
 // Linux/x86-64, without gcc, or without ptrace.
+#include "guest_harness.hpp"
+
 #include "linuxity/host/posix_host.hpp"
 #include "linuxity/kernel/kernel.hpp"
 #include "linuxity/runtime/linux/ptrace_trap.hpp"
@@ -31,8 +33,9 @@ int main() {
     std::puts("run_stat_owner: skipped (needs Linux/x86-64 host)");
     return 0;
 #else
-    const std::string root = "/tmp/lx_statowner_test";
-    std::system(("rm -rf " + root + " && mkdir -p " + root + "/bin " + root + "/etc").c_str());
+    const auto tree = lxtest::make_tree("statowner", /*overlay=*/false,
+                                        "mkdir -p /tmp/lx_statowner_root/etc");
+    const std::string root = tree.root;
 
     { std::FILE* f = std::fopen((root + "/etc/marker").c_str(), "w");
       if (!f) { std::puts("run_stat_owner: skipped (no /tmp)"); return 0; }
@@ -40,25 +43,10 @@ int main() {
     // The on-disk file is owned by whoever runs the test (typically NOT root);
     // that is precisely the host owner the scrub must hide.
 
-    { std::FILE* f = std::fopen("/tmp/lx_statowner_src.c", "w");
-      if (!f) { std::puts("run_stat_owner: skipped (no /tmp)"); return 0; }
-      std::fputs(kSrc, f); std::fclose(f); }
-    int rc = std::system(("gcc -static -O2 -o " + root +
-                          "/bin/prog /tmp/lx_statowner_src.c 2>/dev/null").c_str());
-    if (rc != 0) { std::puts("run_stat_owner: skipped (no static glibc / gcc)"); return 0; }
+    if (!lxtest::compile_guest("run_stat_owner", tree, kSrc)) return 0;
 
-    host::PosixHost hw;
-    kernel::Kernel<host::PosixHost> k{hw};
-    k.files().mount_host("/", root);
-    k.files().mount_virtual("/proc", vfs::make_procfs(k.procs(), k.machine()));
-
-    std::string exec = root + "/bin/prog";
-    runtime::PtraceTrap trap{exec, {"/bin/prog"}, {}, {}};
-    runtime::Cpu cpu{trap, k, trap, abi::Arch::x86_64};
-
-    auto r = cpu.run(uaddr(0), uaddr(0));
-    std::system(("rm -rf " + root).c_str());
-    std::remove("/tmp/lx_statowner_src.c");
+    auto r = lxtest::run_guest(tree);
+    lxtest::remove_tree(tree);
 
     if (!r) { std::puts("run_stat_owner: skipped (ptrace unavailable)"); return 0; }
     if (*r == 3) {

@@ -8,6 +8,8 @@
 // the raw open(2) path via syscall(SYS_open, ...) and asserts a clean read,
 // repeated enough to catch the (formerly ~60%) flake. Skips gracefully off
 // Linux/x86-64, without gcc, or without ptrace.
+#include "guest_harness.hpp"
+
 #include "linuxity/host/posix_host.hpp"
 #include "linuxity/kernel/kernel.hpp"
 #include "linuxity/runtime/linux/ptrace_trap.hpp"
@@ -40,28 +42,14 @@ int main() {
     std::puts("run_open_procfs: skipped (needs Linux/x86-64 host)");
     return 0;
 #else
-    const std::string root = "/tmp/lx_openprocfs_test";
-    std::system(("rm -rf " + root + " && mkdir -p " + root + "/bin " + root + "/proc").c_str());
+    // An empty /proc in the LOWER layer: the synthesized mount must win over
+    // it, which is the thing under test.
+    const auto tree = lxtest::make_tree("openprocfs", /*overlay=*/false,
+                                        "mkdir -p /tmp/lx_openprocfs_root/proc");
+    if (!lxtest::compile_guest("run_open_procfs", tree, kSrc)) return 0;
 
-    { std::FILE* f = std::fopen("/tmp/lx_openprocfs_src.c", "w");
-      if (!f) { std::puts("run_open_procfs: skipped (no /tmp)"); return 0; }
-      std::fputs(kSrc, f); std::fclose(f); }
-    int rc = std::system(("gcc -static -O2 -o " + root +
-                          "/bin/prog /tmp/lx_openprocfs_src.c 2>/dev/null").c_str());
-    if (rc != 0) { std::puts("run_open_procfs: skipped (no static glibc / gcc)"); return 0; }
-
-    host::PosixHost hw;
-    kernel::Kernel<host::PosixHost> k{hw};
-    k.files().mount_host("/", root);
-    k.files().mount_virtual("/proc", vfs::make_procfs(k.procs(), k.machine()));
-
-    std::string exec = root + "/bin/prog";
-    runtime::PtraceTrap trap{exec, {"/bin/prog"}, {}, {}};
-    runtime::Cpu cpu{trap, k, trap, abi::Arch::x86_64};
-
-    auto r = cpu.run(uaddr(0), uaddr(0));
-    std::system(("rm -rf " + root).c_str());
-    std::remove("/tmp/lx_openprocfs_src.c");
+    auto r = lxtest::run_guest(tree);
+    lxtest::remove_tree(tree);
 
     if (!r) { std::puts("run_open_procfs: skipped (ptrace unavailable)"); return 0; }
     if (*r == 2 || *r == 3) {
