@@ -830,13 +830,44 @@ public:
     // The current guest tid, so the loop can attribute a syscall to a pid.
     [[nodiscard]] ::pid_t current_tid() const noexcept { return cur_; }
 
+    // Stat a REAL host path, so the dispatcher can answer a host-backed guest
+    // stat in the SAME trap stop instead of redirecting the call and stepping
+    // the guest to its syscall exit. Optional by design: the dispatcher asks
+    // with `requires`, so a backend without it keeps the two-stop path and the
+    // worst case of not having it is slower, never wrong.
+    //
+    // The supervisor's own stat is safe here because the path has ALREADY been
+    // translated through FileNamespace -- it is a host path we chose, not
+    // guest-controlled text, so this cannot be used to escape the namespace.
+    [[nodiscard]] std::optional<abi::wire::StatFields>
+    stat_host_path(const std::string& path) const {
+        struct ::stat st{};
+        if (::lstat(path.c_str(), &st) != 0) return std::nullopt;
+        abi::wire::StatFields h;
+        h.mode     = static_cast<std::uint32_t>(st.st_mode);
+        h.dev      = static_cast<std::uint64_t>(st.st_dev);
+        h.ino      = static_cast<std::uint64_t>(st.st_ino);
+        h.nlink    = static_cast<std::uint64_t>(st.st_nlink);
+        h.rdev     = static_cast<std::uint64_t>(st.st_rdev);
+        h.size     = static_cast<std::uint64_t>(st.st_size);
+        h.blksize  = static_cast<std::int64_t>(st.st_blksize);
+        h.blocks   = static_cast<std::int64_t>(st.st_blocks);
+        h.mtime_ns = static_cast<std::uint64_t>(st.st_mtim.tv_sec) * 1'000'000'000ull +
+                     static_cast<std::uint64_t>(st.st_mtim.tv_nsec);
+        h.atime_ns = static_cast<std::uint64_t>(st.st_atim.tv_sec) * 1'000'000'000ull +
+                     static_cast<std::uint64_t>(st.st_atim.tv_nsec);
+        h.ctime_ns = static_cast<std::uint64_t>(st.st_ctim.tv_sec) * 1'000'000'000ull +
+                     static_cast<std::uint64_t>(st.st_ctim.tv_nsec);
+        return h;
+    }
+
+    struct TaskIds { std::int32_t pid, tid, ppid; };
     // The GUEST-namespace identity of the task that trapped: its pid, its
     // thread id (== pid for the main thread; a distinct host tid otherwise),
-    // and its parent's guest pid. The dispatcher answers getpid/gettid/
-    // getppid from THIS, so every task sees its own coherent pid rather than
-    // a fixed "pid 1". The root task is pid 1 with ppid 0 (init has no
-    // parent in linuxity's world).
-    struct TaskIds { std::int32_t pid, tid, ppid; };
+    // and its parent's guest pid. The dispatcher answers getpid/gettid/getppid
+    // from THIS, so every task sees its own coherent pid rather than a fixed
+    // "pid 1". The root task is pid 1 with ppid 0 (init has no parent in
+    // linuxity's world).
     [[nodiscard]] TaskIds current_ids() {
         std::int32_t pid = gpid_of(cur_);
         std::int32_t ppid = 0;

@@ -33,6 +33,37 @@
 
 namespace lx::abi::wire {
 
+// What a stat YIELDS, host-neutral.
+//
+// Lives HERE, in abi/, because the portable dispatcher encodes it and abi/ is
+// deliberately independent of host/ (the only host header syscall.hpp includes
+// is a Windows compat shim). Putting it in host::HStat -- which already
+// describes a host file for vfs/hostfs.hpp -- looked like the DRY choice and
+// was a layering error: it made the portable dispatcher depend on the host
+// interface for one optimisation.
+//
+// A backend fills this from whatever its OS offers (statx on Linux, stat64 on
+// Darwin, GetFileInformationByHandleEx on Win32); the dispatcher encodes it
+// with the layouts below. So a backend never sees a guest offset and cannot
+// get one wrong, and there is still ONE encoder per ABI shared by real and
+// synthesized stats.
+//
+// Timestamps keep nanosecond resolution because that is what statx reports;
+// truncating to seconds makes `make` see a just-written file as unchanged.
+struct StatFields {
+    std::uint32_t mode{0};       // full st_mode, S_IFMT included
+    std::uint64_t dev{0};
+    std::uint64_t ino{0};
+    std::uint64_t nlink{1};
+    std::uint64_t rdev{0};
+    std::uint64_t size{0};
+    std::int64_t  blksize{4096};
+    std::int64_t  blocks{0};
+    std::uint64_t atime_ns{0};
+    std::uint64_t mtime_ns{0};
+    std::uint64_t ctime_ns{0};
+};
+
 // -- struct stat -----------------------------------------------------------
 //
 // x86-64:
