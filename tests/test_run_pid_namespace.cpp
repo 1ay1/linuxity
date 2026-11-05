@@ -16,6 +16,8 @@
 // The child ships its own getpid() to the parent over a pipe so the parent can
 // compare "the pid I was handed by fork" against "the pid the child sees for
 // itself" — they MUST be equal and MUST be small. Exit 0 iff all hold.
+#include "guest_harness.hpp"
+
 #include "linuxity/host/posix_host.hpp"
 #include "linuxity/kernel/kernel.hpp"
 #include "linuxity/runtime/linux/ptrace_trap.hpp"
@@ -71,36 +73,23 @@ static const char* kProbe =
     "  return 0;\n"
     "}\n";
 
-static int run(const std::string& root, const std::string& prog) {
-    host::PosixHost hw;
-    kernel::Kernel<host::PosixHost> k{hw};
-    k.files().mount_host("/", root);
-    k.files().mount_virtual("/proc", vfs::make_procfs(k.procs(), k.machine()));
-    { kernel::ProcInfo init; init.pid = 1; init.cmdline = prog;
-      k.procs().upsert(init); }
-    std::string exec = root + prog;
-    runtime::PtraceTrap trap{exec, {prog}, {}, {}};
-    runtime::Cpu cpu{trap, k, trap, abi::Arch::x86_64};
-    auto r = cpu.run(uaddr(0), uaddr(0));
-    return r ? *r : -1;
-}
-
 int main() {
 #if !defined(__linux__) || !defined(__x86_64__)
     std::puts("run_pid_namespace: skipped (needs Linux/x86-64 host)");
     return 0;
 #else
-    const std::string root = "/tmp/lx_pidns_root";
-    std::system(("rm -rf " + root + " && mkdir -p " + root + "/bin").c_str());
-    { std::FILE* f = std::fopen("/tmp/lx_pidns.c", "w");
-      if (!f) { std::puts("run_pid_namespace: skipped (no /tmp)"); return 0; }
-      std::fputs(kProbe, f); std::fclose(f); }
-    int rc = std::system(("gcc -static -O2 -o " + root + "/bin/pidprobe /tmp/lx_pidns.c 2>/dev/null").c_str());
-    if (rc != 0) { std::puts("run_pid_namespace: skipped (no static gcc)"); return 0; }
+    const auto tree = lxtest::make_tree("pidns", /*overlay=*/false, "",
+                                        "/bin/pidprobe");
+    if (!lxtest::compile_guest("run_pid_namespace", tree, kProbe)) return 0;
 
-    int code = run(root, "/bin/pidprobe");
-    std::system(("rm -rf " + root).c_str());
-    std::remove("/tmp/lx_pidns.c");
+    auto r = lxtest::run_guest(tree, [&](auto& k) {
+        kernel::ProcInfo init;
+        init.pid = 1;
+        init.cmdline = tree.exec;
+        k.procs().upsert(init);
+    });
+    lxtest::remove_tree(tree);
+    const int code = r ? *r : -1;
 
     if (code == -1) { std::puts("run_pid_namespace: skipped (ptrace unavailable)"); return 0; }
     if (code != 0) {

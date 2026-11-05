@@ -16,6 +16,8 @@
 // The store persists in the overlay UPPER layer's .linuxity-meta journal, so we
 // mount a real upper dir. If the guest ever saw the host's raw owner or lost a
 // chmod, one of the ~10 checks below diverges and the probe returns its code.
+#include "guest_harness.hpp"
+
 #include "linuxity/host/posix_host.hpp"
 #include "linuxity/kernel/kernel.hpp"
 #include "linuxity/runtime/linux/ptrace_trap.hpp"
@@ -76,48 +78,41 @@ static const char* kProbe =
     "  return 0;\n"
     "}\n";
 
-static int run(const std::string& root, const std::string& upper,
-               const std::string& prog) {
-    host::PosixHost hw;
-    kernel::Kernel<host::PosixHost> k{hw};
-    k.files().mount_host("/", root, upper);
-    k.files().mount_virtual("/proc", vfs::make_procfs(k.procs(), k.machine()));
-    { kernel::ProcInfo init; init.pid = 1; init.cmdline = prog;
-      k.procs().upsert(init); }
-    std::string exec = root + prog;
-    std::vector<std::string> env{"PATH=/bin:/usr/bin", "HOME=/root"};
-    runtime::PtraceTrap trap{exec, {prog}, env, {}};
-    runtime::Cpu cpu{trap, k, trap, abi::Arch::x86_64};
-    auto r = cpu.run(uaddr(0), uaddr(0));
-    return r ? *r : -1;
-}
-
 int main() {
 #if !defined(__linux__) || !defined(__x86_64__)
     std::puts("run_meta: skipped (needs Linux/x86-64 host)");
     return 0;
 #else
-    const std::string root  = "/tmp/lx_meta_root";
-    const std::string upper = "/tmp/lx_meta_upper";
-    std::system(("rm -rf " + root + " " + upper +
-                 " && mkdir -p " + root + "/bin " + root + "/work " + upper).c_str());
-    { std::FILE* f = std::fopen("/tmp/lx_meta.c", "w");
-      if (!f) { std::puts("run_meta: skipped (no /tmp)"); return 0; }
-      std::fputs(kProbe, f); std::fclose(f); }
-    int rc = std::system(("gcc -static -O2 -o " + root +
-                          "/bin/mprobe /tmp/lx_meta.c 2>/dev/null").c_str());
-    if (rc != 0) { std::puts("run_meta: skipped (no static gcc)"); return 0; }
+    // /work exists only in the read-only LOWER, so the guest's chmod/chown
+    // of things under it must copy up into the upper layer.
+    const auto tree = lxtest::make_tree("meta", /*overlay=*/true,
+                                        "mkdir -p /tmp/lx_meta_root/work",
+                                        "/bin/mprobe");
+    if (!lxtest::compile_guest("run_meta", tree, kProbe)) return 0;
+    const std::string root  = tree.root;
+    const std::string upper = tree.upper;
 
-    int code = run(root, upper, "/bin/mprobe");
+    // A real environment: a static glibc startup reads it, and an empty envp
+    // is a different code path than a populated one.
+    auto probe = [&] {
+        auto r = lxtest::run_guest(tree, [&](auto& k) {
+            kernel::ProcInfo init;
+            init.pid = 1;
+            init.cmdline = tree.exec;
+            k.procs().upsert(init);
+        }, {}, {"PATH=/bin:/usr/bin", "HOME=/root"});
+        return r ? *r : -1;
+    };
+
+    const int code = probe();
 
     // Second run REUSES the same upper dir: the journal must replay, so the
-    // recreated /work/g from the first run is still root-owned (no stale record)
-    // and the probe (which recreates state from scratch) again returns 0 —
-    // proving the persisted journal doesn't corrupt a subsequent run.
-    int code2 = run(root, upper, "/bin/mprobe");
+    // recreated /work/g from the first run is still root-owned (no stale
+    // record) and the probe (which recreates state from scratch) again returns
+    // 0 -- proving the persisted journal doesn't corrupt a subsequent run.
+    const int code2 = probe();
 
-    std::system(("rm -rf " + root + " " + upper).c_str());
-    std::remove("/tmp/lx_meta.c");
+    lxtest::remove_tree(tree);
 
     if (code == -1) { std::puts("run_meta: skipped (ptrace unavailable)"); return 0; }
     if (code != 0) {

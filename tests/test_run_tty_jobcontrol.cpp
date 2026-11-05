@@ -12,6 +12,8 @@
 // asks the slave for its foreground group via TIOCGPGRP, and checks the answer
 // equals getpgrp() (== the guest pid, 1) — exactly what a shell compares. It
 // also checks TIOCSPGRP succeeds. Exit 0 iff both hold.
+#include "guest_harness.hpp"
+
 #include "linuxity/host/posix_host.hpp"
 #include "linuxity/kernel/kernel.hpp"
 #include "linuxity/runtime/linux/ptrace_trap.hpp"
@@ -43,36 +45,23 @@ static const char* kProbe =
     "  return 0;\n"
     "}\n";
 
-static int run(const std::string& root, const std::string& prog) {
-    host::PosixHost hw;
-    kernel::Kernel<host::PosixHost> k{hw};
-    k.files().mount_host("/", root);
-    k.files().mount_virtual("/proc", vfs::make_procfs(k.procs(), k.machine()));
-    { kernel::ProcInfo init; init.pid = 1; init.cmdline = prog;
-      k.procs().upsert(init); }
-    std::string exec = root + prog;
-    runtime::PtraceTrap trap{exec, {prog}, {}, {}};
-    runtime::Cpu cpu{trap, k, trap, abi::Arch::x86_64};
-    auto r = cpu.run(uaddr(0), uaddr(0));
-    return r ? *r : -1;
-}
-
 int main() {
 #if !defined(__linux__) || !defined(__x86_64__)
     std::puts("run_tty_jobcontrol: skipped (needs Linux/x86-64 host)");
     return 0;
 #else
-    const std::string root = "/tmp/lx_tty_root";
-    std::system(("rm -rf " + root + " && mkdir -p " + root + "/bin").c_str());
-    { std::FILE* f = std::fopen("/tmp/lx_tty.c", "w");
-      if (!f) { std::puts("run_tty_jobcontrol: skipped (no /tmp)"); return 0; }
-      std::fputs(kProbe, f); std::fclose(f); }
-    int rc = std::system(("gcc -static -O2 -o " + root + "/bin/ttyprobe /tmp/lx_tty.c 2>/dev/null").c_str());
-    if (rc != 0) { std::puts("run_tty_jobcontrol: skipped (no static gcc)"); return 0; }
+    const auto tree = lxtest::make_tree("tty", /*overlay=*/false, "",
+                                        "/bin/ttyprobe");
+    if (!lxtest::compile_guest("run_tty_jobcontrol", tree, kProbe)) return 0;
 
-    int code = run(root, "/bin/ttyprobe");
-    std::system(("rm -rf " + root).c_str());
-    std::remove("/tmp/lx_tty.c");
+    auto r = lxtest::run_guest(tree, [&](auto& k) {
+        kernel::ProcInfo init;
+        init.pid = 1;
+        init.cmdline = tree.exec;
+        k.procs().upsert(init);
+    });
+    lxtest::remove_tree(tree);
+    const int code = r ? *r : -1;
 
     if (code == -1) { std::puts("run_tty_jobcontrol: skipped (ptrace unavailable)"); return 0; }
     if (code != 0) {
