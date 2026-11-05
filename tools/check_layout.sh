@@ -75,6 +75,38 @@ hits=$(grep -lE '^[[:space:]]*#[[:space:]]*include.*(<windows|<sys/|<dirent|runt
        include/linuxity/abi/wire/*.hpp 2>/dev/null || true)
 [ -n "$hits" ] && note "abi/wire/ depends on a platform or backend: $hits"
 
+# 7. A syscall is named through the GENERATED Sysno table (abi/sysno.hpp), not
+#    by its raw number. A literal like `case 56:` is correct on x86-64 and
+#    silently names a DIFFERENT syscall on aarch64 -- the one bug class here
+#    that produces plausible wrong answers instead of errors. (ptrace_trap's
+#    returns_pid() matched 56/57/58/435/61 that way; it now decodes.)
+#
+#    Scoped to files that actually SWITCH on a syscall-number variable, so a
+#    switch over register indices or termios flags doesn't trip it.
+#
+#    KNOWN EXCEPTION, tracked not excused: windows/sys.hpp is a second
+#    dispatcher with 71 raw cases. It is being deleted in favour of routing
+#    WhpTrap through abi::Syscalls + WhpHostCalls (doc/SYSCALL_LAYER.md step
+#    5), which cannot be compile-verified without a Windows toolchain. Until
+#    then this reports but does not fail, and the COUNT is pinned so the file
+#    can only shrink -- if it grows, that is a new violation and this fails.
+win_raw_budget=71
+for f in $(grep -rlE 'switch \((nr|sysno|regs_\.nr\(\)|f\.regs\.nr)' \
+           include/linuxity src 2>/dev/null | grep -v '^include/linuxity/abi/'); do
+    n=$(grep -cE 'case (SYS_[A-Za-z_0-9]+|[0-9]+):' "$f" 2>/dev/null || echo 0)
+    [ "$n" -eq 0 ] && continue
+    if [ "$f" = "include/linuxity/runtime/windows/sys.hpp" ]; then
+        if [ "$n" -gt "$win_raw_budget" ]; then
+            note "$f grew to $n raw syscall cases (budget $win_raw_budget); use Sysno"
+        else
+            printf '  note: %s still has %s raw syscall cases (budget %s, shrinking to 0 -- see doc/SYSCALL_LAYER.md step 5)\n' \
+                "$f" "$n" "$win_raw_budget"
+        fi
+        continue
+    fi
+    note "$f dispatches on raw syscall numbers ($n cases); use Sysno"
+done
+
 if [ "$fail" -eq 0 ]; then
     echo "runtime layout: all structural invariants hold"
 else

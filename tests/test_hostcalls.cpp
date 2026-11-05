@@ -176,6 +176,48 @@ int main() {
         ::unlink(path);
     }
 
+    // -- the Win32 time conversions, checked on ANY host -------------------
+    // WhpHostCalls can't be compiled here (no Win32 headers), but its
+    // arithmetic is pure and is the part most likely to be wrong, so the same
+    // formulas are checked directly. Keep these in sync with
+    // runtime/windows/hostcalls.hpp.
+    {
+        auto from_filetime = [](std::uint64_t ticks) {
+            constexpr std::uint64_t kEpochDelta = 116'444'736'000'000'000ULL;
+            const std::uint64_t t = ticks > kEpochDelta ? ticks - kEpochDelta : 0;
+            return Timespec{std::int64_t(t / 10'000'000),
+                            std::int64_t((t % 10'000'000) * 100)};
+        };
+        auto from_qpc = [](std::int64_t c, std::int64_t f) {
+            return Timespec{c / f, ((c % f) * 1'000'000'000) / f};
+        };
+        auto sleep_ms = [](Timespec d) {
+            return d.sec * 1000 + (d.nsec + 999'999) / 1'000'000;
+        };
+
+        // FILETIME is 100ns ticks since 1601-01-01; the guest wants the Unix
+        // epoch. 2024-01-01T00:00:00Z is FILETIME 133485408000000000.
+        const auto t2024 = from_filetime(133'485'408'000'000'000ULL);
+        check(t2024.sec == 1'704'067'200, "FILETIME -> Unix epoch seconds");
+        check(t2024.nsec == 0, "FILETIME -> nsec");
+        // A pre-1970 FILETIME must clamp, not go negative.
+        check(from_filetime(1000).sec == 0, "pre-epoch FILETIME clamps to 0");
+
+        // QPC: a 10MHz counter at 3.5s.
+        const auto q = from_qpc(35'000'000, 10'000'000);
+        check(q.sec == 3 && q.nsec == 500'000'000, "QPC -> 3.5s");
+        // nsec must stay normalized even just under a full second.
+        const auto q2 = from_qpc(9'999'999, 10'000'000);
+        check(q2.sec == 0 && q2.nsec < 1'000'000'000, "QPC nsec normalized");
+
+        // Sleep() takes whole ms. A sub-millisecond request must round UP:
+        // rounding 100us down to 0 turns a guest's yield into a busy-spin.
+        check(sleep_ms(Timespec{0, 100'000}) == 1, "100us rounds up to 1ms");
+        check(sleep_ms(Timespec{0, 1}) == 1, "1ns rounds up to 1ms");
+        check(sleep_ms(Timespec{0, 0}) == 0, "a zero sleep stays 0");
+        check(sleep_ms(Timespec{2, 500'000'000}) == 2500, "2.5s -> 2500ms");
+    }
+
     if (failures == 0) std::puts("hostcalls: all checks passed");
     return failures == 0 ? 0 : 1;
 }

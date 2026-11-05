@@ -33,6 +33,8 @@
 #endif
 #include <windows.h>
 
+#include "linuxity/abi/result.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -252,62 +254,108 @@ struct LinuxTimespec {
 }
 
 // -- errno -----------------------------------------------------------------
-// Linux errno values (x86-64). Only the ones a Win32 error can actually
-// produce are listed; anything unmapped becomes EIO rather than a lie.
+// Linux errno values (x86-64), as Win32 code needs them.
+//
+// These are ALIASES of lx::Errno, not a second table: the numbers are ABI and
+// duplicating them is how two spellings of EACCES drift apart. The names stay
+// because this backend's call sites read as `-win32::LBADF`, and a negative
+// errno is what a Linux syscall returns.
+//
+// error_to_linux() below is the part that genuinely belongs here -- mapping a
+// DWORD from GetLastError() is irreducibly Win32 -- but it now yields the one
+// shared Errno type so the value can cross into the portable dispatcher.
 enum : std::int32_t {
-    LPERM = 1, LNOENT = 2, LSRCH = 3, LINTR = 4, LIO = 5, LNXIO = 6,
-    L2BIG = 7, LNOEXEC = 8, LBADF = 9, LCHILD = 10, LAGAIN = 11,
-    LNOMEM = 12, LACCES = 13, LFAULT = 14, LBUSY = 16, LEXIST = 17,
-    LXDEV = 18, LNODEV = 19, LNOTDIR = 20, LISDIR = 21, LINVAL = 22,
-    LNFILE = 23, LMFILE = 24, LNOTTY = 25, LFBIG = 27, LNOSPC = 28,
-    LSPIPE = 29, LROFS = 30, LMLINK = 31, LPIPE = 32, LRANGE = 34,
-    LNAMETOOLONG = 36,
-    LNOSYS = 38, LNOTEMPTY = 39, LLOOP = 40, LNOTSOCK = 88,
-    LCONNRESET = 104, LTIMEDOUT = 110, LCONNREFUSED = 111,
+    LPERM  = static_cast<std::int32_t>(lx::Errno::eperm),
+    LNOENT = static_cast<std::int32_t>(lx::Errno::enoent),
+    LSRCH  = static_cast<std::int32_t>(lx::Errno::esrch),
+    LINTR  = static_cast<std::int32_t>(lx::Errno::eintr),
+    LIO    = static_cast<std::int32_t>(lx::Errno::eio),
+    LNXIO  = static_cast<std::int32_t>(lx::Errno::enxio),
+    L2BIG  = static_cast<std::int32_t>(lx::Errno::e2big),
+    LNOEXEC = static_cast<std::int32_t>(lx::Errno::enoexec),
+    LBADF  = static_cast<std::int32_t>(lx::Errno::ebadf),
+    LCHILD = static_cast<std::int32_t>(lx::Errno::echild),
+    LAGAIN = static_cast<std::int32_t>(lx::Errno::eagain),
+    LNOMEM = static_cast<std::int32_t>(lx::Errno::enomem),
+    LACCES = static_cast<std::int32_t>(lx::Errno::eacces),
+    LFAULT = static_cast<std::int32_t>(lx::Errno::efault),
+    LBUSY  = static_cast<std::int32_t>(lx::Errno::ebusy),
+    LEXIST = static_cast<std::int32_t>(lx::Errno::eexist),
+    LXDEV  = static_cast<std::int32_t>(lx::Errno::exdev),
+    LNODEV = static_cast<std::int32_t>(lx::Errno::enodev),
+    LNOTDIR = static_cast<std::int32_t>(lx::Errno::enotdir),
+    LISDIR = static_cast<std::int32_t>(lx::Errno::eisdir),
+    LINVAL = static_cast<std::int32_t>(lx::Errno::einval),
+    LNFILE = static_cast<std::int32_t>(lx::Errno::enfile),
+    LMFILE = static_cast<std::int32_t>(lx::Errno::emfile),
+    LNOTTY = static_cast<std::int32_t>(lx::Errno::enotty),
+    LFBIG  = static_cast<std::int32_t>(lx::Errno::efbig),
+    LNOSPC = static_cast<std::int32_t>(lx::Errno::enospc),
+    LSPIPE = static_cast<std::int32_t>(lx::Errno::espipe),
+    LROFS  = static_cast<std::int32_t>(lx::Errno::erofs),
+    LMLINK = static_cast<std::int32_t>(lx::Errno::emlink),
+    LPIPE  = static_cast<std::int32_t>(lx::Errno::epipe),
+    LRANGE = static_cast<std::int32_t>(lx::Errno::erange),
+    LNAMETOOLONG = static_cast<std::int32_t>(lx::Errno::enametoolong),
+    LNOSYS = static_cast<std::int32_t>(lx::Errno::enosys),
+    LNOTEMPTY = static_cast<std::int32_t>(lx::Errno::enotempty),
+    LLOOP  = static_cast<std::int32_t>(lx::Errno::eloop),
+    LTIMEDOUT = static_cast<std::int32_t>(lx::Errno::etimedout),
+    LCONNREFUSED = static_cast<std::int32_t>(lx::Errno::econnrefused),
+    // No lx::Errno spelling yet; these are socket-only and unused by the
+    // file paths, so they keep their literal values until a socket layer
+    // needs them in the shared enum.
+    LNOTSOCK = 88, LCONNRESET = 104,
 };
 
-[[nodiscard]] inline std::int32_t error_to_linux(DWORD e) noexcept {
+// The one place a Win32 DWORD becomes a guest errno. Returns the shared
+// lx::Errno so the result can travel into the portable dispatcher.
+[[nodiscard]] inline lx::Errno error_to_errno(DWORD e) noexcept {
     switch (e) {
-        case ERROR_SUCCESS:             return 0;
+        case ERROR_SUCCESS:             return lx::Errno::ok;
         case ERROR_FILE_NOT_FOUND:
         case ERROR_PATH_NOT_FOUND:
         case ERROR_INVALID_DRIVE:
-        case ERROR_BAD_NETPATH:         return LNOENT;
-        case ERROR_TOO_MANY_OPEN_FILES: return LMFILE;
+        case ERROR_BAD_NETPATH:         return lx::Errno::enoent;
+        case ERROR_TOO_MANY_OPEN_FILES: return lx::Errno::emfile;
         case ERROR_ACCESS_DENIED:
         case ERROR_SHARING_VIOLATION:
-        case ERROR_LOCK_VIOLATION:      return LACCES;
-        case ERROR_INVALID_HANDLE:      return LBADF;
+        case ERROR_LOCK_VIOLATION:      return lx::Errno::eacces;
+        case ERROR_INVALID_HANDLE:      return lx::Errno::ebadf;
         case ERROR_NOT_ENOUGH_MEMORY:
-        case ERROR_OUTOFMEMORY:         return LNOMEM;
-        case ERROR_NO_MORE_FILES:       return 0;   // end of dir, not an error
-        case ERROR_WRITE_PROTECT:       return LROFS;
-        case ERROR_NOT_READY:           return LNXIO;
+        case ERROR_OUTOFMEMORY:         return lx::Errno::enomem;
+        case ERROR_NO_MORE_FILES:       return lx::Errno::ok;  // end of dir
+        case ERROR_WRITE_PROTECT:       return lx::Errno::erofs;
+        case ERROR_NOT_READY:           return lx::Errno::enxio;
         case ERROR_CRC:
         case ERROR_SEEK:
         case ERROR_WRITE_FAULT:
         case ERROR_READ_FAULT:
-        case ERROR_GEN_FAILURE:         return LIO;
+        case ERROR_GEN_FAILURE:         return lx::Errno::eio;
         case ERROR_HANDLE_DISK_FULL:
-        case ERROR_DISK_FULL:           return LNOSPC;
-        case ERROR_NOT_SUPPORTED:       return LNOSYS;
+        case ERROR_DISK_FULL:           return lx::Errno::enospc;
+        case ERROR_NOT_SUPPORTED:       return lx::Errno::enosys;
         case ERROR_FILE_EXISTS:
-        case ERROR_ALREADY_EXISTS:      return LEXIST;
+        case ERROR_ALREADY_EXISTS:      return lx::Errno::eexist;
         case ERROR_INVALID_PARAMETER:
-        case ERROR_INVALID_FUNCTION:    return LINVAL;
+        case ERROR_INVALID_FUNCTION:    return lx::Errno::einval;
         case ERROR_BROKEN_PIPE:
-        case ERROR_NO_DATA:             return LPIPE;
-        case ERROR_DIR_NOT_EMPTY:       return LNOTEMPTY;
-        case ERROR_DIRECTORY:           return LNOTDIR;
+        case ERROR_NO_DATA:             return lx::Errno::epipe;
+        case ERROR_DIR_NOT_EMPTY:       return lx::Errno::enotempty;
+        case ERROR_DIRECTORY:           return lx::Errno::enotdir;
         case ERROR_BUFFER_OVERFLOW:
-        case ERROR_FILENAME_EXCED_RANGE:return LNAMETOOLONG;
-        case ERROR_NOT_SAME_DEVICE:     return LXDEV;
-        case ERROR_OPERATION_ABORTED:   return LINTR;
-        case ERROR_BAD_EXE_FORMAT:      return LNOEXEC;
-        case ERROR_CANT_RESOLVE_FILENAME: return LLOOP;
-        case WAIT_TIMEOUT:              return LTIMEDOUT;
-        default:                        return LIO;
+        case ERROR_FILENAME_EXCED_RANGE:return lx::Errno::enametoolong;
+        case ERROR_NOT_SAME_DEVICE:     return lx::Errno::exdev;
+        case ERROR_OPERATION_ABORTED:   return lx::Errno::eintr;
+        case ERROR_BAD_EXE_FORMAT:      return lx::Errno::enoexec;
+        case ERROR_CANT_RESOLVE_FILENAME: return lx::Errno::eloop;
+        case WAIT_TIMEOUT:              return lx::Errno::etimedout;
+        default:                        return lx::Errno::eio;
     }
+}
+
+[[nodiscard]] inline std::int32_t error_to_linux(DWORD e) noexcept {
+    return static_cast<std::int32_t>(error_to_errno(e));
 }
 
 // The negative-errno a Linux syscall returns on failure.

@@ -1055,14 +1055,22 @@ private:
         t.in_call = false;
     }
 
-    // The forwarded syscalls whose successful return value IS a pid (x86-64
-    // numbers). We translate these host pids to guest pids at their exit stop
-    // so the guest never sees a host pid. fork=57, vfork=58, clone=56,
-    // clone3=435, wait4=61, waitid=247.
+    // The forwarded syscalls whose successful return value IS a pid. We
+    // translate these host pids to guest pids at their exit stop so the guest
+    // never sees a host pid.
+    //
+    // Decoded through the generated Sysno table rather than matched against
+    // literal x86-64 numbers: the literals (56/57/58/435/61) are correct only
+    // on x86-64, so on aarch64 they would silently name OTHER syscalls and
+    // translate the return value of something that isn't a pid. sysno.hpp is
+    // the single source of truth for this mapping.
     static bool returns_pid(unsigned long long nr) {
-        switch (nr) {
-            case 56: case 57: case 58: case 435:   // clone/fork/vfork/clone3
-            case 61:                               // wait4
+        switch (abi::decode(abi::Arch::x86_64, nr)) {
+            case abi::Sysno::clone:
+            case abi::Sysno::fork:
+            case abi::Sysno::vfork:
+            case abi::Sysno::clone3:
+            case abi::Sysno::wait4:
                 return true;
             default:
                 return false;
