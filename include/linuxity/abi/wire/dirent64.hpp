@@ -39,6 +39,8 @@
 #include <span>
 #include <string_view>
 
+#include "linuxity/abi/wire/stat.hpp"   // FileType / kFileTypeMask
+
 namespace lx::abi::wire {
 
 // -- d_type ----------------------------------------------------------------
@@ -113,15 +115,18 @@ struct Dirent {
 // on every targeted host, and this is the mapping every backend needs when it
 // has a mode but no dirent type (a DT_UNKNOWN fallback, or a synthesized node).
 [[nodiscard]] constexpr DType dtype_from_mode(std::uint32_t mode) noexcept {
-    switch (mode & 0170000u) {           // S_IFMT
-        case 0040000u: return DType::dir;       // S_IFDIR
-        case 0100000u: return DType::regular;   // S_IFREG
-        case 0120000u: return DType::symlink;   // S_IFLNK
-        case 0020000u: return DType::chr;       // S_IFCHR
-        case 0060000u: return DType::blk;       // S_IFBLK
-        case 0010000u: return DType::fifo;      // S_IFIFO
-        case 0140000u: return DType::sock;      // S_IFSOCK
-        default:       return DType::unknown;
+    // The S_IF* values are named in abi/wire/stat.hpp; this maps them onto
+    // the dirent d_type space, which uses DIFFERENT numbers for the same
+    // concepts (DT_DIR is 4, S_IFDIR is 0040000).
+    switch (mode & kFileTypeMask) {
+        case bits(FileType::dir):     return DType::dir;
+        case bits(FileType::regular): return DType::regular;
+        case bits(FileType::symlink): return DType::symlink;
+        case bits(FileType::chr):     return DType::chr;
+        case bits(FileType::blk):     return DType::blk;
+        case bits(FileType::fifo):    return DType::fifo;
+        case bits(FileType::sock):    return DType::sock;
+        default:                      return DType::unknown;
     }
 }
 

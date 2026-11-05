@@ -374,6 +374,43 @@ int main() {
               "has_at does not cross-match");
     }
 
+    // -- S_IF* file-type bits ----------------------------------------------
+    // These were spelled three times (twice inline in syscall.hpp, plus bare
+    // octal in dtype_from_mode). They're OCTAL: writing 0040000 as 40000
+    // decimal is a silent plausible wrong answer.
+    {
+        using namespace lx::abi::wire;
+        check(bits(FileType::dir) == 0040000u, "S_IFDIR is 0040000");
+        check(bits(FileType::regular) == 0100000u, "S_IFREG is 0100000");
+        check(bits(FileType::symlink) == 0120000u, "S_IFLNK is 0120000");
+        check(kFileTypeMask == 0170000u, "S_IFMT is 0170000");
+
+        // The type mask must not overlap the permission bits, or a chmod
+        // would change a file's TYPE.
+        check((kFileTypeMask & 0777u) == 0u, "type mask misses the perm bits");
+
+        // is_type works with permissions OR'd in, which is how it's used.
+        check(is_type(bits(FileType::dir) | 0755u, FileType::dir),
+              "a 0755 directory is a directory");
+        check(!is_type(bits(FileType::regular) | 0755u, FileType::dir),
+              "a 0755 regular file is not a directory");
+        check(is_type(bits(FileType::symlink) | 0777u, FileType::symlink),
+              "a 0777 symlink is a symlink");
+
+        // dtype_from_mode bridges S_IF* to the dirent d_type space, which
+        // uses DIFFERENT numbers for the same concepts (DT_DIR 4 vs
+        // S_IFDIR 0040000). A mix-up here is how `find -type d` goes blind.
+        check(dtype_from_mode(bits(FileType::dir) | 0755u) == DType::dir,
+              "S_IFDIR -> DT_DIR");
+        check(dtype_from_mode(bits(FileType::regular) | 0644u) == DType::regular,
+              "S_IFREG -> DT_REG");
+        check(dtype_from_mode(bits(FileType::symlink) | 0777u) == DType::symlink,
+              "S_IFLNK -> DT_LNK");
+        check(dtype_from_mode(0) == DType::unknown, "no type bits -> DT_UNKNOWN");
+        check(static_cast<std::uint32_t>(DType::dir) != bits(FileType::dir),
+              "DT_DIR and S_IFDIR are genuinely different numbers");
+    }
+
     if (failures == 0) std::puts("wire: all checks passed");
     return failures == 0 ? 0 : 1;
 }

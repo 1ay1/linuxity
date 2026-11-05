@@ -659,9 +659,8 @@ private:
     // relative to a bogus "fd" instead of the cwd (breaking `mkdir -p`, and
     // every *at call a relative path is passed to).
     [[nodiscard]] std::string_view dir_of(std::int64_t dirfd) const {
-        constexpr std::int32_t kAtFdCwd = -100;
         std::int32_t fd = static_cast<std::int32_t>(dirfd);
-        if (fd == kAtFdCwd) return {};
+        if (fd == wire::kAtFdCwd) return {};
         return k_.files().path_of_fd(fd);
     }
 
@@ -1729,13 +1728,12 @@ private:
             std::uint64_t __spare3[12];
         } sx{};
         constexpr std::uint32_t kBasicStats = 0x7ff;  // STATX_BASIC_STATS
-        constexpr std::uint16_t kIfDir = 0040000, kIfReg = 0100000, kIfLnk = 0120000;
         sx.stx_mask    = kBasicStats;
         sx.stx_blksize = 4096;
         sx.stx_nlink   = 1;
-        sx.stx_mode    = static_cast<std::uint16_t>(is_link ? kIfLnk | 0777u
-                                                : is_dir  ? kIfDir | 0555u
-                                                          : kIfReg | 0444u);
+        sx.stx_mode    = static_cast<std::uint16_t>(is_link ? wire::bits(wire::FileType::symlink) | 0777u
+                                                : is_dir  ? wire::bits(wire::FileType::dir) | 0555u
+                                                          : wire::bits(wire::FileType::regular) | 0444u);
         sx.stx_ino     = 1;
         sx.stx_size    = size;
         sx.stx_blocks  = (size + 511) / 512;
@@ -1753,9 +1751,8 @@ private:
     // smashing detected" the first time anything stats /dev/pts.
     [[nodiscard]] Outcome write_statbuf(UAddr buf, bool is_dir, std::uint64_t size,
                                         bool is_link = false) {
-        constexpr std::uint32_t kIfDir = 0040000, kIfReg = 0100000, kIfLnk = 0120000;
-        const std::uint32_t mode = is_link ? kIfLnk | 0777u
-                                 : is_dir  ? kIfDir | 0555u : kIfReg | 0444u;
+        const std::uint32_t mode = is_link ? wire::bits(wire::FileType::symlink) | 0777u
+                                 : is_dir  ? wire::bits(wire::FileType::dir) | 0555u : wire::bits(wire::FileType::regular) | 0444u;
         const auto blocks = static_cast<std::int64_t>((size + 511) / 512);
         if (arch_ == Arch::aarch64) {
             struct StatGeneric {

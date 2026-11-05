@@ -96,4 +96,44 @@ static_assert(kStatx.mode_width == 2 && kStatX86_64.mode_width == 4);
 static_assert(kStatX86_64.mode != kStatGeneric.mode);
 static_assert(kStatX86_64.size != kStatGeneric.size);
 
+// -- S_IF*: the file-type bits of st_mode -----------------------------------
+//
+// These were spelled three times: inline in write_statx, inline again in
+// write_statbuf, and as bare octal literals inside dtype_from_mode. They are
+// ABI (the guest's libc runs S_ISDIR on these bits), and they are OCTAL --
+// writing 0040000 as 40000 decimal is a silent, plausible wrong answer, which
+// is exactly why they should be typed once.
+enum class FileType : std::uint32_t {
+    fifo    = 0010000,
+    chr     = 0020000,
+    dir     = 0040000,
+    blk     = 0060000,
+    regular = 0100000,
+    symlink = 0120000,
+    sock    = 0140000,
+};
+
+inline constexpr std::uint32_t kFileTypeMask = 0170000;   // S_IFMT
+
+[[nodiscard]] constexpr std::uint32_t bits(FileType t) noexcept {
+    return static_cast<std::uint32_t>(t);
+}
+
+[[nodiscard]] constexpr bool is_type(std::uint32_t mode, FileType t) noexcept {
+    return (mode & kFileTypeMask) == bits(t);
+}
+
+// Every type must fit inside the mask, and the mask must not overlap the
+// permission bits (0777) or a chmod would change a file's type.
+static_assert((bits(FileType::dir) & kFileTypeMask) == bits(FileType::dir));
+static_assert((bits(FileType::regular) & kFileTypeMask) == bits(FileType::regular));
+static_assert((bits(FileType::symlink) & kFileTypeMask) == bits(FileType::symlink));
+static_assert((kFileTypeMask & 0777u) == 0,
+              "the type mask must not overlap the permission bits");
+// The three types linuxity synthesizes are distinct under the mask.
+static_assert(bits(FileType::dir) != bits(FileType::regular));
+static_assert(bits(FileType::regular) != bits(FileType::symlink));
+static_assert(is_type(bits(FileType::dir) | 0755u, FileType::dir));
+static_assert(!is_type(bits(FileType::regular) | 0755u, FileType::dir));
+
 } // namespace lx::abi::wire
