@@ -362,3 +362,46 @@ descriptors** (`/dev/null` for 0..8), which is a host operation.
    cursor, since a shared one would let two fds consume each other's entries.
    Pass the path binding through explicitly; let the cursor default to fresh.
 3. Delete the duplicated halves; `test_fd_slots` already covers the behaviour.
+
+
+## Correction: there are not three dispatchers
+
+I spent several rounds describing "three syscall dispatchers" with 30
+syscalls implemented three times. That framing was wrong, and tracing the
+actual control flow is what corrected it.
+
+**darwin drives the portable dispatcher.** `src/main_macos.cpp` constructs
+`runtime::Cpu loop{trap, ...}`, so `abi::Syscalls::dispatch()` decides every
+fate and hands `HvfTrap` an already-translated path via `redirect()`. Its 277
+`case S::` labels live in `service()`, reached only through `forward()` /
+`redirect()` — they are the **FORWARD implementation**: the work a Linux host
+gets free from its kernel and macOS has to emulate. That is not duplication,
+it is the thing the `Outcome` sum type was built to express.
+
+**windows is the real duplicate.** `src/main_windows.cpp` runs its own
+hand-rolled loop (`sys.service(f)` at line 400), bypassing `runtime::Cpu` and
+`abi::Syscalls` entirely. Its 72 cases *are* a second dispatcher.
+
+So the remaining work is one backend, not three, and the fix is the one
+already written down as step 5: route `WhpTrap` through `runtime::Cpu` with
+`WhpHostCalls` supplying the host primitives.
+
+### What the overlap actually was
+
+Of the 30 "three-way" syscalls, only one family wanted the same answer
+everywhere, and it is now shared in `abi/identity.hpp`:
+getpid/gettid/getppid/getuid/geteuid/getgid/getegid.
+
+The rest failed the test deliberately:
+
+| family | why not shared |
+|---|---|
+| sessions (`getpgrp`, `setsid`, …) | darwin has a real pgid/sid table; a shared flat answer would make it WORSE |
+| lifecycle (`exit`, `exit_group`) | portable forwards, darwin unwinds one thread, windows ends the VM — three different acts |
+| `setuid`/`setgid` | belong to the dispatcher's wider credential group (`setreuid`/`setresuid`/`setgroups`/`setfsuid`); lifting two of that set out would re-create the problem |
+| path/fd ops | the translation is ALREADY shared — the dispatcher does it and passes a host path down. Only the host call differs, which is what a backend is for. |
+
+The test for `abi/identity.hpp` is: an answer belongs there only when every
+backend should give the same one. I wrote a `flat_session_answer()` helper,
+found nothing could use it without losing fidelity, and deleted it — dead
+shared code is worse than none.

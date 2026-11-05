@@ -70,20 +70,21 @@ identity_answer(Sysno sc, const TaskIdentity& id) noexcept {
     }
 }
 
-// Session and process-group ids. Separate from the above because a backend
-// that genuinely models process groups (the ptrace backend does, via the host)
-// must NOT use these flat answers -- it has better ones. The kernel-less
-// backends have no host process tree to ask, so a flat world (every task its
-// own leader) is the honest approximation.
-[[nodiscard]] constexpr std::optional<std::int64_t>
-flat_session_answer(Sysno sc, const TaskIdentity& id) noexcept {
-    switch (sc) {
-        case Sysno::getpgrp:                 return id.pid;
-        case Sysno::getpgid: case Sysno::getsid: return id.pid;
-        case Sysno::setpgid: case Sysno::setsid: return 0;
-        default: return std::nullopt;
-    }
-}
+// NOT HERE: process groups and sessions (getpgrp/getpgid/getsid/setpgid/
+// setsid). I wrote a flat_session_answer() for them and then deleted it,
+// because the three backends have three DIFFERENT fidelities and each is
+// right for its own situation:
+//
+//   portable  a flat fallback, but FORWARDS when the backend models groups
+//             (`requires { mem_.models_process_groups(); }`)
+//   darwin    a real pgid/sid table (pids_.pgid_of / set_sid), which is
+//             strictly better than flat -- setsid even refuses correctly
+//             when the caller is already a group leader
+//   windows   flat, because it has no process model at all
+//
+// Sharing a flat answer would have made darwin WORSE. That is the test for
+// this file: an answer belongs here only when every backend should give the
+// same one. Identity passes that test; sessions do not.
 
 static_assert(identity_answer(Sysno::getpid, {7, 7, 1}) == 7);
 static_assert(identity_answer(Sysno::gettid, {7, 9, 1}) == 9);

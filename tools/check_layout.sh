@@ -176,7 +176,7 @@ check_include() {   # <symbol-regex> <required-header>
 }
 
 check_include 'host::random_bytes'            'host/entropy.hpp'    'host::random_bytes'
-check_include 'abi::(identity_answer|TaskIdentity|flat_session_answer)' \
+check_include 'abi::(identity_answer|TaskIdentity)' \
               'abi/identity.hpp'    'a shared identity answer'
 check_include 'abi::wire::(Timespec|Timeval|Itimerval|Itimerspec|kNsecPerSec|to_millis_ceil)' \
               'abi/wire/time.hpp'   'a wire time type'
