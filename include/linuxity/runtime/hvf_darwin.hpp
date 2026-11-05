@@ -23,6 +23,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <optional>
 
 namespace lx::runtime::darwin {
 
@@ -148,6 +149,124 @@ static_assert(sizeof(LinuxStatfs) == 120);
     std::memcpy(l.f_fsid, &s.f_fsid, sizeof l.f_fsid);
     l.f_namelen = 255;
     return l;
+}
+
+// -- fcntl record locks ----------------------------------------------------
+// Linux `struct flock` and Darwin's differ in BOTH field order and width, so
+// a byte copy produces a lock on the wrong range of the wrong file:
+//
+//   Linux (aarch64): { short l_type; short l_whence; off_t l_start;
+//                      off_t l_len;  pid_t l_pid;   /* pad */ }
+//   Darwin:          { off_t l_start; off_t l_len; pid_t l_pid;
+//                      short l_type;  short l_whence; }
+//
+// The lock TYPES also differ: Linux F_RDLCK/WRLCK/UNLCK are 0/1/2, Darwin's
+// are 1/3/2. Without this translation every lock request is EINVAL -- which
+// is exactly what made `useradd` fail with "cannot lock /etc/passwd", and
+// what breaks git, sqlite and dpkg/pacman databases.
+struct LinuxFlock {
+    std::int16_t l_type, l_whence;
+    std::int64_t l_start, l_len;
+    std::int32_t l_pid;
+    std::int32_t pad_;
+};
+static_assert(sizeof(LinuxFlock) == 32);
+
+enum class LockType : std::int16_t { read = 0, write = 1, unlock = 2 };
+
+[[nodiscard]] inline std::optional<short> lock_type_to_darwin(std::int16_t lt) noexcept {
+    switch (static_cast<LockType>(lt)) {
+        case LockType::read:   return F_RDLCK;
+        case LockType::write:  return F_WRLCK;
+        case LockType::unlock: return F_UNLCK;
+        default:               return std::nullopt;
+    }
+}
+[[nodiscard]] inline std::int16_t lock_type_to_linux(short dt) noexcept {
+    switch (dt) {
+        case F_RDLCK: return static_cast<std::int16_t>(LockType::read);
+        case F_WRLCK: return static_cast<std::int16_t>(LockType::write);
+        default:      return static_cast<std::int16_t>(LockType::unlock);
+    }
+}
+
+// NOTE: `struct flock` must be spelled with the tag -- Darwin also declares a
+// FUNCTION named flock(2), and the unqualified name resolves to that.
+[[nodiscard]] inline std::optional<struct ::flock> flock_to_darwin(const LinuxFlock& l) noexcept {
+    const auto type = lock_type_to_darwin(l.l_type);
+    if (!type) return std::nullopt;
+    struct ::flock d{};
+    d.l_start  = l.l_start;
+    d.l_len    = l.l_len;
+    d.l_pid    = l.l_pid;
+    d.l_type   = *type;
+    d.l_whence = l.l_whence;          // SEEK_SET/CUR/END agree (0/1/2)
+    return d;
+}
+
+[[nodiscard]] inline LinuxFlock flock_to_linux(const struct ::flock& d) noexcept {
+    LinuxFlock l{};
+    l.l_type   = lock_type_to_linux(d.l_type);
+    l.l_whence = d.l_whence;
+    l.l_start  = d.l_start;
+    l.l_len    = d.l_len;
+    l.l_pid    = d.l_pid;
+    return l;
+}
+
+// -- struct statx ----------------------------------------------------------
+// The modern stat. coreutils, git and systemd prefer it and only fall back
+// to fstatat if it returns ENOSYS -- but glibc caches that verdict, so a
+// backend that refuses it pays the fallback cost forever AND breaks callers
+// that pass AT_EMPTY_PATH (statx on an fd with no path), which has no
+// fstatat equivalent.
+struct LinuxStatx {
+    std::uint32_t stx_mask, stx_blksize;
+    std::uint64_t stx_attributes;
+    std::uint32_t stx_nlink, stx_uid, stx_gid;
+    std::uint16_t stx_mode, spare0_;
+    std::uint64_t stx_ino, stx_size, stx_blocks, stx_attributes_mask;
+    struct Ts { std::int64_t sec; std::uint32_t nsec; std::int32_t pad_; };
+    Ts stx_atime, stx_btime, stx_ctime, stx_mtime;
+    std::uint32_t stx_rdev_major, stx_rdev_minor;
+    std::uint32_t stx_dev_major, stx_dev_minor;
+    std::uint64_t stx_mnt_id, stx_dio_mem_align_pad;
+    std::uint64_t spare2_[12];
+};
+// The offsets ARE the ABI: a field at the wrong displacement is read as a
+// different field by the guest, which is far worse than an error.
+static_assert(sizeof(LinuxStatx) == 256);
+static_assert(offsetof(LinuxStatx, stx_mode) == 28);
+static_assert(offsetof(LinuxStatx, stx_ino) == 32);
+static_assert(offsetof(LinuxStatx, stx_size) == 40);
+static_assert(offsetof(LinuxStatx, stx_atime) == 64);
+static_assert(offsetof(LinuxStatx, stx_mtime) == 112);
+static_assert(offsetof(LinuxStatx, stx_dev_major) == 136);
+
+// The STATX_* bits we can actually answer from a Darwin stat.
+inline constexpr std::uint32_t kStatxBasicStats = 0x7ff;
+
+[[nodiscard]] inline LinuxStatx statx_from_darwin(const struct ::stat& s) noexcept {
+    LinuxStatx x{};
+    x.stx_mask    = kStatxBasicStats;
+    x.stx_blksize = static_cast<std::uint32_t>(s.st_blksize);
+    x.stx_nlink   = s.st_nlink;
+    x.stx_uid     = 0;                 // linuxity presents a root-owned world
+    x.stx_gid     = 0;
+    x.stx_mode    = static_cast<std::uint16_t>(s.st_mode);
+    x.stx_ino     = s.st_ino;
+    x.stx_size    = static_cast<std::uint64_t>(s.st_size);
+    x.stx_blocks  = static_cast<std::uint64_t>(s.st_blocks);
+    x.stx_atime   = {s.st_atimespec.tv_sec, static_cast<std::uint32_t>(s.st_atimespec.tv_nsec), 0};
+    x.stx_mtime   = {s.st_mtimespec.tv_sec, static_cast<std::uint32_t>(s.st_mtimespec.tv_nsec), 0};
+    x.stx_ctime   = {s.st_ctimespec.tv_sec, static_cast<std::uint32_t>(s.st_ctimespec.tv_nsec), 0};
+    x.stx_btime   = {s.st_birthtimespec.tv_sec,
+                     static_cast<std::uint32_t>(s.st_birthtimespec.tv_nsec), 0};
+    x.stx_rdev_major = static_cast<std::uint32_t>((s.st_rdev >> 24) & 0xff);
+    x.stx_rdev_minor = static_cast<std::uint32_t>(s.st_rdev & 0xffffff);
+    x.stx_dev_major  = static_cast<std::uint32_t>((s.st_dev >> 24) & 0xff);
+    x.stx_dev_minor  = static_cast<std::uint32_t>(s.st_dev & 0xffffff);
+    return x;
 }
 
 // -- linux_dirent64 --------------------------------------------------------

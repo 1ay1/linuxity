@@ -93,6 +93,7 @@ private:
     w.vec(f.vmas);
     w.pod(f.brk); w.pod(f.arena);
     w.vec(f.fds);
+    w.vec(f.fd_hosts);
     w.pod(f.sig_actions); w.pod(f.sig_mask); w.pod(f.altstack);
     w.str(f.namespace_state);
     return w.take();
@@ -102,7 +103,7 @@ private:
     Reader r{b};
     return r.pod(f.cpu) && r.pod(f.self) && r.pod(f.parent) &&
            r.pod(f.child_settid) && r.pod(f.clear_child_tid) && r.pod(f.umask) &&
-           r.vec(f.vmas) && r.pod(f.brk) && r.pod(f.arena) && r.vec(f.fds) &&
+           r.vec(f.vmas) && r.pod(f.brk) && r.pod(f.arena) && r.vec(f.fds) && r.vec(f.fd_hosts) &&
            r.pod(f.sig_actions) && r.pod(f.sig_mask) && r.pod(f.altstack) &&
            r.str(f.namespace_state);
 }

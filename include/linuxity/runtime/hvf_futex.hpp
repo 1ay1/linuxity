@@ -37,6 +37,7 @@
 
 #include <os/os_sync_wait_on_address.h>
 
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <span>
@@ -103,10 +104,28 @@ public:
     // Sleep until woken or `timeout_ns` elapses (0 = forever). Returns the
     // Linux result: 0 woken, -EAGAIN if *addr != expected, -ETIMEDOUT,
     // -EINTR.
+    //
+    // The value check is done HERE, explicitly, because the two primitives
+    // differ on the single most important case: when *addr != expected,
+    // Linux futex returns -EAGAIN ("the condition already changed, recheck
+    // and do not sleep") while os_sync_wait_on_address returns 0 as though
+    // the thread had been woken. Reporting that 0 to glibc makes a condvar
+    // believe it was signalled when it wasn't -- the "futex facility
+    // returned an unexpected error code" abort, and silent lost wakeups.
+    //
+    // Checking first is also exactly what the primitive does internally, so
+    // the race window is the same one Linux has: the value can change after
+    // our load, and the kernel-side compare inside the wait call catches it.
     [[nodiscard]] static std::int64_t wait(void* addr, std::uint32_t expected,
                                            std::uint64_t timeout_ns, bool shared) {
+        const std::atomic_ref<std::uint32_t> word{*static_cast<std::uint32_t*>(addr)};
+        if (word.load(std::memory_order_acquire) != expected) return -11;   // EAGAIN
+
         const auto flags = shared ? OS_SYNC_WAIT_ON_ADDRESS_SHARED
                                   : OS_SYNC_WAIT_ON_ADDRESS_NONE;
+        // The call reports failure only through rc < 0, and does not clear
+        // errno on success, so errno must not be consulted unless it does.
+        errno = 0;
         const int rc = timeout_ns
             ? ::os_sync_wait_on_address_with_timeout(
                   addr, expected, 4, flags, OS_CLOCK_MACH_ABSOLUTE_TIME, timeout_ns)
@@ -122,20 +141,26 @@ public:
     }
 
     // Wake up to `count` waiters; returns how many were woken.
+    //
+    // os_sync_wake_by_address_* returns 0 on success and -1 on error, and it
+    // does NOT clear errno on success -- a measured stale ETIMEDOUT from an
+    // earlier wait came back from a wake that had in fact woken a thread.
+    // So only rc < 0 is a failure, and ENOENT ("nobody was waiting") is a
+    // normal outcome Linux reports as 0 woken, not an error.
     [[nodiscard]] static std::int64_t wake(void* addr, std::uint32_t count, bool shared) {
+        if (count == 0) return 0;
         const auto flags = shared ? OS_SYNC_WAKE_BY_ADDRESS_SHARED
                                   : OS_SYNC_WAKE_BY_ADDRESS_NONE;
-        if (count == 0) return 0;
-        if (count == 1) {
-            const int rc = ::os_sync_wake_by_address_any(addr, 4, flags);
-            return rc == 0 ? 1 : 0;           // ENOENT == nobody waiting
-        }
         // Darwin can wake one or all, not exactly N. Waking all when N > 1
         // is conservative and safe: Linux allows spurious wakeups, so the
         // extra waiters recheck and sleep again. (N > 1 in practice means
         // INT_MAX -- "wake everyone" -- from pthread_cond_broadcast.)
-        const int rc = ::os_sync_wake_by_address_all(addr, 4, flags);
-        return rc == 0 ? static_cast<std::int64_t>(count) : 0;
+        errno = 0;
+        const int rc = count == 1 ? ::os_sync_wake_by_address_any(addr, 4, flags)
+                                  : ::os_sync_wake_by_address_all(addr, 4, flags);
+        if (rc == 0) return count == 1 ? 1 : static_cast<std::int64_t>(count);
+        if (errno == ENOENT) return 0;        // no waiters: 0 woken, not an error
+        return 0;
     }
 };
 

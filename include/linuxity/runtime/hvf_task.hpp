@@ -175,14 +175,9 @@ public:
     std::atomic<std::uint64_t> pending{0};
     std::atomic<std::uint32_t> umask{022};
 
-    // Monotonic tid allocator. Linux hands threads distinct tids from the
-    // same space as pids; within one process a counter is enough.
-    [[nodiscard]] std::int32_t next_tid() noexcept {
-        return tid_next_.fetch_add(1, std::memory_order_relaxed);
-    }
-    void set_tid_base(std::int32_t base) noexcept {
-        tid_next_.store(base, std::memory_order_relaxed);
-    }
+    // (No tid allocator here on purpose: tids share ONE namespace with pids
+    // across the whole guest tree, so they come from the shared PidSpace.
+    // A per-process counter collides with other processes' pids.)
 
 private:
     std::mutex mu_;
@@ -192,7 +187,6 @@ private:
     std::vector<Thread> threads_;
     std::atomic<bool> group_exiting_{false};
     int group_status_{0};
-    std::atomic<std::int32_t> tid_next_{1};
 };
 
 } // namespace lx::runtime

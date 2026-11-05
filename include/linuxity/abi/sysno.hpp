@@ -154,6 +154,22 @@ enum class Sysno {
     // every spawn helper before exec. (The set*id credential syscalls are
     // already declared above.)
     close_range,
+    // fchmodat2(dirfd, path, mode, flags): fchmodat WITH flags, so
+    // AT_SYMLINK_NOFOLLOW finally works. Linux 6.6+; coreutils and libarchive
+    // call it first and only fall back on ENOSYS -- but pacman treats the
+    // resulting warning storm as a failed transaction.
+    fchmodat2,
+    // seccomp(2): accepted and not enforced (linuxity is not a sandbox), but
+    // it must EXIST -- pacman, sshd and systemd all abort if it is missing.
+    seccomp,
+    // Memory locking and residency. gpg-agent mlock()s its key buffers and
+    // warns "using insecure memory" if that fails; msync is how a writer
+    // flushes a MAP_SHARED file mapping.
+    mlock, munlock, mlockall, munlockall, mlock2, mincore, msync,
+    // Scheduling queries every runtime makes at startup (Go, Rust, the JVM,
+    // OpenMP size their thread pools from these).
+    sched_setaffinity, sched_getparam, sched_setparam, sched_getscheduler,
+    sched_setscheduler, sched_get_priority_max, sched_get_priority_min, getcpu,
 };
 
 // Decode an arch-specific raw syscall number into the canonical identity.
@@ -242,6 +258,23 @@ enum class Sysno {
                 case 227: return Sysno::clock_settime;
                 case 164: return Sysno::settimeofday;
                 case 436: return Sysno::close_range;
+                case 317: return Sysno::seccomp;
+                case 452: return Sysno::fchmodat2;
+                case 149: return Sysno::mlock;
+                case 150: return Sysno::munlock;
+                case 151: return Sysno::mlockall;
+                case 152: return Sysno::munlockall;
+                case 325: return Sysno::mlock2;
+                case 27:  return Sysno::mincore;
+                case 26:  return Sysno::msync;
+                case 203: return Sysno::sched_setaffinity;
+                case 143: return Sysno::sched_getparam;
+                case 142: return Sysno::sched_setparam;
+                case 145: return Sysno::sched_getscheduler;
+                case 144: return Sysno::sched_setscheduler;
+                case 146: return Sysno::sched_get_priority_max;
+                case 147: return Sysno::sched_get_priority_min;
+                case 309: return Sysno::getcpu;
                 // -- sockets ---------------------------------------------
                 case 41:  return Sysno::socket;
                 case 53:  return Sysno::socketpair;
@@ -496,6 +529,34 @@ enum class Sysno {
                 case 152: return Sysno::setfsgid;
                 case 159: return Sysno::setgroups;
                 case 436: return Sysno::close_range;
+                case 277: return Sysno::seccomp;
+                case 452: return Sysno::fchmodat2;
+                case 228: return Sysno::mlock;
+                case 229: return Sysno::munlock;
+                case 230: return Sysno::mlockall;
+                case 231: return Sysno::munlockall;
+                case 284: return Sysno::mlock2;
+                case 232: return Sysno::mincore;
+                case 227: return Sysno::msync;
+                case 122: return Sysno::sched_setaffinity;
+                case 121: return Sysno::sched_getparam;
+                case 118: return Sysno::sched_setparam;
+                case 120: return Sysno::sched_getscheduler;
+                case 119: return Sysno::sched_setscheduler;
+                case 125: return Sysno::sched_get_priority_max;
+                case 126: return Sysno::sched_get_priority_min;
+                case 168: return Sysno::getcpu;
+                // Present on aarch64 but previously decoded only for
+                // x86-64. landlock is the one that MATTERS in practice:
+                // pacman 7's download worker calls landlock_create_ruleset
+                // and treats ENOSYS as fatal, so `pacman -Sy` died after
+                // "Synchronizing package databases..." with no diagnostic.
+                case 444: return Sysno::landlock_create_ruleset;
+                case 445: return Sysno::landlock_add_rule;
+                case 446: return Sysno::landlock_restrict_self;
+                case 163: return Sysno::getrlimit;
+                case 164: return Sysno::setrlimit;
+                // (aarch64 has no getpgrp(2); glibc uses getpgid(0).)
                 // -- sockets (aarch64 has no socketcall multiplexer) -----
                 case 198: return Sysno::socket;
                 case 199: return Sysno::socketpair;

@@ -49,6 +49,7 @@
 #include "linuxity/abi/result.hpp"
 #include "linuxity/abi/syscall.hpp"
 #include "linuxity/runtime/hvf_darwin.hpp"
+#include "linuxity/runtime/hvf_epoll.hpp"
 #include "linuxity/runtime/hvf_exec.hpp"
 #include "linuxity/runtime/hvf_fd.hpp"
 #include "linuxity/runtime/hvf_futex.hpp"
@@ -263,6 +264,35 @@ public:
         g_pending.notify_waiters();
     }
 
+    // The portable dispatcher decides AF_UNIX bind/connect: it translates the
+    // socket's filesystem path into the overlay (the writable upper for a
+    // bind, wherever the node lives for a connect) and hands the result here
+    // as a SOCK_REWRITE outcome. The ptrace backend pokes the new path into
+    // the guest's sockaddr; we never need to touch guest memory, because we
+    // build the Darwin sockaddr directly from the translated string.
+    //
+    // Without this hook the Cpu loop falls back to a plain forward with the
+    // UNTRANSLATED path, which is why gpg-agent failed with "error binding
+    // socket to '/etc/pacman.d/gnupg/S.gpg-agent': No such file or
+    // directory" -- the host has no /etc/pacman.d -- and `pacman -S` then
+    // died with "keyring is not writable".
+    [[nodiscard]] Result<std::int64_t> rewrite_sockaddr(UAddr, const std::string& host_path,
+                                                        int, unsigned long long) {
+        const auto sc = abi::decode(abi::Arch::aarch64, regs_.nr());
+        const int h = host_fd(static_cast<int>(regs_.arg(0)));
+        if (h < 0) return complete(-9);
+        ::sockaddr_un sun{};
+        if (host_path.size() >= sizeof sun.sun_path) return complete(-36);   // ENAMETOOLONG
+        sun.sun_family = AF_UNIX;
+        std::memcpy(sun.sun_path, host_path.c_str(), host_path.size() + 1);
+        sun.sun_len = static_cast<std::uint8_t>(offsetof(::sockaddr_un, sun_path)
+                                                + host_path.size() + 1);
+        const int rc = sc == abi::Sysno::bind
+            ? ::bind(h, reinterpret_cast<::sockaddr*>(&sun), sun.sun_len)
+            : ::connect(h, reinterpret_cast<::sockaddr*>(&sun), sun.sun_len);
+        return complete(rc < 0 ? darwin::fail() : 0);
+    }
+
     [[nodiscard]] Result<std::int64_t> forward() {
         return complete(service(nullptr, nullptr));
     }
@@ -318,6 +348,13 @@ private:
         // shows the dispatcher's decision; only the backend knows what the
         // emulated call actually returned, which is what debugging needs.
         static const bool strace = std::getenv("LINUXITY_STRACE") != nullptr;
+        // LINUXITY_STRACE=2 also shows the bytes a write carried. A failing
+        // program usually SAYS why -- to a log, a pipe, or its parent -- and
+        // seeing that text beats reverse-engineering it from return codes.
+        static const bool payloads = [] {
+            const char* v = std::getenv("LINUXITY_STRACE");
+            return v && v[0] == '2';
+        }();
         if (strace)
             std::fprintf(stderr, "[%d] %3llu(%#llx, %#llx, %#llx, %#llx) = %lld\n",
                          task_.tid, static_cast<unsigned long long>(regs_.nr()),
@@ -326,6 +363,16 @@ private:
                          static_cast<unsigned long long>(regs_.arg(2)),
                          static_cast<unsigned long long>(regs_.arg(3)),
                          static_cast<long long>(rc));
+        if (payloads && regs_.nr() == 64 && rc > 0) {          // aarch64 write
+            auto win = machine_.ram().clamp(regs_.arg(1), static_cast<std::size_t>(rc));
+            std::string shown;
+            for (std::byte b : win.first(std::min<std::size_t>(win.size(), 200))) {
+                const auto c = static_cast<unsigned char>(b);
+                if (c >= 0x20 && c < 0x7f) shown.push_back(static_cast<char>(c));
+                else { char hex[5]; std::snprintf(hex, sizeof hex, "\\x%02x", c); shown += hex; }
+            }
+            std::fprintf(stderr, "      \"%s\"\n", shown.c_str());
+        }
         LX_TRY(resume(rc));
         return ok(rc);
     }
@@ -619,6 +666,47 @@ private:
         }
         return n;
     }
+    // Linux clock id -> Darwin clock id.
+    //
+    // The table matters more than it looks: id 5 is CLOCK_REALTIME_COARSE, a
+    // WALL clock, and an earlier mapping sent it to CLOCK_MONOTONIC (time
+    // since boot). gpg reads the wall clock through the coarse id, saw
+    // ~1970, and rejected every key as "created 16088 days in the future" --
+    // so `pacman-key --populate` could not sign the distro's keys.
+    //
+    // Darwin has no COARSE variants or BOOTTIME; the precise clock of the
+    // same KIND is a correct substitute (coarse only promises lower cost,
+    // never a different epoch). Negative ids are per-process/thread CPU
+    // clocks encoded by glibc (clock_getcpuclockid); report this process.
+    [[nodiscard]] static std::optional<::clockid_t> linux_clock_to_darwin(std::int64_t id) noexcept {
+        switch (id) {
+            case 0:  return CLOCK_REALTIME;            // REALTIME
+            case 5:  return CLOCK_REALTIME;            // REALTIME_COARSE  (wall clock!)
+            case 8:  return CLOCK_REALTIME;            // REALTIME_ALARM
+            case 11: return CLOCK_REALTIME;            // TAI (leap offset ignored)
+            case 1:  return CLOCK_MONOTONIC;           // MONOTONIC
+            case 6:  return CLOCK_MONOTONIC;           // MONOTONIC_COARSE
+            case 4:  return CLOCK_MONOTONIC_RAW;       // MONOTONIC_RAW
+            case 7:  return CLOCK_MONOTONIC;           // BOOTTIME (Darwin's counts sleep too)
+            case 9:  return CLOCK_MONOTONIC;           // BOOTTIME_ALARM
+            case 2:  return CLOCK_PROCESS_CPUTIME_ID;  // PROCESS_CPUTIME_ID
+            case 3:  return CLOCK_THREAD_CPUTIME_ID;   // THREAD_CPUTIME_ID
+            default:
+                if (id < 0) return CLOCK_PROCESS_CPUTIME_ID;   // CPUCLOCK encodings
+                return std::nullopt;
+        }
+    }
+
+    // The physical core this host thread is running on, from the ARM
+    // TPIDRRO-free source Darwin exposes to user space.
+    [[nodiscard]] static std::uint32_t current_cpu() noexcept {
+        std::uint64_t mpidr = 0;
+        // Darwin publishes the CPU number in the low bits of TPIDRRO_EL0's
+        // shadow via the commpage; fall back to 0 if unavailable.
+        __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(mpidr));
+        return static_cast<std::uint32_t>(mpidr & 0x7);
+    }
+
     // TimerSet speaks std::chrono; the guest speaks struct itimerval /
     // itimerspec. Two small converters keep that boundary in one place.
     [[nodiscard]] static LinuxItimerval to_itimerval(const TimerSet::Interval& i) {
@@ -943,7 +1031,18 @@ private:
     [[nodiscard]] std::int64_t do_clone_thread(const CloneRequest& req) {
         if (!spawn_thread_) return -38;
         if (!req.stack) return -22;                      // a thread needs a stack
-        const std::int32_t tid = proc_.next_tid();
+        // A thread's tid lives in the SAME number space as every pid in the
+        // guest (Linux: tids and pids are one namespace, and a process's pid
+        // IS its main thread's tid). So it is allocated from the SHARED pid
+        // table, never from a per-process counter.
+        //
+        // A per-process counter starting at 1 is exactly the bug this
+        // replaces: a fork child (pid 2) handed its first thread tid 1 --
+        // the PARENT's pid -- and tid 2 -- its OWN pid. A later
+        // tgkill/exit/futex aimed at "tid 1" then hit the wrong task, and
+        // `pacman -Sy` was killed by a SIGTERM no guest had sent.
+        const std::int32_t tid = pids_.allocate(::getpid());
+        if (tid < 0) return -11;                         // EAGAIN: namespace full
 
         // The child resumes at the same PC as the parent (right after the
         // svc) with x0 = 0 and its own stack/TLS -- exactly what the kernel
@@ -1002,7 +1101,11 @@ private:
             img.brk = sp.brk();
             img.arena = sp.arena();
         });
-        img.fds = proc_.with_fds([&](FdTable& t) { return t.export_table(); });
+        {
+            auto ex = proc_.with_fds([&](FdTable& t) { return t.export_table(); });
+            img.fds = std::move(ex.entries);
+            img.fd_hosts = std::move(ex.host_fds);
+        }
         proc_.with_signals([&](SignalDispositions& d) {
             for (int s = 1; s <= kLinuxNsig; ++s) img.sig_actions[s - 1] = d.get(s);
         });
@@ -1029,6 +1132,7 @@ public:
         std::uint64_t brk{};
         AddressSpace::Arena arena{};
         std::vector<FdTable::Exported> fds;
+        std::vector<int> fd_hosts;        // parent-side host fd per open-file group
         std::array<LinuxSigaction, kLinuxNsig> sig_actions{};
         std::uint64_t sig_mask{};
         LinuxStack altstack{};
@@ -1058,8 +1162,6 @@ public:
         // it so `timeout`, `wait` and job control see it.
         route_host_signal(17, true);
         timers_.start([](int linux_sig) {
-            if (std::getenv("LINUXITY_STRACE"))
-                std::fprintf(stderr, "[timer] fire signal %d\n", linux_sig);
             if (linux_sig > 0 && linux_sig <= kLinuxNsig) {
                 g_pending.bits.fetch_or(sigbit(linux_sig), std::memory_order_relaxed);
                 g_pending.kick_all();
@@ -1285,19 +1387,16 @@ private:
             }
 
             // -- clock_gettime(clkid, timespec*). Both kernels agree on the
-            //    struct (two 64-bit words) and on CLOCK_REALTIME=0 /
-            //    MONOTONIC=1, so only the clock id needs mapping.
-            case S::clock_gettime: {
-                ::clockid_t id = CLOCK_REALTIME;
-                switch (a0) {
-                    case 1: case 5: id = CLOCK_MONOTONIC;        break;
-                    case 2: case 3: id = CLOCK_PROCESS_CPUTIME_ID; break;
-                    default:        id = CLOCK_REALTIME;         break;
-                }
+            //    struct (two 64-bit words); the clock IDs need mapping.
+            case S::clock_gettime: case S::clock_getres: {
+                const auto id = linux_clock_to_darwin(static_cast<std::int64_t>(a0));
+                if (!id) return -22;                             // EINVAL: no such clock
                 struct ::timespec ts{};
-                if (::clock_gettime(id, &ts) < 0) return darwin::fail();
-                struct LinuxTimespec { std::int64_t sec; std::int64_t nsec; };
-                LinuxTimespec out{ts.tv_sec, ts.tv_nsec};
+                const int rc = sc == S::clock_gettime ? ::clock_gettime(*id, &ts)
+                                                      : ::clock_getres(*id, &ts);
+                if (rc < 0) return darwin::fail();
+                if (!a1) return 0;                               // clock_getres(id, NULL)
+                const LinuxTimespec out{ts.tv_sec, ts.tv_nsec};
                 return ram.put(a1, out) ? 0 : -14;
             }
 
@@ -1335,12 +1434,36 @@ private:
                         // The bitset is ignored: Linux permits spurious
                         // wakeups, so a waiter whose bit did not match
                         // rechecks and sleeps again.
+                        //
+                        // The TIMEOUT KIND differs between the two ops, and
+                        // getting it wrong is what produced glibc's "futex
+                        // facility returned an unexpected error code":
+                        //   FUTEX_WAIT         -- RELATIVE timeout.
+                        //   FUTEX_WAIT_BITSET  -- ABSOLUTE deadline, against
+                        //                         CLOCK_REALTIME if the
+                        //                         FUTEX_CLOCK_REALTIME bit
+                        //                         is set, else CLOCK_MONOTONIC.
+                        // pthread_cond_timedwait uses the second form.
                         std::uint64_t ns = 0;
                         if (a3) {
                             struct { std::int64_t sec, nsec; } ts{};
                             if (!machine_.ram().get(a3, ts)) return -14;
-                            ns = static_cast<std::uint64_t>(ts.sec) * 1'000'000'000ull
-                               + static_cast<std::uint64_t>(ts.nsec);
+                            const bool absolute =
+                                static_cast<FutexOp>(cmd) == FutexOp::wait_bitset;
+                            const auto want = static_cast<std::uint64_t>(ts.sec) * 1'000'000'000ull
+                                            + static_cast<std::uint64_t>(ts.nsec);
+                            if (absolute) {
+                                const bool realtime =
+                                    (static_cast<std::uint32_t>(a1) & kFutexClockRealtime) != 0;
+                                struct ::timespec now{};
+                                ::clock_gettime(realtime ? CLOCK_REALTIME : CLOCK_MONOTONIC, &now);
+                                const auto cur = static_cast<std::uint64_t>(now.tv_sec) * 1'000'000'000ull
+                                               + static_cast<std::uint64_t>(now.tv_nsec);
+                                if (want <= cur) return -110;      // already expired
+                                ns = want - cur;
+                            } else {
+                                ns = want;
+                            }
                             if (ns == 0) ns = 1;        // 0 would mean "forever"
                         }
                         return Futex::wait(p, static_cast<std::uint32_t>(a2), ns, shared);
@@ -1388,9 +1511,21 @@ private:
                     default:
                         // Priority-inheritance futexes need a real PI mutex
                         // in the kernel. glibc only uses them for
-                        // PTHREAD_PRIO_INHERIT mutexes, which it falls back
-                        // from on ENOSYS.
-                        return -38;
+                        // PTHREAD_PRIO_INHERIT mutexes and falls back on
+                        // ENOSYS, so that answer is correct HERE -- but any
+                        // OTHER unknown op must be EINVAL, because glibc
+                        // treats an unexpected errno from futex as fatal
+                        // ("The futex facility returned an unexpected error
+                        // code") rather than retrying.
+                        switch (static_cast<FutexOp>(cmd)) {
+                            case FutexOp::lock_pi: case FutexOp::unlock_pi:
+                            case FutexOp::trylock_pi:
+                            case FutexOp::wait_requeue_pi:
+                            case FutexOp::cmp_requeue_pi:
+                                return -38;                      // ENOSYS
+                            default:
+                                return -22;                      // EINVAL
+                        }
                 }
             }
 
@@ -1418,8 +1553,10 @@ private:
                                      static_cast<long>(req.nsec)};
                 constexpr std::uint64_t kTimerAbstime = 1;
                 if (clk && (a1 & kTimerAbstime)) {
+                    const auto id = linux_clock_to_darwin(static_cast<std::int64_t>(a0));
+                    if (!id) return -22;
                     struct ::timespec now{};
-                    ::clock_gettime(a0 == 1 ? CLOCK_MONOTONIC : CLOCK_REALTIME, &now);
+                    ::clock_gettime(*id, &now);
                     std::int64_t d = (req.sec - now.tv_sec) * 1'000'000'000LL +
                                      (req.nsec - now.tv_nsec);
                     if (d <= 0) return 0;
@@ -1433,8 +1570,185 @@ private:
                 return proc_.umask.exchange(static_cast<std::uint32_t>(a0 & 0777),
                                            std::memory_order_relaxed);
             }
+            // -- Resource limits and accounting -----------------------------
+            case S::getrlimit: case S::setrlimit: {
+                // The legacy 2-arg forms; prlimit64 is the modern one and is
+                // already handled. Both report the same limits.
+                struct LinuxRlimit { std::uint64_t cur, max; };
+                if (sc == S::setrlimit) return 0;          // accepted, not enforced
+                LinuxRlimit out{~0ull, ~0ull};
+                if (a0 == 3) out.cur = ExecArena::stack_reserve;      // RLIMIT_STACK
+                else if (a0 == 7) out = {FdTable::kMaxFds, FdTable::kMaxFds};  // NOFILE
+                return ram.put(a1, out) ? 0 : -14;
+            }
+            case S::times: {
+                // times(struct tms*) -> clock ticks since an arbitrary epoch.
+                // Linux's CLK_TCK is 100, so report centiseconds.
+                struct ::rusage ru{};
+                ::getrusage(RUSAGE_SELF, &ru);
+                struct LinuxTms { std::int64_t utime, stime, cutime, cstime; };
+                auto ticks = [](const struct ::timeval& tv) {
+                    return static_cast<std::int64_t>(tv.tv_sec) * 100 + tv.tv_usec / 10'000;
+                };
+                struct ::rusage ch{};
+                ::getrusage(RUSAGE_CHILDREN, &ch);
+                const LinuxTms out{ticks(ru.ru_utime), ticks(ru.ru_stime),
+                                   ticks(ch.ru_utime), ticks(ch.ru_stime)};
+                if (a0 && !ram.put(a0, out)) return -14;
+                struct ::timespec up{};
+                ::clock_gettime(CLOCK_MONOTONIC, &up);
+                return up.tv_sec * 100 + up.tv_nsec / 10'000'000;
+            }
+            case S::getrusage: {
+                // struct rusage: the two timevals plus the counters programs
+                // actually read (maxrss, faults, context switches).
+                struct LinuxRusage {
+                    std::int64_t utime_sec, utime_usec, stime_sec, stime_usec;
+                    std::int64_t maxrss, ixrss, idrss, isrss;
+                    std::int64_t minflt, majflt, nswap, inblock, oublock;
+                    std::int64_t msgsnd, msgrcv, nsignals, nvcsw, nivcsw;
+                };
+                static_assert(sizeof(LinuxRusage) == 144);
+                const int who = static_cast<int>(a0) == -1 ? RUSAGE_CHILDREN : RUSAGE_SELF;
+                struct ::rusage ru{};
+                if (::getrusage(who, &ru) < 0) return darwin::fail();
+                LinuxRusage out{};
+                out.utime_sec  = ru.ru_utime.tv_sec;
+                out.utime_usec = ru.ru_utime.tv_usec;
+                out.stime_sec  = ru.ru_stime.tv_sec;
+                out.stime_usec = ru.ru_stime.tv_usec;
+                // Darwin reports maxrss in BYTES, Linux in kilobytes.
+                out.maxrss  = ru.ru_maxrss / 1024;
+                out.minflt  = ru.ru_minflt;
+                out.majflt  = ru.ru_majflt;
+                out.inblock = ru.ru_inblock;
+                out.oublock = ru.ru_oublock;
+                out.nsignals = ru.ru_nsignals;
+                out.nvcsw   = ru.ru_nvcsw;
+                out.nivcsw  = ru.ru_nivcsw;
+                return ram.put(a1, out) ? 0 : -14;
+            }
+
             case S::getgroups:
                 return 0;           // root, no supplementary groups
+
+            // -- Scheduling. Guest threads are host threads, so the honest
+            //    answer for every query comes from the host.
+            case S::sched_setaffinity:
+                // Darwin has no hard CPU pinning; XNU places threads itself.
+                // Accepting is correct (affinity is a hint on Linux too when
+                // the mask covers every CPU, which is what runtimes request).
+                return 0;
+            case S::sched_getscheduler:
+                return 0;                                        // SCHED_OTHER
+            case S::sched_setscheduler: case S::sched_setparam:
+                // Only SCHED_OTHER with priority 0 is meaningful unprivileged;
+                // realtime classes need host privileges we don't take.
+                return a1 == 0 ? 0 : -1;                         // EPERM
+            case S::sched_getparam:
+                return ram.put(a1, std::int32_t{0}) ? 0 : -14;   // sched_priority
+            case S::sched_get_priority_max: case S::sched_get_priority_min:
+                // SCHED_FIFO/RR (1/2) span 1..99 on Linux; SCHED_OTHER is 0.
+                return (a0 == 1 || a0 == 2) ? (sc == S::sched_get_priority_max ? 99 : 1) : 0;
+            case S::getcpu: {
+                // getcpu(cpu*, node*, cache*). Report the core this host
+                // thread is on right now -- what the guest is actually doing.
+                if (a0 && !ram.put(a0, std::uint32_t{current_cpu()})) return -14;
+                if (a1 && !ram.put(a1, std::uint32_t{0})) return -14;   // one NUMA node
+                return 0;
+            }
+
+            // -- prctl(option, ...). A grab-bag; these are the options real
+            //    programs depend on.
+            case S::prctl: {
+                constexpr std::uint64_t kSetName = 15, kGetName = 16,
+                                        kSetNoNewPrivs = 38, kGetNoNewPrivs = 39,
+                                        kSetDumpable = 4, kGetDumpable = 3,
+                                        kSetPdeathsig = 1, kGetPdeathsig = 2,
+                                        kSetSeccomp = 22, kGetSeccomp = 21,
+                                        kCapbsetRead = 23, kSetChildSubreaper = 36;
+                switch (a0) {
+                    case kSetName: {
+                        // The thread name; /proc/self/comm reads it back.
+                        auto name = ram.cstr(a1, 16);
+                        ::pthread_setname_np(name.c_str());
+                        return 0;
+                    }
+                    case kGetName: {
+                        char buf[16]{};
+                        ::pthread_getname_np(::pthread_self(), buf, sizeof buf);
+                        auto win = ram.at(a1, sizeof buf);
+                        if (win.empty()) return -14;
+                        std::memcpy(win.data(), buf, sizeof buf);
+                        return 0;
+                    }
+                    // PR_SET_NO_NEW_PRIVS is a one-way latch that only
+                    // RESTRICTS: nothing in linuxity's world grants
+                    // privilege anyway (there is no setuid execution), so
+                    // honouring it is exact, not a pretence. pacman 7's
+                    // download sandbox sets it and aborts if it fails --
+                    // which is why `pacman -Sy` died here.
+                    case kSetNoNewPrivs:
+                        no_new_privs_ = a1 != 0;
+                        return 0;
+                    case kGetNoNewPrivs:
+                        return no_new_privs_ ? 1 : 0;
+                    case kSetDumpable: case kGetDumpable:
+                        return a0 == kGetDumpable ? 1 : 0;
+                    case kSetPdeathsig:
+                        // The signal to send this process when its parent
+                        // dies. Recorded; nothing to arm on Darwin, and a
+                        // guest that relies on it for cleanup is no worse
+                        // off than on a kernel that delivered it late.
+                        pdeathsig_ = static_cast<int>(a1);
+                        return 0;
+                    case kGetPdeathsig:
+                        return ram.put(a1, std::int32_t{pdeathsig_}) ? 0 : -14;
+                    case kSetSeccomp:
+                        return 0;               // see S::seccomp below
+                    case kGetSeccomp:
+                        return seccomp_mode_;
+                    case kCapbsetRead:
+                        return 1;               // uid 0: every bound capability
+                    case kSetChildSubreaper:
+                        return 0;
+                    default:
+                        // An unknown prctl is EINVAL, not ENOSYS: the
+                        // SYSCALL exists, the option doesn't. libc branches
+                        // on exactly that difference.
+                        return -22;
+                }
+            }
+
+            // -- seccomp(op, flags, args). linuxity is not a sandbox (see
+            //    doc/ROADMAP.md): a filter is ACCEPTED and not enforced,
+            //    which is the same contract as the Linux ptrace backend.
+            //    The alternative is worse than useless -- pacman, systemd,
+            //    OpenSSH and Chrome all treat a seccomp failure as fatal,
+            //    so ENOSYS turns "no extra hardening" into "cannot run".
+            case S::seccomp: {
+                constexpr std::uint64_t kSetModeStrict = 0,
+                                        kSetModeFilter = 1,
+                                        kGetActionAvail = 2;
+                switch (a0) {
+                    case kSetModeStrict: seccomp_mode_ = 1; return 0;
+                    case kSetModeFilter: seccomp_mode_ = 2; return 0;
+                    case kGetActionAvail: return 0;    // every action "available"
+                    default: return -22;
+                }
+            }
+
+            // -- capget/capset: uid 0 holds everything, and nothing here
+            //    drops privilege, so report a full set.
+            case S::capget: {
+                struct CapData { std::uint32_t effective, permitted, inheritable; };
+                if (a1) {
+                    const CapData full{~0u, ~0u, ~0u};
+                    const CapData sets[2] = {full, full};   // two 32-bit chunks
+                    if (!ram.put(a1, sets)) return -14;
+                }
+                return 0;
+            }
 
             // -- Credentials. linuxity's world is uid 0 and has exactly one
             //    identity, so a request to BECOME root (or stay root) is
@@ -1614,6 +1928,44 @@ private:
                 // on every call. Recorded so /proc/self/maps is truthful and
                 // so enforcement can be added without an ABI change.
                 return proc_.with_space([&](AddressSpace& t) { return t.protect(a0, a1, prot_from_linux(a2)); }) ? 0 : -12;
+            // -- mlock family. Guest RAM is a single host mapping that
+            //    linuxity already keeps resident, so locking a guest range
+            //    means locking the host pages behind it -- which is exactly
+            //    what a caller like gpg-agent wants (key material that can't
+            //    be paged out). If the host refuses (RLIMIT_MEMLOCK), report
+            //    ENOMEM/EPERM as Linux would, never ENOSYS: gpg treats ENOSYS
+            //    as "this kernel can't protect memory" and degrades silently.
+            case S::mlock: case S::munlock: case S::mlock2: {
+                auto win = machine_.ram().clamp(a0, a1);
+                if (win.empty() && a1) return -12;               // ENOMEM: unmapped
+                const int rc = sc == S::munlock ? ::munlock(win.data(), win.size())
+                                                : ::mlock(win.data(), win.size());
+                return rc < 0 ? darwin::fail() : 0;
+            }
+            case S::mlockall: case S::munlockall:
+                // The whole guest is one mapping; locking all of it would pin
+                // every byte of guest RAM. Accept: Linux grants mlockall to
+                // root, and pinning is an optimisation the guest can't observe.
+                return 0;
+            case S::mincore: {
+                // mincore(addr, len, vec): one byte per page, bit 0 =
+                // resident. Guest RAM is a live host mapping, so ask the host.
+                const std::uint64_t pages = AddressSpace::page_up(a1) / AddressSpace::kPageSize;
+                auto vec = machine_.ram().clamp(a2, pages);
+                if (vec.empty() && pages) return -14;
+                if (!proc_.with_space([&](AddressSpace& sp) { return sp.find(a0) != nullptr; }))
+                    return -12;                                  // ENOMEM: not mapped
+                std::memset(vec.data(), 1, vec.size());          // resident
+                return 0;
+            }
+            case S::msync: {
+                // msync(addr, len, flags): a file-backed MAP_SHARED mapping
+                // is materialised by pread in this backend, so there is no
+                // dirty page to write back. Validate the range like Linux.
+                if (a0 % AddressSpace::kPageSize) return -22;    // EINVAL
+                return proc_.with_space([&](AddressSpace& sp) { return sp.find(a0) != nullptr; })
+                    ? 0 : -12;
+            }
             case S::madvise: {
                 // Only MADV_DONTNEED changes visible state: anonymous pages
                 // must read back as zero afterwards. glibc's malloc relies
@@ -1668,6 +2020,7 @@ private:
         switch (sc) {
             case S::close:
                 dirs_.erase(gfd);                  // drop any directory stream
+                epolls_.erase(gfd);                // and any epoll set
                 return proc_.with_fds([&](FdTable& t) { return t.close(gfd); });
             case S::dup:   return proc_.with_fds([&](FdTable& t) { return t.dup(gfd, std::nullopt, false); });
             case S::dup3: {
@@ -1815,9 +2168,95 @@ private:
             case S::flock:
                 if (!need_fd()) return -9;
                 return ::flock(*hfd, static_cast<int>(a1)) < 0 ? darwin::fail() : 0;
+            // -- epoll. Every modern Linux event loop (systemd, nginx, Go's
+            //    netpoller, libuv, asyncio) waits here and has no fallback,
+            //    so this is implemented on kqueue rather than refused. See
+            //    hvf_epoll.hpp for the level/edge and per-filter differences.
+            case S::epoll_create1: {
+                auto set = std::make_shared<EpollSet>();
+                if (!set->valid()) return darwin::fail();
+                // The guest holds an ordinary fd; /dev/null backs it so that
+                // close(), dup() and the fd table need no special case.
+                const int placeholder = ::open("/dev/null", O_RDWR | O_CLOEXEC);
+                if (placeholder < 0) return darwin::fail();
+                constexpr std::uint64_t kCloexec = 0x80000;     // EPOLL_CLOEXEC
+                const int g = proc_.with_fds([&](FdTable& t) {
+                    return t.install(placeholder, (a0 & kCloexec) != 0);
+                });
+                if (g < 0) { ::close(placeholder); return -24; }
+                epolls_[g] = std::move(set);
+                return g;
+            }
+            case S::epoll_ctl: {
+                auto it = epolls_.find(gfd);
+                if (it == epolls_.end()) return -22;            // EINVAL: not an epoll fd
+                const int target = static_cast<int>(a2);
+                const int target_host = host_fd(target);
+                if (target_host < 0) return -9;
+                std::uint32_t mask = 0;
+                std::uint64_t token = 0;
+                if (static_cast<int>(a1) != kEpollCtlDel) {
+                    LinuxEpollEvent ev{};
+                    if (!ram.get(a3, ev)) return -14;
+                    mask = ev.events;
+                    token = ev.data;
+                }
+                return it->second->ctl(static_cast<int>(a1), target_host, target, mask, token);
+            }
+            case S::epoll_pwait: {
+                auto it = epolls_.find(gfd);
+                if (it == epolls_.end()) return -22;
+                std::vector<LinuxEpollEvent> ready;
+                const auto n = it->second->wait(ready, static_cast<int>(a2),
+                                                static_cast<int>(static_cast<std::int32_t>(a3)));
+                if (n < 0) return n;
+                for (std::size_t i = 0; i < ready.size(); ++i)
+                    if (!ram.put(a1 + i * sizeof(LinuxEpollEvent), ready[i])) return -14;
+                return n;
+            }
+
             case S::getdents64:
                 if (!need_fd()) return -9;
                 return do_getdents(gfd, *hfd, a1, a2);
+
+            // -- copy_file_range(fd_in, off_in*, fd_out, off_out*, len, flags)
+            //    coreutils' `cp` and `install` prefer it; Darwin has no
+            //    equivalent that takes explicit offsets, so do it with
+            //    pread/pwrite -- which is precisely the fallback Linux itself
+            //    uses when the filesystems differ.
+            case S::copy_file_range: {
+                const int in = host_fd(gfd);
+                const int out = host_fd(static_cast<int>(a2));
+                if (in < 0 || out < 0) return -9;
+                std::int64_t off_in = -1, off_out = -1;
+                if (a1) { std::int64_t v{}; if (!ram.get(a1, v)) return -14; off_in = v; }
+                if (a3) { std::int64_t v{}; if (!ram.get(a3, v)) return -14; off_out = v; }
+                std::uint64_t remaining = regs_.arg(4), done = 0;
+                std::vector<std::byte> buf(std::min<std::uint64_t>(remaining, 1u << 20));
+                while (remaining) {
+                    const auto want = std::min<std::uint64_t>(remaining, buf.size());
+                    const auto got = off_in < 0
+                        ? ::read(in, buf.data(), want)
+                        : ::pread(in, buf.data(), want, static_cast<off_t>(off_in));
+                    if (got < 0) return done ? static_cast<std::int64_t>(done) : darwin::fail();
+                    if (got == 0) break;                       // EOF
+                    const auto put = off_out < 0
+                        ? ::write(out, buf.data(), static_cast<std::size_t>(got))
+                        : ::pwrite(out, buf.data(), static_cast<std::size_t>(got),
+                                   static_cast<off_t>(off_out));
+                    if (put < 0) return done ? static_cast<std::int64_t>(done) : darwin::fail();
+                    done += static_cast<std::uint64_t>(put);
+                    remaining -= static_cast<std::uint64_t>(put);
+                    if (off_in >= 0) off_in += put;
+                    if (off_out >= 0) off_out += put;
+                    if (put < got) break;
+                }
+                if (a1 && off_in >= 0 && !ram.put(a1, off_in)) return -14;
+                if (a3 && off_out >= 0 && !ram.put(a3, off_out)) return -14;
+                return static_cast<std::int64_t>(done);
+            }
+            case S::fadvise64:
+                return 0;              // purely advisory; Darwin's F_RDAHEAD differs
             // close_range(first, last, flags): libc's closefrom(), used by
             // every spawn helper right before exec.
             case S::close_range: {
@@ -1923,6 +2362,35 @@ private:
         // the lock, then do the blocking-capable host call outside it.
         const int h = proc_.with_fds([&](FdTable& t) { return t.host(gfd).value_or(-1); });
         if (h < 0) return -9;
+
+        // -- Record locks. F_SETLKW can BLOCK (that is the point: it waits
+        //    for the holder to release), so it must run with no lock of ours
+        //    held -- which is why the fd was resolved first.
+        constexpr std::uint64_t kGetlk = 5, kSetlk = 6, kSetlkw = 7;
+        constexpr std::uint64_t kOfdGetlk = 36, kOfdSetlk = 37, kOfdSetlkw = 38;
+        if (cmd == kGetlk || cmd == kSetlk || cmd == kSetlkw ||
+            cmd == kOfdGetlk || cmd == kOfdSetlk || cmd == kOfdSetlkw) {
+            const GuestRam ram = machine_.ram();
+            darwin::LinuxFlock lf{};
+            if (!ram.get(arg, lf)) return -14;
+            auto df = darwin::flock_to_darwin(lf);
+            if (!df) return -22;
+            // Darwin has no OFD locks; its POSIX locks are per-process, which
+            // is the same scope a single-threaded locker observes. Mapping
+            // them is strictly better than refusing: the alternative is
+            // `useradd`, git and sqlite all failing to lock at all.
+            const bool get = cmd == kGetlk || cmd == kOfdGetlk;
+            const bool wait = cmd == kSetlkw || cmd == kOfdSetlkw;
+            const int dcmd = get ? F_GETLK : (wait ? F_SETLKW : F_SETLK);
+            if (::fcntl(h, dcmd, &*df) < 0) return darwin::fail();
+            if (get) {
+                // F_GETLK reports the CONFLICTING lock, or l_type=F_UNLCK if
+                // the range is free.
+                return ram.put(arg, darwin::flock_to_linux(*df)) ? 0 : -14;
+            }
+            return 0;
+        }
+
         switch (cmd) {
             case kGetfl: {
                 const int fl = ::fcntl(h, F_GETFL);
@@ -2199,6 +2667,27 @@ private:
                 if (rc < 0) return darwin::fail();
                 return ram.put(a2, darwin::to_linux(st)) ? 0 : -14;
             }
+            case S::statx: {
+                // statx(dirfd, path, flags, mask, buf). AT_EMPTY_PATH with an
+                // empty path means "stat the fd itself" -- there is no
+                // fstatat spelling for that, which is why refusing statx
+                // breaks callers outright rather than making them fall back.
+                constexpr std::uint64_t kNoFollow = 0x100, kEmptyPath = 0x1000;
+                struct ::stat st{};
+                int rc;
+                if ((a2 & kEmptyPath) && (!path || path->empty())) {
+                    const int h = host_fd(static_cast<int>(regs_.arg(0)));
+                    if (h < 0) return -9;
+                    rc = ::fstat(h, &st);
+                } else if (path) {
+                    rc = (a2 & kNoFollow) ? ::lstat(path->c_str(), &st)
+                                          : ::stat(path->c_str(), &st);
+                } else {
+                    return -2;
+                }
+                if (rc < 0) return darwin::fail();
+                return ram.put(regs_.arg(4), darwin::statx_from_darwin(st)) ? 0 : -14;
+            }
             case S::faccessat: case S::faccessat2:
                 if (!path) return -2;
                 return ::access(path->c_str(), static_cast<int>(a2)) < 0
@@ -2215,6 +2704,44 @@ private:
                 if (!path) return -2;
                 return ::mkdir(path->c_str(), static_cast<mode_t>(a2)) < 0
                            ? darwin::fail() : 0;
+            case S::mknodat: {
+                // mknodat(dirfd, path, mode, dev). FIFOs and regular files
+                // are real on Darwin; device nodes need privilege we don't
+                // take, and a guest's /dev is synthesized by the core
+                // anyway, so report EPERM for those exactly as an
+                // unprivileged Linux kernel does.
+                if (!path) return -2;
+                constexpr std::uint64_t kIfmt = 0170000, kIfifo = 0010000,
+                                        kIfreg = 0100000, kIfsock = 0140000;
+                const std::uint64_t fmt = a2 & kIfmt;
+                const auto mode = static_cast<mode_t>(a2 & 07777);
+                if (fmt == kIfifo)
+                    return ::mkfifo(path->c_str(), mode) < 0 ? darwin::fail() : 0;
+                if (fmt == 0 || fmt == kIfreg) {
+                    const int fd = ::open(path->c_str(),
+                                          O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, mode);
+                    if (fd < 0) return darwin::fail();
+                    ::close(fd);
+                    return 0;
+                }
+                if (fmt == kIfsock) {
+                    // A bound AF_UNIX socket creates its own node; mknod of
+                    // one is vanishingly rare and needs no device number.
+                    const int s = ::socket(AF_UNIX, SOCK_STREAM, 0);
+                    if (s < 0) return darwin::fail();
+                    ::sockaddr_un sun{};
+                    if (path->size() >= sizeof sun.sun_path) { ::close(s); return -36; }
+                    sun.sun_family = AF_UNIX;
+                    std::memcpy(sun.sun_path, path->c_str(), path->size() + 1);
+                    const int rc = ::bind(s, reinterpret_cast<::sockaddr*>(&sun),
+                                          static_cast<socklen_t>(
+                                              offsetof(::sockaddr_un, sun_path)
+                                              + path->size() + 1));
+                    ::close(s);
+                    return rc < 0 ? darwin::fail() : 0;
+                }
+                return -1;                                       // EPERM: device node
+            }
             case S::unlinkat: {
                 if (!path) return -2;
                 constexpr std::uint64_t kRemoveDir = 0x200;        // AT_REMOVEDIR
@@ -2286,6 +2813,22 @@ private:
                 if (!path) return -2;
                 return ::chmod(path->c_str(), static_cast<mode_t>(a2)) < 0
                            ? darwin::fail() : 0;
+            case S::fchmodat2: {
+                // fchmodat2(dirfd, path, mode, flags) -- fchmodat with real
+                // flag support. AT_SYMLINK_NOFOLLOW means "change the LINK's
+                // mode, not its target's", which Darwin spells lchmod.
+                //
+                // Refusing this is not harmless: libarchive calls it for
+                // every symlink it extracts, and `pacman -S git` turned the
+                // ENOSYS into "warning ... (Can't set permissions to 0777)"
+                // for each one and then failed the whole transaction.
+                if (!path) return -2;
+                constexpr std::uint64_t kNoFollow = 0x100;
+                const auto mode = static_cast<mode_t>(a2);
+                const int rc = (a3 & kNoFollow) ? ::lchmod(path->c_str(), mode)
+                                                : ::chmod(path->c_str(), mode);
+                return rc < 0 ? darwin::fail() : 0;
+            }
             case S::truncate:
                 if (!path) return -2;
                 return ::truncate(path->c_str(), static_cast<off_t>(regs_.arg(1))) < 0
@@ -2342,7 +2885,12 @@ private:
     std::vector<std::string> env_;
     bool execed_{false};
     bool thread_exited_{false};
+    bool no_new_privs_{false};
+    int pdeathsig_{0};
+    std::int64_t seccomp_mode_{0};
     TimerSet timers_;
+    // epoll sets, keyed by the guest fd that names them.
+    std::map<int, std::shared_ptr<EpollSet>> epolls_;
     // Open directory streams for getdents64, keyed by guest fd.
     struct Entry {
         std::uint64_t ino{};

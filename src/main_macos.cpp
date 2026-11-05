@@ -46,12 +46,15 @@ namespace {
 
 void usage() {
     std::fputs(
-        "usage: linuxity [--root DIR] [--bind HOST[:GUEST]]... [--memory MiB]\n"
-        "                PROGRAM [ARGS...]\n"
+        "usage: linuxity [--root DIR] [--persist DIR] [--bind HOST[:GUEST]]...\n"
+        "                [--memory MiB] PROGRAM [ARGS...]\n"
         "\n"
         "Run a Linux aarch64 program natively on this Mac.\n"
         "\n"
         "  --root DIR     an extracted distro rootfs to use as the guest '/'\n"
+        "  --persist DIR  keep guest writes here across runs (installs, config).\n"
+        "                 Without it, writes go to a per-run scratch dir and\n"
+        "                 are discarded. Either way the rootfs stays pristine.\n"
         "  --bind H[:G]   expose host directory H at guest path G (default H)\n"
         "  --memory MiB   guest RAM (default 2048)\n"
         "\n"
@@ -83,6 +86,7 @@ void crash_handler(int sig) {
 // correct: there is no second representation to keep in sync.
 struct Options {
     std::string root;
+    std::string persist;             // --persist DIR: a durable upper layer
     std::vector<std::pair<std::string, std::string>> binds;
     std::uint64_t mem_mib = 2048;
     std::vector<std::string> raw;     // exactly the option tokens we consumed
@@ -99,6 +103,7 @@ struct Options {
             return argv[++i];
         };
         if (a == "--root") o.root = need();
+        else if (a == "--persist") o.persist = need();
         else if (a == "--bind") {
             std::string spec = need();
             auto colon = spec.find(':');
@@ -132,7 +137,24 @@ struct Machine {
         spec.nodename = "linuxity";
         spec.machine_arch = "aarch64";
         k.set_machine(std::move(spec));
-        k.files().mount_host("/", o.root);
+
+        // Stack a WRITABLE upper layer over the read-only rootfs. The core
+        // implements the full overlayfs model -- copy-up on first write,
+        // whiteouts for deletes, a shadow uid/mode journal -- so the distro
+        // you extracted is never mutated by the guest. Without this the
+        // guest writes straight into the rootfs directory and silently
+        // corrupts it: `pacman -S` would half-install into your pristine
+        // tree, and `rm` would delete from it for real.
+        //
+        // The upper is decided ONCE, by the root process, and every fork
+        // child inherits the SAME path. That is load-bearing: a guest fork
+        // is a fresh linuxity process (see hvf_fork.hpp), so deriving the
+        // scratch dir from getpid() gave each child its own empty layer.
+        // pacman's download worker then wrote core.db into a layer the
+        // parent never looked at, and the sync silently "failed".
+        upper_ = o.persist.empty() ? scratch_upper() : o.persist;
+        mkdir_p(upper_);
+        k.files().mount_host("/", o.root, upper_);
         k.files().mount_virtual("/proc", vfs::make_procfs(k.procs(), k.machine()));
         k.files().mount_virtual("/sys", vfs::make_sysfs(k.machine()));
         k.files().mount_virtual("/dev", vfs::make_devfs());
@@ -150,13 +172,42 @@ struct Machine {
         root_ = o.root;
     }
 
-    // host path -> guest path: the inverse of resolve() for the rootfs.
+    // host path -> guest path: the inverse of resolve(). With an overlay a
+    // guest path has TWO possible host homes (upper and lower), and
+    // readlink("/proc/self/fd/N") must report the guest name whichever layer
+    // the fd actually came from.
     [[nodiscard]] std::string unresolve(const std::string& host) const {
-        if (host.size() > root_.size() && host.starts_with(root_) && host[root_.size()] == '/')
-            return host.substr(root_.size());
+        for (const std::string& base : {upper_, root_}) {
+            if (base.empty()) continue;
+            if (host.size() > base.size() && host.starts_with(base) &&
+                host[base.size()] == '/')
+                return host.substr(base.size());
+        }
         return host;
     }
     std::string root_;
+    std::string upper_;
+
+    // The per-RUN scratch upper. The root process picks it and exports it in
+    // the environment; fork children are spawned with that environment, so
+    // they find the same name instead of minting a new one.
+    [[nodiscard]] static std::string scratch_upper() {
+        constexpr const char* kVar = "LINUXITY_SCRATCH_UPPER";
+        if (const char* inherited = std::getenv(kVar); inherited && *inherited)
+            return inherited;
+        std::string fresh = "/tmp/linuxity-upper-" + std::to_string(::getpid());
+        ::setenv(kVar, fresh.c_str(), 1);
+        return fresh;
+    }
+
+    // mkdir -p, so --persist can name a path that doesn't exist yet.
+    static void mkdir_p(const std::string& p) {
+        for (std::size_t i = 1; i <= p.size(); ++i)
+            if (i == p.size() || p[i] == '/') {
+                const std::string seg = p.substr(0, i);
+                if (seg != "/") (void)::mkdir(seg.c_str(), 0755);
+            }
+    }
 
     [[nodiscard]] std::string resolve(const std::string& guest) {
         auto pc = k.files().classify(k.files().absolutize(guest));
@@ -201,13 +252,16 @@ public:
         // every source to a private HIGH number in the parent (above any
         // target), then dup2 from those. No high fd can be a target, so no
         // action can clobber another's source.
-        int max_group = -1;
-        for (const auto& e : img.fds) max_group = std::max(max_group, e.group);
+        //
+        // The groups come straight from the table's export, which already
+        // lists every distinct open file -- including each eventfd's hidden
+        // write end -- so nothing the child's table refers to is left behind.
         posix_spawn_file_actions_t fa;
         ::posix_spawn_file_actions_init(&fa);
-        std::vector<int> placed(static_cast<std::size_t>(max_group + 1), -1);
+        const std::vector<int>& sources = img.fd_hosts;
+        std::vector<int> placed(sources.size(), -1);
         std::vector<int> staged;                     // high copies, closed after spawn
-        const int targets = static_cast<int>(placed.size()) + 1;   // + the pid table
+        const int targets = static_cast<int>(sources.size()) + 1;   // + the pid table
         const int high_floor = 3 + targets + 64;
         auto stage = [&](int src) {
             const int h = ::fcntl(src, F_DUPFD_CLOEXEC, high_floor);
@@ -215,11 +269,9 @@ public:
             return h;
         };
         int next = 3;
-        for (const auto& e : img.fds) {
-            auto gi = static_cast<std::size_t>(e.group);
-            if (placed[gi] >= 0) continue;
+        for (std::size_t gi = 0; gi < sources.size(); ++gi) {
             placed[gi] = next;
-            ::posix_spawn_file_actions_adddup2(&fa, stage(e.host), next);
+            ::posix_spawn_file_actions_adddup2(&fa, stage(sources[gi]), next);
             ++next;
         }
         const int pid_fd_child = next++;
@@ -410,6 +462,7 @@ void run_guest_thread(ThreadContext& ctx, runtime::HvfTrap::ThreadStart start) {
 
     runtime::g_pending.unregister_cpu(cpu.handle());
     ctx.proc.remove_thread(task.tid);
+    ctx.pids.release(task.tid);          // the tid returns to the shared namespace
 }
 
 // -- Run a guest to completion (shared by root and fork children) ---------------
@@ -562,8 +615,10 @@ int main(int argc, char** argv) {
     runtime::ProcessState proc;
     runtime::TaskState task;
     task.tid = 1;                      // the initial thread IS the process
-    proc.set_tid_base(2);
     runtime::HvfTrap trap{machine, cpu, proc, task, pids};
+    // Only the ROOT process reserves the low fds: a fork child inherits its
+    // parent's whole table (reservations included) through the handoff.
+    proc.with_fds([](runtime::FdTable& t) { t.reserve_low_fds(); });
     trap.set_arena(ex->brk_base, runtime::ExecArena::mmap_top(machine.mem_size()));
     for (const auto& sg : ex->segments)
         trap.adopt(sg.begin, sg.end, runtime::prot_from_elf(sg.flags));

@@ -58,6 +58,28 @@ public:
         }
     }
 
+    // Occupy guest fds 3..8 with harmless /dev/null handles, so the guest's
+    // own descriptors begin at 9 -- exactly like a program launched from a
+    // real login session, which always inherits a few (terminal, journal,
+    // dbus socket).
+    //
+    // This is load-bearing, not cosmetic. pacman's download worker closes a
+    // low descriptor and immediately reopens that SAME number for core.db,
+    // while sibling threads still believe the number is the old libcurl
+    // wakeup channel and keep writing 8-byte wakeups to it. In a bare
+    // 0,1,2-only process the two collide on fd 3 and the wakeups land INSIDE
+    // the database: measured, core.db began 01 00 00 00 00 00 00 00 and
+    // pacman rejected it as "Unrecognized archive format". The Linux backend
+    // reserves these slots for the same reason (src/main.cpp,
+    // reserve_low_fds); both backends must agree.
+    void reserve_low_fds() {
+        for (int want = 3; want <= 8; ++want) {
+            const int h = ::open("/dev/null", O_RDWR | O_CLOEXEC);
+            if (h < 0) return;
+            if (install(h, false) != want) return;       // dense from 0, so this holds
+        }
+    }
+
     // Host fd backing guest fd `g`, or nullopt (EBADF).
     [[nodiscard]] std::optional<int> host(int g) const noexcept {
         if (g < 0 || static_cast<std::size_t>(g) >= slots_.size()) return std::nullopt;
@@ -85,19 +107,25 @@ public:
     }
 
     // dup(g) -> lowest free; dup3(g, to) -> exactly `to` (closing it first).
+    // A dup of an eventfd is still an eventfd: the peer travels with it.
     [[nodiscard]] int dup(int g, std::optional<int> to, bool cloexec) {
         if (!host(g)) return -9;
-        auto file = slots_[static_cast<std::size_t>(g)].file;
+        const Slot& src = slots_[static_cast<std::size_t>(g)];
+        auto file = src.file;
+        auto peer = src.peer;
         if (!to) {
             for (std::size_t i = 0; i < slots_.size(); ++i)
-                if (!slots_[i].file) { slots_[i] = {std::move(file), cloexec}; return static_cast<int>(i); }
+                if (!slots_[i].file) {
+                    slots_[i] = {std::move(file), cloexec, std::move(peer)};
+                    return static_cast<int>(i);
+                }
             if (slots_.size() >= kMaxFds) return -24;
-            slots_.push_back({std::move(file), cloexec});
+            slots_.push_back({std::move(file), cloexec, std::move(peer)});
             return static_cast<int>(slots_.size() - 1);
         }
         if (*to < 0 || *to >= kMaxFds) return -9;
         if (*to == g) return g;
-        install_at(*to, std::move(file), cloexec);
+        install_at(*to, std::move(file), cloexec, std::move(peer));
         return *to;
     }
 
@@ -141,40 +169,61 @@ public:
 
     // -- Fork handoff -------------------------------------------------------
     // A spawn-based fork (runtime/hvf_fork.hpp) gives the child a fresh fd
-    // table, so the parent describes its table as (guest fd, host fd, flags)
-    // and arranges for each distinct host fd to arrive in the child at a
-    // known number. Guest fds sharing one HostFd (dup) must STILL share one
-    // after the fork -- they share a file offset on Linux -- so entries are
-    // grouped by the HostFd object, not by host fd number.
+    // table, so the parent describes its table and arranges for each distinct
+    // host fd to arrive in the child at a known number.
+    //
+    // The unit of identity is the OPEN FILE (the HostFd object), not the fd
+    // number: guest fds sharing one HostFd (dup) must still share one after
+    // the fork, because they share an offset on Linux. And an eventfd is ONE
+    // guest fd over TWO host fds -- its read end and its write end -- so the
+    // write end must travel too. Dropping it (as an earlier version did) left
+    // the child believing fd 3 was an eventfd while holding only half of it;
+    // pacman's download worker then reopened fd 3 for core.db, and its
+    // sibling threads' 8-byte wakeups landed IN the database file.
     struct Exported {
         int guest;
-        int host;      // number in the PARENT (posix_spawn dup2's it across)
-        int group;     // equal for guest fds that share an open file
+        int group;          // the open file, numbered densely
+        int peer_group;     // eventfd write end's group, or -1
         bool cloexec;
     };
-    [[nodiscard]] std::vector<Exported> export_table() const {
-        std::vector<Exported> out;
-        std::vector<const HostFd*> groups;
+    struct Export {
+        std::vector<Exported> entries;
+        std::vector<int> host_fds;      // host fd for each group, in the PARENT
+    };
+    [[nodiscard]] Export export_table() const {
+        Export out;
+        std::vector<const HostFd*> seen;
+        auto group_of = [&](const std::shared_ptr<HostFd>& f) -> int {
+            if (!f) return -1;
+            auto it = std::find(seen.begin(), seen.end(), f.get());
+            if (it != seen.end()) return static_cast<int>(it - seen.begin());
+            seen.push_back(f.get());
+            out.host_fds.push_back(f->get());
+            return static_cast<int>(seen.size() - 1);
+        };
         for (std::size_t g = 0; g < slots_.size(); ++g) {
             const Slot& s = slots_[g];
             if (!s.file) continue;
-            auto it = std::find(groups.begin(), groups.end(), s.file.get());
-            int grp = static_cast<int>(it - groups.begin());
-            if (it == groups.end()) groups.push_back(s.file.get());
-            out.push_back({static_cast<int>(g), s.file->get(), grp, s.cloexec});
+            out.entries.push_back({static_cast<int>(g), group_of(s.file),
+                                   group_of(s.peer), s.cloexec});
         }
         return out;
     }
-    // Child side: `host_of_group[i]` is where group i's fd landed.
+    // Child side: `host_of_group[i]` is where group i's host fd landed.
     void import_table(const std::vector<Exported>& in,
                       const std::vector<int>& host_of_group) {
         slots_.clear();
         std::vector<std::shared_ptr<HostFd>> files(host_of_group.size());
+        auto file_for = [&](int gi) -> std::shared_ptr<HostFd> {
+            if (gi < 0 || static_cast<std::size_t>(gi) >= files.size()) return {};
+            auto& f = files[static_cast<std::size_t>(gi)];
+            if (!f) f = std::make_shared<HostFd>(host_of_group[static_cast<std::size_t>(gi)]);
+            return f;
+        };
         for (const Exported& e : in) {
-            auto gi = static_cast<std::size_t>(e.group);
-            if (gi >= files.size()) continue;
-            if (!files[gi]) files[gi] = std::make_shared<HostFd>(host_of_group[gi]);
-            install_at(e.guest, files[gi], e.cloexec);
+            auto file = file_for(e.group);
+            if (!file) continue;
+            install_at(e.guest, std::move(file), e.cloexec, file_for(e.peer_group));
         }
     }
 
@@ -186,10 +235,11 @@ private:
         std::shared_ptr<HostFd> peer;
     };
 
-    void install_at(int g, std::shared_ptr<HostFd> file, bool cloexec) {
+    void install_at(int g, std::shared_ptr<HostFd> file, bool cloexec,
+                    std::shared_ptr<HostFd> peer = {}) {
         if (static_cast<std::size_t>(g) >= slots_.size())
             slots_.resize(static_cast<std::size_t>(g) + 1);
-        slots_[static_cast<std::size_t>(g)] = {std::move(file), cloexec};
+        slots_[static_cast<std::size_t>(g)] = {std::move(file), cloexec, std::move(peer)};
     }
 
     std::vector<Slot> slots_;

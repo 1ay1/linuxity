@@ -39,6 +39,17 @@ KVM platform use this same model.
       Working today against a real Arch Linux ARM rootfs:
         * `linuxity --root ~/arch /usr/bin/bash` is an interactive shell:
           prompt, job control, pipelines, scripts, `trap`, redirection.
+        * **A real package manager.** `pacman -Sy`, `pacman -S git`,
+          `pacman-key --init/--populate` all work against live mirrors:
+          HTTPS downloads, gpg signature verification, the keyring, and
+          package extraction with correct symlink permissions.
+        * **git** clones, commits and logs. nano, vim, ssh, openssl, tar,
+          coreutils, find/xargs, useradd/groupadd/chpasswd, flock, df, stat.
+        * **Copy-on-write overlay.** The rootfs you extracted is NEVER
+          mutated: writes copy up into an upper layer, deletes become
+          whiteouts, and uid/mode changes go to a shadow journal.
+          `--persist DIR` keeps that layer across runs (installs survive);
+          without it, a per-run scratch dir.
         * **Threads.** `clone(CLONE_THREAD)` gives each guest thread its own
           host thread and vCPU over shared guest RAM, so threads run in
           parallel on the real cores (8 threads of CPU work: 0.167 s vs
@@ -46,19 +57,20 @@ KVM platform use this same model.
           os_sync_wait_on_address has the same compare-and-sleep contract,
           including cross-process shared support.
         * **Processes.** fork via COW snapshot + spawn, execve (program +
-          PT_INTERP + `#!` chains), wait4, a shared guest pid namespace.
+          PT_INTERP + `#!` chains), wait4, a shared guest pid/tid namespace.
         * **Signals.** Full rt_sigframe delivery with FP/SIMD state,
           sigreturn, sigaltstack, per-thread masks, sigsuspend, and
           group/broadcast kills confined to the guest's own process tree.
         * **Timers.** setitimer and the POSIX timer_* family on a timer
           wheel, so `timeout`, `alarm` and connect deadlines work.
-        * **Sockets.** socket/bind/connect/send/recv/poll translated to
-          Darwin, so the guest uses the Mac's real network. DNS resolves.
-        * coreutils, `pacman -Q`, vim, ssh, openssl, tar, find/xargs, git.
-      Remaining: TLS fails if the HOST clock is wrong (certificates look
-      not-yet-valid), no write overlay on macOS yet (guest writes land in the
-      rootfs directory), mprotect is tracked but not enforced in the page
-      tables, and `ps` needs a fuller /proc.
+        * **Sockets + epoll.** The full BSD socket set translated to Darwin,
+          and epoll implemented on kqueue (level/edge, oneshot, EPOLLRDHUP),
+          so Linux event loops work rather than hitting ENOSYS.
+        * **Locks and modern stat.** fcntl POSIX record locks (what
+          `useradd`, git and sqlite use) and statx including AT_EMPTY_PATH.
+      Remaining: `mprotect` is tracked in the VMA map but not enforced in
+      the page tables; `ps` needs a fuller /proc; CI does not yet build the
+      macOS binary (it needs a signed binary and a rootfs).
 - [ ] **M1: Linux completeness ladder.** Each rung is a release:
       1. busybox / coreutils / bash
       2. `pacman -Syu`, `apk add`, `apt install`
