@@ -28,9 +28,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <sys/event.h>
 #include <sys/sysctl.h>
 #include <cstdio>
 #include <cstdlib>
@@ -113,7 +116,7 @@ struct Options {
         }
         else if (a == "--memory") o.mem_mib = std::strtoull(need(), nullptr, 10);
         else if (a == "-h" || a == "--help") { usage(); std::exit(0); }
-        else if (a == "--fork-child") break;      // internal: see main()
+        else if (a == "--fork-child" || a == "--zygote") break;   // internal: see main()
         else if (a.starts_with("--")) {
             std::fprintf(stderr, "linuxity: unknown option %s\n", argv[i]);
             usage();
@@ -340,6 +343,31 @@ public:
             std::lock_guard l{machine_wrap_.k.mutex()};
             img.namespace_state = machine_wrap_.k.files().export_process_state();
         }
+        // FAST PATH: a ZYGOTE -- a linuxity spawned ahead of time, already
+        // through dyld, static init, Machine setup and the bootstrap lookup,
+        // parked on its reply port. posix_spawn + a fresh process's startup
+        // is ~5 ms of every fork (measured); with a warm zygote a fork is a
+        // COW snapshot plus one Mach message. Its fds (including 0/1/2,
+        // which must be the forking process's CURRENT ones) ride in that
+        // message as fileports. A fresh zygote is started right after, off
+        // the fork's critical path, for the next fork.
+        if (static const bool no_zyg = std::getenv("LINUXITY_NO_ZYGOTE") != nullptr; !no_zyg) {
+            if (Zygote z = take_zygote(); z.pid > 0) {
+                std::vector<int> fds{0, 1, 2};
+                fds.insert(fds.end(), img.fd_hosts.begin(), img.fd_hosts.end());
+                fds.push_back(pids_.fd());
+                const mach_port_t mem = runtime::fork_ipc::snapshot(machine_.raw_base(),
+                                                                    machine_.mem_size());
+                const bool sent = runtime::fork_ipc::send_with_fds(
+                    z.reply, mem, machine_.mem_size(), runtime::wire::encode(img), fds);
+                ::mach_port_deallocate(::mach_task_self(), z.reply);
+                mark("zygote-sent");
+                if (sent) { spawn_zygote_async(); return z.pid; }
+                ::kill(z.pid, SIGKILL);
+                int st = 0; ::waitpid(z.pid, &st, 0);
+            }
+            spawn_zygote_async();     // warm one for next time
+        }
 
         // One host fd per distinct open file, placed at 3, 4, 5... in the child.
         //
@@ -454,6 +482,115 @@ public:
     }
 
 private:
+    // -- Zygotes ------------------------------------------------------------
+    // A zygote is a linuxity started with `--zygote SERVICE`: it does all of
+    // a fork child's process-level setup, looks up SERVICE, sends us its
+    // reply port ("hello") and blocks receiving the handoff. We keep at most
+    // ONE warm per guest process (it costs a parked process, ~6 MB RSS).
+    struct Zygote { pid_t pid{-1}; mach_port_t reply{MACH_PORT_NULL}; };
+    struct ZygoteSlot {
+        std::mutex mu;
+        std::condition_variable cv;
+        int pending{0};                  // spawns in flight
+        std::vector<Zygote> ready;
+    };
+    ZygoteSlot& slot() { static ZygoteSlot s; return s; }
+    // Pool depth: back-to-back forks (a shell loop, `make -j`, configure)
+    // drain warm zygotes faster than fresh ones start (~5 ms each, spawned
+    // in parallel). Measured: depth 3 ran dry every third fork of a tight
+    // fork/wait loop (3.7 ms stall); 6 covers it. A parked zygote is ~6 MB
+    // RSS and no CPU, and the pool only fills once forking starts.
+    static constexpr int kPool = 6;
+
+    // Take a warm zygote; if none is ready but one is coming, wait briefly.
+    Zygote take_zygote() {
+        auto& s = slot();
+        std::unique_lock l{s.mu};
+        static const bool zp = std::getenv("LINUXITY_PROFILE_FORK") != nullptr;
+        const std::size_t had = s.ready.size();
+        const auto w0 = std::chrono::steady_clock::now();
+        s.cv.wait_for(l, std::chrono::milliseconds(20),
+                      [&] { return !s.ready.empty() || s.pending == 0; });
+        if (zp) std::fprintf(stderr, "[pool] ready=%zu pending=%d waited %lld us\n", had, s.pending,
+            static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - w0).count()));
+        if (s.ready.empty()) return {};
+        Zygote z = s.ready.back();
+        s.ready.pop_back();
+        return z;
+    }
+    void spawn_zygote_async() {
+        auto& s = slot();
+        int want = 0;
+        {
+            std::lock_guard l{s.mu};
+            want = kPool - static_cast<int>(s.ready.size()) - s.pending;
+            if (want <= 0) return;
+            s.pending += want;
+        }
+        for (int k = 0; k < want; ++k)
+            std::thread([this] {
+                Zygote z = spawn_zygote();
+                auto& sl = slot();
+                std::lock_guard l{sl.mu};
+                --sl.pending;
+                if (z.pid > 0) sl.ready.push_back(z);
+                sl.cv.notify_all();
+            }).detach();
+    }
+    // posix_spawn `linuxity <opts> --zygote SVC` and wait for its hello.
+    Zygote spawn_zygote() {
+        const std::string svc_name = runtime::fork_ipc::unique_service_name();
+        mach_port_t svc = MACH_PORT_NULL;
+        ::mach_port_allocate(::mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &svc);
+        ::mach_port_insert_right(::mach_task_self(), svc, svc, MACH_MSG_TYPE_MAKE_SEND);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        if (::bootstrap_register(bootstrap_port, const_cast<char*>(svc_name.c_str()), svc)
+            != KERN_SUCCESS) {
+#pragma clang diagnostic pop
+            ::mach_port_mod_refs(::mach_task_self(), svc, MACH_PORT_RIGHT_RECEIVE, -1);
+            return {};
+        }
+        std::vector<std::string> args{self_exe()};
+        args.insert(args.end(), opts_.raw.begin(), opts_.raw.end());
+        args.emplace_back("--zygote");
+        args.emplace_back(svc_name);
+        std::vector<char*> av;
+        for (auto& a : args) av.push_back(a.data());
+        av.push_back(nullptr);
+        // NO fds are inherited. A parked zygote that held the caller's
+        // stderr kept every `linuxity ... 2>&1 | grep` pipeline open after
+        // the guest exited (the pipe never reached EOF). The real 0/1/2
+        // arrive with the fork; until then it talks to /dev/null.
+        posix_spawn_file_actions_t fa;
+        ::posix_spawn_file_actions_init(&fa);
+        ::posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+        ::posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
+        ::posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
+        posix_spawnattr_t attr;
+        ::posix_spawnattr_init(&attr);
+        ::posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
+        pid_t pid = -1;
+        const int rc = ::posix_spawn(&pid, args[0].c_str(), &fa, &attr, av.data(), environ);
+        ::posix_spawn_file_actions_destroy(&fa);
+        ::posix_spawnattr_destroy(&attr);
+        if (rc != 0) {
+            ::mach_port_mod_refs(::mach_task_self(), svc, MACH_PORT_RIGHT_RECEIVE, -1);
+            return {};
+        }
+        struct { mach_msg_header_t h; mach_msg_trailer_t t; } hello{};
+        const auto got = ::mach_msg(&hello.h, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0,
+                                    sizeof hello, svc, 10'000, MACH_PORT_NULL);
+        ::mach_port_mod_refs(::mach_task_self(), svc, MACH_PORT_RIGHT_RECEIVE, -1);
+        if (got != MACH_MSG_SUCCESS) {
+            ::kill(pid, SIGKILL);
+            int st = 0; ::waitpid(pid, &st, 0);
+            return {};
+        }
+        return {pid, hello.h.msgh_remote_port};
+    }
+
     const Options& opts_;
     Machine& machine_wrap_;
     runtime::HvfMachine& machine_;
@@ -625,6 +762,9 @@ void run_guest_thread(ThreadContext& ctx, runtime::HvfTrap::ThreadStart start) {
 }  // namespace
 
 namespace {
+// Set once a zygote received its fork: from then on it is a real guest
+// process and outlives its parent like any child would.
+std::atomic<bool>& zygote_claimed() { static std::atomic<bool> b{false}; return b; }
 // /proc sees EVERY live guest process, not just this host process's
 // fork-time snapshot of the process table. Each guest process is its own
 // host process; the shared PidSpace page is the only cross-process truth.
@@ -727,6 +867,105 @@ int main(int argc, char** argv) {
         runtime::HvfTrap trap{machine, cpu, proc, task, pids};
         attach_live_procs(m, pids);
         trap.resume_fork_child(img, ca.group_fds);
+        return run(o, m, machine, cpu, proc, task, pids, trap);
+    }
+
+    // -- Zygote: `--zygote SERVICE`. A fork child spawned AHEAD of the fork.
+    // Everything a process costs to start (dyld, static init, Machine and
+    // overlay attach, the bootstrap lookup) happens now, while no guest is
+    // waiting; then it parks in mach_msg until the parent forks. Its fds
+    // arrive in the handoff as fileports: [0,1,2, groups..., pidspace].
+    if (i + 1 < argc && std::string_view{argv[i]} == "--zygote") {
+        smark("zyg-main");
+        Machine m{o, /*fork_child=*/true};
+        smark("zyg-machine");
+        // Pre-warm the VM and this thread's vCPU while parked: hv_vm_create
+        // + hv_vcpu_create are ~0.6 ms of a fork otherwise. A vCPU belongs
+        // to the thread that made it, and this main thread is the one that
+        // will run the guest, so it is safe to create it now.
+        runtime::HvfMachine machine;
+        if (!machine.prewarm()) return 127;
+        runtime::HvfCpu cpu;
+        if (!cpu.create()) return 127;
+        smark("zyg-vcpu");
+        mach_port_t parent = MACH_PORT_NULL;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        if (::bootstrap_look_up(bootstrap_port, argv[i + 1], &parent) != KERN_SUCCESS)
+            return 127;
+#pragma clang diagnostic pop
+        mach_port_t reply = MACH_PORT_NULL;
+        ::mach_port_allocate(::mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &reply);
+        ::mach_port_insert_right(::mach_task_self(), reply, reply, MACH_MSG_TYPE_MAKE_SEND);
+        struct { mach_msg_header_t h; } hello{};
+        hello.h.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_MAKE_SEND);
+        hello.h.msgh_size = sizeof hello;
+        hello.h.msgh_remote_port = parent;
+        hello.h.msgh_local_port = reply;
+        if (::mach_msg(&hello.h, MACH_SEND_MSG, sizeof hello, 0, MACH_PORT_NULL,
+                       MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL) != MACH_MSG_SUCCESS)
+            return 127;
+        // If the parent dies before forking, our send right's target goes
+        // away; a dead-name notification would be the clean exit, but the
+        // receive below simply fails when the parent's port set is torn
+        // down with it. Either way: never run guest code without a handoff.
+        // If our creator exits without forking (the guest session ended), a
+        // parked zygote must not linger. Watch the parent pid; exit with it.
+        {
+            const pid_t creator = ::getppid();
+            std::thread([creator] {
+                const int kq = ::kqueue();
+                struct ::kevent ev{};
+                EV_SET(&ev, static_cast<uintptr_t>(creator), EVFILT_PROC, EV_ADD,
+                       NOTE_EXIT, 0, nullptr);
+                if (kq < 0 || ::kevent(kq, &ev, 1, nullptr, 0, nullptr) < 0) {
+                    if (::kill(creator, 0) != 0) ::_exit(0);
+                    return;
+                }
+                struct ::kevent out{};
+                while (::kevent(kq, nullptr, 0, &out, 1, nullptr) < 0 && errno == EINTR) {}
+                if (!zygote_claimed().load()) ::_exit(0);
+            }).detach();
+        }
+        runtime::fork_ipc::Received in;
+        if (!runtime::fork_ipc::receive_with_fds(reply, in) || in.fds.size() < 4)
+            return 127;
+        zygote_claimed().store(true);
+        static const bool zprof = std::getenv("LINUXITY_PROFILE_FORK") != nullptr;
+        const auto z0 = std::chrono::steady_clock::now();
+        auto zmark = [&](const char* w) {
+            if (zprof) std::fprintf(stderr, "[zyg %d] %-10s %6lld us\n", ::getpid(), w,
+                static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - z0).count()));
+        };
+        // Lay the fds out exactly like the posix_spawn path: 0/1/2 as given,
+        // the open-file groups wherever they land, the pid space last.
+        for (int t = 0; t < 3; ++t) {
+            if (in.fds[static_cast<std::size_t>(t)] != t) {
+                ::dup2(in.fds[static_cast<std::size_t>(t)], t);
+                ::close(in.fds[static_cast<std::size_t>(t)]);
+            }
+        }
+        const int pid_fd = in.fds.back();
+        std::vector<int> groups(in.fds.begin() + 3, in.fds.end() - 1);
+        void* ram = runtime::fork_ipc::map_snapshot(in.memory, in.mem_size);
+        zmark("mapped");
+        runtime::HvfTrap::ForkImage img;
+        if (!ram || !machine.init_from(ram, in.mem_size) || !runtime::wire::decode(in.blob, img)) {
+            std::fputs("linuxity: zygote handoff failed\n", stderr);
+            return 127;
+        }
+        zmark("vm");
+        m.k.files().import_process_state(img.namespace_state);
+        runtime::g_pending.reset_for_fork_child();
+        runtime::PidSpace pids{pid_fd};
+        zmark("vcpu");
+        runtime::ProcessState proc;
+        runtime::TaskState task;
+        runtime::HvfTrap trap{machine, cpu, proc, task, pids};
+        attach_live_procs(m, pids);
+        trap.resume_fork_child(img, groups);
+        zmark("resumed");
         return run(o, m, machine, cpu, proc, task, pids, trap);
     }
 

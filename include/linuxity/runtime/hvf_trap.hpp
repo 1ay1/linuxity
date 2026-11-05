@@ -1520,6 +1520,7 @@ private:
     //      which starts a fresh linuxity that resumes the guest with x0 = 0.
     [[nodiscard]] std::int64_t do_fork(const CloneRequest& req) {
         if (!pids_.valid() || !spawn_) return -38;
+        const auto fstart = std::chrono::steady_clock::now();
         const std::int32_t child = pids_.allocate(0);   // placeholder host pid
         if (child < 0) return -11;                       // EAGAIN
 
@@ -1554,7 +1555,12 @@ private:
         });
 
         std::fflush(nullptr);
+        static const bool fprof = std::getenv("LINUXITY_PROFILE_FORK") != nullptr;
+        const auto f0 = std::chrono::steady_clock::now();
         const pid_t host = spawn_(img);
+        if (fprof) std::fprintf(stderr, "[do_fork] spawn_ %lld us\n",
+            static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - f0).count()));
         if (host < 0) { pids_.release(child); return -11; }
         pids_.bind(child, host);
         // A forked child inherits its parent's process group and session,
@@ -1566,6 +1572,9 @@ private:
         if (req.flags & clone_flag::parent_settid)
             (void)machine_.ram().put(req.parent_tid_addr, std::int32_t{child});
         children_.push_back({child, host});
+        if (fprof) std::fprintf(stderr, "[do_fork] total %lld us\n",
+            static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - fstart).count()));
         return child;
     }
 
@@ -1755,8 +1764,40 @@ private:
         // zeros -- is a page fault plus a page copy. Untouched pages are
         // already zero (fresh anonymous memory) or stale-but-unmapped, and
         // the loader zeroes every segment and .bss it places.
-        for (const Vma& v : proc_.with_space([&](AddressSpace& t) { return t.vmas(); })) machine_.zero(v.begin, v.size());
+        static const bool eprof = std::getenv("LINUXITY_PROFILE_EXEC") != nullptr;
+        const auto e0 = std::chrono::steady_clock::now();
+        auto emark = [&](const char* w) {
+            if (eprof) std::fprintf(stderr, "[exec %d] %-8s %6lld us\n", task_.tid, w,
+                static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - e0).count()));
+        };
+        std::uint64_t zeroed = 0, nvma = 0;
+        for (const Vma& v : proc_.with_space([&](AddressSpace& t) { return t.vmas(); })) {
+            // Read-only, file-backed mappings (library text, rodata, the
+            // program image) were never written by the guest; their bytes
+            // are file contents, not secrets, and the loader overwrites
+            // whatever it reuses. Zeroing them is pure cost -- 1 ms of
+            // every exec, mostly copying COW pages of libc's text just to
+            // clear them. Writable or anonymous ranges are still cleared.
+            if (!v.anonymous && !has(v.prot, GuestProt::write)) continue;
+            const auto z0 = std::chrono::steady_clock::now();
+            machine_.zero(v.begin, v.size());
+            zeroed += v.size(); ++nvma;
+            if (eprof) {
+                const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - z0).count();
+                if (us > 50) std::fprintf(stderr, "[exec %d]   vma %#llx +%llu KiB prot=%d: %lld us\n", task_.tid,
+                    static_cast<unsigned long long>(v.begin),
+                    static_cast<unsigned long long>(v.size() >> 10), static_cast<int>(v.prot),
+                    static_cast<long long>(us));
+            }
+        }
+        if (eprof) std::fprintf(stderr, "[exec %d] zeroed %llu KiB in %llu vmas\n", task_.tid,
+                                static_cast<unsigned long long>(zeroed >> 10),
+                                static_cast<unsigned long long>(nvma));
+        emark("zero");
         auto ex = hvf_exec(machine_, resolve, guest_path, argv, envp);
+        emark("load");
         if (!ex) {
             std::fprintf(stderr, "linuxity: execve %s failed (errno %d)\n",
                          guest_path.c_str(), static_cast<int>(ex.error()));

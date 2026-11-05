@@ -25,13 +25,18 @@
 
 #include <Hypervisor/Hypervisor.h>
 #include <libkern/OSCacheControl.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
+#include <vector>
 
 namespace lx::runtime {
 
@@ -234,11 +239,25 @@ public:
     // Fork child: adopt the parent's copy-on-write RAM snapshot (already
     // mapped, see hvf_fork.hpp) as this machine's guest memory, in a FRESH
     // process whose Hypervisor.framework has never run.
+    // Create the VM with NO memory yet. A zygote does this while parked, so
+    // the hv_vm_create (and the vCPU it then makes) are off the fork's
+    // critical path; init_from() later just maps the snapshot in.
+    [[nodiscard]] Status prewarm() {
+        if (vm_live_) return ok();
+        if (::hv_vm_create(nullptr) != HV_SUCCESS) return err(Errno::enodev);
+        vm_live_ = true;
+        return ok();
+    }
+
     [[nodiscard]] Status init_from(void* ram, std::uint64_t size) {
         base_ = static_cast<std::byte*>(ram);
         size_ = size;
         owns_ram_ = false;          // the Mach entry mapping owns it
-        return attach();
+        // The snapshot is the PARENT's RAM, page tables and vectors included:
+        // the same layout (same size) builds byte-identical tables. Rewriting
+        // them here touched every L3 page (4 MiB for 2 GiB), forcing a COW
+        // copy of each -- 0.8 ms of every fork for no change. Skip it.
+        return attach(/*build_tables=*/false);
     }
 
     // -- Memory -----------------------------------------------------------
@@ -250,6 +269,30 @@ public:
     }
     [[nodiscard]] std::uint64_t mem_size() const noexcept { return size_; }
     [[nodiscard]] std::byte* raw_base() const noexcept { return base_; }
+
+    // Zero one host-page-aligned run: MADV_ZERO where allowed (plain anon
+    // RAM), mach_vm_write from a zero region on a COW snapshot (where
+    // MADV_ZERO is ENOTSUP), memset as a last resort.
+    static void zero_run(std::uintptr_t at, std::size_t n) noexcept {
+#if defined(MADV_ZERO)
+        if (::madvise(reinterpret_cast<void*>(at), n, MADV_ZERO) == 0) return;
+#endif
+        static constexpr std::size_t kSrc = 16u << 20;
+        static void* const src = [] {
+            void* z = ::mmap(nullptr, kSrc, PROT_READ, MAP_ANON | MAP_PRIVATE, -1, 0);
+            return z == MAP_FAILED ? nullptr : z;
+        }();
+        if (src && n >= (1u << 20)) {
+            bool ok = true;
+            for (std::size_t off = 0; ok && off < n; off += kSrc)
+                ok = ::mach_vm_write(::mach_task_self(), at + off,
+                                     reinterpret_cast<vm_offset_t>(src),
+                                     static_cast<mach_msg_type_number_t>(std::min(kSrc, n - off)))
+                     == KERN_SUCCESS;
+            if (ok) return;
+        }
+        std::memset(reinterpret_cast<void*>(at), 0, n);
+    }
 
     // Clear a guest range, touching NO byte outside [gpa, gpa+n).
     //
@@ -271,6 +314,7 @@ public:
     // So: MADV_ZERO only the host-page-aligned interior (cheap, no page
     // touched), and memset the unaligned head and tail.
     void zero(std::uint64_t gpa, std::size_t n) noexcept {
+        static constexpr std::size_t kZeroSrc = 16u << 20;   // one zero region, reused
         auto win = ram().at(gpa, n);
         if (win.empty()) return;
         static const std::uintptr_t host_page =
@@ -278,12 +322,63 @@ public:
         const auto base = reinterpret_cast<std::uintptr_t>(win.data());
         const std::uintptr_t lo = (base + host_page - 1) & ~(host_page - 1);
         const std::uintptr_t hi = (base + win.size()) & ~(host_page - 1);
+        // Skip pages that were never touched. Most of an exec'ing process's
+        // VMAs are mostly untouched (an 8 MiB stack with a few dirty pages,
+        // library .bss), and a page with no physical backing already reads
+        // as zero. mincore (~0.02 us/page) finds the ones that exist; only
+        // those runs are zeroed. On a fork child's COW snapshot this avoids
+        // copying the untouched pages just to clear them: 2.5 ms of every
+        // exec, measured. A failing mincore falls through to the old path.
+        if (hi > lo) {
+            const std::size_t npages = (hi - lo) / host_page;
+            std::vector<char> vec(npages);
+            if (::mincore(reinterpret_cast<void*>(lo), hi - lo, vec.data()) == 0) {
+                constexpr char kHas = MINCORE_INCORE | MINCORE_PAGED_OUT;
+                for (std::size_t i = 0; i < npages;) {
+                    if (!(vec[i] & kHas)) { ++i; continue; }
+                    std::size_t j = i;
+                    while (j < npages && (vec[j] & kHas)) ++j;
+                    zero_run(lo + i * host_page, (j - i) * host_page);
+                    i = j;
+                }
+                if (lo > base) std::memset(win.data(), 0, lo - base);
+                if (base + win.size() > hi)
+                    std::memset(reinterpret_cast<void*>(hi), 0, base + win.size() - hi);
+                return;
+            }
+        }
 #if defined(MADV_ZERO)
         if (hi > lo &&
             ::madvise(reinterpret_cast<void*>(lo), hi - lo, MADV_ZERO) == 0) {
             std::memset(win.data(), 0, lo - base);
             std::memset(reinterpret_cast<void*>(hi), 0, base + win.size() - hi);
             return;
+        }
+        if (hi > lo) {
+            // MADV_ZERO is refused (ENOTSUP) on a fork child's RAM: that is
+            // a mach_vm_map of a COW memory entry, not plain anonymous
+            // memory. memset there COPIES every page out of the snapshot
+            // first (13 MB at each exec = 2.2 ms). mach_vm_write from a
+            // zero region lets the VM system do it a page at a time: 0.35 ms
+            // for the same range, and verified (tools/.. zr5) to be seen by
+            // the GUEST through its existing IPA mapping, unlike the
+            // MAP_FIXED remap noted above. Same 16 KiB host-page rule.
+            static void* const zero_src = [] {
+                void* z = ::mmap(nullptr, kZeroSrc, PROT_READ, MAP_ANON | MAP_PRIVATE, -1, 0);
+                return z == MAP_FAILED ? nullptr : z;
+            }();
+            bool ok = zero_src != nullptr;
+            for (std::uintptr_t at = lo; ok && at < hi; at += kZeroSrc) {
+                const std::size_t n = std::min<std::size_t>(kZeroSrc, hi - at);
+                ok = ::mach_vm_write(::mach_task_self(), at,
+                                     reinterpret_cast<vm_offset_t>(zero_src),
+                                     static_cast<mach_msg_type_number_t>(n)) == KERN_SUCCESS;
+            }
+            if (ok) {
+                std::memset(win.data(), 0, lo - base);
+                std::memset(reinterpret_cast<void*>(hi), 0, base + win.size() - hi);
+                return;
+            }
         }
 #endif
         std::memset(win.data(), 0, win.size());
@@ -298,13 +393,17 @@ public:
     }
 
 private:
-    [[nodiscard]] Status attach() {
-        build_page_tables(base_, size_);
-        write_vector_stub(base_);
-        ::sys_icache_invalidate(base_ + HvfLayout::vectors, 16 * 0x80);
+    [[nodiscard]] Status attach(bool build_tables = true) {
+        if (build_tables) {
+            build_page_tables(base_, size_);
+            write_vector_stub(base_);
+            ::sys_icache_invalidate(base_ + HvfLayout::vectors, 16 * 0x80);
+        }
 
-        if (::hv_vm_create(nullptr) != HV_SUCCESS) return err(Errno::enodev);
-        vm_live_ = true;
+        if (!vm_live_) {
+            if (::hv_vm_create(nullptr) != HV_SUCCESS) return err(Errno::enodev);
+            vm_live_ = true;
+        }
         const auto flags = static_cast<hv_memory_flags_t>(
             HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
         if (::hv_vm_map(base_, 0, size_, flags) != HV_SUCCESS)

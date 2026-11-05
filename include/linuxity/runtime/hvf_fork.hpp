@@ -32,6 +32,7 @@
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <mach/mach_vm.h>
+#include <sys/fileport.h>
 #include <servers/bootstrap.h>
 #include <unistd.h>
 
@@ -117,7 +118,97 @@ struct Received {
     mach_port_t memory{MACH_PORT_NULL};
     std::uint64_t mem_size{};
     std::vector<std::byte> blob;
+    std::vector<int> fds;          // fileports turned back into local fds
 };
+
+// -- fds as Mach rights ------------------------------------------------------
+// A pre-spawned (zygote) child can't get its fds through posix_spawn file
+// actions -- it already exists. Darwin's fileport turns an fd into a send
+// right and back, so the fds ride in the same Mach message as the RAM.
+[[nodiscard]] inline mach_port_t fd_to_port(int fd) {
+    mach_port_t p = MACH_PORT_NULL;
+    return ::fileport_makeport(fd, &p) == 0 ? p : MACH_PORT_NULL;
+}
+
+// The handoff with fds: memory port + blob + an OOL array of fileports.
+struct HandoffMsgFds {
+    mach_msg_header_t header;
+    mach_msg_body_t body;
+    mach_msg_port_descriptor_t memory;
+    mach_msg_ool_descriptor_t blob;
+    mach_msg_ool_ports_descriptor_t fds;
+    std::uint64_t mem_size;
+};
+struct HandoffRecvFds {
+    HandoffMsgFds msg;
+    mach_msg_trailer_t trailer;
+};
+
+[[nodiscard]] inline bool send_with_fds(mach_port_t dest, mach_port_t memory,
+                                        std::uint64_t mem_size,
+                                        const std::vector<std::byte>& blob,
+                                        const std::vector<int>& fds) {
+    std::vector<mach_port_t> ports;
+    ports.reserve(fds.size());
+    for (int fd : fds) {
+        const mach_port_t p = fd_to_port(fd);
+        if (p == MACH_PORT_NULL) {
+            for (mach_port_t q : ports) ::mach_port_deallocate(::mach_task_self(), q);
+            return false;
+        }
+        ports.push_back(p);
+    }
+    HandoffMsgFds m{};
+    m.header.msgh_bits = MACH_MSGH_BITS_COMPLEX | MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+    m.header.msgh_size = sizeof m;
+    m.header.msgh_remote_port = dest;
+    m.header.msgh_id = 0x4c59;               // 'LY'
+    m.body.msgh_descriptor_count = 3;
+    m.memory.name = memory;
+    m.memory.disposition = MACH_MSG_TYPE_MOVE_SEND;
+    m.memory.type = MACH_MSG_PORT_DESCRIPTOR;
+    m.blob.address = const_cast<std::byte*>(blob.data());
+    m.blob.size = static_cast<mach_msg_size_t>(blob.size());
+    m.blob.deallocate = FALSE;
+    m.blob.copy = MACH_MSG_VIRTUAL_COPY;
+    m.blob.type = MACH_MSG_OOL_DESCRIPTOR;
+    m.fds.address = ports.empty() ? nullptr : ports.data();
+    m.fds.count = static_cast<mach_msg_size_t>(ports.size());
+    m.fds.deallocate = FALSE;
+    m.fds.copy = MACH_MSG_VIRTUAL_COPY;
+    m.fds.disposition = MACH_MSG_TYPE_MOVE_SEND;
+    m.fds.type = MACH_MSG_OOL_PORTS_DESCRIPTOR;
+    m.mem_size = mem_size;
+    const bool ok = ::mach_msg(&m.header, MACH_SEND_MSG, sizeof m, 0, MACH_PORT_NULL,
+                               MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL) == MACH_MSG_SUCCESS;
+    if (!ok) for (mach_port_t q : ports) ::mach_port_deallocate(::mach_task_self(), q);
+    return ok;
+}
+
+[[nodiscard]] inline bool receive_with_fds(mach_port_t port, Received& out) {
+    HandoffRecvFds r{};
+    if (::mach_msg(&r.msg.header, MACH_RCV_MSG, 0, sizeof r, port,
+                   MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL) != MACH_MSG_SUCCESS)
+        return false;
+    out.memory = r.msg.memory.name;
+    out.mem_size = r.msg.mem_size;
+    auto* p = static_cast<std::byte*>(r.msg.blob.address);
+    out.blob.assign(p, p + r.msg.blob.size);
+    ::mach_vm_deallocate(::mach_task_self(),
+                         reinterpret_cast<mach_vm_address_t>(r.msg.blob.address),
+                         r.msg.blob.size);
+    auto* ports = static_cast<mach_port_t*>(r.msg.fds.address);
+    out.fds.clear();
+    for (mach_msg_size_t i = 0; i < r.msg.fds.count; ++i) {
+        const int fd = ::fileport_makefd(ports[i]);
+        ::mach_port_deallocate(::mach_task_self(), ports[i]);
+        out.fds.push_back(fd);
+    }
+    if (ports)
+        ::mach_vm_deallocate(::mach_task_self(), reinterpret_cast<mach_vm_address_t>(ports),
+                             r.msg.fds.count * sizeof(mach_port_t));
+    return true;
+}
 
 [[nodiscard]] inline bool receive(mach_port_t port, Received& out) {
     HandoffRecv r{};
