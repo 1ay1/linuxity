@@ -753,11 +753,16 @@ private:
     [[nodiscard]] bool at_dirfd_unresolvable(const Regs& r, int path_arg,
                                              bool at) {
         if (!at) return false;
+        return at_dirfd_unresolvable(
+            r, read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)])));
+    }
+    // Same check on a path already read. Each read_cstr is a guest-memory
+    // copy, and path_stat used to do three of them for one stat.
+    [[nodiscard]] bool at_dirfd_unresolvable(const Regs& r,
+                                             std::string_view raw) const {
         const auto dirfd = static_cast<std::int64_t>(r.arg[0]);
         if (static_cast<std::int32_t>(dirfd) == wire::kAtFdCwd) return false;
         // An absolute path ignores the dirfd entirely -- nothing to resolve.
-        const std::string raw =
-            read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)]));
         if (raw.empty() || raw.front() == '/') return false;
         return dir_of(dirfd).empty();
     }
@@ -781,8 +786,10 @@ private:
     enum class PathSyntax { ok, empty, needs_dir };
 
     [[nodiscard]] PathSyntax path_syntax(const Regs& r, int path_arg) {
-        const std::string raw =
-            read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)]));
+        return path_syntax(
+            read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)])));
+    }
+    [[nodiscard]] static PathSyntax path_syntax(std::string_view raw) noexcept {
         if (raw.empty()) return PathSyntax::empty;
         if (raw.size() > 1 && raw.back() == '/') return PathSyntax::needs_dir;
         return PathSyntax::ok;
@@ -790,7 +797,12 @@ private:
 
     [[nodiscard]] std::string resolve_arg(const Regs& r, int path_arg, bool at,
                                           bool follow_leaf = true) {
-        std::string raw = read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)]));
+        return resolve_raw(
+            r, read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)])), at,
+            follow_leaf);
+    }
+    [[nodiscard]] std::string resolve_raw(const Regs& r, const std::string& raw,
+                                          bool at, bool follow_leaf = true) {
         std::string_view dir = at ? dir_of(static_cast<std::int64_t>(r.arg[0]))
                                   : std::string_view{};
         std::string abs = k_.files().absolutize(raw, dir);
@@ -970,7 +982,11 @@ private:
         // the differential harness. AT_EMPTY_PATH means "stat the dirfd
         // itself", which we don't service, so let the host answer that.
         const std::uint64_t at_flags = at ? r.arg[3] : 0;
-        const PathSyntax syn = path_syntax(r, path_arg);
+        // Read the guest path ONCE. It used to be copied out of guest memory
+        // three times per stat (syntax, dirfd check, resolve).
+        const std::string raw =
+            read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)]));
+        const PathSyntax syn = path_syntax(raw);
         if (syn == PathSyntax::empty)
             return wire::has_at(at_flags, wire::AtFlag::empty_path)
                        ? fwd()
@@ -978,9 +994,9 @@ private:
 
         // A dirfd we cannot resolve means we'd resolve the path against the
         // wrong directory; the host owns the real fd table, so let it answer.
-        if (at_dirfd_unresolvable(r, path_arg, at)) return fwd();
+        if (at && at_dirfd_unresolvable(r, raw)) return fwd();
 
-        std::string abs = resolve_arg(r, path_arg, at, follow);
+        std::string abs = resolve_raw(r, raw, at, follow);
         auto pc = k_.files().classify(abs, /*for_write=*/false, follow);
 
         // "/etc/passwd/" must be ENOTDIR. The Redirect below hands the host a
@@ -2348,8 +2364,19 @@ public:
             if (rec->have & kernel::MetaRecord::kUid) uid = rec->uid;
             if (rec->have & kernel::MetaRecord::kGid) gid = rec->gid;
         }
-        put_u32(base + uid_off, uid);
-        put_u32(base + gid_off, gid);
+        // uid and gid are ADJACENT u32s on every layout we serve (x86-64
+        // stat @28/@32, aarch64 stat @24/@28, statx @20/@24), so write them as
+        // one 8-byte copy: one process_vm_writev per stat instead of two.
+        // Fall back to two writes if a future layout ever splits them.
+        if (gid_off == uid_off + 4) {
+            std::array<std::byte, 8> b{};
+            std::memcpy(b.data(), &uid, 4);
+            std::memcpy(b.data() + 4, &gid, 4);
+            (void)mem_.copy_out(uaddr(base + uid_off), b);
+        } else {
+            put_u32(base + uid_off, uid);
+            put_u32(base + gid_off, gid);
+        }
 
         // --- mode: overlay the guest-intended permission bits when recorded ---
         if (rec && (rec->have & kernel::MetaRecord::kMode)) {

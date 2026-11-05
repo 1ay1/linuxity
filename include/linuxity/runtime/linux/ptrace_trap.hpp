@@ -422,6 +422,23 @@ public:
         Task& t = tasks_[cur_];
         struct user_regs_struct r = t.regs;
         r.orig_rax = static_cast<unsigned long long>(-1);
+        if (seccomp_) {
+            // Fast path: one stop, not two. At a PTRACE_EVENT_SECCOMP stop,
+            // orig_rax = -1 skips the call and the kernel returns whatever we
+            // leave in rax (seccomp(2), SECCOMP_RET_TRACE). The old path
+            // stepped to the syscall EXIT just to write rax there: 7 ptrace
+            // calls and 2 waits per answered syscall, measured. Now 3 and 1.
+            r.rax = static_cast<unsigned long long>(ret);
+            ::ptrace(PTRACE_SETREGS, cur_, 0, &r);
+            t.action = Action::none;
+            t.in_call = false;
+            const int sig = t.pending_sig;
+            t.pending_sig = 0;
+            resume_run(cur_, sig);
+            return ok();
+        }
+        // PTRACE_SYSCALL fallback (no seccomp): at an ordinary entry stop the
+        // kernel still owes us the exit stop, so write rax there.
         ::ptrace(PTRACE_SETREGS, cur_, 0, &r);
         t.action = Action::set_ret;
         t.ret = ret;
@@ -494,7 +511,7 @@ public:
         std::size_t need = host_path.size() + 1;
         std::uint64_t scratch =
             (t.regs.rsp - 256 - need) & ~std::uint64_t{15};
-        if (!poke_path(scratch, host_path)) {
+        if (!poke_path(scratch, host_path, /*dead_scratch=*/true)) {
             // The path could not be written into this task's memory at all
             // (PTRACE_POKEDATA -> EIO and process_vm_writev -> EPERM). This
             // happens for a DAEMONIZED guest task: gpg spawns gpg-agent, which
@@ -525,7 +542,7 @@ public:
             std::size_t need2 = host_path2.size() + 1;
             std::uint64_t scratch2 =
                 (scratch - 256 - need2) & ~std::uint64_t{15};
-            if (!poke_path(scratch2, host_path2))
+            if (!poke_path(scratch2, host_path2, /*dead_scratch=*/true))
                 return err<std::int64_t>(Errno::efault);
             set_arg(r, path_arg2, scratch2);
         }
@@ -1044,11 +1061,28 @@ public:
     // child whose stop we reached indirectly); the vm write uses a different
     // kernel access path and often still succeeds. Returns false only if BOTH
     // paths fail, which the caller degrades to a forward-unmodified.
-    [[nodiscard]] bool poke_path(std::uint64_t at, const std::string& s) const {
-        if (poke_bytes(at, s)) return true;
+    [[nodiscard]] bool poke_path(std::uint64_t at, const std::string& s,
+                                 bool dead_scratch = false) const {
+        if (dead_scratch ? poke_scratch(at, s) : poke_bytes(at, s)) return true;
         std::vector<std::byte> b(s.size() + 1);
         std::memcpy(b.data(), s.c_str(), s.size() + 1);
         return static_cast<bool>(copy_out(uaddr(at), std::span<const std::byte>{b}));
+    }
+
+    // Write a NUL-terminated string into DEAD stack scratch below rsp. Nothing
+    // live sits in the tail of the last word there, so there is nothing to
+    // preserve and no PEEK first: one POKE per word instead of PEEK+POKE.
+    // Still PTRACE_POKEDATA, for the ordering reason in redirect().
+    [[nodiscard]] bool poke_scratch(std::uint64_t at, const std::string& s) const {
+        const std::size_t n = s.size() + 1;
+        for (std::size_t off = 0; off < n; off += sizeof(long)) {
+            long word = 0;
+            std::memcpy(&word, s.c_str() + off, std::min(sizeof(long), n - off));
+            if (::ptrace(PTRACE_POKEDATA, cur_, reinterpret_cast<void*>(at + off),
+                         reinterpret_cast<void*>(word)) != 0)
+                return false;
+        }
+        return true;
     }
 
     // Write a NUL-terminated string into the CURRENT task at `at` using
