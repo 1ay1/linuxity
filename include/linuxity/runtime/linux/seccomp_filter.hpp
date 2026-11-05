@@ -98,6 +98,18 @@ inline constexpr int kTrappedX86_64[] = {
     89, 267,                     // readlink/readlinkat
     79,                          // getcwd
     217,                         // getdents64
+    // lseek MUST be trapped, for directory fds specifically. rewinddir(3) and
+    // seekdir(3) are an lseek on the dirfd, and an overlay-union or virtual
+    // directory's entries live in OUR dir_stream, not in the backing host fd.
+    // Run natively, the host lseek rewinds a directory that holds only the
+    // upper layer's entries (or nothing at all for a synthesized dir) while
+    // our cursor stays at EOF -- so the second readdir pass returns ZERO
+    // entries. That broke every rewinddir-driven tree walk: libalpm rewinds
+    // the package DB, so `pacman -Q` found nothing on an intact database.
+    // The dispatcher's Sysno::lseek case was already written for this and was
+    // simply unreachable, which is exactly the failure this list's header
+    // comment warns about: a syscall missing here silently runs raw.
+    8,                           // lseek         (dir cursor is ours)
     // extended attributes: the path variants translate to the overlay; the
     // f* variants act on an already-open fd (still trapped so the dispatcher
     // can forward them uniformly).

@@ -19,7 +19,7 @@ set(LX_LIVE_TESTS
     run_native run_rootfs run_multiproc run_signal run_identity run_stat_owner
     run_open_procfs run_mutate run_dev run_socket run_daemon run_shebang
     run_tty_jobcontrol run_pid_namespace run_seccomp run_meta run_bind
-    run_foreign_exec run_untranslated run_empty_path)
+    run_foreign_exec run_untranslated run_empty_path run_rewinddir)
 
 set(LX_TESTS ${LX_PORTABLE_TESTS})
 if(NOT WIN32)

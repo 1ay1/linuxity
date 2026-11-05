@@ -256,13 +256,24 @@ public:
             case Sysno::getcwd:      return do_getcwd(r);
             case Sysno::getdents64:  return do_getdents64(r);
             case Sysno::lseek: {
-                // rewinddir()/seekdir() on a VIRTUAL or overlay-union
-                // directory: our stream keeps its own position, so a real
-                // lseek on the backing fd left it at the end. The second
-                // readdir pass then returned stale bytes -- lscpu counted
-                // nodes, rewound, and parsed "node138688924" out of garbage,
-                // then asserted on a NULL cpuset. Position = entry index
-                // (d_off is the index of the next entry, see getdents64).
+                // rewinddir()/seekdir() on a VIRTUAL or overlay-union directory:
+                // our stream keeps its own position, so a real lseek on the
+                // backing fd rewinds the WRONG thing -- the host fd sees only
+                // the upper layer (or nothing, for a synthesized dir) while
+                // our cursor stays at EOF, and the next readdir pass returns
+                // zero entries.
+                //
+                // This case existed but was UNREACHABLE: lseek was missing
+                // from the seccomp trapped set, so it ran natively and never
+                // reached us. That is what made `pacman -Q` report nothing --
+                // libalpm rewinds the package DB before loading it. See the
+                // note next to 8 in runtime/linux/seccomp_filter.hpp.
+                //
+                // Cost: a regular-file seek is one hash lookup that misses,
+                // then fwd(). Measured at ~3% on `ls -lR /usr` and in the
+                // noise on seek-heavy work, which is worth a correct rewind.
+                // Position = entry index (d_off is the index of the next
+                // entry, see getdents64).
                 const int fd = static_cast<int>(r.arg[0]);
                 if (auto* ds = k_.files().dir_stream(fd)) {
                     const auto off = static_cast<std::int64_t>(r.arg[1]);
