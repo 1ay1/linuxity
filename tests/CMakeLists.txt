@@ -4,7 +4,7 @@
 set(LX_PORTABLE_TESTS
     core authority vfs interp file_namespace sysfs_proctree
     resources address_space sysno conformance outcome wire fd_slots
-    conform_law conform_hosts)
+    conform_law conform_hosts conform_coverage)
 
 # Tests that instantiate PosixHost. These exercise the POSIX *host backend*
 # (mmap/dirent/pread), not the portable core, so they are POSIX-only: the
@@ -21,6 +21,45 @@ set(LX_LIVE_TESTS
     run_open_procfs run_mutate run_dev run_socket run_daemon run_shebang
     run_tty_jobcontrol run_pid_namespace run_seccomp run_meta run_bind
     run_foreign_exec run_untranslated run_empty_path run_rewinddir run_fd_reuse run_proc_self run_proc_link run_path_escape)
+
+# ---- differential conformance -------------------------------------------
+#
+# The test that actually verifies handlers: run each scenario's probe natively
+# AND under linuxity, then compare with judge(). Linux-only because it needs a
+# live kernel as the oracle; on macOS/Windows the same comparison runs against
+# recorded goldens instead (conform_hosts covers that path).
+#
+# Probes are C, built with raw syscalls and no libc conveniences -- glibc
+# caches (telldir), retries (EINTR) and emulates (open->openat), so a libc
+# call observes glibc's opinion of the kernel rather than the kernel.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # Probes are C; the project is C++-only, so enable C just for them.
+    enable_language(C)
+    set(LX_PROBES dirseek statpaths)
+    foreach(p IN LISTS LX_PROBES)
+        add_executable(probe_${p} probes/${p}.c)
+        target_include_directories(probe_${p} PRIVATE probes)
+        set_target_properties(probe_${p} PROPERTIES
+            OUTPUT_NAME ${p}
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/probes)
+        # A probe must observe the kernel, not the optimiser.
+        target_compile_options(probe_${p} PRIVATE -O0)
+    endforeach()
+
+    add_executable(test_conform_diff test_conform_diff.cpp)
+    target_link_libraries(test_conform_diff PRIVATE linuxity_core)
+    add_dependencies(test_conform_diff linuxity)
+    foreach(p IN LISTS LX_PROBES)
+        add_dependencies(test_conform_diff probe_${p})
+    endforeach()
+
+    add_test(NAME conform_diff COMMAND test_conform_diff)
+    # Absolute paths: the guest resolves its program through its own
+    # namespace, so a relative path fails with ENOENT (exit 127).
+    set_tests_properties(conform_diff PROPERTIES
+        ENVIRONMENT "LX_PROBE_DIR=${CMAKE_BINARY_DIR}/probes;LX_BINARY=${CMAKE_BINARY_DIR}/linuxity;LX_GOLDEN_DIR=${CMAKE_SOURCE_DIR}/tests/goldens"
+        TIMEOUT 120)
+endif()
 
 set(LX_TESTS ${LX_PORTABLE_TESTS})
 if(NOT WIN32)

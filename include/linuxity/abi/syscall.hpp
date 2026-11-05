@@ -739,6 +739,25 @@ private:
     // `/proc/self/exe` opens the binary. Expand them here, for every path
     // syscall, unless the link is the LEAF and the caller asked not to follow
     // it (readlink, lstat, AT_SYMLINK_NOFOLLOW) -- those see the link itself.
+
+    // Two kernel rules live in the path's SYNTAX and are lost once it is
+    // normalized -- a trailing slash gets stripped, and an empty string gets
+    // absolutized to the cwd:
+    //
+    //   stat("")              -> ENOENT   (not the cwd)
+    //   stat("/etc/passwd/")  -> ENOTDIR  (a trailing slash demands a dir)
+    //
+    // Both were silently succeeding. Found by the differential harness.
+    enum class PathSyntax { ok, empty, needs_dir };
+
+    [[nodiscard]] PathSyntax path_syntax(const Regs& r, int path_arg) {
+        const std::string raw =
+            read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)]));
+        if (raw.empty()) return PathSyntax::empty;
+        if (raw.size() > 1 && raw.back() == '/') return PathSyntax::needs_dir;
+        return PathSyntax::ok;
+    }
+
     [[nodiscard]] std::string resolve_arg(const Regs& r, int path_arg, bool at,
                                           bool follow_leaf = true) {
         std::string raw = read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)]));
@@ -916,8 +935,40 @@ private:
     // virtual files synthesize a stat buffer into guest memory ourselves.
     [[nodiscard]] Outcome path_stat(const Regs& r, int path_arg, bool at,
                                     bool follow = true) {
+        // Syntax first: an empty path is ENOENT (not the cwd), and a trailing
+        // slash demands a directory. Both were succeeding before -- found by
+        // the differential harness. AT_EMPTY_PATH means "stat the dirfd
+        // itself", which we don't service, so let the host answer that.
+        const std::uint64_t at_flags = at ? r.arg[3] : 0;
+        const PathSyntax syn = path_syntax(r, path_arg);
+        if (syn == PathSyntax::empty)
+            return wire::has_at(at_flags, wire::AtFlag::empty_path)
+                       ? fwd()
+                       : eno(Errno::enoent);
+
         std::string abs = resolve_arg(r, path_arg, at, follow);
         auto pc = k_.files().classify(abs, /*for_write=*/false, follow);
+
+        // "/etc/passwd/" must be ENOTDIR. The Redirect below hands the host a
+        // NORMALIZED path with the slash already stripped, so the host kernel
+        // never sees the constraint -- we have to enforce it. A virtual node
+        // has no host inode either, so both realms are decided here.
+        if (syn == PathSyntax::needs_dir) {
+            if (pc.realm == kernel::Realm2::virtual_file) {
+                const std::string& vp =
+                    pc.virtual_path.empty() ? abs : pc.virtual_path;
+                auto vf = k_.files().produce(vp);
+                if (vf && !vf->is_dir) return eno(Errno::enotdir);
+            } else if (pc.realm == kernel::Realm2::host_backed) {
+                // Re-stat the host path WITH the slash restored and let the
+                // host kernel apply its own rule, rather than reimplementing
+                // "is a directory" here.
+                return Redirect{PathArg{path_arg, pc.host_path + "/"}}
+                    .with(Scrub{Scrub::Layout::stat,
+                                uaddr(r.arg[static_cast<std::size_t>(path_arg) + 1]),
+                                abs});
+            }
+        }
         if (pc.realm == kernel::Realm2::host_backed) {
             // The host kernel will fill the statbuf with the host file's
             // owner; scrub it to root afterwards. statbuf is arg[1] for
@@ -1078,6 +1129,31 @@ private:
         std::string raw0 =
             read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)]));
         if (raw0.empty()) return at ? fwd() : eno(Errno::enoent);
+
+        // /proc/self and /proc/thread-self ARE symlinks -- to "<pid>" and
+        // "<pid>/task/<tid>". readlink must see them as such, but resolve_arg
+        // rebinds them to /proc/<pid> first (so every OTHER path syscall
+        // reaches the right directory), after which readlink saw a directory
+        // and returned EINVAL where Linux returns the pid. Answer before the
+        // rebind can erase the link. Found by the differential harness.
+        {
+            const std::string pre = kernel::FileNamespace::normalize(
+                k_.files().absolutize(raw0,
+                                      at ? dir_of(static_cast<std::int64_t>(r.arg[0]))
+                                         : std::string_view{}));
+            const std::size_t bi0 = static_cast<std::size_t>(path_arg) + 1;
+            const auto id = ids();
+            if (pre == "/proc/self")
+                return write_link(uaddr(r.arg[bi0]),
+                                  static_cast<std::size_t>(r.arg[bi0 + 1]),
+                                  std::to_string(id.pid));
+            if (pre == "/proc/thread-self")
+                return write_link(uaddr(r.arg[bi0]),
+                                  static_cast<std::size_t>(r.arg[bi0 + 1]),
+                                  std::to_string(id.pid) + "/task/" +
+                                      std::to_string(id.tid));
+        }
+
         std::string abs = resolve_arg(r, path_arg, at, /*follow_leaf=*/false);
         // The buffer + size follow the path arg: readlink(path,buf,sz) ->
         // arg1/arg2; readlinkat(dirfd,path,buf,sz) -> arg2/arg3.

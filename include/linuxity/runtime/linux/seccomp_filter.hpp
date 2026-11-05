@@ -162,10 +162,18 @@ inline constexpr int kTrappedX86_64[] = {
     468, 469,                    // file_getattr/file_setattr (refused)
     470,                         // listns (refused)
     197, 198, 199,               // removexattr/lremovexattr/fremovexattr
-    // UNTRAPPED(close,3): it fires constantly (every fd
-    // teardown) and linuxity only uses it for fd->path bookkeeping, which is
-    // non-essential (readlink recovers paths lazily). Trapping it would also
-    // fire during bootstrap before TRACESECCOMP is set. Left native.
+    // close(3) IS trapped, despite firing on every fd teardown, because a
+    // virtual dir fd's DirStream has to die with it. Untrapped, the stream
+    // outlived the fd and getdents64 kept serving it: a closed /proc fd
+    // returned 0 (clean EOF) where Linux returns EBADF, so a guest looping
+    // "read until 0" never saw the error. The fd-reuse half of this was
+    // already patched in do_openat (the `ps aux` SIGFPE), which only works
+    // when the number gets reused -- a closed-and-not-reused fd slipped
+    // through. Found by the differential harness against the host kernel.
+    //
+    // Cost: one trap per close, ~25us, measured against openat's 200 traps
+    // in 5ms. Worth it for an errno the guest can actually branch on.
+    3,                           // close
     // dup/dup2/dup3/fcntl(F_DUPFD*) ARE trapped: a dup'd fd must inherit the
     // original's fd->path and virtual-dir bindings, or an *at call relative to
     // the new fd resolves against the wrong directory. coreutils `rm -rf`

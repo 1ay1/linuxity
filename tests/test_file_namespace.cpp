@@ -344,8 +344,30 @@ int main() {
         std::system(("rm -rf " + base).c_str());
     }
 
+    // The ROOT itself must classify to a usable host path. mount_host used to
+    // strip the trailing slash unconditionally, reducing a host_base of "/"
+    // to "" -- and join_host("", "") is "", so classify("/") handed the
+    // dispatcher an empty path and stat("/") returned ENOENT. Deeper paths
+    // accidentally worked (join_host("", "usr") == "/usr"), so only the root
+    // was broken, which was enough to make `rm -r` fail: it stats "/" on the
+    // way up. Found by the differential harness against the host kernel.
+    {
+        kernel::FileNamespace rf;
+        rf.mount_host("/", "/");
+        for (const char* p : {"/", "/.", "//"}) {
+            const auto rc = rf.classify(
+                kernel::FileNamespace::normalize(p), false, false);
+            assert(rc.realm == Realm2::host_backed);
+            assert(rc.host_path == "/");   // not ""
+        }
+        // And a path below the root still resolves, without a doubled slash.
+        const auto uc = rf.classify("/usr", false, false);
+        assert(uc.realm == Realm2::host_backed);
+        assert(uc.host_path == "/usr");
+    }
+
     std::puts("file_namespace: mount table, normalization, realm "
-              "classification, synthesized /proc, cross-mount symlinks, and "
-              "copy-up overlay correct");
+              "classification, synthesized /proc, cross-mount symlinks, "
+              "root-mount host paths, and copy-up overlay correct");
     return 0;
 }

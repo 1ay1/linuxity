@@ -134,6 +134,18 @@ inline std::string Scenario::key() const {
                     .exercising(abi::Sysno::lseek)
                     .on(DirFlavour::virtualised));
 
+    // stat/access/statx/readlink across realms, with the error paths that
+    // matter: empty path (ENOENT), trailing slash on a file (ENOTDIR),
+    // file-as-directory (ENOTDIR), and /proc/self as a real symlink. All four
+    // were divergent before the differential harness found them.
+    v.push_back(Scenario{"statpaths", "statpaths"}
+                    .exercising(abi::Sysno::newfstatat)
+                    .exercising(abi::Sysno::faccessat)
+                    .exercising(abi::Sysno::statx)
+                    .exercising(abi::Sysno::readlinkat)
+                    .exercising(abi::Sysno::fstat)
+                    .on(DirFlavour::virtualised));
+
     return v;
 }
 

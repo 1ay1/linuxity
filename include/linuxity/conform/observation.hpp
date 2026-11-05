@@ -304,6 +304,57 @@ private:
     std::tuple<Ls...> laws_;
 };
 
+// Compare an fd-returning call by WHETHER it succeeded, not by which number
+// it got. Allocation-dependent values are not comparable between two
+// processes -- and linuxity deliberately differs here: src/main.cpp holds
+// /dev/null on fds 3..8 (commit ea99143) so pacman's parallel libcurl workers
+// cannot race for fd 3, which corrupted core.db. So the guest's first new fd
+// is 4 where native gets 3, by design.
+//
+// This is NOT a blanket exemption: success-vs-failure and the errno still
+// have to agree, so `openat` returning EACCES where native succeeded is still
+// a divergence. Only the fd's NUMERIC value is excused.
+class FdNumbersDiffer {
+public:
+    [[nodiscard]] bool exempt(const Observation& n,
+                              const Observation& g) const noexcept {
+        if (!returns_fd(n.call) || n.call != g.call) return false;
+        // Both succeeded: the numbers may differ. Either failing, or one
+        // failing and the other not, must still be compared.
+        return n.returned.is_ok() && g.returned.is_ok();
+    }
+    [[nodiscard]] static constexpr std::string_view reason() noexcept {
+        return "fd numbers are allocation-dependent; linuxity reserves 3..8 "
+               "so guests start allocating at 4 (see src/main.cpp)";
+    }
+
+private:
+    [[nodiscard]] static constexpr bool returns_fd(abi::Sysno s) noexcept {
+        switch (s) {
+            case abi::Sysno::open:
+            case abi::Sysno::openat:
+            case abi::Sysno::openat2:
+            case abi::Sysno::creat:
+            case abi::Sysno::dup:
+            case abi::Sysno::dup2:
+            case abi::Sysno::dup3:
+            case abi::Sysno::socket:
+            case abi::Sysno::accept:
+            case abi::Sysno::accept4:
+            case abi::Sysno::epoll_create1:
+            case abi::Sysno::eventfd2:
+            case abi::Sysno::memfd_create:
+            case abi::Sysno::inotify_init1:
+            case abi::Sysno::timerfd_create:
+            case abi::Sysno::signalfd4:
+            case abi::Sysno::pidfd_open:
+                return true;
+            default:
+                return false;
+        }
+    }
+};
+
 // The exemptions that hold on EVERY host, each with its reason. This is the
 // SSOT for "results that cannot agree between two processes" -- scenarios
 // extend it rather than restating it.
@@ -317,6 +368,13 @@ private:
         Exempt{abi::Sysno::gettimeofday,  "time advances between runs"},
         Exempt{abi::Sysno::time,          "time advances between runs"},
     };
+}
+
+// The universal exemptions plus fd-number tolerance. This is what the live
+// differential test uses: fd numbers differ by design, so comparing them
+// would report a divergence on every single open.
+[[nodiscard]] constexpr auto default_law() noexcept {
+    return AnyOf{universal_exemptions(), FdNumbersDiffer{}};
 }
 
 // -- rendering (defined in observation.cpp) --------------------------------

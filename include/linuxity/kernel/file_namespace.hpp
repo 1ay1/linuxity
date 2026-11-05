@@ -131,8 +131,14 @@ public:
     void mount_host(std::string prefix, std::string host_base,
                     std::string upper = {}) {
         if (prefix.size() > 1 && prefix.back() == '/') prefix.pop_back();
-        if (!host_base.empty() && host_base.back() == '/') host_base.pop_back();
-        if (!upper.empty() && upper.back() == '/') upper.pop_back();
+        // Strip a trailing slash, but never reduce "/" to "": an empty
+        // host_base makes join_host(base, "") return "", so classify("/")
+        // handed the dispatcher an empty host path and stat("/") came back
+        // ENOENT. Deeper paths accidentally worked (join_host("", "usr") is
+        // "/usr"), which is why only the root itself was broken -- and that
+        // was enough to make `rm -r` fail, since it stats "/" walking up.
+        if (host_base.size() > 1 && host_base.back() == '/') host_base.pop_back();
+        if (upper.size() > 1 && upper.back() == '/') upper.pop_back();
         // The shadow metadata journal lives in the ROOT mount's upper layer,
         // so uid/mode overlays for the whole guest tree share one store that
         // persists across runs. Attach the first time a rooted overlay mounts.
@@ -585,7 +591,13 @@ private:
 
     static std::string join_host(std::string_view base, std::string_view rel) {
         std::string p{base};
-        if (!rel.empty()) { p += '/'; p += rel; }
+        if (!rel.empty()) {
+            // A base of "/" already ends in the separator; appending another
+            // gives "//usr". Harmless to the kernel, but it leaks into
+            // host_path and then into every error message and golden trace.
+            if (!p.empty() && p.back() != '/') p += '/';
+            p += rel;
+        }
         return p;
     }
 
