@@ -21,6 +21,7 @@
 #include "linuxity/loader/elf.hpp"
 #include "linuxity/loader/interp.hpp"
 #include "linuxity/runtime/hvf_load.hpp"
+#include "linuxity/runtime/hvf_vdso.hpp"
 #include "linuxity/runtime/hvf_vm.hpp"
 
 #include <cstdio>
@@ -103,7 +104,8 @@ struct ExecResult {
                             ld->segments.end());
     }
 
-    auto sp = hvf_build_stack(vm, *prog, argv, envp, at_base, guest_path);
+    auto sp = hvf_build_stack(vm, *prog, argv, envp, at_base, guest_path,
+                              vdso::install(vm));
     if (!sp) return err<ExecResult>(sp.error());
     out.entry = entry;
     out.sp = *sp;

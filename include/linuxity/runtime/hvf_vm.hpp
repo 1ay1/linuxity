@@ -354,6 +354,19 @@ public:
         // plus the RES1 bits. Caches ON matters: libc issues DC/IC
         // maintenance and relies on normal memory ordering.
         sr(HV_SYS_REG_SCTLR_EL1, 0x30d0199dull);
+        // CNTKCTL_EL1: EL0VCTEN | EL0PCTEN -- let EL0 read CNTVCT_EL0/CNTFRQ
+        // directly, as Linux does. This is what makes the vDSO's
+        // clock_gettime a few instructions instead of a VM exit (~1 us), and
+        // it un-breaks any guest that reads the counter itself (JITs, Go's
+        // runtime, benchmark harnesses): before, `mrs x0, cntvct_el0` raised
+        // an undefined-instruction exception and killed the program.
+        sr(HV_SYS_REG_CNTKCTL_EL1, 0x3ull);
+        // CNTVCT_EL0 = mach_absolute_time() - vtimer_offset. Zero offset makes
+        // the guest's counter THE host's absolute time -- identical in every
+        // vCPU, every thread and every fork child (each a fresh VM whose
+        // counter would otherwise restart). The vDSO's tick->ns mapping is
+        // then a constant, computed once per exec, valid forever.
+        (void)::hv_vcpu_set_vtimer_offset(cpu_, 0);
         return ok();
     }
 

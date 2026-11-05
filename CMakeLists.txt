@@ -8,9 +8,15 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Default to an OPTIMIZED build. linuxity is a runtime: every guest syscall
+# runs through this code, so a Debug default made everything ~35% slower
+# per syscall and doubled process startup (measured: getpid 1.47 -> 1.02 us,
+# screenfetch 1.45 -> 0.78 s). RelWithDebInfo keeps symbols for sample(1)
+# and crash reports. Pass -DCMAKE_BUILD_TYPE=Debug to develop.
 if(NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE Debug CACHE STRING "" FORCE)
+    set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "" FORCE)
 endif()
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -g -DNDEBUG" CACHE STRING "" FORCE)
 
 if(MSVC)
     # The GCC/Clang warning set below has no MSVC spelling; /W4 is the

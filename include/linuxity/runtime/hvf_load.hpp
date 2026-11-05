@@ -134,7 +134,8 @@ struct HvfImage {
         const std::vector<std::string>& argv,
         const std::vector<std::string>& envp,
         std::uint64_t at_base = 0,
-        const std::string& execfn = {}) {
+        const std::string& execfn = {},
+        std::uint64_t sysinfo_ehdr = 0) {
     std::uint64_t sp = vm.mem_size() - HvfLayout::stack_guard;
 
     auto push_bytes = [&](const void* data, std::size_t n) -> std::uint64_t {
@@ -188,6 +189,9 @@ struct HvfImage {
     aux(23, 0);                                // AT_SECURE
     aux(25, rnd_addr);                         // AT_RANDOM
     aux(31, execfn_addr);                      // AT_EXECFN
+    // AT_SYSINFO_EHDR: the vDSO. glibc takes clock_gettime/gettimeofday
+    // from it instead of trapping (a VM exit each, ~50x a native read).
+    if (sysinfo_ehdr) aux(33, sysinfo_ehdr);
     aux(0,  0);                                // AT_NULL
     if (v.size() % 2) v.push_back(0);          // keep sp 16-aligned
 

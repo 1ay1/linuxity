@@ -470,6 +470,13 @@ struct ChildArgs {
 [[nodiscard]] bool receive_fork(const ChildArgs& ca, runtime::HvfMachine& vm,
                                 runtime::HvfTrap::ForkImage& img) {
     mach_port_t parent = MACH_PORT_NULL;
+    static const bool prof = std::getenv("LINUXITY_PROFILE_FORK") != nullptr;
+    const auto r0 = std::chrono::steady_clock::now();
+    auto rmark = [&](const char* w) {
+        if (prof) std::fprintf(stderr, "[recv %d] %-10s %7lld us\n", ::getpid(), w,
+            static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - r0).count()));
+    };
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     if (::bootstrap_look_up(bootstrap_port, const_cast<char*>(ca.service.c_str()), &parent)
@@ -489,7 +496,9 @@ struct ChildArgs {
         return false;
 
     runtime::fork_ipc::Received in;
+    rmark("hello-sent");
     if (!runtime::fork_ipc::receive(reply, in)) return false;
+    rmark("received");
     void* ram = runtime::fork_ipc::map_snapshot(in.memory, in.mem_size);
     if (!ram || !vm.init_from(ram, in.mem_size)) return false;
     return runtime::wire::decode(in.blob, img);
@@ -642,6 +651,28 @@ void attach_live_procs(Machine& m, runtime::PidSpace& pids) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Startup stage timer (LINUXITY_PROFILE_START=1): where a fresh linuxity
+    // spends its first milliseconds. Every guest fork pays this.
+    static const bool sprof = std::getenv("LINUXITY_PROFILE_START") != nullptr;
+    if (sprof) {
+        // Time from exec (kernel's process start) to main: dyld + static init.
+        struct kinfo_proc kp{};
+        std::size_t len = sizeof kp;
+        int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, ::getpid()};
+        if (::sysctl(mib, 4, &kp, &len, nullptr, 0) == 0) {
+            timeval now{}; ::gettimeofday(&now, nullptr);
+            const auto& st = kp.kp_proc.p_starttime;
+            std::fprintf(stderr, "[start %d] exec->main  %7lld us\n", ::getpid(),
+                static_cast<long long>((now.tv_sec - st.tv_sec) * 1000000LL + (now.tv_usec - st.tv_usec)));
+        }
+    }
+    static const auto s0 = std::chrono::steady_clock::now();
+    auto smark = [](const char* w) {
+        if (sprof) std::fprintf(stderr, "[start %d] %-12s %7lld us\n", ::getpid(), w,
+            static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - s0).count()));
+    };
+    smark("main");
     if (std::getenv("LINUXITY_DEBUG")) {
         ::signal(SIGSEGV, crash_handler);
         ::signal(SIGBUS, crash_handler);
@@ -674,6 +705,7 @@ int main(int argc, char** argv) {
         }
         Machine m{o, /*fork_child=*/true};
         cmark("machine");
+        smark("machine");
         runtime::HvfMachine machine;
         runtime::HvfTrap::ForkImage img;
         if (!receive_fork(ca, machine, img)) {
