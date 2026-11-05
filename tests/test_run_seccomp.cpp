@@ -9,6 +9,8 @@
 // fork event), and a burst of NON-intercepted syscalls (lseek) that the fast
 // path runs natively. If the seccomp path skipped an intercepted syscall or
 // mishandled the clone/wait exit, the codes would diverge.
+#include "guest_harness.hpp"
+
 #include "linuxity/host/posix_host.hpp"
 #include "linuxity/kernel/kernel.hpp"
 #include "linuxity/runtime/linux/ptrace_trap.hpp"
@@ -38,45 +40,38 @@ static const char* kProbe =
     "  return 0;\n"
     "}\n";
 
-static int run(const std::string& root, const std::string& prog) {
-    host::PosixHost hw;
-    kernel::Kernel<host::PosixHost> k{hw};
-    k.files().mount_host("/", root);
-    k.files().mount_virtual("/proc", vfs::make_procfs(k.procs(), k.machine()));
-    { kernel::ProcInfo init; init.pid = 1; init.cmdline = prog;
-      k.procs().upsert(init); }
-    std::string exec = root + prog;
-    runtime::PtraceTrap trap{exec, {prog}, {}, {}};
-    runtime::Cpu cpu{trap, k, trap, abi::Arch::x86_64};
-    auto r = cpu.run(uaddr(0), uaddr(0));
-    return r ? *r : -1;
-}
-
 int main() {
 #if !defined(__linux__) || !defined(__x86_64__)
     std::puts("run_seccomp: skipped (needs Linux/x86-64 host)");
     return 0;
 #else
-    const std::string root = "/tmp/lx_seccomp_root";
-    std::system(("rm -rf " + root + " && mkdir -p " + root + "/bin " + root + "/etc").c_str());
-    { std::FILE* f = std::fopen((root + "/etc/probe.txt").c_str(), "w");
-      if (f) { std::fputs("hi\n", f); std::fclose(f); } }
-    { std::FILE* f = std::fopen("/tmp/lx_seccomp.c", "w");
-      if (!f) { std::puts("run_seccomp: skipped (no /tmp)"); return 0; }
-      std::fputs(kProbe, f); std::fclose(f); }
-    int rc = std::system(("gcc -static -O2 -o " + root + "/bin/scprobe /tmp/lx_seccomp.c 2>/dev/null").c_str());
-    if (rc != 0) { std::puts("run_seccomp: skipped (no static gcc)"); return 0; }
+    const auto tree = lxtest::make_tree("seccomp", /*overlay=*/false,
+        "mkdir -p /tmp/lx_seccomp_root/etc"
+        " && printf 'hi\\n' > /tmp/lx_seccomp_root/etc/probe.txt",
+        "/bin/scprobe");
+    if (!lxtest::compile_guest("run_seccomp", tree, kProbe)) return 0;
+
+    // The same guest is run twice -- once with the seccomp fast path, once
+    // forced onto PTRACE_SYSCALL -- and both must agree, so wrap the harness.
+    auto run = [&] {
+        auto r = lxtest::run_guest(tree, [&](auto& k) {
+            kernel::ProcInfo init;
+            init.pid = 1;
+            init.cmdline = tree.exec;
+            k.procs().upsert(init);
+        });
+        return r ? *r : -1;
+    };
 
     // Fast path (seccomp filter installed if the host supports it).
     ::unsetenv("LINUXITY_NO_SECCOMP");
-    int fast = run(root, "/bin/scprobe");
+    int fast = run();
     // Forced fallback (PTRACE_SYSCALL on every syscall).
     ::setenv("LINUXITY_NO_SECCOMP", "1", 1);
-    int slow = run(root, "/bin/scprobe");
+    int slow = run();
     ::unsetenv("LINUXITY_NO_SECCOMP");
 
-    std::system(("rm -rf " + root).c_str());
-    std::remove("/tmp/lx_seccomp.c");
+    lxtest::remove_tree(tree);
 
     if (fast == -1 || slow == -1) { std::puts("run_seccomp: skipped (ptrace unavailable)"); return 0; }
     if (slow != 0) {

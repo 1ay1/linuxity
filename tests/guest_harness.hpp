@@ -34,6 +34,7 @@
 #include <optional>
 #include <string>
 #include <sys/stat.h>
+#include <vector>
 
 namespace lxtest {
 
@@ -115,12 +116,20 @@ inline void remove_tree(const GuestTree& g) {
 // Run the compiled guest under the ptrace backend, with the rootfs mounted
 // (over an overlay upper when `g.upper` is set) and /proc synthesized.
 //
+// `argv` defaults to just the program path, and `env` to EMPTY -- matching
+// what the tests did before this harness existed, so converting one doesn't
+// silently change what it exercises. A test that needs a populated
+// environment passes one (run_bind does: a static glibc startup reads the
+// environment, and an empty envp is a different code path).
+//
 // Returns the guest's exit code, or nullopt when ptrace is unavailable --
 // which happens under a restrictive container or an existing tracer, and is
 // a skip rather than a failure.
 template <class Setup>
-[[nodiscard]] inline std::optional<int> run_guest(const GuestTree& g,
-                                                   Setup&& extra_setup) {
+[[nodiscard]] inline std::optional<int> run_guest(
+        const GuestTree& g, Setup&& extra_setup,
+        std::vector<std::string> argv = {},
+        std::vector<std::string> env = {}) {
     lx::host::PosixHost hw;
     lx::kernel::Kernel<lx::host::PosixHost> k{hw};
     if (g.upper.empty()) k.files().mount_host("/", g.root);
@@ -130,8 +139,9 @@ template <class Setup>
     // Whatever else this particular test needs mounted or bound.
     extra_setup(k);
 
+    if (argv.empty()) argv.push_back(g.exec);
     const std::string host_exec = g.root + g.exec;
-    lx::runtime::PtraceTrap trap{host_exec, {g.exec}, {}, {}};
+    lx::runtime::PtraceTrap trap{host_exec, argv, env, {}};
     lx::runtime::Cpu cpu{trap, k, trap, lx::abi::Arch::x86_64};
     auto r = cpu.run(lx::uaddr(0), lx::uaddr(0));
     if (!r) return std::nullopt;
