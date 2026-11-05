@@ -57,6 +57,7 @@
 
 #include "linuxity/abi/result.hpp"
 #include "linuxity/abi/types.hpp"
+#include "linuxity/abi/wire/time.hpp"
 
 namespace lx::runtime {
 
@@ -74,12 +75,11 @@ enum class ClockId : std::int32_t {
     boottime          = 7,
 };
 
-// A POSIX timespec, as the guest sees it. Host-free: this is the ABI shape,
-// not any host's struct.
-struct Timespec {
-    std::int64_t sec{};
-    std::int64_t nsec{};
-};
+// A POSIX timespec, as the guest sees it. Defined ONCE in abi/wire/time.hpp:
+// this struct had three identical declarations (here, darwin/timer.hpp,
+// windows/win32.hpp), and the duplication bred a second FILETIME conversion
+// with different pre-epoch clamping than the one Windows already had.
+using Timespec = abi::wire::Timespec;
 
 // -- the contract ----------------------------------------------------------
 //

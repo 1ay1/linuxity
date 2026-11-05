@@ -38,10 +38,13 @@
 namespace lx::runtime {
 
 // Linux struct itimerval / itimerspec, as the guest lays them out.
-struct LinuxTimeval { std::int64_t sec, usec; };
-struct LinuxTimespec { std::int64_t sec, nsec; };
-struct LinuxItimerval { LinuxTimeval interval, value; };
-struct LinuxItimerspec { LinuxTimespec interval, value; };
+// The guest's time structs. Defined ONCE in abi/wire/time.hpp -- they had
+// three identical declarations across the tree. The Darwin conversions below
+// stay here (a host timespec is a host type); only the shape is shared.
+using LinuxTimeval     = abi::wire::Timeval;
+using LinuxTimespec    = abi::wire::Timespec;
+using LinuxItimerval   = abi::wire::Itimerval;
+using LinuxItimerspec  = abi::wire::Itimerspec;
 
 // sigevent's notify kinds.
 inline constexpr int kSigevSignal = 0;

@@ -126,7 +126,7 @@ public:
                 LARGE_INTEGER f{};
                 if (!::QueryPerformanceFrequency(&f) || f.QuadPart == 0)
                     return ok(Timespec{0, 100});
-                return ok(Timespec{0, std::int64_t(1'000'000'000 / f.QuadPart)});
+                return ok(Timespec{0, abi::wire::kNsecPerSec / f.QuadPart});
             }
             default:
                 // GetSystemTimeAsFileTime ticks in 100ns units.
@@ -135,11 +135,10 @@ public:
     }
 
     [[nodiscard]] Status sleep_for(Timespec d) {
-        // Sleep() takes whole milliseconds. Round a sub-millisecond request UP
-        // to 1ms rather than down to 0: a guest asking for 100us expects to
-        // yield, and a busy-spin here would peg a core.
-        const std::int64_t ms = d.sec * 1000 + (d.nsec + 999'999) / 1'000'000;
-        ::Sleep(static_cast<DWORD>(ms < 0 ? 0 : ms));
+        // Sleep() takes whole milliseconds, and the rounding direction is in
+        // the shared helper: a sub-millisecond request rounds UP, because
+        // Sleep(0) is a spin that pegs a core rather than a yield.
+        ::Sleep(static_cast<DWORD>(abi::wire::to_millis_ceil(d)));
         return ok();
     }
 
@@ -154,17 +153,13 @@ public:
     }
 
 private:
-    // Wall clock: FILETIME is 100ns ticks since 1601-01-01, the guest wants
-    // seconds since 1970-01-01.
+    // Wall clock. Uses win32::from_filetime -- the conversion that was ALREADY
+    // here. I first wrote a second one against my own Timespec, with different
+    // pre-epoch clamping; that is exactly the drift a shared struct prevents.
     [[nodiscard]] static Timespec from_filetime() noexcept {
         FILETIME ft{};
         ::GetSystemTimeAsFileTime(&ft);
-        std::uint64_t t = (std::uint64_t(ft.dwHighDateTime) << 32) |
-                           std::uint64_t(ft.dwLowDateTime);
-        constexpr std::uint64_t kEpochDelta = 116'444'736'000'000'000ULL;
-        t = t > kEpochDelta ? t - kEpochDelta : 0;
-        return Timespec{std::int64_t(t / 10'000'000),
-                        std::int64_t((t % 10'000'000) * 100)};
+        return win32::from_filetime(ft);
     }
 
     // Monotonic: QPC, which is what Windows guarantees never goes backwards.
@@ -175,7 +170,7 @@ private:
             return Timespec{0, 0};
         const std::int64_t sec = c.QuadPart / f.QuadPart;
         const std::int64_t rem = c.QuadPart % f.QuadPart;
-        return Timespec{sec, (rem * 1'000'000'000) / f.QuadPart};
+        return Timespec{sec, (rem * abi::wire::kNsecPerSec) / f.QuadPart};
     }
 
     FdTable& fds_;

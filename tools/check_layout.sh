@@ -107,6 +107,27 @@ for f in $(grep -rlE 'switch \((nr|sysno|regs_\.nr\(\)|f\.regs\.nr)' \
     note "$f dispatches on raw syscall numbers ($n cases); use Sysno"
 done
 
+# 8. A guest ABI struct is DECLARED once, in abi/wire/, and aliased elsewhere.
+#    struct timespec had three identical declarations (hostcalls.hpp,
+#    darwin/timer.hpp, windows/win32.hpp). Three copies of a two-field struct
+#    look harmless -- the damage is what grows AROUND them: Windows already
+#    had a FILETIME->timespec conversion, and the duplicate struct bred a
+#    second one with different pre-epoch clamping.
+#
+#    Backends may still DEFINE a struct whose layout is genuinely per-ABI
+#    (LinuxStat differs between x86-64 and asm-generic) as long as it
+#    static_asserts against abi/wire -- rule 5's authority check covers that.
+#    What this rule forbids is re-declaring a shape that does NOT vary.
+for s in Timespec Timeval Itimerval Itimerspec; do
+    hits=$(grep -rlE "^(struct|using)[[:space:]]+(Linux)?$s[[:space:]]*[{=]" \
+           include/linuxity src 2>/dev/null \
+           | grep -v '^include/linuxity/abi/wire/' || true)
+    for f in $hits; do
+        grep -qE "^using[[:space:]]+(Linux)?$s[[:space:]]*=" "$f" \
+            || note "$f re-declares guest ABI struct $s; alias abi/wire instead"
+    done
+done
+
 if [ "$fail" -eq 0 ]; then
     echo "runtime layout: all structural invariants hold"
 else

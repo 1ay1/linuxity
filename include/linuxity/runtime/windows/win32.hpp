@@ -36,6 +36,7 @@
 #include "linuxity/abi/result.hpp"
 #include "linuxity/abi/wire/open_flags.hpp"
 #include "linuxity/abi/wire/stat.hpp"
+#include "linuxity/abi/wire/time.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -185,10 +186,11 @@ inline constexpr std::uint32_t kSIfsock = 0xc000;
 inline constexpr std::int64_t kFiletimeEpochDeltaSec = 11'644'473'600ll;
 inline constexpr std::int64_t kFiletimeTicksPerSec   = 10'000'000ll;
 
-struct LinuxTimespec {
-    std::int64_t sec;
-    std::int64_t nsec;
-};
+// The guest's timespec. Defined ONCE in abi/wire/time.hpp -- it had three
+// identical declarations across the tree, and the duplication bred a second
+// FILETIME conversion (in WhpHostCalls) that clamped pre-epoch times
+// differently from the from_filetime below. One struct, one conversion.
+using LinuxTimespec = abi::wire::Timespec;
 
 [[nodiscard]] inline LinuxTimespec from_filetime(FILETIME ft) noexcept {
     const std::uint64_t ticks =

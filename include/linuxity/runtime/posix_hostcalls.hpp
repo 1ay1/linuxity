@@ -17,6 +17,7 @@
 #include "linuxity/abi/result.hpp"
 #include "linuxity/abi/types.hpp"
 #include "linuxity/abi/wire/errno_map.hpp"
+#include "linuxity/abi/wire/time.hpp"
 #include "linuxity/runtime/hostcalls.hpp"
 
 #include <algorithm>
