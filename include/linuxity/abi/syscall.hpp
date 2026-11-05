@@ -1551,7 +1551,6 @@ private:
         auto pc = k_.files().classify(abs, /*for_write=*/false, /*follow=*/false);
         if (pc.realm == kernel::Realm2::virtual_file) return eno(Errno::erofs);
         if (pc.realm == kernel::Realm2::absent)       return eno(pc.error);
-        k_.files().meta().set_mode(abs, mode);
         // ALSO apply the mode to the real host inode, best-effort. The shadow
         // store makes the FULL guest-intended mode authoritative at stat time,
         // but some bits must physically land on the inode to have any effect:
@@ -1560,8 +1559,9 @@ private:
         // then execve'd — record-only left it non-executable → EACCES
         // "Permission denied"). We chmod the file we actually own in the
         // overlay upper; a copy-up first ensures a lower-only file gains a
-        // writable upper twin to mark. Failure is ignored (the shadow store
-        // still presents the intended mode).
+        // writable upper twin to mark. When the inode then carries the bits
+        // exactly, the shadow store keeps NO record (it would add nothing).
+        std::uint32_t landed = 0xffffffffu;
         {
             auto wc = k_.files().classify(abs, /*for_write=*/true,
                                           /*follow=*/false, Wi::copy_leaf);
@@ -1572,9 +1572,13 @@ private:
             // fixed at 0777 and ignored by the kernel, so there is nothing to
             // apply; the shadow store still presents the intended mode at stat
             // time. Only chmod a REGULAR file/dir we own in the upper.
-            if (!wc.host_path.empty() && !is_symlink(wc.host_path.c_str()))
-                (void)::chmod(wc.host_path.c_str(), mode & 07777);
+            if (!wc.host_path.empty() && !is_symlink(wc.host_path.c_str()) &&
+                ::chmod(wc.host_path.c_str(), mode & 07777) == 0) {
+                struct ::stat st{};
+                if (::lstat(wc.host_path.c_str(), &st) == 0) landed = st.st_mode;
+            }
         }
+        k_.files().meta().set_mode(abs, mode, landed);
         return val(0);
     }
 
@@ -1586,12 +1590,16 @@ private:
         std::string_view gp = k_.files().path_of_fd(static_cast<int>(r.arg[0]));
         std::uint32_t mode = static_cast<std::uint32_t>(r.arg[1]);
         if (!gp.empty()) {
-            k_.files().meta().set_mode(std::string{gp}, mode);
-            // Best-effort apply to the host inode (execute bit for execve).
+            // Best-effort apply to the host inode (execute bit for execve);
+            // record in the shadow store only what the inode couldn't take.
             auto wc = k_.files().classify(std::string{gp}, /*for_write=*/true,
                                           /*follow=*/false, Wi::copy_leaf);
-            if (!wc.host_path.empty())
-                (void)::chmod(wc.host_path.c_str(), mode & 07777);
+            std::uint32_t landed = 0xffffffffu;
+            if (!wc.host_path.empty() && ::chmod(wc.host_path.c_str(), mode & 07777) == 0) {
+                struct ::stat st{};
+                if (::lstat(wc.host_path.c_str(), &st) == 0) landed = st.st_mode;
+            }
+            k_.files().meta().set_mode(std::string{gp}, mode, landed);
         }
         return val(0);
     }

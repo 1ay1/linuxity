@@ -121,23 +121,25 @@ public:
         // so uid/mode overlays for the whole guest tree share one store that
         // persists across runs. Attach the first time a rooted overlay mounts.
         if (prefix == "/" && !upper.empty() && !meta_attached_) {
-            meta_.attach(upper);
+            // Only the ROOT linuxity process (no guest running yet) may
+            // compact journals or repair pacman's db. A guest fork is a fresh
+            // linuxity that mounts again -- doing it there deleted pacman's
+            // LIVE db.lck and in-progress local entries mid-transaction from
+            // any helper pacman spawned, and rescanned the db per fork.
+            meta_.set_host_bases({upper, host_base});
+            meta_.attach(upper, /*compact=*/is_root_);
             meta_attached_ = true;
             whiteout_journal_ = upper + "/.linuxity-whiteout";
-            load_whiteouts();
-            // Manager-layer hygiene, run ONCE at attach while no guest is
-            // live: a pacman transaction that was interrupted (session leader
-            // exited, host reap) can leave a stale db.lck and half-written
-            // local-DB entries (a package dir with only `mtree`, no `desc`) in
-            // the durable upper. On a real machine you'd `rm db.lck` and
-            // reinstall; we do the equivalent so the next run isn't poisoned.
-            // proot-distro performs the same class of lock/partial cleanup at
-            // its container-manager layer. Only touches the writable UPPER.
-            repair_pacman_db(upper);
+            const std::size_t wl = load_whiteouts();
+            if (is_root_ && wl > 1024 && wl > whiteouts_.size() * 4) rewrite_whiteouts();
+            if (is_root_) repair_pacman_db(upper);
         }
         mounts_.push_back(Mount{std::move(prefix), std::move(host_base),
                                 std::move(upper), {}});
     }
+    // A fork child (a guest process started by another guest process) must
+    // not do root-only hygiene. Set before the first mount_host.
+    void set_fork_child(bool child) noexcept { is_root_ = !child; }
 
     // The shadow permission/ownership store (per-path mode/uid/gid overlay).
     // The dispatcher records guest chmod/chown here and overlays it back onto
@@ -772,6 +774,7 @@ private:
     std::unordered_map<int, DirStream> dir_streams_;
     MetaStore meta_{};
     bool meta_attached_{false};
+    bool is_root_{true};
 
     // WHITEOUTS. Removing a file that lives ONLY in the read-only lower layer
     // must not touch the pristine rootfs. Instead we record the guest path
@@ -816,12 +819,14 @@ public:
     }
 
 private:
-    void load_whiteouts() {
-        if (whiteout_journal_.empty()) return;
+    std::size_t load_whiteouts() {
+        if (whiteout_journal_.empty()) return 0;
         std::FILE* fp = std::fopen(whiteout_journal_.c_str(), "r");
-        if (!fp) return;
+        if (!fp) return 0;
+        std::size_t lines = 0;
         char line[4096];
         while (std::fgets(line, sizeof line, fp)) {
+            ++lines;
             std::string s{line};
             while (!s.empty() && (s.back() == '\n' || s.back() == '\r'))
                 s.pop_back();
@@ -830,6 +835,17 @@ private:
             else                  whiteouts_.insert(s);
         }
         std::fclose(fp);
+        return lines;
+    }
+    // The whiteout journal is append-only too (100k lines for 4.8k live
+    // entries after a few upgrades). Rewrite it to the live set, atomically.
+    void rewrite_whiteouts() {
+        const std::string tmp = whiteout_journal_ + ".tmp";
+        std::FILE* fp = std::fopen(tmp.c_str(), "w");
+        if (!fp) return;
+        for (const auto& w : whiteouts_) std::fprintf(fp, "%s\n", w.c_str());
+        if (std::fclose(fp) == 0) std::rename(tmp.c_str(), whiteout_journal_.c_str());
+        else std::remove(tmp.c_str());
     }
 };
 

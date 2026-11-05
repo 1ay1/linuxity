@@ -129,7 +129,8 @@ struct Machine {
     host::PosixHost hw;
     kernel::Kernel<host::PosixHost> k{hw};
 
-    explicit Machine(const Options& o) {
+    explicit Machine(const Options& o, bool fork_child = false) {
+        k.files().set_fork_child(fork_child);
         kernel::MachineSpec spec;
         const long n = ::sysconf(_SC_NPROCESSORS_ONLN);
         spec.ncpu = n > 0 ? n : 1;
@@ -651,6 +652,15 @@ int main(int argc, char** argv) {
 
     // -- Fork child: `--fork-child SERVICE PIDFD GROUPFDS` follows the options.
     if (i + 3 < argc && std::string_view{argv[i]} == "--fork-child") {
+        const auto c0 = std::chrono::steady_clock::now();
+        const bool prof = std::getenv("LINUXITY_PROFILE_FORK") != nullptr;
+        auto cmark = [&](const char* what) {
+            if (!prof) return;
+            std::fprintf(stderr, "[child %d] %-10s %7lld us\n", ::getpid(), what,
+                         static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - c0).count()));
+        };
+        cmark("main");
         ChildArgs ca;
         ca.service = argv[i + 1];
         ca.pid_fd = std::atoi(argv[i + 2]);
@@ -662,17 +672,10 @@ int main(int argc, char** argv) {
                 at = comma + 1;
             }
         }
-        Machine m{o};
+        Machine m{o, /*fork_child=*/true};
+        cmark("machine");
         runtime::HvfMachine machine;
         runtime::HvfTrap::ForkImage img;
-        const auto c0 = std::chrono::steady_clock::now();
-        const bool prof = std::getenv("LINUXITY_PROFILE_FORK") != nullptr;
-        auto cmark = [&](const char* what) {
-            if (!prof) return;
-            std::fprintf(stderr, "[child %d] %-10s %7lld us\n", ::getpid(), what,
-                         static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
-                             std::chrono::steady_clock::now() - c0).count()));
-        };
         if (!receive_fork(ca, machine, img)) {
             std::fputs("linuxity: fork handoff failed\n", stderr);
             return 127;

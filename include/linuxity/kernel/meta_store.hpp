@@ -42,6 +42,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 namespace lx::kernel {
 
@@ -64,13 +65,44 @@ public:
     // <upper>/.linuxity-meta; if it exists we replay it into memory. Called
     // once at mount time. An empty upper (no COW layer) leaves the store
     // purely in-memory (still coherent within a single run).
-    void attach(std::string upper_dir) {
+    void attach(std::string upper_dir, bool compact = false) {
         if (!upper_dir.empty() && upper_dir.back() == '/') upper_dir.pop_back();
         upper_ = std::move(upper_dir);
         if (upper_.empty()) return;
         journal_path_ = upper_ + "/.linuxity-meta";
-        replay();
+        const std::size_t lines = replay();
+        // Root-only: drop records the host inode already satisfies (written
+        // by older versions before set_mode checked the landed mode), and a
+        // mode on a symlink (always 0777, never consulted). One lstat per
+        // record, once per session, keeps every later fork's replay tiny.
+        std::size_t pruned = 0;
+        if (compact) {
+            for (auto it = table_.begin(); it != table_.end();) {
+                MetaRecord& r = it->second;
+                if (r.have & MetaRecord::kMode) {
+                    struct ::stat st{};
+                    bool ok = false;
+                    for (const std::string& base : host_bases_) {
+                        if (::lstat((base + it->first).c_str(), &st) == 0) { ok = true; break; }
+                    }
+                    if (ok && (S_ISLNK(st.st_mode) || (st.st_mode & 07777u) == r.mode))
+                        r.have &= static_cast<std::uint8_t>(~MetaRecord::kMode);
+                }
+                if (is_redundant(r)) { it = table_.erase(it); ++pruned; }
+                else ++it;
+            }
+        }
+        // The journal is append-only (crash-safe, last writer wins), so it
+        // grows without bound: a few pacman upgrades left 148k lines for 18
+        // live records, and EVERY fork child replayed all of it -- 8.5 MB
+        // parsed per fork, most of screenfetch's 10 s. The root process
+        // rewrites it to the live set (atomically: temp + rename) when it
+        // is mostly dead weight.
+        if (compact && (pruned || (lines > 1024 && lines > table_.size() * 4))) rewrite();
     }
+    // Host directories a guest path may live in (upper first, then lower),
+    // for compaction's "does the inode already carry this mode" check.
+    void set_host_bases(std::vector<std::string> b) { host_bases_ = std::move(b); }
 
     // The overlay journal filename, relative to the upper dir — the ONE name
     // the directory-union enumeration must hide so the guest never sees it.
@@ -80,7 +112,22 @@ public:
 
     // Record a guest chmod: the guest-intended permission bits (07777 mask;
     // file-type bits are ignored). Idempotent per path.
-    void set_mode(const std::string& guest_path, std::uint32_t mode) {
+    //
+    // `host_mode` (if known) is what the host inode carries AFTER the caller
+    // applied the chmod to it. When the inode already holds exactly the
+    // requested bits, and no owner is recorded, the overlay adds nothing --
+    // stat reads the inode -- so nothing is journaled. Ordinary 0644/0755
+    // chmods from package installs (13k of them here) all land in this case.
+    void set_mode(const std::string& guest_path, std::uint32_t mode,
+                  std::uint32_t host_mode = 0xffffffffu) {
+        if (host_mode != 0xffffffffu && (host_mode & 07777u) == (mode & 07777u)) {
+            auto it = table_.find(guest_path);
+            if (it == table_.end()) return;
+            it->second.have &= static_cast<std::uint8_t>(~MetaRecord::kMode);
+            if (is_redundant(it->second)) { table_.erase(it); append_tombstone(guest_path); }
+            else append(guest_path, it->second);
+            return;
+        }
         auto& r = table_[guest_path];
         r.mode = mode & 07777u;
         r.have |= MetaRecord::kMode;
@@ -90,12 +137,30 @@ public:
     // Record a guest chown. Either component may be -1 (0xffffffff) meaning
     // "leave unchanged", exactly like chown(2); we then keep the prior value
     // (or root's 0 if none was recorded).
+    //
+    // root:root is what every file already reports (the guest runs as uid 0
+    // over a world it owns), so chown to 0:0 on a path with no record is a
+    // no-op and is NOT journaled. pacman chowns every file it installs to
+    // root, which left 53k redundant records that every fork re-parsed.
     void set_owner(const std::string& guest_path, std::uint32_t uid,
                    std::uint32_t gid) {
+        auto it = table_.find(guest_path);
+        if (it == table_.end() && (uid == 0 || uid == 0xffffffffu) &&
+            (gid == 0 || gid == 0xffffffffu))
+            return;
         auto& r = table_[guest_path];
         if (uid != 0xffffffffu) { r.uid = uid; r.have |= MetaRecord::kUid; }
         if (gid != 0xffffffffu) { r.gid = gid; r.have |= MetaRecord::kGid; }
+        if (is_redundant(r)) { table_.erase(guest_path); append_tombstone(guest_path); return; }
         append(guest_path, r);
+    }
+
+    // A record that says nothing the default view doesn't already: owner
+    // root (or unset) and no mode. Such records are dropped.
+    [[nodiscard]] static bool is_redundant(const MetaRecord& r) noexcept {
+        const bool owner_default = (!(r.have & MetaRecord::kUid) || r.uid == 0) &&
+                                   (!(r.have & MetaRecord::kGid) || r.gid == 0);
+        return owner_default && !(r.have & MetaRecord::kMode);
     }
 
     // On rename/link the metadata should travel with the file. Move any record
@@ -168,11 +233,13 @@ private:
 
     // Replay the journal into memory, last-writer-wins (a later append for the
     // same path supersedes the earlier one — so append-only is self-healing).
-    void replay() {
+    std::size_t replay() {
         std::FILE* fp = std::fopen(journal_path_.c_str(), "r");
-        if (!fp) return;
+        if (!fp) return 0;
+        std::size_t lines = 0;
         char line[8192];
         while (std::fgets(line, sizeof line, fp)) {
+            ++lines;
             unsigned mode = 0, uid = 0, gid = 0, have = 0;
             int off = 0;
             // "%o %u %u %u " then the rest (which may contain spaces) is the path.
@@ -187,14 +254,29 @@ private:
             MetaRecord r;
             r.mode = mode; r.uid = uid; r.gid = gid;
             r.have = static_cast<std::uint8_t>(have);
+            if (is_redundant(r)) { table_.erase(path); continue; }
             table_[path] = r;   // last line for a path wins
         }
         std::fclose(fp);
+        return lines;
     }
 
     std::string upper_;
+    std::vector<std::string> host_bases_;
     std::string journal_path_;
     std::unordered_map<std::string, MetaRecord> table_;
+
+    // Rewrite the journal to exactly the live records, atomically.
+    void rewrite() {
+        const std::string tmp = journal_path_ + ".tmp";
+        std::FILE* fp = std::fopen(tmp.c_str(), "w");
+        if (!fp) return;
+        for (const auto& [path, r] : table_)
+            std::fprintf(fp, "%o %u %u %u %s\n", r.mode, r.uid, r.gid,
+                         static_cast<unsigned>(r.have), path.c_str());
+        if (std::fclose(fp) == 0) std::rename(tmp.c_str(), journal_path_.c_str());
+        else std::remove(tmp.c_str());
+    }
 };
 
 } // namespace lx::kernel
