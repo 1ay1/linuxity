@@ -173,25 +173,6 @@ public:
         machine_.set_fastcall(176, 0);                                          // getgid
         machine_.set_fastcall(177, 0);                                          // getegid
         machine_.set_fastcall(124, 0);                                          // sched_yield
-        // rt_sigprocmask: a pure read-modify-write of the mask. Only while
-        // single-threaded -- the scratch word is process-wide, and each
-        // thread has its own mask.
-        if (!threaded_) {
-            if (auto* s = machine_.fastcall_scratch()) s->sig_mask = task_.sig_mask;
-            machine_.enable_sigprocmask_fastcall(135);
-        }
-    }
-
-    // Adopt whatever the in-guest handler did to the mask since our last
-    // trap. Called at the top of every trap, before anything reads it.
-    void sync_fastcall_state() noexcept {
-        if (threaded_) return;
-        if (auto* s = machine_.fastcall_scratch()) task_.sig_mask = s->sig_mask;
-    }
-    // Push a host-side change back out to the handler.
-    void publish_sig_mask() noexcept {
-        if (threaded_) return;
-        if (auto* s = machine_.fastcall_scratch()) s->sig_mask = task_.sig_mask;
     }
 
     // A thread adopts its creator's process identity (tgid) and its own tid.
@@ -255,12 +236,6 @@ public:
             // Delivering before the result is written makes the handler
             // return into a context whose x0 is the syscall's first ARGUMENT,
             // and the interrupted code then dereferences garbage.
-            //
-            // Adopt the guest's mask FIRST: rt_sigprocmask may have run
-            // in-guest since our last trap (no VM exit), so task_.sig_mask
-            // is stale here -- and delivering a signal the guest has just
-            // blocked is exactly the bug that would cause.
-            sync_fastcall_state();
             (void)deliver_pending();
             if (exited_) return ok(false);
             auto regs = cpu_.run();
@@ -269,7 +244,6 @@ public:
                 return err<bool>(regs.error());
             }
             regs_ = *regs;
-            sync_fastcall_state();      // and again: the guest just ran
             if (regs_.ec() != kEcSvc64) {
                 // A fault the guest HANDLES (handler frame now loaded into
                 // the vCPU) must simply resume. Returning true here would
@@ -289,10 +263,6 @@ public:
     }
 
     [[nodiscard]] Status resume(std::int64_t ret) {
-        // Whatever the host just did to the signal mask, hand it to the
-        // in-guest handler before the guest runs again. One place, so no
-        // caller has to remember (there are nine sites that write it).
-        publish_sig_mask();
         // rt_sigreturn restored the ENTIRE interrupted context, x0 and PC
         // included; writing a return value would corrupt it.
         if (std::exchange(task_.in_sigreturn, false)) return ok();
@@ -1634,7 +1604,6 @@ private:
         // trap path, for every thread, permanently.
         threaded_ = true;
         machine_.clear_fastcall(178);
-        machine_.clear_fastcall(135);   // each thread has its own mask
         if (!spawn_thread_) return -38;
         if (!req.stack) return -22;                      // a thread needs a stack
         // A thread's tid lives in the SAME number space as every pid in the
