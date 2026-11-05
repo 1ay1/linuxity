@@ -732,6 +732,28 @@ private:
         return k_.files().path_of_fd(fd);
     }
 
+    // An *at syscall with a RELATIVE path needs the dirfd's directory to
+    // resolve against. dir_of returns "" for an fd whose path we never
+    // recorded, and absolutize then treats "" as the CWD -- so the call
+    // silently resolved against the wrong directory. For a bad fd that turned
+    // EBADF into ENOENT; for a good-but-unrecorded fd it would resolve the
+    // wrong file, which is worse.
+    //
+    // Either way we cannot answer, so FORWARD and let the host kernel decide.
+    // It owns the real fd table and returns the true errno. Found by the
+    // differential harness (newfstatat on a bad dirfd).
+    [[nodiscard]] bool at_dirfd_unresolvable(const Regs& r, int path_arg,
+                                             bool at) {
+        if (!at) return false;
+        const auto dirfd = static_cast<std::int64_t>(r.arg[0]);
+        if (static_cast<std::int32_t>(dirfd) == wire::kAtFdCwd) return false;
+        // An absolute path ignores the dirfd entirely -- nothing to resolve.
+        const std::string raw =
+            read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)]));
+        if (raw.empty() || raw.front() == '/') return false;
+        return dir_of(dirfd).empty();
+    }
+
     // Resolve arg-carried path to an absolute, normalized guest path.
     //
     // /proc/<pid>/{exe,cwd,root} are magic links: the kernel FOLLOWS them in
@@ -945,6 +967,10 @@ private:
             return wire::has_at(at_flags, wire::AtFlag::empty_path)
                        ? fwd()
                        : eno(Errno::enoent);
+
+        // A dirfd we cannot resolve means we'd resolve the path against the
+        // wrong directory; the host owns the real fd table, so let it answer.
+        if (at_dirfd_unresolvable(r, path_arg, at)) return fwd();
 
         std::string abs = resolve_arg(r, path_arg, at, follow);
         auto pc = k_.files().classify(abs, /*for_write=*/false, follow);

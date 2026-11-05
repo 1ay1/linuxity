@@ -146,6 +146,20 @@ inline std::string Scenario::key() const {
                     .exercising(abi::Sysno::fstat)
                     .on(DirFlavour::virtualised));
 
+    // fd lifecycle: dup/dup2/dup3, fcntl, and the EBADF boundaries. This is
+    // where linuxity keeps its own table alongside the host's real fds, so a
+    // drift between the two surfaces as a wrong errno -- a bad dirfd with a
+    // relative path was ENOENT instead of EBADF.
+    v.push_back(Scenario{"fdops", "fdops"}
+                    .exercising(abi::Sysno::dup)
+                    .exercising(abi::Sysno::dup2)
+                    .exercising(abi::Sysno::dup3)
+                    .exercising(abi::Sysno::fcntl)
+                    .exercising(abi::Sysno::close)
+                    .exercising(abi::Sysno::openat)
+                    .exercising(abi::Sysno::read)
+                    .on(DirFlavour::host_backed));
+
     return v;
 }
 
