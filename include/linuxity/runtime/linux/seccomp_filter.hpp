@@ -98,11 +98,19 @@ inline constexpr int kTrappedX86_64[] = {
     61,                          // wait4                 (pid translated both ways)
     247,                         // waitid    (id in, siginfo.si_pid out, both xlated)
     62,                          // kill                  (signal to guest pid)
-    // UNTRAPPED(tgkill,234) UNTRAPPED(tkill,200): glibc's raise()
-    // uses tgkill, and the child raises SIGSTOP during bootstrap BEFORE the
-    // tracer sets TRACESECCOMP; a filtered tgkill would ENOSYS and abort the
-    // launch. A guest tgkill targets a thread that shares the host tgid, so
-    // running it natively is already correct.
+    // tkill(200)/tgkill(234) ARE trapped. The old note claimed "a guest tgkill
+    // targets a thread that shares the host tgid, so running it natively is
+    // already correct" -- false. The guest passes a GUEST pid (1), the host has
+    // no such thread in its group, and both returned EPERM where Linux
+    // succeeds. tgkill(self,self,0) is the thread-liveness probe every
+    // threading runtime uses, and kill(self,0) worked while these did not.
+    //
+    // The bootstrap hazard the note described is real: the child self-stops
+    // before the tracer arms TRACESECCOMP. It now does that through
+    // rt_tgsigqueueinfo(297) -- untrapped, no handler, never needed -- so the
+    // whole kill family can be intercepted. See ptrace_trap.hpp start().
+    200,                         // tkill                 (guest tid in)
+    234,                         // tgkill                (guest tid in)
     63,                          // uname
     99,                          // sysinfo
     204,                         // sched_getaffinity

@@ -86,13 +86,11 @@ public:
             // resource cgroup and installs rlimit fallbacks. Runs pre-TRACEME
             // so enforcement is in effect the instant the guest's _start runs.
             if (pre_exec_) pre_exec_();
-            // Our own tid, read BEFORE the filter goes up. The SIGSTOP below
-            // needs it, and gettid is now trapped -- calling it after the
-            // filter is installed but before the tracer is armed ENOSYS-fails,
-            // so the child never stops and the handshake deadlocks (observed:
-            // guests ran to completion printing nothing). Reading it here, two
-            // lines earlier, is all it takes.
-            const int my_tid = static_cast<int>(::syscall(SYS_gettid));
+            // Our own ids, read BEFORE the filter goes up: getpid and gettid
+            // are both trapped, so calling them after the filter is installed
+            // but before the tracer is armed would ENOSYS-fail.
+            const int pre_pid = static_cast<int>(::syscall(SYS_getpid));
+            const int pre_tid = static_cast<int>(::syscall(SYS_gettid));
             // Install the seccomp trap filter so ONLY the syscalls linuxity
             // intercepts stop into the tracer; everything else runs natively.
             // Report the outcome to the parent, then let the filter be
@@ -110,11 +108,34 @@ public:
             // Stop here so the parent can arm PTRACE_O_TRACESECCOMP before the
             // first (now TRACE-filtered) execve runs; otherwise that exec
             // traps with no tracer listening and ENOSYS-aborts (_exit 127).
-            // tkill(200) is unfiltered, whereas kill(2), getpid(2) and now
-            // gettid(186) are all trapped -- calling any of them here, with no
-            // tracer armed, ENOSYS-fails and we would never stop. Hence the
-            // tid captured above the filter.
-            ::syscall(SYS_tkill, my_tid, SIGSTOP);
+            //
+            // The self-stop must use a syscall this filter does NOT trap:
+            // with the filter up but no tracer armed, a trapped syscall
+            // ENOSYS-fails, the child never stops, and the parent waits
+            // forever (observed: guests ran to completion printing nothing).
+            // kill, getpid, gettid, tkill and tgkill are all trapped now, so
+            // the stop goes through rt_tgsigqueueinfo(297), which linuxity has
+            // no handler for and never needs to intercept. Reserving one
+            // obscure syscall is cheaper than leaving the whole kill family
+            // native -- untrapped tkill/tgkill returned EPERM to guests,
+            // because the guest passes a GUEST pid the host cannot signal.
+            //
+            // siginfo for a queued signal: si_code SI_TKILL (-6) makes the
+            // kernel treat it exactly like tkill.
+            struct {
+                int si_signo, si_errno, si_code;
+                int pad[29];
+            } info{};
+            info.si_signo = SIGSTOP;
+            info.si_code = -6;                 // SI_TKILL
+            if (::syscall(SYS_rt_tgsigqueueinfo, pre_pid, pre_tid, SIGSTOP,
+                          &info) != 0) {
+                // Pre-5.x kernels or a seccomp policy we did not expect.
+                // If the stop never happens the parent's waitpid reports the
+                // exec instead, which the loop handles -- a degradation, not
+                // a hang.
+                ::syscall(SYS_tkill, pre_tid, SIGSTOP);
+            }
             std::vector<char*> cargv;
             for (auto& a : argv_) cargv.push_back(a.data());
             cargv.push_back(nullptr);

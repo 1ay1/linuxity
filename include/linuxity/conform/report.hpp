@@ -212,6 +212,36 @@ inline std::string Scenario::key() const {
                     .exercising(abi::Sysno::utimensat)
                     .on(DirFlavour::host_backed));
 
+    // mmap/munmap/mprotect/mremap/madvise/brk. linuxity tracks the guest's
+    // address space itself, so this has the same two-bookkeepings risk as the
+    // fd table. ADDRESSES are not comparable (ASLR alone differs every run),
+    // so the probe asserts invariants: anonymous memory is zero-filled,
+    // contents survive an mremap, MADV_DONTNEED zeroes, a too-low brk returns
+    // the old break rather than an errno.
+    v.push_back(Scenario{"memory", "memory"}
+                    .exercising(abi::Sysno::mmap)
+                    .exercising(abi::Sysno::munmap)
+                    .exercising(abi::Sysno::mprotect)
+                    .exercising(abi::Sysno::mremap)
+                    .exercising(abi::Sysno::madvise)
+                    .exercising(abi::Sysno::brk)
+                    .on(DirFlavour::host_backed));
+
+    // Signal dispositions and masks. linuxity delivers signals itself and
+    // translates guest pids to host tids on the way, so this is mostly its own
+    // code. No handler is ever RUN -- delivery timing is not deterministic --
+    // but the bookkeeping is: what sigaction reports, what the mask holds,
+    // which errnos the edges give. This caught tgkill/tkill returning EPERM
+    // for the standard thread-liveness probe.
+    v.push_back(Scenario{"signals", "signals"}
+                    .exercising(abi::Sysno::rt_sigaction)
+                    .exercising(abi::Sysno::rt_sigprocmask)
+                    .exercising(abi::Sysno::rt_sigpending)
+                    .exercising(abi::Sysno::sigaltstack)
+                    .exercising(abi::Sysno::tgkill)
+                    .exercising(abi::Sysno::tkill)
+                    .on(DirFlavour::virtualised));
+
     return v;
 }
 

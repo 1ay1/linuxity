@@ -133,12 +133,20 @@ public:
             case Sysno::kill:
                 return sig(static_cast<std::int32_t>(r.arg[0]),
                            static_cast<std::int32_t>(r.arg[1]));
-            case Sysno::tkill:
-                return sig(static_cast<std::int32_t>(r.arg[0]),
-                           static_cast<std::int32_t>(r.arg[1]));
-            case Sysno::tgkill:
-                return sig(static_cast<std::int32_t>(r.arg[1]),
-                           static_cast<std::int32_t>(r.arg[2]));
+            // tkill/tgkill address a THREAD, so unlike kill they have no
+            // process-group form: a non-positive id is EINVAL, not a group.
+            // Both used to accept it and report success.
+            case Sysno::tkill: {
+                const auto tid = static_cast<std::int32_t>(r.arg[0]);
+                if (tid <= 0) return eno(Errno::einval);
+                return sig(tid, static_cast<std::int32_t>(r.arg[1]));
+            }
+            case Sysno::tgkill: {
+                const auto tgid = static_cast<std::int32_t>(r.arg[0]);
+                const auto tid  = static_cast<std::int32_t>(r.arg[1]);
+                if (tgid <= 0 || tid <= 0) return eno(Errno::einval);
+                return sig(tid, static_cast<std::int32_t>(r.arg[2]));
+            }
 
             // -- identity + credentials. Each task answers with ITS OWN
             //    guest pid/tid/ppid (from the trap's live task map) so every
