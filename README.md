@@ -155,12 +155,49 @@ would escalate to a triple fault in a guest that has no IDT. So `#PF`
 `#UD` — **linuxity is the guest's page-fault handler**, which is what makes
 lazy `mmap` and a growing heap implementable without a guest kernel.
 
+#### Running a real Arch rootfs
+
+**Dynamically linked Arch binaries run** — `/bin/ls`, `/bin/bash`, `/bin/id`,
+`/bin/uname` all work, driven by Arch's own `ld-linux-x86-64.so.2` and
+`libc.so.6`:
+
+```bat
+curl -L --ssl-no-revoke -o arch.tar.zst ^
+  https://geo.mirror.pkgbuild.com/iso/latest/archlinux-bootstrap-x86_64.tar.zst
+mkdir archroot && tar --zstd -xf arch.tar.zst -C archroot
+
+:: Windows tar cannot create symlinks without privilege, and it drops them
+:: silently-ish. Two kinds matter, and both are fatal in confusing ways:
+cd archroot\root.x86_64
+for %D in (bin lib sbin) do mklink /J %D usr\%D
+mklink /J lib64 usr\lib
+cd ..\..
+
+:: ...and the shared-library SONAME links. The real file is libcap.so.2.78
+:: but every binary's DT_NEEDED names libcap.so.2, so ld.so reports
+:: "cannot open shared object file" for a library that IS present. This
+:: reads each ELF's own SONAME and hard-links it (no privilege needed):
+python tools\fix_rootfs_symlinks.py archroot\root.x86_64
+
+linuxity.exe --root archroot\root.x86_64 /bin/ls -la /usr
+linuxity.exe --root archroot\root.x86_64 /bin/bash -c "echo hi; pwd"
+linuxity.exe --root archroot\root.x86_64 /bin/uname -a
+:: -> Linux linuxity 6.6.0-linuxity #1 linuxity portable Linux ABI x86_64 GNU/Linux
+linuxity.exe --root archroot\root.x86_64 /bin/id
+:: -> uid=0(root) gid=0(root) groups=0(root)   (identity VIRTUALIZED)
+```
+
+Bash runs loops, arithmetic and variable expansion. What does NOT work yet is
+anything needing a second process: `fork`/`execve` are unimplemented, so
+`bash -c "/bin/echo hi"` reports "Function not implemented" rather than
+pretending. Threads (`clone`), signal delivery and sockets are likewise
+absent.
+
 Status: CPU, memory, registers, the trap loop, the ELF loader, the SysV
-startup stack, the fd table, the memory manager and ~70 syscalls are
-implemented and tested. Still outstanding before a full rootfs shell:
-loading `ld.so` is wired up but **dynamically linked binaries need a real
-rootfs to be verified**, and threads, signals, sockets and fork/exec are not
-implemented — see `doc/ROADMAP.md` (M6).
+startup stack, the fd table, the memory manager, `ld.so` loading and ~70
+syscalls are implemented and tested — enough to run real dynamically linked
+distro binaries. Next up is `fork`/`execve`, then threads and signals — see
+`doc/ROADMAP.md` (M6).
 
 Requires a C++23 compiler (`std::expected`, concepts). Tested with GCC 16.
 Native execution uses a `ptrace` trap backend on Linux/x86-64: the guest runs

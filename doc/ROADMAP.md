@@ -203,10 +203,30 @@ every `syscall` into a VM exit.
       first/last-page writes, openat+read through the rootfs, and TLS via
       `%fs` — all six checks pass.
 
-      Remaining: `ld.so` loading is wired (PT_INTERP resolved through the
-      rootfs, AT_BASE set, control entering the interpreter) but needs a
-      real rootfs to verify; then threads (clone), signal delivery, sockets,
-      and fork/exec as NT processes.
+      **DYNAMICALLY LINKED ARCH BINARIES RUN**, driven by Arch's own
+      `ld-linux-x86-64.so.2` and `libc.so.6`: `/bin/ls -la`, `/bin/bash -c`
+      (loops, arithmetic, variable expansion), `/bin/id` (reporting
+      uid=0(root) after parsing the rootfs `/etc/passwd`), `/bin/uname -a`.
+      ld.so maps each shared object, relocates it and mprotects its segments,
+      all serviced through #UD traps.
+
+      Two things that had to be right for that, and were not at first:
+        * The loader's regions must be ADOPTED into the VMA map.
+          AddressSpace::protect refuses a range it does not fully cover, so
+          ld.so's post-relocation mprotect failed with ENOMEM and glibc
+          aborted with "cannot apply additional memory protection after
+          relocation".
+        * Extracting a rootfs on Windows silently loses every symlink, and
+          two kinds are fatal: the top-level `/lib64 -> usr/lib` (so
+          PT_INTERP cannot resolve) and every library SONAME alias (the file
+          is `libcap.so.2.78`, DT_NEEDED says `libcap.so.2`, and ld.so
+          reports "cannot open shared object file" for a library that is
+          physically present). `tools/fix_rootfs_symlinks.py` reads each
+          ELF's own SONAME and hard-links it, needing no privilege.
+
+      Remaining: `fork`/`execve` (so `bash -c "/bin/echo hi"` currently
+      reports "Function not implemented" rather than pretending), then
+      threads (clone), signal delivery, and sockets.
 - [ ] **M7 (optional): foreign arch.** x86-64 rootfs on arm64 via FEX.
 
 ## Non-goals

@@ -5,3 +5,13 @@ build/
 compile_commands.json
 .cache/
 build-*/
+
+# Downloaded distro rootfs images and their tarballs. These are large
+# (an Arch bootstrap tarball is ~128 MB) and are fetched on demand for
+# testing the kernel-less backends -- never committed.
+*.tar.zst
+*.tar.gz
+*.tar.xz
+archroot/
+rootfs/
+*-rootfs/

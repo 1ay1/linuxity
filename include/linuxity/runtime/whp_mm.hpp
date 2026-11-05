@@ -142,6 +142,24 @@ public:
         brk_floor_ = (image_end + kPageMask) & ~kPageMask;
     }
 
+    // Record a region the LOADER mapped, not us (ELF segments, the startup
+    // stack). It must appear in the VMA map even though it sits below the
+    // mmap arena, because the guest will call mprotect and munmap on it.
+    //
+    // This is not bookkeeping for its own sake. ld.so maps each shared
+    // object writable, applies relocations, then mprotects .text and .rodata
+    // read-only -- and AddressSpace::protect refuses a range that is not
+    // fully covered by VMAs. Without adoption that mprotect fails with
+    // ENOMEM and glibc aborts with "cannot apply additional memory
+    // protection after relocation", which is a confusing way to be told the
+    // VMA map has a hole in it.
+    void adopt(std::uint64_t begin, std::uint64_t end, GuestProt prot,
+               bool anonymous) {
+        if (end <= begin) return;
+        space_.adopt(Vma{begin & ~kPageMask, (end + kPageMask) & ~kPageMask,
+                         prot, anonymous});
+    }
+
     [[nodiscard]] std::uint64_t brk_current() const noexcept { return space_.brk(); }
     [[nodiscard]] const AddressSpace& space() const noexcept { return space_; }
     [[nodiscard]] FrameAllocator& frames() noexcept { return frames_; }

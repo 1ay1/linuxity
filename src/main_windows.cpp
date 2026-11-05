@@ -272,6 +272,7 @@ int main(int argc, char** argv) {
     std::uint64_t entry = img->entry;
     std::uint64_t at_base = 0;
     std::uint64_t highest_end = img->image_end;
+    std::vector<WhpImage::Segment> all_segments = img->segments;
 
     auto interp = whp_read_interp(host_path);
     if (interp && !interp->empty()) {
@@ -292,12 +293,21 @@ int main(int argc, char** argv) {
         at_base = ld->load_bias;
         entry = ld->entry;
         highest_end = std::max(highest_end, ld->image_end);
+        all_segments.insert(all_segments.end(), ld->segments.begin(),
+                            ld->segments.end());
     }
 
     // brk starts above every loaded image; the mmap arena sits below the
     // stack. Both must be set before the guest runs, since libc calls brk
     // and mmap during startup.
     mm.init(highest_end, WhpLayout::mmap_top(ram));
+
+    // Tell the VMA map about everything the LOADER mapped. ld.so mprotects
+    // its own and the program's segments after relocating, and that is
+    // refused for any range the map does not fully cover.
+    for (const auto& sg : all_segments) {
+        mm.adopt(sg.begin, sg.end, prot_from_elf(sg.flags), /*anonymous=*/false);
+    }
 
     std::vector<std::string> envp{
         "PATH=/usr/local/bin:/usr/bin:/bin",
@@ -310,6 +320,15 @@ int main(int argc, char** argv) {
     if (!sp) {
         std::fprintf(stderr, "linuxity: could not build the startup stack\n");
         return 1;
+    }
+
+    // The stack is loader-mapped too, so it also needs adopting -- libc
+    // queries and occasionally mprotects it.
+    {
+        const std::uint64_t top = WhpLayout::stack_top(ram);
+        mm.adopt(top - WhpLayout::stack_size, top,
+                 GuestProt(unsigned(GuestProt::read) | unsigned(GuestProt::write)),
+                 /*anonymous=*/true);
     }
 
     WhpCpu cpu;
