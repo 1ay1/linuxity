@@ -100,7 +100,7 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
             std::vector<kernel::VirtualDirent> e;
             for (std::int32_t pid : procs.pids())
                 e.push_back({std::to_string(pid), true});
-            for (const char* f : {"stat","meminfo","cpuinfo","uptime","loadavg",
+            for (const char* f : {"stat","meminfo","vmstat","cpuinfo","uptime","loadavg",
                                   "version","cmdline","filesystems","mounts",
                                   "self","sys"})
                 e.push_back({f, std::string_view{f} == "sys"});
@@ -189,6 +189,41 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
             s += row("Slab:",          65536ull << 10);
             s += row("SReclaimable:",  32768ull << 10);
             s += row("SUnreclaim:",    32768ull << 10);
+            return ok(text_file(std::move(s)));
+        }
+        if (abs == "/proc/vmstat") {
+            // Virtual-memory event counters, one `name value` pair per line.
+            //
+            // It did not exist at all, and libproc2's vmstat reader fails
+            // outright on a missing FILE ("vmstat: Unable to create vmstat
+            // structure") while tolerating any field it doesn't recognise --
+            // it looks each name up in a hash table and skips misses. So the
+            // file must exist and be well-formed; the field list only has to
+            // cover what consumers actually read.
+            //
+            // vmstat(8) reads pgpgin/pgpgout (block I/O) and pswpin/pswpout
+            // (swap). There is no swap and linuxity does no paging of its own,
+            // so the swap counters are truthfully 0. nr_free_pages is derived
+            // from the same MemFree that /proc/meminfo reports, so the two
+            // files cannot disagree.
+            const std::uint64_t page = 4096;
+            std::string s;
+            auto row = [&](const char* name, std::uint64_t v) {
+                s += name; s += ' '; s += std::to_string(v); s += '\n';
+            };
+            row("nr_free_pages", mach.mem_free() / page);
+            row("nr_inactive_anon", 0);
+            row("nr_active_anon", (mach.mem_total - mach.mem_free()) / page);
+            row("nr_inactive_file", mach.mem_buffers() / page);
+            row("nr_active_file", mach.mem_cached() / page);
+            row("nr_dirty", 0);
+            row("nr_writeback", 0);
+            row("pgpgin", 0);
+            row("pgpgout", 0);
+            row("pswpin", 0);
+            row("pswpout", 0);
+            row("pgfault", 0);
+            row("pgmajfault", 0);
             return ok(text_file(std::move(s)));
         }
         if (abs == "/proc/stat") {
