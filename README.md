@@ -61,8 +61,10 @@ JIT-backed kernel — with no virtual dispatch in the hot path.
 - `include/linuxity/abi/`    — `result.hpp`, `types.hpp`, `syscall.hpp`
 - `include/linuxity/kernel/` — `subsystem.hpp` (concepts), `authority.hpp` (the host-authority boundary), `file_namespace.hpp` (mount table + cwd + fd table + realm classifier), `kernel.hpp`
 - `include/linuxity/vfs/`    — `inode.hpp` (FileSystem concept), `tmpfs.hpp` (in-memory backend), `hostfs.hpp` (on-disk rootfs backend), `procfs.hpp` (synthesized /proc), `vfs.hpp` (mount table + path resolution)
-- `include/linuxity/host/`   — `host.hpp` (the concept), `posix_host.hpp` (Linux/Darwin backend)
+- `include/linuxity/host/`   — `host.hpp` (the concept), `posix_host.hpp` (Linux/Darwin backend), `win_posix.hpp` (the POSIX corners the Win32 CRT lacks)
+- `include/linuxity/runtime/` — `trap.hpp` (the backend-agnostic loop), `ptrace_trap.hpp` (Linux), `hvf_*.hpp` (macOS/arm64), `whp_*.hpp` (Windows/x86-64)
 - `src/main.cpp`             — wires host → kernel → ABI, issues guest syscalls
+- `src/main_macos.cpp`, `src/main_windows.cpp` — the kernel-less hosts
 - `tests/`                   — host-free type-algebra, authority, and VFS tests
 
 ## Build
@@ -92,6 +94,43 @@ ctest --test-dir build
 ./build/linuxity /bin/cat /proc/version
 #   -> Linux version 6.6.0-linuxity (linuxity@linuxity) ...  (SYNTHESIZED)
 ```
+
+### Windows
+
+Builds with MSYS2/UCRT64 or MSVC. The Windows backend intercepts guest
+syscalls by clearing `IA32_EFER.SCE` — which makes `syscall` raise `#UD` —
+and routing that vector to the host through WHP's `ExceptionExitBitmap`, so
+the guest runs entirely at CPL 3 with **no guest kernel and no ring-0 code**.
+
+It needs the *Windows Hypervisor Platform* feature:
+
+```bat
+dism /online /Enable-Feature /FeatureName:HypervisorPlatform /All
+```
+
+`WinHvPlatform.dll` is loaded on demand, so the binary still runs (and
+explains itself) where that feature is off. To check a machine — this also
+proves the trap path by running guest code natively and catching a real
+syscall:
+
+```bat
+linuxity.exe --check
+```
+
+```
+linuxity WHP backend check
+  WinHvPlatform.dll : loaded
+  hypervisor running: yes
+  exception VM exits: yes  (the #UD syscall trap is available)
+  partition         : created (16 MiB guest RAM)
+  long mode         : entered at CPL 3
+  syscall trap      : nr=60 arg0=42  (guest ran natively, #UD routed here)
+```
+
+Status: the CPU, memory, register and trap layers are implemented and tested.
+Running a full rootfs additionally needs the Win32 fd table, the ELF loader
+into guest-physical memory, and guest fork/exec as NT processes — see
+`doc/ROADMAP.md` (M6).
 
 Requires a C++23 compiler (`std::expected`, concepts). Tested with GCC 16.
 Native execution uses a `ptrace` trap backend on Linux/x86-64: the guest runs

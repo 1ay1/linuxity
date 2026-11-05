@@ -13,6 +13,7 @@ This is the *why* and the *how it works*; for the *how to use it* see
 3. [Source layout](#3-source-layout)
 4. [The type discipline](#4-the-type-discipline)
 5. [The trap backend (native execution)](#5-the-trap-backend-native-execution)
+5a. [The kernel-less backends (macOS, Windows)](#5a-the-kernel-less-backends-macos-windows)
 6. [Syscall fates: virtualize / forward / redirect / inject / signal](#6-syscall-fates)
 7. [The seccomp fast path](#7-the-seccomp-fast-path)
 8. [The filesystem namespace](#8-the-filesystem-namespace)
@@ -155,6 +156,63 @@ Key properties:
 
 The generic loop lives in `runtime/trap.hpp` (`Cpu`), written against the
 `SyscallTrap` concept so it is backend-agnostic.
+
+### 5a. The kernel-less backends (macOS, Windows)
+
+Neither macOS nor Windows has a ptrace that can intercept a *Linux* syscall.
+So on those hosts the guest runs as user code inside a bare hypervisor
+address space with **no guest kernel at all**, and each syscall exits the VM
+directly into linuxity. Two things change, and everything else follows:
+
+- **`forward()` has nothing to forward to.** There is no host Linux kernel, so
+  what is a pass-through on Linux becomes an *emulation* against the native
+  API (Darwin `pread`, Win32 `ReadFile`), and `mmap`/`brk`/`mprotect` are
+  served by our own guest-physical allocator plus page-table edits.
+- **Guest memory is directly addressable.** The hypervisor shares the pages,
+  so `copy_in`/`copy_out` are a bounds-checked `memcpy` instead of
+  `process_vm_readv` — and there is no TOCTOU window on a redirected path,
+  because the guest is stopped and *we* read the path ourselves.
+
+How the syscall is actually trapped is the per-host crux:
+
+| host | file | mechanism |
+|---|---|---|
+| macOS arm64 | `runtime/hvf_trap.hpp` | `svc #0` traps to EL2; HVF hands it over. |
+| Windows x86-64 | `runtime/whp_trap.hpp` | `IA32_EFER.SCE = 0` makes `syscall` raise `#UD`; WHP's `ExceptionExitBitmap` routes vector 6 to the host. |
+
+**The Windows trick is worth dwelling on.** WHP has no "syscall exit" reason,
+so the obvious design is to leave SCE enabled, point `LSTAR` at a ring-0 stub
+inside the guest, and have that stub force an exit. That works but requires a
+kernel GDT/IDT/TSS and an entry trampoline in the guest address space — a tiny
+kernel, which is the thing this project exists to avoid. Clearing one EFER bit
+gets the same interception with the guest staying wholly at **CPL 3**.
+
+Two consequences the Windows backend must honor, both of which are easy to get
+wrong silently:
+
+1. **`#UD` is a fault, not a trap.** `RIP` points *at* the two-byte `0F 05`,
+   not past it, so resuming requires advancing `RIP` by 2. (On arm64 `svc` has
+   already retired and `ELR_EL1` is the next instruction.) This lives in one
+   place, `GuestRegs::advance()`.
+2. **A genuine bad instruction arrives through the same exit.** The backend
+   checks the faulting bytes really are `0F 05`; anything else is a real
+   invalid opcode and becomes SIGILL, rather than a wild syscall dispatch on
+   whatever happened to be in `rax`.
+
+The Windows backend also needs real paging, which the arm64 one does not:
+64-bit long mode *requires* `CR0.PG`, so `runtime/whp_mem.hpp` carries a
+GVA→GPA walker (honoring 1 GiB/2 MiB leaves) and stitches buffers that straddle
+non-contiguous pages. The vCPU is placed directly into long mode at CPL 3 by
+setting `CR0`/`CR3`/`CR4`/`EFER` and the segment registers — a hypervisor lets
+us assert the architectural state a boot sequence would have reached, so there
+is no real-mode bootstrap.
+
+Finally, `WinHvPlatform.dll` is resolved with `LoadLibrary` at runtime
+(`runtime/whp_api.hpp`) rather than linked. WHP is an optional Windows feature;
+linking it would make the binary fail in the loader with `0xC0000135` on a
+machine where it is off, instead of printing a diagnostic. `linuxity --check`
+reports exactly which prerequisite is missing, and on a capable machine proves
+the whole path by trapping a real syscall out of natively-executed guest code.
 
 ---
 

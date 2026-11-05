@@ -1,15 +1,12 @@
 // tests/test_hvf_vma.cpp
 //
 // The guest address-space interval map. Pure logic -- no hypervisor, no
-// Darwin -- so it runs in CI on any host, including the Linux job.
+// Darwin, no Windows -- so it runs on EVERY host, and both kernel-less
+// backends (HVF, WHP) depend on exactly these semantics.
 #include "linuxity/runtime/hvf_vma.hpp"
 
 #include <cstdio>
 #include <cstdlib>
-
-#if !(defined(__APPLE__) && defined(__aarch64__))
-int main() { std::puts("hvf_vma: skipped (not macOS/arm64)"); return 0; }
-#else
 
 using namespace lx::runtime;
 
@@ -135,4 +132,3 @@ int main() {
     if (failures == 0) std::puts("hvf_vma: all checks passed");
     return failures ? 1 : 0;
 }
-#endif

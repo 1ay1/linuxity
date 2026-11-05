@@ -23,10 +23,53 @@
 #include <cstdint>
 #include <cstring>
 #include <sys/stat.h>
+#include "linuxity/host/win_posix.hpp"
 #include <optional>
 #include <span>
 #include <string>
 #include <vector>
+
+// -- Host portability: lstat ------------------------------------------------
+// The core calls lstat(2) in exactly one place (is_symlink below), to avoid a
+// pointless host chmod on a symlink. The Win32 CRT has no lstat and no
+// S_ISLNK, because NTFS reparse points are not POSIX symlinks and the CRT
+// does not pretend otherwise -- so on Windows the honest answer is "this
+// path is not a POSIX symlink", and the chmod proceeds.
+//
+// Confining the difference to this one shim is what keeps the WHP backend
+// from having to fork the core. (A full reparse-point query belongs in the
+// Win32 host backend, not in the portable ABI layer.)
+namespace lx::abi::hostcompat {
+
+#if defined(_WIN32)
+inline constexpr bool kHasLstat = false;
+[[nodiscard]] inline bool path_is_symlink(const char*) noexcept { return false; }
+// Read back the mode that actually landed on the host inode. Win32's stat
+// has no lstat variant, but since there are no POSIX symlinks there, stat
+// and lstat would agree anyway.
+[[nodiscard]] inline bool host_mode_of(const char* path,
+                                      std::uint32_t& mode) noexcept {
+    struct ::stat st{};
+    if (::stat(path, &st) != 0) return false;
+    mode = static_cast<std::uint32_t>(st.st_mode);
+    return true;
+}
+#else
+inline constexpr bool kHasLstat = true;
+[[nodiscard]] inline bool path_is_symlink(const char* path) noexcept {
+    struct ::stat st{};
+    return ::lstat(path, &st) == 0 && S_ISLNK(st.st_mode);
+}
+[[nodiscard]] inline bool host_mode_of(const char* path,
+                                      std::uint32_t& mode) noexcept {
+    struct ::stat st{};
+    if (::lstat(path, &st) != 0) return false;
+    mode = static_cast<std::uint32_t>(st.st_mode);
+    return true;
+}
+#endif
+
+} // namespace lx::abi::hostcompat
 
 namespace lx::abi {
 
@@ -1574,8 +1617,9 @@ private:
             // time. Only chmod a REGULAR file/dir we own in the upper.
             if (!wc.host_path.empty() && !is_symlink(wc.host_path.c_str()) &&
                 ::chmod(wc.host_path.c_str(), mode & 07777) == 0) {
-                struct ::stat st{};
-                if (::lstat(wc.host_path.c_str(), &st) == 0) landed = st.st_mode;
+                std::uint32_t got = 0;
+                if (hostcompat::host_mode_of(wc.host_path.c_str(), got))
+                    landed = got;
             }
         }
         k_.files().meta().set_mode(abs, mode, landed);
@@ -1596,8 +1640,9 @@ private:
                                           /*follow=*/false, Wi::copy_leaf);
             std::uint32_t landed = 0xffffffffu;
             if (!wc.host_path.empty() && ::chmod(wc.host_path.c_str(), mode & 07777) == 0) {
-                struct ::stat st{};
-                if (::lstat(wc.host_path.c_str(), &st) == 0) landed = st.st_mode;
+                std::uint32_t got = 0;
+                if (hostcompat::host_mode_of(wc.host_path.c_str(), got))
+                    landed = got;
             }
             k_.files().meta().set_mode(std::string{gp}, mode, landed);
         }
@@ -2197,9 +2242,10 @@ public:
 
     // True iff `path` is a symbolic link (lstat, no follow). Used to skip a
     // pointless/failing host chmod on a symlink the guest is "chmod"ing.
+    // Delegates to the host shim: Win32 has no POSIX symlinks, so there the
+    // answer is always false.
     static bool is_symlink(const char* path) {
-        struct ::stat st{};
-        return ::lstat(path, &st) == 0 && S_ISLNK(st.st_mode);
+        return hostcompat::path_is_symlink(path);
     }
 };
 

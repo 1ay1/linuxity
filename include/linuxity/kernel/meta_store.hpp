@@ -35,6 +35,7 @@
 #pragma once
 
 #include <sys/stat.h>
+#include "linuxity/host/win_posix.hpp"
 
 #include <cstdint>
 #include <cstdio>

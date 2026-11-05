@@ -14,9 +14,13 @@
 // vector rather than a node-based map because the VMA count is small (tens,
 // not thousands) and a linear scan over contiguous memory beats pointer
 // chasing at that size -- while keeping O(log n) lookup via binary search.
+//
+// HOST-AGNOSTIC: this is pure interval arithmetic -- no hypervisor, no OS
+// calls -- so it is deliberately NOT platform-gated. Both kernel-less
+// backends build on it: HVF (macOS/arm64) and WHP (Windows/x86-64) need the
+// identical mmap/munmap/mprotect/brk semantics, and duplicating a splitting
+// interval map per backend is how the two drift apart.
 #pragma once
-
-#if defined(__APPLE__) && defined(__aarch64__)
 
 #include <algorithm>
 #include <cstdint>
@@ -261,5 +265,3 @@ private:
 };
 
 } // namespace lx::runtime
-
-#endif // __APPLE__ && __aarch64__

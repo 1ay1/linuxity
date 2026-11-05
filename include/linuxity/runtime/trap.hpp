@@ -29,6 +29,7 @@
 
 #include "linuxity/abi/result.hpp"
 #include "linuxity/abi/syscall.hpp"
+#include "linuxity/host/win_posix.hpp"
 
 #include <concepts>
 #include <cstdint>
@@ -38,7 +39,11 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#if !defined(_WIN32)
 #include <unistd.h>
+#else
+#include <io.h>
+#endif
 
 namespace lx::runtime {
 

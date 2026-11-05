@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -17,10 +18,22 @@ static int failures = 0;
 #define CHECK(cond, msg) do { if (!(cond)) { \
     std::printf("interp: FAIL %s\n", msg); ++failures; } } while (0)
 
+// The temp directory, portably. This test writes small ELF/script fixtures
+// to disk and reads them back; hardcoding /tmp made it a POSIX-only test for
+// no reason -- the code under inspection (file-header classification) is
+// pure portable logic.
+static std::string temp_dir() {
+    std::error_code ec;
+    auto p = std::filesystem::temp_directory_path(ec);
+    if (ec || p.empty()) return ".";
+    return p.string();
+}
+
 // Write bytes to a temp file, return its path.
 static std::string write_file(const std::string& name,
                               const std::vector<unsigned char>& bytes) {
-    std::string path = "/tmp/lx_interp_" + name;
+    std::string path =
+        (std::filesystem::path(temp_dir()) / ("lx_interp_" + name)).string();
     std::FILE* f = std::fopen(path.c_str(), "wb");
     if (f) { std::fwrite(bytes.data(), 1, bytes.size(), f); std::fclose(f); }
     return path;
@@ -56,7 +69,10 @@ int main() {
         CHECK(read_elf_machine(forgn) == ForeignArch::foreign, "foreign ELF flagged");
         CHECK(read_elf_machine(script) == ForeignArch::native,
               "non-ELF treated as native (handled elsewhere)");
-        CHECK(read_elf_machine("/tmp/lx_interp_does_not_exist") == ForeignArch::native,
+        CHECK(read_elf_machine(
+                  (std::filesystem::path(temp_dir()) / "lx_interp_does_not_exist")
+                      .string()
+                      .c_str()) == ForeignArch::native,
               "missing file is not foreign");
     }
 
@@ -110,12 +126,27 @@ int main() {
 
     // --- unreadable ---
     {
-        FileHeaderInfo i = inspect_file_header("/tmp/lx_interp_missing_xyz");
+        FileHeaderInfo i = inspect_file_header(
+            (std::filesystem::path(temp_dir()) / "lx_interp_missing_xyz")
+                .string()
+                .c_str());
         CHECK(i.kind == FileHeaderInfo::Kind::unreadable, "missing file unreadable");
     }
 
-    // Cleanup.
-    std::system("rm -f /tmp/lx_interp_* 2>/dev/null");
+    // Cleanup. std::filesystem rather than shelling out to `rm`, which does
+    // not exist on every host this test now runs on.
+    {
+        std::error_code ec;
+        for (const auto& e :
+             std::filesystem::directory_iterator(temp_dir(), ec)) {
+            if (ec) break;
+            const auto fn = e.path().filename().string();
+            if (fn.rfind("lx_interp_", 0) == 0) {
+                std::error_code rm;
+                std::filesystem::remove(e.path(), rm);
+            }
+        }
+    }
 
     if (failures) { std::printf("interp: %d checks FAILED\n", failures); return 1; }
     std::puts("interp: single-read file-header inspection classifies static/dynamic/"

@@ -26,6 +26,19 @@ backend runs the guest ELF as user code inside a bare hypervisor address space
 exits the VM into linuxity, which services it and resumes. Noah and gVisor's
 KVM platform use this same model.
 
+How the syscall is intercepted differs per host, and on x86-64 the trick is
+worth stating because it is what removes the need for a guest kernel:
+
+| host | mechanism |
+|---|---|
+| Linux | ptrace / seccomp-unotify |
+| macOS arm64 | `svc #0` traps to EL2 (HVF gives it to us) |
+| Windows x86-64 | **`IA32_EFER.SCE = 0` makes `syscall` raise `#UD`**, and WHP's `ExceptionExitBitmap` routes vector 6 to the host |
+
+So on Windows the guest stays wholly at CPL 3 with no LSTAR trampoline, no
+ring-0 code and no IDT/TSS in its address space — one cleared EFER bit turns
+every `syscall` into a VM exit.
+
 ## Milestones
 
 - [x] **M0: portable core.** abi/kernel/vfs build and pass unit tests on macOS
@@ -110,7 +123,45 @@ KVM platform use this same model.
       opens files and injects fds (`SECCOMP_IOCTL_NOTIF_ADDFD`), so there is
       no path-rewrite race.
 - [ ] **M5: HVF backend (macOS arm64).** See M5a above — started.
-- [ ] **M6: WHP backend (Windows x86-64).**
+- [ ] **M6: WHP backend (Windows x86-64) — CPU/MEMORY/TRAP LAYERS LANDED.**
+      Guest syscalls are intercepted by clearing `IA32_EFER.SCE` so that
+      `syscall` raises `#UD`, and routing vector 6 to the host through the
+      partition's `ExceptionExitBitmap`. No guest kernel, no ring-0 code: the
+      guest runs entirely at CPL 3 and its instructions execute bare on the
+      CPU.
+
+      In place and verified on real hardware (`linuxity --check`):
+        * `runtime/whp_api.hpp` — WHP entry points resolved at RUNTIME via
+          LoadLibrary, so the binary still starts (and explains itself) on a
+          machine where the Hypervisor Platform feature is off, instead of
+          dying in the loader with 0xC0000135.
+        * `runtime/whp_vm.hpp` — partition setup, guest RAM shared with
+          `WHvMapGpaRange`, 4-level page tables, a GDT, and a vCPU entered
+          DIRECTLY in 64-bit long mode at CPL 3 (no real-mode bootstrap:
+          a hypervisor lets us just set the architectural state).
+        * `runtime/whp_regs.hpp` — the register working set batched into ONE
+          hypercall in and one out, since WHP's register API is vectorized.
+          Decodes the x86-64 Linux ABI (`rax`; `rdi rsi rdx r10 r8 r9` —
+          note **r10, not rcx**, which `syscall` clobbers).
+        * `runtime/whp_mem.hpp` — bounds-checked guest RAM spans plus the
+          GVA→GPA page-table walk. x86-64 long mode REQUIRES paging, so
+          unlike the flat arm64 space every guest pointer must be walked,
+          and buffers that straddle non-contiguous pages are stitched.
+        * `runtime/whp_win32.hpp` — the Linux/Win32 translation layer
+          (open flags, `struct stat` with asserted offsets, errno, the
+          1601↔1970 epoch, UTF-16 `\\?\` paths).
+        * `runtime/whp_trap.hpp` — models `SyscallTrap`, so the SAME
+          `runtime::Cpu` loop drives it. Distinguishes our syscall trap from
+          a GENUINE `#UD` by checking the faulting bytes are `0F 05`, so a
+          guest crash becomes SIGILL instead of a wild syscall dispatch.
+        * `host/win_posix.hpp` — the POSIX corners the Win32 CRT lacks
+          (`mkdir` arity, `S_ISLNK`, `O_CLOEXEC`, `d_type`), confined to one
+          header so the core stays free of `#ifdef`s.
+
+      Remaining before `--root` runs a shell: the Win32 fd table on NT
+      handles, the ELF loader into guest-physical memory, and guest
+      fork/exec as NT processes (the analogues of `hvf_fd` / `hvf_load` /
+      `hvf_fork`).
 - [ ] **M7 (optional): foreign arch.** x86-64 rootfs on arm64 via FEX.
 
 ## Non-goals

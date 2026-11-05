@@ -21,3 +21,37 @@ jobs:
       - run: cmake -S . -B build -DCMAKE_CXX_COMPILER=clang++
       - run: cmake --build build -j
       - run: ctest --test-dir build --output-on-failure
+
+  windows:
+    # Portable core + the WHP backend's offline half.
+    #
+    # GitHub's Windows runners are themselves VMs WITHOUT nested
+    # virtualization, so no WHP partition can be created there. That is
+    # exactly why tests/test_whp.cpp is split: the translation and
+    # page-table-walk checks run here and guard the logic most likely to
+    # break silently, while the live partition checks SKIP rather than fail.
+    # The job therefore proves the backend COMPILES and its logic is correct
+    # on every push; the hardware path is verified locally and by
+    # `linuxity --check` on a real machine.
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+      - shell: msys2 {0}
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+      - shell: msys2 {0}
+        run: cmake --build build
+      - shell: msys2 {0}
+        run: ctest --test-dir build --output-on-failure
+      - name: report backend availability
+        shell: msys2 {0}
+        # Expected to report "no hypervisor" on a CI runner; it must exit
+        # cleanly with a real diagnostic rather than crashing in the loader.
+        run: ./build/linuxity.exe --check || true

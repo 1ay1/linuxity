@@ -30,6 +30,8 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include "linuxity/host/win_posix.hpp"
+#include "linuxity/host/dirent_type.hpp"
 
 #include <cstdint>
 #include <algorithm>
@@ -616,9 +618,10 @@ private:
             if (name == "." || name == "..") continue;
             if (seen.count(name)) continue;
             DType t;
-            if      (e->d_type == DT_LNK) t = DType::symlink;
-            else if (e->d_type == DT_DIR) t = DType::dir;
-            else if (e->d_type == DT_REG) t = DType::regular;
+            const auto dt = dirent_type(e);
+            if      (dt == DT_LNK) t = DType::symlink;
+            else if (dt == DT_DIR) t = DType::dir;
+            else if (dt == DT_REG) t = DType::regular;
             else {                                   // DT_UNKNOWN: lstat it
                 struct ::stat ls{};
                 if (::lstat((host_dir + "/" + name).c_str(), &ls) == 0)
