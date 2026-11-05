@@ -1604,7 +1604,9 @@ private:
             : k_.files().classify(abs, /*for_write=*/false, follow);
         if (pc.realm == kernel::Realm2::virtual_file) return eno(Errno::enotsup);
         if (pc.host_path.empty()) return eno(pc.error);
-        return Redirect{PathArg{0, std::move(pc.host_path)}};
+        // Hand the guest path along so PathArg can see this is an identity
+        // translation and the trap loop can forward instead of rewriting.
+        return Redirect{PathArg{path_arg, std::move(pc.host_path), abs}};
     }
 
     [[nodiscard]] Outcome do_getcwd(const Regs& r) {

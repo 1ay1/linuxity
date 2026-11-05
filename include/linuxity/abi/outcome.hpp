@@ -65,11 +65,25 @@ struct Scrub {
 
 // A path argument to rewrite: which arg register holds the `char*`, and the
 // translated real host path to splice in. Required together, by construction.
+//
+// `rewrites` records whether the splice would actually CHANGE anything. With
+// no --root the guest tree IS the host tree, so classify() hands back the path
+// it was given and the rewrite is an identity -- 132K of them in one
+// `ls -lR /usr/include`, each paying a ptrace stop to write a path back over
+// itself. The comparison is free here (both strings are in hand) and
+// impossible later: a Redirect carries only the translated path, so by the
+// time the trap loop sees it the original is gone. Computed once, in the
+// constructor, so no call site can forget.
 struct PathArg {
     int         arg;
     std::string host_path;
+    bool        rewrites{true};
 
     PathArg(int a, std::string hp) : arg{a}, host_path{std::move(hp)} {}
+
+    // The form that knows the guest path it came from, and so can tell.
+    PathArg(int a, std::string hp, std::string_view guest_path)
+        : arg{a}, host_path{std::move(hp)}, rewrites{host_path != guest_path} {}
 };
 
 // dup/dup2/dup3/fcntl(F_DUPFD*) make a NEW fd aliasing an existing one, so the
@@ -132,6 +146,18 @@ struct Redirect {
     Redirect&& with(Scrub s) && { scrub = std::move(s); return std::move(*this); }
     Redirect&& with(PathArg p) && { second = std::move(p); return std::move(*this); }
     Redirect&& parents() && { make_parents = true; return std::move(*this); }
+
+    // Is this redirect a pure no-op -- nothing to rewrite, no second path, no
+    // directories to create, no buffer to scrub? Then the guest's own
+    // registers are already correct and the call can simply be forwarded,
+    // which costs one stop instead of two and no guest-memory writes.
+    //
+    // Asked by the trap loop (the single Redirect consumer), so the 14 sites
+    // that BUILD a Redirect do not each need to know about the optimisation.
+    [[nodiscard]] bool is_noop() const noexcept {
+        return !second && !make_parents && !scrub && first.arg >= 0 &&
+               !first.rewrites;
+    }
 };
 
 // INJECT - the guest opened a purely virtual node (procfs/tmpfs). Materialize

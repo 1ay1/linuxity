@@ -142,6 +142,19 @@ public:
                     // A mutation may need its destination's parent host dirs to
                     // exist first (the overlay upper starts empty), and may
                     // carry a SECOND path to translate (rename/link/symlink).
+
+                    // FAST PATH: when the translation is an identity and there
+                    // is nothing else to do, the guest's registers already say
+                    // what we would write. Forwarding costs one stop and no
+                    // guest-memory traffic; redirecting costs two stops plus a
+                    // path poke. That is the common case without --root, where
+                    // the guest tree IS the host tree.
+                    if (rd.is_noop()) {
+                        auto fr = trap_.forward();
+                        if (!fr) return recover(fr.error());
+                        return Step::next;
+                    }
+
                     const int   arg2 = rd.second ? rd.second->arg : -1;
                     const auto& hp2  = rd.second ? rd.second->host_path
                                                  : empty_path();
