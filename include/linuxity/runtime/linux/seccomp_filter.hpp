@@ -59,22 +59,28 @@ inline constexpr int kTrappedX86_64[] = {
     // -- identity & process model ------------------------------------------
     39,   // getpid
     110,  // getppid
-    // UNTRAPPED(gettid,186): glibc's raise()/abort() call it, and the
-    // bootstrap SIGSTOP (raise) must work BEFORE TRACESECCOMP is armed. gettid
-    // returns the host tid, which for a single-threaded guest process equals
-    // its pid; a monitor reads tid from /proc (already virtualized), so
-    // running gettid natively is harmless.
+    // gettid(186) IS trapped. It used to be left native on the reasoning that
+    // "the host tid equals the pid for a single-threaded process, so running
+    // it natively is harmless" -- true of the HOST's pid, but the guest's pid
+    // is virtualised to 1, so the guest saw getpid()==1 and gettid()==1507743
+    // (the raw host tid). Linux guarantees tid == pid for a thread-group
+    // leader, and every threading runtime relies on it.
+    //
+    // This is the fifth bug of the handled-but-untrapped shape, after
+    // lseek/rewinddir, fchmodat2, creat and set_tid_address below. Found by
+    // the differential harness.
+    //
+    // The bootstrap worry was real but misplaced: glibc's raise()/abort() call
+    // gettid before TRACESECCOMP is armed, and an unarmed filter means the
+    // call runs natively anyway -- trapping it cannot break what happens
+    // before the trap exists.
+    186,  // gettid
     102, 104, 107, 108,          // getuid/getgid/geteuid/getegid
     // set_tid_address(218): the dispatcher answers it with the GUEST tid, but
     // it was never trapped, so the handler was dead and glibc's _start got
     // the HOST tid instead (measured: 1370571 where the guest's is 1). Found
     // by tools/check_syscall_coverage.sh, which exists because this
-    // handled-but-untrapped shape has now caused four bugs (lseek/rewinddir,
-    // fchmodat2, creat, this).
-    //
-    // Unlike gettid -- deliberately left native above, since the bootstrap
-    // raise() needs it before TRACESECCOMP is armed -- this one is called
-    // once per thread start and costs nothing to trap.
+    // handled-but-untrapped shape keeps causing bugs.
     218,                         // set_tid_address
     118, 120,                    // getresuid/getresgid (bash/sudo $UID at init)
     56, 57, 58,                  // clone/fork/vfork      (pid translated)

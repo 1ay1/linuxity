@@ -160,6 +160,41 @@ inline std::string Scenario::key() const {
                     .exercising(abi::Sysno::read)
                     .on(DirFlavour::host_backed));
 
+    // read/write/pread/readv/lseek on a regular file. Most of these FORWARD
+    // on Linux, which is the point: this pins that the forwarding path keeps
+    // offsets, short reads and errnos exact, and catches it if someone later
+    // decides to intercept one. Buffer CONTENT is compared here (unlike a
+    // directory listing) because a file this probe wrote is deterministic.
+    v.push_back(Scenario{"rwio", "rwio"}
+                    .exercising(abi::Sysno::read)
+                    .exercising(abi::Sysno::write)
+                    .exercising(abi::Sysno::pread64)
+                    .exercising(abi::Sysno::pwrite64)
+                    .exercising(abi::Sysno::readv)
+                    .exercising(abi::Sysno::writev)
+                    .exercising(abi::Sysno::ftruncate)
+                    .exercising(abi::Sysno::unlinkat)
+                    .on(DirFlavour::host_backed));
+
+    // Process identity and the /proc views of it. linuxity SYNTHESIZES almost
+    // all of this -- fake pid 1, own pid namespace, procfs built from its own
+    // process table -- so interception is near-total and the risk is highest.
+    // The pid VALUE is exempt (the guest is 1, a native run is not), so this
+    // asserts invariants instead: tid == pid for a thread-group leader, and
+    // /proc/self/status agreeing with the syscalls. The tid invariant is what
+    // caught gettid returning the raw host tid.
+    v.push_back(Scenario{"procid", "procid"}
+                    .exercising(abi::Sysno::getpid)
+                    .exercising(abi::Sysno::gettid)
+                    .exercising(abi::Sysno::getppid)
+                    .exercising(abi::Sysno::getuid)
+                    .exercising(abi::Sysno::getgid)
+                    .exercising(abi::Sysno::uname)
+                    .exercising(abi::Sysno::prlimit64)
+                    .exercising(abi::Sysno::sched_getaffinity)
+                    .exercising(abi::Sysno::kill)
+                    .on(DirFlavour::virtualised));
+
     return v;
 }
 

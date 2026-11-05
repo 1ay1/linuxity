@@ -86,6 +86,13 @@ public:
             // resource cgroup and installs rlimit fallbacks. Runs pre-TRACEME
             // so enforcement is in effect the instant the guest's _start runs.
             if (pre_exec_) pre_exec_();
+            // Our own tid, read BEFORE the filter goes up. The SIGSTOP below
+            // needs it, and gettid is now trapped -- calling it after the
+            // filter is installed but before the tracer is armed ENOSYS-fails,
+            // so the child never stops and the handshake deadlocks (observed:
+            // guests ran to completion printing nothing). Reading it here, two
+            // lines earlier, is all it takes.
+            const int my_tid = static_cast<int>(::syscall(SYS_gettid));
             // Install the seccomp trap filter so ONLY the syscalls linuxity
             // intercepts stop into the tracer; everything else runs natively.
             // Report the outcome to the parent, then let the filter be
@@ -103,13 +110,11 @@ public:
             // Stop here so the parent can arm PTRACE_O_TRACESECCOMP before the
             // first (now TRACE-filtered) execve runs; otherwise that exec
             // traps with no tracer listening and ENOSYS-aborts (_exit 127).
-            // Stop via tkill(gettid, SIGSTOP): tkill(200)/gettid(186) are
-            // unfiltered, whereas kill(2) AND getpid(2) are BOTH in the trap
-            // list -- calling either here (no tracer armed yet) ENOSYS-fails,
-            // so a raise()/tgkill(getpid,...) would silently not stop us and
-            // the execve would run un-arm'd and abort.
-            ::syscall(SYS_tkill,
-                      static_cast<int>(::syscall(SYS_gettid)), SIGSTOP);
+            // tkill(200) is unfiltered, whereas kill(2), getpid(2) and now
+            // gettid(186) are all trapped -- calling any of them here, with no
+            // tracer armed, ENOSYS-fails and we would never stop. Hence the
+            // tid captured above the filter.
+            ::syscall(SYS_tkill, my_tid, SIGSTOP);
             std::vector<char*> cargv;
             for (auto& a : argv_) cargv.push_back(a.data());
             cargv.push_back(nullptr);
