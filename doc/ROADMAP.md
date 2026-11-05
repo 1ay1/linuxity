@@ -93,17 +93,44 @@ every `syscall` into a VM exit.
           SIGSEGV/SIGBUS/SIGILL with si_addr and si_code at the faulting PC,
           so guard-page and JIT handlers work. With no handler the fault is
           fatal (139).
+        * **Terminals and job control.** Guest ptys (`/dev/ptmx` +
+          `/dev/pts/N`) with Linux device numbers, so `daemon()`, `tmux`
+          (new/split/detach), `script` and `ssh` work. Real job control:
+          ^Z suspends, `bg`/`fg` resume, ^C interrupts the foreground
+          process group only. Descriptors pass over unix sockets via
+          SCM_RIGHTS.
         * **TUIs.** agentty, vim, htop and cmatrix. If the rootfs has no entry
           for the host terminal (kitty, ghostty, ...), it is bridged in.
         * **Shared kernel state is locked.** One recursive mutex guards the
           namespace and process tables across guest threads. It is held for
           bookkeeping only, never across a blocking host syscall.
-      Performance: a trapped syscall costs ~1.5 us; hv_vcpu_run alone is
-      ~1.0 us. Every `svc` must exit to the host: with HCR_EL2.TGE set,
-      EL0 exceptions can't be taken at a guest EL1 vector (we measured this),
-      so the way to go faster is fewer exits (a vDSO for clocks), not
-      cheaper ones. Overlay directory unions are built lazily, on first
-      getdents: `pacman -S python` takes 4.4 s, down from 2m41s.
+      Performance: a trapped syscall costs ~1.05 us, of which hv_vcpu_run
+      alone is ~0.9 us. The exit itself is the floor, so going faster means
+      taking fewer exits, not cheaper ones. Two mechanisms do that:
+        * **A vDSO** for clocks: clock_gettime is ~19 ns, fully in-guest.
+        * **An identity fast path.** A 15-instruction handler installed in
+          an EL1 vector slot answers getpid/gettid/getppid/getuid/geteuid/
+          getgid/getegid/sched_yield from a table in EL1-only memory and
+          `eret`s without ever leaving the VM: ~30 ns instead of ~1050 ns.
+          (The earlier conclusion that HCR_EL2.TGE made this impossible was
+          wrong -- it was a mis-encoded `add` in the probe. EL0 exceptions
+          CAN be taken at a guest EL1 vector.) `LINUXITY_FASTCALL=0`
+          disables it. The table is revoked for calls that stop being
+          constant, e.g. gettid once the process is threaded.
+      Offloading rt_sigprocmask the same way is PARKED, not shipped: the
+      41-instruction handler it needs does not fit in one 32-instruction
+      vector slot, and placing the body after the table hangs for reasons
+      not yet understood. See `doc/experiments/README.md` before retrying.
+      Most of the remaining syscall mix (readlinkat, openat, close, read,
+      statx, mmap, fstat ~ 70%) genuinely needs the host and cannot use an
+      in-guest path, so the host-side cost of a trap matters too:
+      path classification now does ONE readlink where it used to do two
+      lstats plus a readlink, directory unions skip a stat per layer and
+      allocate nothing per entry, and path normalization allocates nothing
+      at all. `ls -lR /usr` is 26% faster as a result; `find`, `grep -r`,
+      `stat` and interpreter startup all improved with no regression.
+      Overlay directory unions are built lazily, on first getdents:
+      `pacman -S python` takes 4.4 s, down from 2m41s.
       Remaining: `mprotect` is tracked in the VMA map but not enforced in
       the page tables; `ps` needs a fuller /proc; CI does not yet build the
       macOS binary (it needs a signed binary and a rootfs).
