@@ -1,0 +1,29 @@
+# LTP differential failure budget.
+#
+# The number below is the maximum acceptable count of LINUXITY_FAILS from
+# tools/ltp_diff.sh -- tests that pass natively on this host but fail under
+# linuxity. Only that class counts: an absolute pass rate is dominated by
+# tests needing root or a kernel config we lack (reported as TCONF, rc=32).
+#
+# tools/ltp_ratchet.sh fails the build if the count exceeds this. Lower it
+# whenever a fix lands; raising it needs a reason in the commit message.
+#
+# CURRENT ENTRIES, all the same shape: tests that exhaust the fd table (open
+# every descriptor up to RLIMIT_NOFILE, then check the next call is EMFILE).
+# They PASS under linuxity -- verified by hand, they print TPASS -- but each
+# fd costs a ptrace round-trip, so a few thousand of them exceed the
+# harness deadline. These are a throughput artifact, not wrong behaviour.
+#
+#   open04   exhausts the fd table, then checks EMFILE
+#   kill10   forks 2 process groups x 10 procs and cross-signals them;
+#            native does it in 1.0s, we exceed 30s
+#
+# Also in this class but only seen at tighter deadlines: dup06, fcntl12,
+# fork09, epoll_create03, epoll_wait08. All verified by hand to print TPASS
+# under linuxity -- each fd or signal costs a ptrace round-trip, so the
+# volume, not the behaviour, is what misses the deadline.
+#
+# The real fix is making fd-heavy paths cheaper, not a bigger deadline; until
+# then they sit in the budget rather than being silently excluded, so the
+# count stays honest.
+2
