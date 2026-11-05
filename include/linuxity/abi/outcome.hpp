@@ -135,14 +135,17 @@ struct Redirect {
 };
 
 // INJECT - the guest opened a purely virtual node (procfs/tmpfs). Materialize
-// its bytes into a host memfd and splice that fd in; reads and mmaps then hit
-// real memory at native speed.
+// its bytes into a host temp and splice that path into `path_arg`, so the real
+// open returns a real fd; reads and mmaps then hit real memory at native
+// speed. A virtual DIRECTORY is backed by an empty temp dir so O_DIRECTORY
+// opens succeed and getdents64 can enumerate the synthesized entries.
 struct Inject {
-    std::vector<std::byte> content;
+    int                    path_arg;  // register holding the char* path
+    std::vector<std::byte> content;   // empty for a directory
     bool                   is_dir{false};
 
-    explicit Inject(std::vector<std::byte> c, bool dir = false)
-        : content{std::move(c)}, is_dir{dir} {}
+    Inject(int pa, std::vector<std::byte> c, bool dir = false)
+        : path_arg{pa}, content{std::move(c)}, is_dir{dir} {}
 };
 
 // RAISE - the guest issued kill/tgkill/tkill against a GUEST pid. Guest pids

@@ -153,8 +153,17 @@ int main() {
     // match() dispatches on the inhabited fate, with no precedence to recall.
     check(std::string_view{name_of(Outcome{std::move(r)})} == "redirect",
           "match picks redirect");
-    check(std::string_view{name_of(Outcome{Inject{{}, true}})} == "inject",
+    check(std::string_view{name_of(Outcome{Inject{1, {}, true}})} == "inject",
           "match picks inject");
+
+    // Inject names the register its temp path is spliced into, alongside the
+    // bytes; a virtual dir carries no content but still needs the arg.
+    Inject file{1, std::vector<std::byte>{std::byte{'h'}, std::byte{'i'}}};
+    check(file.path_arg == 1, "inject path arg");
+    check(file.content.size() == 2, "inject content");
+    check(!file.is_dir, "inject defaults to a file");
+    Inject dir{0, {}, true};
+    check(dir.is_dir && dir.content.empty(), "inject dir carries no bytes");
 
     if (failures == 0) std::puts("outcome: all checks passed");
     return failures == 0 ? 0 : 1;

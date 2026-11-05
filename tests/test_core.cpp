@@ -10,6 +10,17 @@
 
 using namespace lx;
 
+// Read a fate without reaching for a flag. These are the test-side spelling of
+// "what did the dispatcher decide": ask the sum which arm it is.
+[[nodiscard]] static std::int64_t virt_ret(const abi::Outcome& o) {
+    const auto* v = o.get_if<abi::Virtualize>();
+    assert(v && "expected a virtualized value");
+    return v->ret;
+}
+[[nodiscard]] static bool is_forward(const abi::Outcome& o) {
+    return o.get_if<abi::Forward>() != nullptr;
+}
+
 // -- A pure, host-free mock kernel that models every subsystem. -----------
 struct MockKernel {
     Pid pid{Pid{42}};
@@ -75,23 +86,23 @@ int main() {
     abi::Syscalls sys{mk, mem, abi::Arch::x86_64};
 
     abi::Regs r; r.nr = 39; // x86-64 getpid
-    assert(sys.dispatch(r).ret == 42);
+    assert(virt_ret(sys.dispatch(r)) == 42);
 
     // exit/exit_group are FORWARDED: the task actually terminates in the
     // kernel and the trap reaps it (multi-process: only the root's exit ends
     // the whole run), so the dispatcher reports forward, not a virtual exit.
     abi::Regs e; e.nr = 60; e.arg[0] = 7; // x86-64 exit(7)
-    assert(sys.dispatch(e).forward);
+    assert(is_forward(sys.dispatch(e)));
 
     // An unrecognized/real syscall is FORWARDED to the host kernel (the
     // dispatcher only virtualizes identity/lifecycle; everything else runs
-    // natively in the guest). So we get forward=true, not ENOSYS.
+    // natively in the guest). So we get a Forward fate, not ENOSYS.
     abi::Regs u; u.nr = 424242;
-    assert(sys.dispatch(u).forward);
+    assert(is_forward(sys.dispatch(u)));
 
     // getuid is virtualized to root (0).
     abi::Regs g; g.nr = 102; // x86-64 getuid
-    assert(sys.dispatch(g).ret == 0 && !sys.dispatch(g).forward);
+    assert(virt_ret(sys.dispatch(g)) == 0 && !is_forward(sys.dispatch(g)));
 
     std::puts("all runtime type-algebra tests passed");
     return 0;

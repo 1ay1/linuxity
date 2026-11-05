@@ -17,6 +17,7 @@
 #include "linuxity/kernel/machine.hpp"
 #include "linuxity/kernel/process_table.hpp"
 #include "linuxity/kernel/subsystem.hpp"
+#include "linuxity/abi/outcome.hpp"
 #include "linuxity/loader/interp.hpp"
 
 #include <array>
@@ -79,121 +80,6 @@ struct Regs {
     std::uint64_t nr{};
 };
 
-// The outcome of servicing one syscall: the value to place in the guest's
-// return register, whether to FORWARD it to the host kernel instead, and
-// whether the guest asked to terminate.
-//
-// Two additional fates exist for the virtualized filesystem:
-//
-//   * REDIRECT — the guest named a HostFs-backed path; we rewrite the path
-//     argument (register `path_arg`) to point at the translated *real host
-//     path* placed in the child's scratch page, then let the host kernel run
-//     the (now-redirected) syscall. This is how native ld.so mmaps real
-//     library files while the guest still sees only linuxity's namespace.
-//
-//   * INJECT — the guest opened a purely virtual file (procfs/tmpfs); we
-//     materialize its bytes into a host memfd and splice that fd into the
-//     child, returning the fd number. Reads and mmaps then hit real memory.
-struct Outcome {
-    std::int64_t ret{};
-    bool         forward{false};   // let the host kernel run it in the guest
-    bool         exited{false};
-    int          exit_code{0};
-
-    bool         redirect{false};  // rewrite a path arg, then forward
-    int          path_arg{0};      // which arg register holds the char* path
-    std::string  host_path;        // translated real host path to splice in
-
-    // A SECOND path arg to translate in the same call (rename/link/symlink,
-    // whose two operands are BOTH guest paths). When path_arg2 >= 0 the trap
-    // pokes host_path2 into that register too before forwarding. For symlink
-    // the FIRST operand is the link's literal text (a guest path stored as
-    // data, NOT resolved on the host) — only the destination is translated,
-    // so symlink sets path_arg2 to the destination and leaves path_arg = -1.
-    int          path_arg2{-1};
-    std::string  host_path2;
-
-    // Ensure the parent host directory of host_path exists before forwarding.
-    // A create into a freshly-materialized overlay upper dir would ENOENT if
-    // the intermediate dirs were never made; a package manager relies on
-    // `mkdir -p` semantics being implicit under the upper layer.
-    bool         make_parents{false};
-
-    bool                inject{false};  // splice a host memfd, return its fd
-    bool                inject_dir{false}; // the injected node is a directory
-    std::vector<std::byte> content;     // bytes to back the injected fd
-
-    // SIGNAL - the guest issued kill/tgkill/tkill against a GUEST pid. Guest
-    // pids are linuxity's own tiny namespace, unrelated to host pids, so we
-    // must NOT forward the raw number (it would hit an unrelated host task).
-    // The loop translates the target guest pid to its real host tid and
-    // delivers the real signal there.
-    bool         signal{false};
-    std::int32_t sig_pid{0};       // target GUEST pid (0 => current task)
-    std::int32_t sig_num{0};       // signal number to deliver
-
-    // EXEC_INTERP - the guest execve'd a DYNAMIC binary. The host kernel would
-    // resolve its PT_INTERP against the host root and fail, so we rewrite the
-    // exec into `interp_host <prog_guest> <orig-argv...>`: the child execs the
-    // real interpreter, which then opens the program + its libraries through
-    // redirected syscalls inside the rootfs. path_arg names the execve's path
-    // register; the trap rebuilds argv in the child before forwarding.
-    bool         exec_interp{false};
-    std::string  interp_host;      // real host path of the dynamic linker
-    std::string  prog_guest;      // guest path of the program (new argv[0..1])
-    // Extra argv tokens inserted BETWEEN the interpreter (argv[0]) and the
-    // program. For a plain dynamic ELF this is empty. For a `#!` script it
-    // carries the shebang's optional argument (e.g. "-e" from `#!/bin/sh -e`)
-    // and, when the script's interpreter is ITSELF dynamic, the interpreter's
-    // own host path (so argv = ld.so, /bin/sh-host, [-e], script-guest, ...).
-    std::vector<std::string> interp_prefix;
-
-    // Extra argv tokens APPENDED after the program's original arguments. Used
-    // to transparently pass `--overwrite "*"` to pacman so a bootstrap rootfs
-    // with orphan (unowned-but-on-disk) library files never aborts an install
-    // with "<file> exists in filesystem". Empty for every other program.
-    std::vector<std::string> exec_extra_args;
-
-    // POST-REDIRECT id scrub. Host-backed stat/lstat/newfstatat/statx are
-    // REDIRECTED, so the host kernel fills the guest buffer with the HOST
-    // file's uid/gid (whatever user unpacked the rootfs). linuxity presents a
-    // root-owned world, so after the redirect returns 0 we read the buffer
-    // back and rewrite the owner fields to 0. scrub_stat names the buffer
-    // address and which layout to patch.
-    enum class ScrubKind : std::uint8_t { none, stat, statx };
-    ScrubKind    scrub{ScrubKind::none};
-    UAddr        scrub_buf{};
-    // The normalized GUEST path being stat'd. scrub_ids looks the shadow
-    // metadata store up by this key to overlay the guest-intended mode/uid/gid
-    // onto the host inode the redirect just filled. Empty for non-stat scrubs.
-    std::string  scrub_guest_path;
-
-    // AF_UNIX bind/connect path translation. The guest is NOT chroot'd when
-    // linuxity runs unprivileged (chroot(2) needs CAP_SYS_CHROOT), so an
-    // absolute sun_path forwarded raw lands on the HOST filesystem — leaking
-    // e.g. /etc/pacman.d/gnupg/S.gpg-agent onto the host and colliding with
-    // stale host sockets ("Address already in use" / stat "Bad address").
-    // sock_rewrite pokes the translated overlay host path into the sockaddr's
-    // sun_path (at sock_path_addr) and sets the socklen register to
-    // sock_new_len before forwarding, so both peers (bind + connect) resolve
-    // to the same in-overlay node. host_path carries the translated path.
-    bool         sock_rewrite{false};
-    UAddr        sock_path_addr{};   // guest addr of sockaddr_un.sun_path
-    int          sock_len_arg{2};    // which arg register holds socklen
-    std::uint64_t sock_new_len{0};   // new socklen value (family + path + NUL)
-
-    // DUP fd-binding mirror. dup/dup2/dup3/fcntl(F_DUPFD*) create a NEW fd that
-    // aliases an existing one; the new fd must inherit the source fd's
-    // fd->path and virtual-dir bindings, or an *at call relative to the new fd
-    // resolves against the wrong directory (breaks `rm -rf` via coreutils fts,
-    // which dups its dir fd then unlinkat's entries relative to the dup).
-    // These are FORWARDED (the host does the real dup); when dup_from >= 0 the
-    // run loop mirrors bindings from dup_from onto the forwarded return fd.
-    // dup2/dup3 also close their explicit target first, so dup_close names an
-    // fd whose stale binding must be dropped before the mirror.
-    int          dup_from{-1};
-    int          dup_close{-1};
-};
 
 // A guest-memory accessor the dispatcher uses to copy_in/copy_out. Modeled as
 // a concept so the dispatcher stays decoupled from the concrete AddressSpace;
@@ -673,13 +559,14 @@ public:
     }
 
 private:
-    static Outcome val(std::int64_t v) { Outcome o{}; o.ret = v; return o; }
-    static Outcome fwd() { Outcome o{}; o.forward = true; return o; }
+    // The four shorthands every handler returns through. They now just name
+    // a fate, so no handler touches a flag or a payload field directly.
+    static Outcome val(std::int64_t v) { return Outcome::value(v); }
+    static Outcome fwd() { return Outcome::forward(); }
     static Outcome sig(std::int32_t pid, std::int32_t signum) {
-        Outcome o{}; o.signal = true; o.sig_pid = pid; o.sig_num = signum;
-        return o;
+        return Outcome::raise_at(pid, signum);
     }
-    static Outcome eno(Errno e) { return val(-static_cast<std::int64_t>(e)); }
+    static Outcome eno(Errno e) { return Outcome::error(e); }
 
     // The trapped task's guest identity. When the memory backend also exposes
     // the live task map (the ptrace trap does), report that task's real
@@ -861,12 +748,6 @@ private:
             open_wi = Wi::parents_only;
         auto pc = k_.files().classify(abs, for_write, /*follow=*/true, open_wi);
         if (pc.realm == kernel::Realm2::host_backed) {
-            Outcome o{};
-            o.redirect  = true;
-            o.path_arg  = path_arg;
-            o.host_path = std::move(pc.host_path);
-            o.ret       = 0;               // trap fills ret with the real fd
-            o.forward   = false;
             // Remember the guest path for this fd after the trap assigns it.
             pending_open_ = abs;
             // If this opens a directory that is overlaid (writable upper over
@@ -890,7 +771,7 @@ private:
                 pending_dir_   = true;
                 pending_lazy_  = abs;
             }
-            return o;
+            return Redirect{PathArg{path_arg, std::move(pc.host_path)}};
         }
         if (pc.realm == kernel::Realm2::virtual_file) {
             // Follow a cross-mount symlink to the RESOLVED virtual path (e.g.
@@ -898,18 +779,13 @@ private:
             const std::string& vp = pc.virtual_path.empty() ? abs : pc.virtual_path;
             auto vf = k_.files().produce(vp);
             if (!vf) return eno(vf.error());
-            Outcome o{};
-            o.inject  = true;
-            o.path_arg = path_arg;              // which reg holds the char* path
-            o.content = std::move(vf->bytes);   // empty for a dir
             pending_open_ = vp;
             // A virtual DIRECTORY: stash its entries so getdents64 on the
             // resulting fd enumerates them (the backing temp node is a real
             // empty directory so O_DIRECTORY opens succeed).
             pending_dir_ = vf->is_dir;
-            o.inject_dir = vf->is_dir;
             pending_entries_ = std::move(vf->entries);
-            return o;
+            return Inject{path_arg, std::move(vf->bytes), vf->is_dir};
         }
         return eno(pc.error);
     }
@@ -921,15 +797,12 @@ private:
         std::string abs = resolve_arg(r, path_arg, at, follow);
         auto pc = k_.files().classify(abs, /*for_write=*/false, follow);
         if (pc.realm == kernel::Realm2::host_backed) {
-            Outcome o{};
-            o.redirect = true; o.path_arg = path_arg; o.host_path = std::move(pc.host_path);
             // The host kernel will fill the statbuf with the host file's
             // owner; scrub it to root afterwards. statbuf is arg[1] for
             // stat/lstat, arg[2] for newfstatat.
-            o.scrub = Outcome::ScrubKind::stat;
-            o.scrub_buf = at ? uaddr(r.arg[2]) : uaddr(r.arg[1]);
-            o.scrub_guest_path = abs;
-            return o;
+            return Redirect{PathArg{path_arg, std::move(pc.host_path)}}
+                .with(Scrub{Scrub::Layout::stat,
+                            at ? uaddr(r.arg[2]) : uaddr(r.arg[1]), abs});
         }
         // Virtual stat: forward is impossible, so synthesize a stat64 buffer.
         if (pc.realm == kernel::Realm2::virtual_file) {
@@ -947,13 +820,12 @@ private:
                     if (follow) {
                         auto tc = k_.files().classify(tgt, false, true);
                         if (tc.realm == kernel::Realm2::host_backed) {
-                            Outcome o{};
-                            o.redirect = true; o.path_arg = path_arg;
-                            o.host_path = std::move(tc.host_path);
-                            o.scrub = Outcome::ScrubKind::stat;
-                            o.scrub_buf = at ? uaddr(r.arg[2]) : uaddr(r.arg[1]);
-                            o.scrub_guest_path = tgt;
-                            return o;
+                            return Redirect{
+                                PathArg{path_arg, std::move(tc.host_path)}}
+                                .with(Scrub{Scrub::Layout::stat,
+                                            at ? uaddr(r.arg[2])
+                                               : uaddr(r.arg[1]),
+                                            tgt});
                         }
                     }
                     kernel::VirtualFile lf;
@@ -1005,12 +877,8 @@ private:
         // target's type ("regular file") and made git's symlink probe fail.
         auto pc = k_.files().classify(abs, /*for_write=*/false, /*follow=*/!nofollow);
         if (pc.realm == kernel::Realm2::host_backed) {
-            Outcome o{};
-            o.redirect = true; o.path_arg = 1; o.host_path = std::move(pc.host_path);
-            o.scrub = Outcome::ScrubKind::statx;
-            o.scrub_buf = uaddr(r.arg[4]);
-            o.scrub_guest_path = abs;
-            return o;
+            return Redirect{PathArg{1, std::move(pc.host_path)}}
+                .with(Scrub{Scrub::Layout::statx, uaddr(r.arg[4]), abs});
         }
         if (pc.realm == kernel::Realm2::virtual_file) {
             const std::string& vp = pc.virtual_path.empty() ? abs : pc.virtual_path;
@@ -1022,13 +890,9 @@ private:
                     if (!nofollow) {
                         auto tc = k_.files().classify(tgt, false, true);
                         if (tc.realm == kernel::Realm2::host_backed) {
-                            Outcome o{};
-                            o.redirect = true; o.path_arg = 1;
-                            o.host_path = std::move(tc.host_path);
-                            o.scrub = Outcome::ScrubKind::statx;
-                            o.scrub_buf = uaddr(r.arg[4]);
-                            o.scrub_guest_path = tgt;
-                            return o;
+                            return Redirect{PathArg{1, std::move(tc.host_path)}}
+                                .with(Scrub{Scrub::Layout::statx,
+                                            uaddr(r.arg[4]), tgt});
                         }
                     }
                     return write_statx(uaddr(r.arg[4]), false, tgt.size(), true);
@@ -1050,9 +914,7 @@ private:
         std::string abs = resolve_arg(r, path_arg, at);
         auto pc = k_.files().classify(abs);
         if (pc.realm == kernel::Realm2::host_backed) {
-            Outcome o{};
-            o.redirect = true; o.path_arg = path_arg; o.host_path = std::move(pc.host_path);
-            return o;
+            return Redirect{PathArg{path_arg, std::move(pc.host_path)}};
         }
         if (pc.realm == kernel::Realm2::virtual_file) return val(0);
         return eno(pc.error);
@@ -1077,10 +939,7 @@ private:
         std::string abs = k_.files().absolutize(raw, dir);
         auto pc = k_.files().classify(abs);
         if (pc.realm == kernel::Realm2::host_backed) {
-            Outcome o{};
-            o.redirect = true; o.path_arg = path_arg;
-            o.host_path = std::move(pc.host_path);
-            return o;
+            return Redirect{PathArg{path_arg, std::move(pc.host_path)}};
         }
         if (pc.realm == kernel::Realm2::virtual_file) return eno(Errno::enoent);
         return eno(pc.error);
@@ -1110,10 +969,7 @@ private:
 
         auto pc = k_.files().classify(abs, /*for_write=*/false, /*follow=*/false);
         if (pc.realm == kernel::Realm2::host_backed) {
-            Outcome o{};
-            o.redirect = true; o.path_arg = path_arg;
-            o.host_path = std::move(pc.host_path);
-            return o;
+            return Redirect{PathArg{path_arg, std::move(pc.host_path)}};
         }
         if (pc.realm == kernel::Realm2::virtual_file) {
             // A synthesized symlink (e.g. /dev/stdin -> /proc/self/fd/0)
@@ -1302,14 +1158,13 @@ private:
             if (!interp.empty()) {
                 std::string interp_abs = k_.files().absolutize(interp);
                 auto ipc = k_.files().classify(interp_abs);
-                Outcome o{};
-                o.exec_interp = true;
-                o.path_arg    = path_arg;
-                o.interp_host = ipc.realm == kernel::Realm2::host_backed
-                                    ? std::move(ipc.host_path) : interp;
-                o.prog_guest  = abs;   // guest path; loader's openat redirects
-                o.exec_extra_args = std::move(extra);
-                return o;
+                // prog_guest is the GUEST path; the loader's openat redirects.
+                ExecInterp ei{path_arg,
+                              ipc.realm == kernel::Realm2::host_backed
+                                  ? std::move(ipc.host_path) : interp,
+                              abs};
+                ei.extra_args = std::move(extra);
+                return ei;
             }
             // A `#!` script: the host kernel would launch the shebang
             // interpreter with the HOST-translated script path, which OUR
@@ -1323,33 +1178,31 @@ private:
                 auto sic = k_.files().classify(si_abs);
                 std::string si_host = sic.realm == kernel::Realm2::host_backed
                                           ? sic.host_path : sh.interp;
-                Outcome o{};
-                o.exec_interp = true;
-                o.path_arg    = path_arg;
-                o.prog_guest  = abs;   // the script, as a guest path
                 // Is the shebang interpreter ITSELF dynamic? Then exec its
                 // ld.so, and pass the interpreter's host path as the first
                 // prefix token (ld.so <sh-host> [-e] <script-guest> ...).
                 std::string si_interp = loader::read_elf_interp(si_host);
+                std::vector<std::string> prefix;
+                std::string interp_host;
                 if (!si_interp.empty()) {
                     std::string ld_abs = k_.files().absolutize(si_interp);
                     auto ldc = k_.files().classify(ld_abs);
-                    o.interp_host = ldc.realm == kernel::Realm2::host_backed
-                                        ? std::move(ldc.host_path) : si_interp;
+                    interp_host = ldc.realm == kernel::Realm2::host_backed
+                                      ? std::move(ldc.host_path) : si_interp;
                     // ld.so opens its program argument through redirected
                     // openat, so pass the interpreter's GUEST path (si_abs),
                     // not its host path — else ld re-translates and double-roots.
-                    o.interp_prefix.push_back(std::move(si_abs));
+                    prefix.push_back(std::move(si_abs));
                 } else {
-                    o.interp_host = std::move(si_host);   // static interpreter
+                    interp_host = std::move(si_host);   // static interpreter
                 }
-                if (!sh.arg.empty()) o.interp_prefix.push_back(std::move(sh.arg));
-                return o;
+                if (!sh.arg.empty()) prefix.push_back(std::move(sh.arg));
+                // prog_guest is the script, as a guest path.
+                ExecInterp ei{path_arg, std::move(interp_host), abs};
+                ei.prefix = std::move(prefix);
+                return ei;
             }
-            Outcome o{};
-            o.redirect = true; o.path_arg = path_arg;
-            o.host_path = std::move(pc.host_path);
-            return o;
+            return Redirect{PathArg{path_arg, std::move(pc.host_path)}};
         }
         return eno(pc.realm == kernel::Realm2::virtual_file ? Errno::eacces
                                                             : pc.error);
@@ -1428,9 +1281,7 @@ private:
         std::string abs = resolve_arg(r, 0, /*at=*/false);
         auto pc = k_.files().classify(abs);
         if (pc.realm == kernel::Realm2::host_backed) {
-            Outcome o{};
-            o.redirect = true; o.path_arg = 0; o.host_path = std::move(pc.host_path);
-            return o;   // host fills arg[1] with the real overlay-fs statfs
+            return Redirect{PathArg{0, std::move(pc.host_path)}};   // host fills arg[1] with the real overlay-fs statfs
         }
         if (pc.realm == kernel::Realm2::virtual_file)
             return write_statfs(uaddr(r.arg[1]));
@@ -1476,9 +1327,7 @@ private:
             : k_.files().classify(abs, /*for_write=*/false, follow);
         if (pc.realm == kernel::Realm2::virtual_file) return eno(Errno::enotsup);
         if (pc.host_path.empty()) return eno(pc.error);
-        Outcome o{};
-        o.redirect = true; o.path_arg = 0; o.host_path = std::move(pc.host_path);
-        return o;
+        return Redirect{PathArg{0, std::move(pc.host_path)}};
     }
 
     [[nodiscard]] Outcome do_getcwd(const Regs& r) {
@@ -1503,21 +1352,15 @@ private:
     // forwarded return value). do_dup only knows oldfd here; the run loop
     // reads the result and calls files().mirror_fd(dup_from, retfd).
     [[nodiscard]] Outcome do_dup(const Regs& r) {
-        Outcome o{};
-        o.forward  = true;
-        o.dup_from = static_cast<int>(r.arg[0]);
-        return o;
+        return Forward{DupMirror{static_cast<int>(r.arg[0])}};
     }
 
     // dup2(oldfd,newfd) / dup3(oldfd,newfd,flags): the new fd number is fixed
     // (arg1). It implicitly closes newfd first, so drop newfd's stale binding,
     // then forward and mirror oldfd -> newfd (== the return value on success).
     [[nodiscard]] Outcome do_dup2(const Regs& r) {
-        Outcome o{};
-        o.forward   = true;
-        o.dup_from  = static_cast<int>(r.arg[0]);
-        o.dup_close = static_cast<int>(r.arg[1]);
-        return o;
+        return Forward{DupMirror{static_cast<int>(r.arg[0]),
+                                 static_cast<int>(r.arg[1])}};
     }
 
     // fcntl(fd,cmd,arg): only F_DUPFD(0)/F_DUPFD_CLOEXEC(1030) create a new fd
@@ -1525,11 +1368,9 @@ private:
     // a plain forward with no fd->path consequence.
     [[nodiscard]] Outcome do_fcntl(const Regs& r) {
         constexpr std::uint64_t kFDupFd = 0, kFDupFdCloexec = 1030;
-        Outcome o{};
-        o.forward = true;
         if (r.arg[1] == kFDupFd || r.arg[1] == kFDupFdCloexec)
-            o.dup_from = static_cast<int>(r.arg[0]);
-        return o;
+            return Forward{DupMirror{static_cast<int>(r.arg[0])}};
+        return fwd();
     }
 
     // A single-path mutation (mkdir/rmdir/unlink/chmod/chown/truncate/...):
@@ -1557,14 +1398,11 @@ private:
         // A removal drops any shadow record so a fresh file created at the same
         // path later starts from the host defaults, not a stale owner/mode.
         if (wi == Wi::remove) k_.files().meta().forget(abs);
-        Outcome o{};
-        o.redirect = true;
-        o.path_arg = path_arg;
-        o.host_path = std::move(pc.host_path);
+        Redirect o{PathArg{path_arg, std::move(pc.host_path)}};
         // Only creates need their parent chain pre-built by the trap; the
         // parents_only classify already mirrored them, so this is belt-and-
         // suspenders for the deep-create case.
-        o.make_parents = (wi == Wi::parents_only);
+        if (wi == Wi::parents_only) o.make_parents = true;
         return o;
     }
 
@@ -1698,14 +1536,11 @@ private:
         // does NOT: both names share the inode, so the original keeps its own
         // record). Do the in-store move BEFORE the redirect returns.
         if (move_meta) k_.files().meta().rename(src, dst);
-        Outcome o{};
-        o.redirect     = true;
-        o.path_arg     = a1;
-        o.host_path    = std::move(ps.host_path);
-        o.path_arg2    = a2;
-        o.host_path2   = std::move(pd.host_path);
-        o.make_parents = true;   // ensure the destination's parent exists
-        return o;
+        // Both operands are guest paths, so both get translated, and the
+        // destination's parent chain must exist before the host runs it.
+        return Redirect{PathArg{a1, std::move(ps.host_path)}}
+            .with(PathArg{a2, std::move(pd.host_path)})
+            .parents();
     }
 
     // symlink(target, linkpath) / symlinkat(target, newdirfd, linkpath):
@@ -1777,15 +1612,10 @@ private:
         // Emit a socket-path rewrite: the trap pokes host_path into the
         // guest's sun_path and sets the socklen register, then forwards the
         // (now overlay-targeted) bind/connect to the kernel.
-        Outcome o{};
-        o.sock_rewrite   = true;
-        o.forward        = true;
-        o.host_path      = std::move(host_path);
-        o.sock_path_addr = uaddr(addr + 2);
-        o.sock_len_arg   = 2;
         // sizeof(sa_family_t) == 2, then the path bytes and its NUL.
-        o.sock_new_len   = 2 + o.host_path.size() + 1;
-        return o;
+        const std::uint64_t new_len = 2 + host_path.size() + 1;
+        return SockRewrite{uaddr(addr + 2), std::move(host_path),
+                           /*len_arg=*/2, new_len};
     }
 
     [[nodiscard]] Outcome path_symlink(const Regs& r, int /*target_arg*/,
@@ -1798,12 +1628,8 @@ private:
         if (pc.realm == kernel::Realm2::virtual_file)
             return eno(Errno::erofs);
         if (pc.host_path.empty()) return eno(pc.error);
-        Outcome o{};
-        o.redirect     = true;
-        o.path_arg     = link_arg;      // rewrite ONLY the linkpath
-        o.host_path    = std::move(pc.host_path);
-        o.make_parents = true;
-        return o;
+        // Rewrite ONLY the linkpath; `target` stays guest-literal.
+        return Redirect{PathArg{link_arg, std::move(pc.host_path)}}.parents();
     }
 
     // Resolve the SECOND path of an *at two-operand syscall. Its dirfd is the
@@ -2180,9 +2006,10 @@ public:
     // so there is one definition of where mode/uid/gid live. No-op unless
     // o.scrub is set. Reads the current bytes back via copy_in so the host's
     // real file-type and any bits we keep are preserved.
-    void scrub_ids(const Outcome& o) {
-        if (o.scrub == Outcome::ScrubKind::none) return;
-        const bool is_statx = o.scrub == Outcome::ScrubKind::statx;
+    // Called only when a Redirect actually carried a Scrub, so there is no
+    // "none" case to test for: the caller's `if (r.scrub)` is the only check.
+    void scrub_ids(const Scrub& s) {
+        const bool is_statx = s.layout == Scrub::Layout::statx;
         // Field offsets differ per ABI:
         //   struct stat x86-64  : st_mode u32 @24, st_uid @28, st_gid @32.
         //   struct stat aarch64 : st_mode u32 @16, st_uid @24, st_gid @28
@@ -2192,13 +2019,13 @@ public:
         const std::size_t mode_off = is_statx ? 28 : (generic ? 16 : 24);
         const std::size_t uid_off  = is_statx ? 20 : (generic ? 24 : 28);
         const std::size_t gid_off  = is_statx ? 24 : (generic ? 28 : 32);
-        const std::uint64_t base = value(o.scrub_buf);
+        const std::uint64_t base = value(s.buf);
 
         // The shadow record for this guest path, if the guest ever chmod/chown'd
         // it. Default (no record) => root-owned, host mode untouched.
         std::optional<kernel::MetaRecord> rec;
-        if (!o.scrub_guest_path.empty())
-            rec = k_.files().meta().lookup(o.scrub_guest_path);
+        if (!s.guest_path.empty())
+            rec = k_.files().meta().lookup(s.guest_path);
 
         // --- uid/gid: default root (0,0); honor recorded owner if present ---
         std::uint32_t uid = 0, gid = 0;

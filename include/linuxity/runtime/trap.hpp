@@ -95,6 +95,7 @@ public:
     // Run a loaded process to completion; returns its exit code.
     [[nodiscard]] Result<int> run(UAddr entry, UAddr sp) {
         abi::Syscalls sys{kernel_, mem_, arch_};
+        int exit_status = 0;
         // Kernel state is shared by every guest thread's loop; lock it for
         // BOOKKEEPING only. The host syscall itself (forward/redirect, which
         // may block in read/wait4/open-a-FIFO) runs unlocked, or one blocked
@@ -121,124 +122,141 @@ public:
             // The dispatcher classifies the trapped syscall: service it from
             // our subsystems, forward it to the host kernel, or exit.
             abi::Outcome o = locked([&] { return sys.dispatch(f.regs); });
-            if (const char* t = trace_env) {
-                std::fprintf(trace_out(t), "[lx] nr=%llu -> %s%s%s%s%s%s%s ret=%lld %s%s%s\n",
-                    static_cast<unsigned long long>(f.regs.nr),
-                    o.inject?"INJECT ":"", o.redirect?"REDIRECT ":"",
-                    o.sock_rewrite?"SOCKREWRITE ":"",
-                    o.signal?"SIGNAL ":"",
-                    o.exec_interp?"EXECINT ":"",
-                    o.forward?"FORWARD ":"", o.exited?"EXIT ":"VIRT ",
-                    static_cast<long long>(o.ret),
-                    o.redirect?o.host_path.c_str():(o.sock_rewrite?o.host_path.c_str():""),
-                    (o.redirect && o.path_arg2>=0)?" -> ":"",
-                    (o.redirect && o.path_arg2>=0)?o.host_path2.c_str():"");
-            }
-            if (o.exited) return ok(o.exit_code);
+            if (const char* t = trace_env) trace_fate(t, f.regs.nr, o);
 
-            if (o.inject) {
-                // A purely virtual node: back it with a real host temp — a
-                // temp FILE (with the synthesized bytes) for a file, or an
-                // empty temp DIRECTORY for a virtual dir so O_DIRECTORY opens
-                // succeed and getdents64 (virtualized) can enumerate it. The
-                // open runs ASYNCHRONOUSLY in the child (event-driven trap),
-                // so we must NOT unlink here — the child hasn't opened it yet;
-                // temps are cleaned up at the end of the run.
-                std::string tmp = o.inject_dir ? materialize_dir()
-                                               : materialize(o.content);
-                auto fdr = trap_.redirect(o.path_arg, tmp);
-                if (!fdr) { LX_TRY(recover_syscall(fdr.error())); continue; }
-                if (!tmp.empty()) temps_.push_back(std::move(tmp));
-                locked([&] { sys.note_opened_fd(*fdr); });
-            } else if (o.redirect) {
-                // Host-backed path: rewrite the arg to the real host path and
-                // let the kernel run it in the child (real fd for mmap). A
-                // host-backed stat leaves the HOST file's owner in the guest
-                // buffer; scrub it to root in the SAME stopped window, before
-                // the task resumes and could read the buffer (racing us).
-                //
-                // A MUTATION (mkdir/rename/...) may need its destination's
-                // parent host dirs to exist first (the overlay upper layer
-                // starts empty), and may carry a SECOND path to translate
-                // (rename/link/symlink). Build the parents and pass the
-                // second rewrite through to the trap.
-                if (o.make_parents) {
-                    make_host_parents(o.host_path);
-                    if (o.path_arg2 >= 0) make_host_parents(o.host_path2);
-                }
-                auto retr = trap_.redirect(
-                    o.path_arg, o.host_path,
-                    [&](std::int64_t rc) { if (rc == 0) locked([&] { sys.scrub_ids(o); }); },
-                    o.path_arg2, o.host_path2);
-                if (!retr) { LX_TRY(recover_syscall(retr.error())); continue; }
-                locked([&] { sys.note_opened_fd(*retr); });
-            } else if (o.sock_rewrite) {
-                // AF_UNIX bind/connect: create the socket's parent chain in
-                // the overlay upper, then poke the translated host path into
-                // the guest's sun_path and forward. Guarded so backends
-                // without the primitive fall back to a plain forward (which
-                // uses the untranslated path — correct only under a real
-                // chroot, but at least well-formed).
-                make_host_parents(o.host_path);
-                if constexpr (requires {
-                        trap_.rewrite_sockaddr(UAddr{}, std::string{}, 0, 0ULL); }) {
-                    auto sr = trap_.rewrite_sockaddr(
-                        o.sock_path_addr, o.host_path,
-                        o.sock_len_arg, o.sock_new_len);
-                    if (!sr) { LX_TRY(recover_syscall(sr.error())); continue; }
-                } else {
-                    auto fr = trap_.forward();
-                    if (!fr) { LX_TRY(recover_syscall(fr.error())); continue; }
-                }
-            } else if (o.signal) {
-                // The guest signalled a GUEST pid. Deliver the real signal to
-                // that task's host tid (guarded so backends without the
-                // bridge just report failure), then hand the caller the
-                // result. The target's death, if fatal, is observed as a
-                // normal reap by next() on a later iteration.
-                std::int64_t ret = -static_cast<std::int64_t>(Errno::eperm);
-                if constexpr (requires { trap_.deliver_signal(0, 0); })
-                    ret = trap_.deliver_signal(o.sig_pid, o.sig_num);
-                LX_TRY(trap_.resume(ret));
-            } else if (o.exec_interp) {
-                // A dynamic guest execve: rewrite it to run through the real
-                // interpreter (guarded so backends without the bridge just
-                // forward the original, which fails cleanly). The image is
-                // replaced on success and observed as an EXEC event.
-                if constexpr (requires {
-                        trap_.exec_through_interp(0, std::string{}, std::string{}); }) {
+            // Act on the fate. Exactly one arm runs, chosen by the type, and
+            // the compiler rejects this match if a fate is left unhandled --
+            // no flag precedence to remember, no silent fallthrough.
+            //
+            // Each arm returns a Step: `done` to finish the whole run,
+            // `again` to retry the loop (a trap primitive raced the guest and
+            // the syscall was already completed with -errno), or `next` to
+            // carry on. A fate CANNOT forget to say what happens next.
+            const Step step = std::move(o).match(
+
+                [&](abi::Exited e) { exit_status = e.code; return Step::done; },
+
+                [&](const abi::Inject& in) {
+                    // A purely virtual node: back it with a real host temp -- a
+                    // temp FILE (with the synthesized bytes) for a file, or an
+                    // empty temp DIRECTORY for a virtual dir so O_DIRECTORY
+                    // opens succeed and getdents64 (virtualized) can enumerate
+                    // it. The open runs ASYNCHRONOUSLY in the child, so we must
+                    // NOT unlink here -- the child hasn't opened it yet; temps
+                    // are cleaned up at the end of the run.
+                    std::string tmp = in.is_dir ? materialize_dir()
+                                                : materialize(in.content);
+                    auto fdr = trap_.redirect(in.path_arg, tmp);
+                    if (!fdr) return recover(fdr.error());
+                    if (!tmp.empty()) temps_.push_back(std::move(tmp));
+                    locked([&] { sys.note_opened_fd(*fdr); });
+                    return Step::next;
+                },
+
+                [&](const abi::Redirect& rd) {
+                    // Host-backed path: rewrite the arg to the real host path
+                    // and let the kernel run it in the child (real fd for
+                    // mmap). A host-backed stat leaves the HOST file's owner in
+                    // the guest buffer; scrub it to root in the SAME stopped
+                    // window, before the task resumes and could read it.
+                    //
+                    // A mutation may need its destination's parent host dirs to
+                    // exist first (the overlay upper starts empty), and may
+                    // carry a SECOND path to translate (rename/link/symlink).
+                    const int   arg2 = rd.second ? rd.second->arg : -1;
+                    const auto& hp2  = rd.second ? rd.second->host_path
+                                                 : empty_path();
+                    if (rd.make_parents) {
+                        make_host_parents(rd.first.host_path);
+                        if (rd.second) make_host_parents(hp2);
+                    }
+                    auto retr = trap_.redirect(
+                        rd.first.arg, rd.first.host_path,
+                        [&](std::int64_t rc) {
+                            // Only a successful stat has a buffer worth fixing,
+                            // and only a Redirect can even carry a scrub.
+                            if (rc == 0 && rd.scrub)
+                                locked([&] { sys.scrub_ids(*rd.scrub); });
+                        },
+                        arg2, hp2);
+                    if (!retr) return recover(retr.error());
+                    locked([&] { sys.note_opened_fd(*retr); });
+                    return Step::next;
+                },
+
+                [&](const abi::SockRewrite& sr) {
+                    // AF_UNIX bind/connect: create the socket's parent chain in
+                    // the overlay upper, then poke the translated host path into
+                    // the guest's sun_path and forward.
+                    make_host_parents(sr.host_path);
+                    auto rr = trap_.rewrite_sockaddr(sr.path_addr, sr.host_path,
+                                                     sr.len_arg, sr.new_len);
+                    if (!rr) return recover(rr.error());
+                    return Step::next;
+                },
+
+                [&](abi::Raise k) {
+                    // The guest signalled a GUEST pid. Deliver the real signal
+                    // to that task's host tid, then hand the caller the result.
+                    // The target's death, if fatal, is observed as a normal reap
+                    // by next() on a later iteration.
+                    auto st = trap_.resume(trap_.deliver_signal(k.guest_pid,
+                                                               k.signum));
+                    if (!st) return Step::fail;
+                    return Step::next;
+                },
+
+                [&](const abi::ExecInterp& ei) {
+                    // A dynamic guest execve: rewrite it to run through the
+                    // real interpreter. The image is replaced on success and
+                    // observed as an EXEC event.
                     auto er = trap_.exec_through_interp(
-                        o.path_arg, o.interp_host, o.prog_guest, o.interp_prefix,
-                        o.exec_extra_args);
-                    if (!er) { LX_TRY(recover_syscall(er.error())); continue; }
-                } else {
-                    auto fr = trap_.forward();
-                    if (!fr) { LX_TRY(recover_syscall(fr.error())); continue; }
-                }
-            } else if (o.forward) {
-                // A dup/dup2/dup3/fcntl(F_DUPFD*): step SYNCHRONOUSLY so we can
-                // read the real new fd and mirror the source fd's path /
-                // virtual-dir binding onto it (an *at call or getdents on the
-                // dup must resolve the same path/entries). dup2/dup3 first
-                // close their explicit target, so drop its stale binding.
-                if (o.dup_from >= 0) {
-                    int from = o.dup_from, closed = o.dup_close;
-                    auto fr = trap_.forward_sync([&](std::int64_t ret) {
-                        if (ret < 0) return;
-                        locked([&] {
-                            if (closed >= 0 && closed != from) sys.on_fd_closed(closed);
-                            sys.on_fd_dup(from, static_cast<int>(ret));
+                        ei.path_arg, ei.interp_host, ei.prog_guest,
+                        ei.prefix, ei.extra_args);
+                    if (!er) return recover(er.error());
+                    return Step::next;
+                },
+
+                [&](const abi::Forward& fo) {
+                    // A dup/dup2/dup3/fcntl(F_DUPFD*) must step SYNCHRONOUSLY
+                    // so we can read the real new fd and mirror the source fd's
+                    // path / virtual-dir binding onto it (an *at call or
+                    // getdents on the dup must resolve the same path and
+                    // entries). dup2/dup3 first close their explicit target, so
+                    // drop its stale binding.
+                    if (fo.mirror) {
+                        const int from   = fo.mirror->from;
+                        const int closed = fo.mirror->close_first;
+                        auto fr = trap_.forward_sync([&](std::int64_t ret) {
+                            if (ret < 0) return;
+                            locked([&] {
+                                if (closed >= 0 && closed != from)
+                                    sys.on_fd_closed(closed);
+                                sys.on_fd_dup(from, static_cast<int>(ret));
+                            });
                         });
-                    });
-                    if (!fr) { LX_TRY(recover_syscall(fr.error())); continue; }
-                } else {
+                        if (!fr) return recover(fr.error());
+                        return Step::next;
+                    }
                     // Let the host kernel run it IN the guest (mmap/brk/...).
                     auto fr = trap_.forward();
-                    if (!fr) { LX_TRY(recover_syscall(fr.error())); continue; }
-                }
-            } else {
-                // Virtualize: hand the guest our answer, no real syscall.
-                LX_TRY(trap_.resume(o.ret));
+                    if (!fr) return recover(fr.error());
+                    return Step::next;
+                },
+
+                [&](abi::Virtualize v) {
+                    // Hand the guest our answer; no real syscall runs.
+                    auto st = trap_.resume(v.ret);
+                    if (!st) return Step::fail;
+                    return Step::next;
+                });
+
+            switch (step) {
+                case Step::done:  cleanup_temps(); return ok(exit_status);
+                case Step::fail:  cleanup_temps();
+                                  return std::unexpected(Errno::eio);
+                case Step::again: continue;
+                case Step::next:  break;
             }
             // The trap continues the task asynchronously; whole-tree exit is
             // reported by next() returning false, so we just loop.
@@ -259,6 +277,82 @@ private:
     // ESRCH specifically means the task is already gone; there is nothing to
     // resume and next() will observe its reap on the following iteration, so
     // we simply swallow it and loop.
+    // What the loop does after acting on one fate. Every match arm must
+    // return one of these, so an arm cannot forget to say what happens next.
+    enum class Step {
+        next,   // fate handled; the task continues, loop again
+        again,  // the syscall was already completed with -errno; just loop
+        done,   // the guest exited; finish the run
+        fail,   // a trap primitive failed unrecoverably
+    };
+
+    // A trap primitive failed. ESRCH means the task died under us, which is
+    // normal; anything else is pushed back to the guest as -errno. Either way
+    // the loop just goes round again.
+    [[nodiscard]] Step recover(Errno e) {
+        if (const char* t = std::getenv("LINUXITY_TRACE"); t && *t)
+            std::fprintf(trace_out(t),
+                "[lx] trap op failed errno=%d -> recovered (inject to guest)\n",
+                int(e));
+        if (e == Errno::esrch) return Step::again;
+        if (!trap_.resume(-static_cast<std::int64_t>(e))) return Step::fail;
+        return Step::again;
+    }
+
+    // A stable empty string to bind the "no second path" reference to.
+    [[nodiscard]] static const std::string& empty_path() {
+        static const std::string kEmpty;
+        return kEmpty;
+    }
+
+    // One line per serviced syscall under LINUXITY_TRACE. The fate names
+    // itself, so this is a match too rather than a row of flag tests.
+    void trace_fate(const char* t, std::uint64_t nr, const abi::Outcome& o) {
+        std::FILE* out = trace_out(t);
+        o.match(
+            [&](const abi::Virtualize& v) {
+                std::fprintf(out, "[lx] nr=%llu -> VIRT ret=%lld\n",
+                    (unsigned long long)nr, (long long)v.ret);
+            },
+            [&](const abi::Forward& f) {
+                if (f.mirror)
+                    std::fprintf(out, "[lx] nr=%llu -> FORWARD dup_from=%d\n",
+                        (unsigned long long)nr, f.mirror->from);
+                else
+                    std::fprintf(out, "[lx] nr=%llu -> FORWARD\n",
+                        (unsigned long long)nr);
+            },
+            [&](const abi::Redirect& rd) {
+                std::fprintf(out, "[lx] nr=%llu -> REDIRECT %s%s%s%s\n",
+                    (unsigned long long)nr, rd.first.host_path.c_str(),
+                    rd.second ? " -> " : "",
+                    rd.second ? rd.second->host_path.c_str() : "",
+                    rd.scrub ? " +scrub" : "");
+            },
+            [&](const abi::Inject& in) {
+                std::fprintf(out, "[lx] nr=%llu -> INJECT %zu bytes%s\n",
+                    (unsigned long long)nr, in.content.size(),
+                    in.is_dir ? " (dir)" : "");
+            },
+            [&](const abi::Raise& k) {
+                std::fprintf(out, "[lx] nr=%llu -> SIGNAL pid=%d sig=%d\n",
+                    (unsigned long long)nr, k.guest_pid, k.signum);
+            },
+            [&](const abi::ExecInterp& ei) {
+                std::fprintf(out, "[lx] nr=%llu -> EXECINT %s %s\n",
+                    (unsigned long long)nr, ei.interp_host.c_str(),
+                    ei.prog_guest.c_str());
+            },
+            [&](const abi::SockRewrite& sr) {
+                std::fprintf(out, "[lx] nr=%llu -> SOCKREWRITE %s\n",
+                    (unsigned long long)nr, sr.host_path.c_str());
+            },
+            [&](const abi::Exited& e) {
+                std::fprintf(out, "[lx] nr=%llu -> EXIT code=%d\n",
+                    (unsigned long long)nr, e.code);
+            });
+    }
+
     [[nodiscard]] Status recover_syscall(Errno e) {
         if (const char* t = std::getenv("LINUXITY_TRACE"); t && *t)
             std::fprintf(trace_out(t),
