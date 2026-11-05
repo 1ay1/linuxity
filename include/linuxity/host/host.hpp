@@ -69,11 +69,42 @@ concept Host = requires(H h, std::size_t n, void* p, Nanos t,
 
 enum class HFileType : std::uint8_t { regular, directory, symlink, other };
 
+// What a host stat YIELDS. ONE type for both consumers:
+//
+//   vfs/hostfs.hpp  -- needs type/size/mode/mtime to present a rootfs entry
+//   abi/syscall.hpp -- needs the rest to answer a guest stat/statx in a
+//                      single trap stop, instead of redirecting the call and
+//                      stepping the guest to its syscall exit
+//
+// It deliberately does NOT describe a guest buffer: laying those bytes out is
+// policy, owned by abi/wire/stat.hpp (which both backends static_assert
+// against). A backend fills these fields from whatever its OS offers -- statx
+// on Linux, stat64 on Darwin, GetFileInformationByHandleEx on Win32 -- and
+// never sees a guest offset, so it cannot get one wrong.
+//
+// `mode` keeps its original meaning -- host PERMISSION bits (st_mode & 0777) --
+// because vfs/hostfs.hpp passes it straight through to a vfs Mode without
+// masking, so widening it there would leak S_IFMT type bits into the rootfs
+// view. A guest stat needs the full value, so that lives in `raw_mode`.
 struct HStat {
-    HFileType type{HFileType::regular};
+    HFileType     type{HFileType::regular};
     std::uint64_t size{};
-    std::uint32_t mode{};   // host permission bits (st_mode & 0777)
+    std::uint32_t mode{};        // host permission bits (st_mode & 0777)
     std::uint64_t mtime_ns{};
+
+    // Added for the single-stop stat path; defaulted so existing producers
+    // and consumers are unaffected.
+    std::uint32_t raw_mode{0};   // full st_mode, S_IFMT included
+    std::uint64_t dev{0};
+    std::uint64_t ino{0};
+    std::uint64_t nlink{1};
+    std::uint32_t uid{0};
+    std::uint32_t gid{0};
+    std::uint64_t rdev{0};
+    std::int64_t  blksize{4096};
+    std::int64_t  blocks{0};
+    std::uint64_t atime_ns{0};
+    std::uint64_t ctime_ns{0};
 };
 
 struct HDirent {

@@ -349,6 +349,15 @@ private:
                         (unsigned long long)nr);
             },
             [&](const abi::Redirect& rd) {
+                // Say when the rewrite is an identity and the loop will just
+                // forward: otherwise the trace reports INTENT and hides the
+                // fast path, which made a profile look unchanged after it
+                // landed.
+                if (rd.is_noop()) {
+                    std::fprintf(out, "[lx] nr=%llu -> FORWARD (identity %s)\n",
+                        (unsigned long long)nr, rd.first.host_path.c_str());
+                    return;
+                }
                 std::fprintf(out, "[lx] nr=%llu -> REDIRECT %s%s%s%s\n",
                     (unsigned long long)nr, rd.first.host_path.c_str(),
                     rd.second ? " -> " : "",

@@ -135,6 +135,33 @@ concept HostMemory = requires(T h) {
     { h.set_brk(UAddr{}) }                -> std::same_as<Result<UAddr>>;
 };
 
+// -- host path stat --------------------------------------------------------
+//
+// Kept SEPARATE from HostCalls, like HostMemory, because it is an OPTIMISATION
+// rather than a necessity: a backend without it still works, it just pays a
+// second trap stop per stat.
+//
+// WHY IT IS A HOST FACILITY. Reading a file's metadata is statx(2) on Linux,
+// stat64 on Darwin, GetFileInformationByHandleEx on Win32 -- three genuinely
+// different implementations, so it passes this file's own test.
+//
+// WHY IT EXISTS AT ALL. A host-backed stat is the most common trapped syscall
+// in real workloads: 63942 of the 150K traps in one `ls -lR /usr/include`,
+// and 93% of the remaining two-stop work once identity redirects started
+// forwarding. Each was a REDIRECT -- rewrite the path, step the guest to its
+// syscall exit, scrub the owner out of the buffer the kernel filled. With this
+// the dispatcher stats the path itself and answers in the SAME stop: measured
+// 0.31us for the host statx plus 0.51us to write the guest buffer, against a
+// ~4.9us second stop.
+//
+// The answer is host::HStat -- the SAME type vfs/hostfs.hpp already consumes,
+// not a parallel one. Encoding it into guest bytes stays in the dispatcher,
+// where abi/wire/stat.hpp owns the offsets, so a backend never sees one.
+template <class T>
+concept HostStat = requires(T h, const char* path) {
+    { h.stat_path(path) } -> std::same_as<Result<host::HStat>>;
+};
+
 // A backend that services syscalls WITHOUT a Linux kernel underneath needs
 // both halves: the facilities, and memory management. Assert this in such a
 // backend's header to get one build error listing what is missing.
