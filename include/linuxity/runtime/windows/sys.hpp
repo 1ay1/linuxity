@@ -23,6 +23,7 @@
 
 #if defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__))
 
+#include "linuxity/abi/wire/path.hpp"
 #include "linuxity/runtime/windows/fd.hpp"
 #include "linuxity/runtime/windows/mm.hpp"
 #include "linuxity/runtime/windows/trap.hpp"
@@ -739,26 +740,18 @@ private:
         return vm_.mem().put(outp, u) ? 0 : -win32::LFAULT;
     }
 
-    // Normalize a guest path (resolve . and ..) without touching the host.
+    // Absolutize a guest path against this process's cwd, then normalize it.
+    //
+    // The `.`/`..` collapsing is NOT reimplemented here: it is
+    // FileNamespace::normalize, which is static and host-free, so there is one
+    // algorithm. This file used to carry a second one -- a different
+    // implementation of the same semantics (vector-of-parts instead of
+    // in-place truncation). I diffed them across 20 cases, including "/..",
+    // "/a/b/../../..", "///a", "/..." and "/a/..b", and they agreed on all of
+    // them -- but two implementations that agree today is a coincidence to be
+    // removed, not a property to rely on.
     [[nodiscard]] std::string normalize_guest(std::string_view gp) const {
-        std::string p = gp.empty() ? cwd_ : std::string{gp};
-        if (p.front() != '/') p = cwd_ == "/" ? "/" + p : cwd_ + "/" + p;
-        std::vector<std::string> parts;
-        std::size_t i = 0;
-        while (i < p.size()) {
-            while (i < p.size() && p[i] == '/') ++i;
-            std::size_t j = i;
-            while (j < p.size() && p[j] != '/') ++j;
-            if (j > i) {
-                std::string seg = p.substr(i, j - i);
-                if (seg == "..") { if (!parts.empty()) parts.pop_back(); }
-                else if (seg != ".") parts.push_back(std::move(seg));
-            }
-            i = j;
-        }
-        std::string out;
-        for (const auto& s : parts) { out += '/'; out += s; }
-        return out.empty() ? "/" : out;
+        return abi::wire::absolutize_path(gp, cwd_);
     }
 
     WhpMachine& vm_;

@@ -22,6 +22,7 @@
 // transformation on top of it — it never mentions ptrace, memfd, or hostfs.
 #pragma once
 
+#include "linuxity/abi/wire/path.hpp"
 #include "linuxity/abi/result.hpp"
 #include "linuxity/abi/types.hpp"
 #include "linuxity/kernel/meta_store.hpp"
@@ -558,45 +559,17 @@ public:
     // Normalize an absolute path: collapse "//", resolve "." and "..", drop a
     // trailing slash (except root). Pure lexical (no symlink following).
     //
-    // Builds the result directly instead of staging components in a
-    // std::vector<string_view> first: the vector heap-allocated on EVERY path
-    // syscall, and ".." can be honoured just as well by truncating `out` back
-    // to its previous '/' as by popping a stack. So the only allocation left
-    // is the returned string, reserved once up front -- the output is never
-    // longer than the input plus a leading slash.
+    // Collapse `.`, `..` and duplicate separators in an absolute guest path.
+    //
+    // The algorithm lives in abi/wire/path.hpp, host-free, because it was
+    // implemented twice: here, and again as normalize_guest() in
+    // windows/sys.hpp with a different structure. They agreed on every input
+    // I diffed, which is exactly the kind of coincidence that breaks the
+    // first time someone fixes an edge case in one copy. Path normalization
+    // is also security-relevant -- a `..` that escapes the root is a sandbox
+    // hole -- so it gets one implementation and one set of tests.
     [[nodiscard]] static std::string normalize(std::string_view p) {
-        std::string out;
-        out.reserve(p.size() + 1);
-        out += '/';
-        std::size_t i = 0;
-        while (i < p.size()) {
-            while (i < p.size() && p[i] == '/') ++i;
-            std::size_t j = i;
-            while (j < p.size() && p[j] != '/') ++j;
-            if (j > i) {
-                const std::string_view comp = p.substr(i, j - i);
-                if (comp == ".") {
-                    // skip
-                } else if (comp == "..") {
-                    // Drop the last component AND its separator, leaving "/"
-                    // only when we have popped back to the root. Truncating
-                    // to rfind('/')+1 instead would leave the slash behind,
-                    // so the next component would double it ("/a//b") and a
-                    // later ".." would strip only that empty tail.
-                    if (out.size() > 1) {
-                        const std::size_t slash = out.rfind('/');
-                        out.resize(slash == 0 ? 1 : slash);
-                    }
-                } else {
-                    if (out.size() > 1) out += '/';
-                    out += comp;
-                }
-            }
-            i = j;
-        }
-        // Trailing '/' survives only for the root itself; "/a/" -> "/a".
-        if (out.size() > 1 && out.back() == '/') out.pop_back();
-        return out;
+        return abi::wire::normalize_path(p);
     }
 
 private:

@@ -1,7 +1,9 @@
 // The abi/wire layer: kernel ABI structs encoded in exactly one place.
 // kernel ABI, so it holds on every host and needs no VM to check.
 #include "linuxity/abi/wire/dirent64.hpp"
+#include "linuxity/abi/wire/iovec.hpp"
 #include "linuxity/abi/wire/open_flags.hpp"
+#include "linuxity/abi/wire/path.hpp"
 #include "linuxity/abi/wire/stat.hpp"
 
 #include <cstdio>
@@ -218,6 +220,82 @@ int main() {
         // test must exclude it or it treats a tmpfile create as a dir open.
         check((bits(OpenFlag::tmpfile) & bits(OpenFlag::directory)) != 0,
               "O_TMPFILE contains O_DIRECTORY (a real trap)");
+    }
+
+    // -- path normalization ------------------------------------------------
+    // One implementation now (it was two: kernel/file_namespace.hpp and
+    // windows/sys.hpp, structured differently). This is security-relevant: a
+    // `..` that escapes the root means the overlay translates a guest path to
+    // a host path ABOVE the rootfs.
+    {
+        using lx::abi::wire::normalize_path;
+        using lx::abi::wire::absolutize_path;
+        auto eq = [&](std::string_view in, std::string_view want) {
+            const std::string got = normalize_path(in);
+            if (got != want) {
+                std::fprintf(stderr, "FAIL normalize(%.*s) = [%s], want [%s]\n",
+                             int(in.size()), in.data(), got.c_str(),
+                             std::string(want).c_str());
+                ++failures;
+            }
+        };
+        eq("/", "/");
+        eq("/a", "/a");
+        eq("/a/b", "/a/b");
+        eq("/a//b", "/a/b");            // duplicate separators collapse
+        eq("///a", "/a");
+        eq("/a/./b", "/a/b");           // "." drops
+        eq("/a/./././b", "/a/b");
+        eq("/./", "/");
+        eq("/a/", "/a");                // trailing slash, except root
+        eq("/a/b/", "/a/b");
+        eq("/a/../b", "/b");            // ".." pops
+        eq("/a/b/../..", "/");
+        eq("/...", "/...");             // "..." is a normal name, not ".."
+        eq("/a/..b", "/a/..b");
+        eq("/..a/b", "/..a/b");
+
+        // THE SECURITY CASES: ".." at or above the root must clamp, never
+        // escape. If any of these returned something starting with ".." or
+        // escaping upward, a guest could read outside the rootfs.
+        eq("/..", "/");
+        eq("/../..", "/");
+        eq("/a/b/../../..", "/");
+        eq("/../../../etc/passwd", "/etc/passwd");
+        eq("/a/../../../../b", "/b");
+
+        // Every result is absolute, has no trailing slash (bar root), and no
+        // empty or dot components.
+        const char* probes[] = {"/", "/a", "/a//b/", "/../x", "/a/./b/../c",
+                                "/./.././a//./b/", "//////", "/a/b/c/../../.."};
+        for (const char* s : probes) {
+            const std::string r = normalize_path(s);
+            check(!r.empty() && r.front() == '/', "result is absolute");
+            check(r == "/" || r.back() != '/', "no trailing slash but root");
+            check(r.find("//") == std::string::npos, "no empty components");
+            check(r.find("/./") == std::string::npos, "no dot components");
+            check(r.find("/../") == std::string::npos, "no dotdot left");
+            check(r.size() < 3 || r.compare(r.size() - 3, 3, "/..") != 0,
+                  "no trailing dotdot");
+        }
+
+        // absolutize: a relative path joins the cwd, an absolute one ignores
+        // it, and an empty path means the cwd itself (AT_EMPTY_PATH).
+        check(absolutize_path("b", "/a") == "/a/b", "relative joins cwd");
+        check(absolutize_path("/b", "/a") == "/b", "absolute ignores cwd");
+        check(absolutize_path("", "/a/b") == "/a/b", "empty path is the cwd");
+        check(absolutize_path("../c", "/a/b") == "/a/c", "relative dotdot");
+        check(absolutize_path("b", "/") == "/b", "cwd root does not double up");
+        // A relative path must not escape the root either.
+        check(absolutize_path("../../../x", "/a") == "/x", "relative clamps");
+    }
+
+    // -- iovec -------------------------------------------------------------
+    {
+        using lx::abi::wire::Iovec;
+        check(sizeof(Iovec) == 16, "iovec is 16 bytes on LP64");
+        check(alignof(Iovec) == 8, "iovec is 8-aligned");
+        check(lx::abi::wire::kIovMax == 1024, "IOV_MAX is 1024");
     }
 
     if (failures == 0) std::puts("wire: all checks passed");
