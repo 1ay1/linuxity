@@ -2003,6 +2003,27 @@ private:
     // for statx(2)) for a virtual node into the guest buffer.
     [[nodiscard]] Outcome write_statx(UAddr buf, bool is_dir, std::uint64_t size,
                                       bool is_link = false) {
+        return write_statx(buf, synth_hstat(is_dir, size, is_link));
+    }
+
+    // The HStat a VIRTUAL node implies. Built once, here, so the synthesized
+    // mode/ino/blocks story is told in one place and both ABI encoders agree
+    // on it.
+    [[nodiscard]] static host::HStat synth_hstat(bool is_dir, std::uint64_t size,
+                                                 bool is_link) {
+        host::HStat h;
+        h.raw_mode = is_link ? wire::bits(wire::FileType::symlink) | 0777u
+                   : is_dir  ? wire::bits(wire::FileType::dir) | 0555u
+                             : wire::bits(wire::FileType::regular) | 0444u;
+        h.ino    = 1;
+        h.nlink  = 1;
+        h.size   = size;
+        h.blocks = static_cast<std::int64_t>((size + 511) / 512);
+        return h;
+    }
+
+    // The HStat form: a REAL host file. See write_statbuf's overload.
+    [[nodiscard]] Outcome write_statx(UAddr buf, const host::HStat& h) {
         struct Statx {
             std::uint32_t stx_mask, stx_blksize;
             std::uint64_t stx_attributes;
@@ -2017,14 +2038,21 @@ private:
         } sx{};
         constexpr std::uint32_t kBasicStats = 0x7ff;  // STATX_BASIC_STATS
         sx.stx_mask    = kBasicStats;
-        sx.stx_blksize = 4096;
-        sx.stx_nlink   = 1;
-        sx.stx_mode    = static_cast<std::uint16_t>(is_link ? wire::bits(wire::FileType::symlink) | 0777u
-                                                : is_dir  ? wire::bits(wire::FileType::dir) | 0555u
-                                                          : wire::bits(wire::FileType::regular) | 0444u);
-        sx.stx_ino     = 1;
-        sx.stx_size    = size;
-        sx.stx_blocks  = (size + 511) / 512;
+        sx.stx_blksize = static_cast<std::uint32_t>(h.blksize);
+        sx.stx_nlink   = static_cast<std::uint32_t>(h.nlink);
+        // uid/gid stay 0: the guest is root and sees root-owned files, the
+        // same policy scrub_ids applies to a forwarded stat.
+        sx.stx_mode    = static_cast<std::uint16_t>(h.raw_mode);
+        sx.stx_ino     = h.ino;
+        sx.stx_size    = h.size;
+        sx.stx_blocks  = static_cast<std::uint64_t>(h.blocks);
+        sx.stx_mtime   = {static_cast<std::int64_t>(h.mtime_ns / 1'000'000'000ull),
+                          static_cast<std::uint32_t>(h.mtime_ns % 1'000'000'000ull), 0};
+        sx.stx_atime   = {static_cast<std::int64_t>(h.atime_ns / 1'000'000'000ull),
+                          static_cast<std::uint32_t>(h.atime_ns % 1'000'000'000ull), 0};
+        sx.stx_ctime   = {static_cast<std::int64_t>(h.ctime_ns / 1'000'000'000ull),
+                          static_cast<std::uint32_t>(h.ctime_ns % 1'000'000'000ull), 0};
+        sx.stx_btime   = sx.stx_ctime;
         if (!mem_.copy_out(buf, {reinterpret_cast<const std::byte*>(&sx), sizeof sx}))
             return eno(Errno::efault);
         return val(0);
@@ -2039,9 +2067,18 @@ private:
     // smashing detected" the first time anything stats /dev/pts.
     [[nodiscard]] Outcome write_statbuf(UAddr buf, bool is_dir, std::uint64_t size,
                                         bool is_link = false) {
-        const std::uint32_t mode = is_link ? wire::bits(wire::FileType::symlink) | 0777u
-                                 : is_dir  ? wire::bits(wire::FileType::dir) | 0555u : wire::bits(wire::FileType::regular) | 0444u;
-        const auto blocks = static_cast<std::int64_t>((size + 511) / 512);
+        return write_statbuf(buf, synth_hstat(is_dir, size, is_link));
+    }
+
+    // The HStat form: a REAL host file, stat'd by the dispatcher so a
+    // host-backed stat is answered in the SAME trap stop instead of
+    // redirecting the call and stepping the guest to its syscall exit. Shares
+    // this encoder with the synthesized form above, so one place knows each
+    // ABI's layout.
+    [[nodiscard]] Outcome write_statbuf(UAddr buf, const host::HStat& h) {
+        const std::uint32_t mode = h.raw_mode;
+        const std::int64_t blocks = h.blocks;
+        const std::uint64_t size = h.size;
         if (arch_ == Arch::aarch64) {
             struct StatGeneric {
                 std::uint64_t st_dev, st_ino;
@@ -2054,9 +2091,20 @@ private:
                 std::uint32_t unused_[2];
             } st{};
             static_assert(sizeof(StatGeneric) == 128);
-            st.st_ino = 1; st.st_nlink = 1; st.st_mode = mode;
+            st.st_dev = h.dev; st.st_ino = h.ino;
+            st.st_nlink = static_cast<std::uint32_t>(h.nlink);
+            st.st_mode = mode; st.st_rdev = h.rdev;
+            // uid/gid stay 0: the guest is root and sees root-owned files,
+            // the same policy scrub_ids applies to a forwarded stat.
             st.st_size = static_cast<std::int64_t>(size);
-            st.st_blksize = 4096; st.st_blocks = blocks;
+            st.st_blksize = static_cast<std::int32_t>(h.blksize);
+            st.st_blocks = blocks;
+            st.mtime = static_cast<std::int64_t>(h.mtime_ns / 1'000'000'000ull);
+            st.mtime_ns = static_cast<std::int64_t>(h.mtime_ns % 1'000'000'000ull);
+            st.atime = static_cast<std::int64_t>(h.atime_ns / 1'000'000'000ull);
+            st.atime_ns = static_cast<std::int64_t>(h.atime_ns % 1'000'000'000ull);
+            st.ctime = static_cast<std::int64_t>(h.ctime_ns / 1'000'000'000ull);
+            st.ctime_ns = static_cast<std::int64_t>(h.ctime_ns % 1'000'000'000ull);
             if (!mem_.copy_out(buf, {reinterpret_cast<const std::byte*>(&st), sizeof st}))
                 return eno(Errno::efault);
             return val(0);
@@ -2070,12 +2118,20 @@ private:
             std::int64_t reserved_[3];
         } st{};
         static_assert(sizeof(Stat64) == 144);
-        st.st_ino     = 1;
-        st.st_nlink   = 1;
+        st.st_dev     = h.dev;
+        st.st_ino     = h.ino;
+        st.st_nlink   = h.nlink;
         st.st_mode    = mode;
+        st.st_rdev    = h.rdev;
         st.st_size    = static_cast<std::int64_t>(size);
-        st.st_blksize = 4096;
+        st.st_blksize = h.blksize;
         st.st_blocks  = blocks;
+        st.mtime      = h.mtime_ns / 1'000'000'000ull;
+        st.mtime_ns   = h.mtime_ns % 1'000'000'000ull;
+        st.atime      = h.atime_ns / 1'000'000'000ull;
+        st.atime_ns   = h.atime_ns % 1'000'000'000ull;
+        st.ctime      = h.ctime_ns / 1'000'000'000ull;
+        st.ctime_ns   = h.ctime_ns % 1'000'000'000ull;
         if (!mem_.copy_out(buf, {reinterpret_cast<const std::byte*>(&st), sizeof st}))
             return eno(Errno::efault);
         return val(0);
