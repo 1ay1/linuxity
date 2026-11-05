@@ -950,7 +950,7 @@ private:
     // (copy_leaf/parents_only classify, or an open O_CREAT) clears the
     // whiteout. Journaled to `.linuxity-whiteout` in the upper layer so the
     // removal persists across runs, exactly like copied-up files and meta.
-    mutable std::unordered_set<std::string> whiteouts_;
+    mutable std::unordered_set<std::string, SvHash, SvEq> whiteouts_;
     std::string whiteout_journal_;
 
 public:
@@ -981,8 +981,12 @@ public:
         }
     }
 
+    // Probed once per entry while enumerating a directory, so it must not
+    // allocate: the transparent hash/equality pair lets an unordered_set of
+    // std::string be looked up by std::string_view directly, instead of
+    // materializing a std::string per call just to throw it away.
     [[nodiscard]] bool is_whiteout(std::string_view guest_path) const {
-        return whiteouts_.find(std::string{guest_path}) != whiteouts_.end();
+        return whiteouts_.find(guest_path) != whiteouts_.end();
     }
 
 private:
