@@ -68,6 +68,29 @@ KVM platform use this same model.
           so Linux event loops work rather than hitting ENOSYS.
         * **Locks and modern stat.** fcntl POSIX record locks (what
           `useradd`, git and sqlite use) and statx including AT_EMPTY_PATH.
+        * **Syscall conformance: 327/327 aarch64 syscalls** are decoded and
+          handled by name (tables generated from kernel headers and checked
+          in CI). The ones we refuse are refused on purpose: EPERM for
+          privileged operations (modules, kexec, reboot) and ENOSYS for
+          missing subsystems (bpf, io_uring, aio, keyrings, mq_*).
+        * **Toolchains.** gcc/g++ (cc1plus is a 42 MiB non-PIE image at
+          0x400000) build and run threaded C++. A guest-owned window keeps
+          fixed-address ET_EXEC images clear of the page tables.
+        * **Synchronous signals.** Guest faults deliver catchable
+          SIGSEGV/SIGBUS/SIGILL with si_addr and si_code at the faulting PC,
+          so guard-page and JIT handlers work. With no handler the fault is
+          fatal (139).
+        * **TUIs.** agentty, vim, htop and cmatrix. If the rootfs has no entry
+          for the host terminal (kitty, ghostty, ...), it is bridged in.
+        * **Shared kernel state is locked.** One recursive mutex guards the
+          namespace and process tables across guest threads. It is held for
+          bookkeeping only, never across a blocking host syscall.
+      Performance: a trapped syscall costs ~1.5 us; hv_vcpu_run alone is
+      ~1.0 us. Every `svc` must exit to the host: with HCR_EL2.TGE set,
+      EL0 exceptions can't be taken at a guest EL1 vector (we measured this),
+      so the way to go faster is fewer exits (a vDSO for clocks), not
+      cheaper ones. Overlay directory unions are built lazily, on first
+      getdents: `pacman -S python` takes 4.4 s, down from 2m41s.
       Remaining: `mprotect` is tracked in the VMA map but not enforced in
       the page tables; `ps` needs a fuller /proc; CI does not yet build the
       macOS binary (it needs a signed binary and a rootfs).
