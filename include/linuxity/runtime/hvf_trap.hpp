@@ -1562,6 +1562,7 @@ private:
         pids_.set_pgid(child, pids_.pgid_of(task_.tid));
         pids_.set_sid(child, pids_.sid_of(task_.tid));
         pids_.set_exe(child, pids_.exe_of(task_.tid));   // same image until it execs
+        pids_.set_ppid(child, task_.tid);
         if (req.flags & clone_flag::parent_settid)
             (void)machine_.ram().put(req.parent_tid_addr, std::int32_t{child});
         children_.push_back({child, host});

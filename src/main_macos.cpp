@@ -614,6 +614,32 @@ void run_guest_thread(ThreadContext& ctx, runtime::HvfTrap::ThreadStart start) {
 
 }  // namespace
 
+namespace {
+// /proc sees EVERY live guest process, not just this host process's
+// fork-time snapshot of the process table. Each guest process is its own
+// host process; the shared PidSpace page is the only cross-process truth.
+void attach_live_procs(Machine& m, runtime::PidSpace& pids) {
+    struct Live final : kernel::ProcessTable::LiveSource {
+        runtime::PidSpace& ps;
+        explicit Live(runtime::PidSpace& p) : ps{p} {}
+        bool alive(std::int32_t pid) const override { return ps.is_process(pid); }
+        std::vector<std::int32_t> pids() const override { return ps.processes(); }
+        kernel::ProcInfo info(std::int32_t pid) const override {
+            kernel::ProcInfo pi;
+            const std::string exe = ps.exe_of(pid);
+            pi.comm = exe.substr(exe.find_last_of('/') + 1).substr(0, 15);
+            pi.cmdline = exe;
+            pi.ppid = ps.ppid_of(pid);
+            pi.state = 'S';
+            pi.exe = exe;
+            return pi;
+        }
+    };
+    static Live live{pids};
+    m.k.procs().set_live_source(&live);
+}
+}  // namespace
+
 int main(int argc, char** argv) {
     if (std::getenv("LINUXITY_DEBUG")) {
         ::signal(SIGSEGV, crash_handler);
@@ -664,6 +690,7 @@ int main(int argc, char** argv) {
         runtime::ProcessState proc;
         runtime::TaskState task;
         runtime::HvfTrap trap{machine, cpu, proc, task, pids};
+        attach_live_procs(m, pids);
         trap.resume_fork_child(img, ca.group_fds);
         return run(o, m, machine, cpu, proc, task, pids, trap);
     }
@@ -742,6 +769,7 @@ int main(int argc, char** argv) {
             exe = m.unresolve(real);
         pids.set_exe(1, exe);
     }
+    attach_live_procs(m, pids);
     // Only the ROOT process reserves the low fds: a fork child inherits its
     // parent's whole table (reservations included) through the handoff.
     proc.with_fds([](runtime::FdTable& t) { t.reserve_low_fds(); });

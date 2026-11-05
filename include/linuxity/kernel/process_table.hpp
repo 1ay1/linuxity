@@ -17,6 +17,7 @@
 
 #include "linuxity/abi/types.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -57,22 +58,65 @@ public:
     }
     void remove(std::int32_t pid) { if (pid != 1) procs_.erase(pid); }
 
-    [[nodiscard]] bool has(std::int32_t pid) const { return procs_.count(pid) != 0; }
+    [[nodiscard]] bool has(std::int32_t pid) const { return find(pid) != nullptr; }
     [[nodiscard]] const ProcInfo* find(std::int32_t pid) const {
         auto it = procs_.find(pid);
-        return it == procs_.end() ? nullptr : &it->second;
+        if (it != procs_.end()) {
+            // Our own record may be a fork-time snapshot (pid 1 is seeded
+            // as "linuxity" before the shell even execs). The live table
+            // knows what each pid runs NOW; refresh the identity from it.
+            if (live_ && live_->alive(pid)) {
+                ProcInfo p = it->second;
+                const ProcInfo l = live_->info(pid);
+                if (!l.exe.empty() && l.exe != p.exe) {
+                    p.comm = l.comm; p.cmdline = l.cmdline; p.exe = l.exe;
+                }
+                if (l.ppid) p.ppid = l.ppid;
+                return &(scratch_[pid] = std::move(p));
+            }
+            return &it->second;
+        }
+        // Not in OUR copy, but alive somewhere in the tree? On the HVF
+        // backend every guest process is a separate host process with its
+        // own copy of this table, frozen at fork: a child shell saw only
+        // pid 1, so /proc/<its own pid> and /proc/<parent> were ENOENT
+        // ("realpath: /proc/2/exe: No such file" from screenfetch under
+        // fish). The backend's shared pid table is the authority on who is
+        // alive; synthesize a record from it.
+        if (live_ && live_->alive(pid)) {
+            ProcInfo p = live_->info(pid);
+            p.pid = pid;
+            return &(scratch_[pid] = std::move(p));
+        }
+        return nullptr;
     }
 
     [[nodiscard]] std::vector<std::int32_t> pids() const {
         std::vector<std::int32_t> out;
         out.reserve(procs_.size());
         for (const auto& [pid, _] : procs_) out.push_back(pid);
+        if (live_) {
+            for (std::int32_t p : live_->pids())
+                if (!procs_.count(p)) out.push_back(p);
+            std::sort(out.begin(), out.end());
+        }
         return out;
     }
-    [[nodiscard]] std::size_t count() const noexcept { return procs_.size(); }
+    [[nodiscard]] std::size_t count() const { return pids().size(); }
+
+    // A cross-process view of the pid namespace, provided by the backend.
+    struct LiveSource {
+        virtual ~LiveSource() = default;
+        [[nodiscard]] virtual bool alive(std::int32_t pid) const = 0;
+        [[nodiscard]] virtual std::vector<std::int32_t> pids() const = 0;
+        [[nodiscard]] virtual ProcInfo info(std::int32_t pid) const = 0;
+    };
+    void set_live_source(const LiveSource* s) noexcept { live_ = s; }
 
 private:
     std::map<std::int32_t, ProcInfo> procs_;
+    const LiveSource* live_{nullptr};
+    mutable std::map<std::int32_t, ProcInfo> scratch_;
 };
 
 } // namespace lx::kernel

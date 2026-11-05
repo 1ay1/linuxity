@@ -23,8 +23,12 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
+#include <cstring>
 #include <optional>
+#include <string>
+#include <string_view>
 #include <vector>
 
 namespace lx::runtime {
@@ -146,6 +150,27 @@ public:
         buf[kExe - 1] = '\0';
         return buf;
     }
+    // A live guest PROCESS (not a thread: threads allocate a tid here too,
+    // but only processes record an image). Its host pid must still exist.
+    [[nodiscard]] bool is_process(std::int32_t g) const noexcept {
+        if (g <= 0 || g >= kMax || !shared_ || !shared_->exe[g][0]) return false;
+        const pid_t h = shared_->host[g].load(std::memory_order_relaxed);
+        return h > 0 && (::kill(h, 0) == 0 || errno == EPERM);
+    }
+    [[nodiscard]] std::vector<std::int32_t> processes() const {
+        std::vector<std::int32_t> out;
+        if (!shared_) return out;
+        for (int g = 1; g < kMax; ++g)
+            if (shared_->exe[g][0] && is_process(g)) out.push_back(g);
+        return out;
+    }
+    // The guest pid that forked g (0 for init). Recorded at fork.
+    void set_ppid(std::int32_t g, std::int32_t parent) noexcept {
+        if (g > 0 && g < kMax && shared_) shared_->ppid[g].store(parent, std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::int32_t ppid_of(std::int32_t g) const noexcept {
+        return (g > 0 && g < kMax && shared_) ? shared_->ppid[g].load(std::memory_order_relaxed) : 0;
+    }
 
     [[nodiscard]] std::optional<pid_t> host_of(std::int32_t g) const noexcept {
         if (g <= 0 || g >= kMax) return std::nullopt;
@@ -180,6 +205,7 @@ private:
         // (a torn read can only produce a wrong name, never a crash: the
         // buffer is always NUL-terminated at kExe-1).
         char exe[kMax][kExe]{};
+        std::atomic<std::int32_t> ppid[kMax]{};
     };
     Shared* shared_{nullptr};
     int fd_{-1};
