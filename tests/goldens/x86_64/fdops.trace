@@ -1,0 +1,36 @@
+# linuxity conformance trace
+# scenario: fdops
+# arch: x86_64
+# recorded-by: live Linux kernel on this host
+# kernel: Linux 7.2.14-zen1-1-zen
+openat = 1 | open a regular file
+dup = 1 | dup succeeds
+dup = 1 | dup returns a distinct fd
+read = 1 | read 4 via the original
+read = 1 | read 4 via the dup
+read = 1 | dup shares the file offset
+dup2 = 1 | dup2 lands on the requested fd
+dup2 = 1 | dup2(fd, fd) is a no-op success
+dup3 = -EINVAL | dup3(fd, fd, 0) must be EINVAL
+dup3 = -EINVAL | dup3 with a bogus flag must be EINVAL
+fcntl = 1 | F_GETFD on a live fd
+fcntl = 0 | F_SETFD CLOEXEC
+fcntl = 1 | F_GETFD reflects the CLOEXEC we set
+fcntl = -EBADF | F_GETFD bad fd is EBADF
+fcntl = -EINVAL | an unknown fcntl cmd must be EINVAL
+fcntl = 1 | F_DUPFD respects its floor
+close = 0 | close the F_DUPFD
+close = -EBADF | close a bad fd is EBADF
+close = -EBADF | close(-1) is EBADF
+fstat = -EBADF | fstat bad fd is EBADF
+newfstatat = -EBADF | newfstatat on a bad dirfd is EBADF
+close = 0 | close the dup
+close = -EBADF | double close is EBADF
+read = -EBADF | read after close is EBADF
+close = 0 | close the dup2 target
+close = 0 | close the original
+read = -EBADF | read the closed original is EBADF
+openat = -ENOTDIR | O_DIRECTORY on a file must be ENOTDIR
+openat = -EISDIR | O_WRONLY on a directory must be EISDIR
+openat = -ENOENT | open a missing file is ENOENT
+openat = -ENOTDIR | file-as-directory component is ENOTDIR

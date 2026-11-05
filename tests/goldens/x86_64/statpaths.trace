@@ -1,0 +1,35 @@
+# linuxity conformance trace
+# scenario: statpaths
+# arch: x86_64
+# recorded-by: live Linux kernel on this host
+# kernel: Linux 7.2.14-zen1-1-zen
+newfstatat = 1 | / (the root itself)
+newfstatat = 1 | /. (root, dot form)
+newfstatat = 1 | /usr
+newfstatat = 1 | /usr/bin (a dir)
+newfstatat = 1 | /etc/hostname (a file)
+newfstatat = 1 | /proc
+newfstatat = 1 | /proc/self
+newfstatat = 1 | /proc/self/stat
+newfstatat = 1 | /proc/uptime
+newfstatat = 1 | /sys
+newfstatat = 1 | /dev
+newfstatat = 1 | /dev/null
+newfstatat = -ENOENT | missing top-level must be ENOENT
+newfstatat = -ENOENT | missing under a real dir
+newfstatat = -ENOENT | missing under /proc
+newfstatat = -ENOTDIR | file-as-directory must be ENOTDIR
+newfstatat = -ENOENT | empty path must be ENOENT
+newfstatat = -ENOTDIR | file with trailing slash must be ENOTDIR
+newfstatat = 1 | lstat /proc/self (a symlink)
+newfstatat = 1 | stat /proc/self follows to a dir
+faccessat = 1 | F_OK on /usr
+faccessat = 1 | R_OK on /etc/hostname
+faccessat = -ENOENT | F_OK on a missing path
+faccessat = -EACCES | X_OK on a non-executable file
+fstat = 1 | fstat stdout
+fstat = -EBADF | fstat bad fd is EBADF
+statx = 1 | statx /usr
+statx = -ENOENT | statx missing is ENOENT
+readlinkat = 1 | readlink /proc/self
+readlinkat = -EINVAL | readlink of a dir is EINVAL

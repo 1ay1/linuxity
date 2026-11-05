@@ -1,0 +1,43 @@
+# linuxity conformance trace
+# scenario: signals
+# arch: x86_64
+# recorded-by: live Linux kernel on this host
+# kernel: Linux 7.2.14-zen1-1-zen
+rt_sigaction = 0 | query SIGUSR1
+rt_sigaction = 1 | a fresh process has SIG_DFL for SIGUSR1
+rt_sigaction = 0 | set SIGUSR1 to SIG_IGN
+rt_sigaction = 1 | SIGUSR1 reads back as SIG_IGN
+kill = 0 | kill self with an ignored signal succeeds
+rt_sigaction = 0 | restore SIGUSR1 to SIG_DFL
+rt_sigaction = -EINVAL | catching SIGKILL is EINVAL
+rt_sigaction = -EINVAL | catching SIGSTOP is EINVAL
+rt_sigaction = -EINVAL | signal 0 is EINVAL for sigaction
+rt_sigaction = -EINVAL | signal 65 is EINVAL
+rt_sigaction = -EINVAL | a negative signal is EINVAL
+rt_sigaction = 0 | SIGRTMIN is a valid signal
+rt_sigaction = -EINVAL | a wrong sigsetsize is EINVAL
+rt_sigprocmask = 0 | clear the signal mask
+rt_sigprocmask = 0 | block SIGUSR1
+rt_sigprocmask = 1 | the mask reports SIGUSR1 blocked
+kill = 0 | kill self with a blocked signal succeeds
+rt_sigpending = 0 | query pending
+rt_sigpending = 1 | SIGUSR1 is pending while blocked
+rt_sigprocmask = 0 | unblock SIGUSR1 (now ignored, so it is discarded)
+rt_sigpending = 1 | SIGUSR1 is no longer pending after unblocking
+rt_sigprocmask = 0 | blocking SIGKILL/SIGSTOP succeeds (silently ignored)
+rt_sigprocmask = 1 | SIGKILL did NOT end up blocked
+rt_sigprocmask = -EINVAL | a bogus sigprocmask how is EINVAL
+rt_sigprocmask = -EINVAL | a wrong sigsetsize is EINVAL
+sigaltstack = 0 | query the alt stack
+sigaltstack = 1 | a fresh process has no alt stack
+sigaltstack = -errno(12) | a too-small alt stack is ENOMEM
+sigaltstack = 0 | a 64K alt stack is accepted
+sigaltstack = 1 | the alt stack size reads back
+kill = 0 | kill(self, 0) is a liveness probe
+kill = -EINVAL | a bogus signal is EINVAL
+kill = -errno(3) | an absent pid is ESRCH
+tgkill = 0 | tgkill(self, self, 0) succeeds
+tgkill = -EINVAL | tgkill with a bogus signal is EINVAL
+tgkill = -EINVAL | tgkill with a negative tgid is EINVAL
+tkill = 0 | tkill(self, 0) succeeds
+tkill = -EINVAL | tkill with a negative tid is EINVAL

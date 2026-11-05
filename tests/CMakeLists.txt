@@ -59,6 +59,35 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set_tests_properties(conform_diff PROPERTIES
         ENVIRONMENT "LX_PROBE_DIR=${CMAKE_BINARY_DIR}/probes;LX_BINARY=${CMAKE_BINARY_DIR}/linuxity;LX_GOLDEN_DIR=${CMAKE_SOURCE_DIR}/tests/goldens"
         TIMEOUT 120)
+
+    # The PORTABILITY PROOF: verify linuxity against the committed goldens,
+    # with no live kernel consulted. This is the test macOS and Windows will
+    # run -- it needs only a ProbeRunner, not HasLinuxKernel -- so having it
+    # green on Linux too means the replay path itself is exercised in CI
+    # rather than only on the hosts that depend on it.
+    add_executable(test_conform_replay test_conform_replay.cpp)
+    target_link_libraries(test_conform_replay PRIVATE linuxity_core)
+    add_dependencies(test_conform_replay linuxity)
+    foreach(p IN LISTS LX_PROBES)
+        add_dependencies(test_conform_replay probe_${p})
+    endforeach()
+    add_test(NAME conform_replay COMMAND test_conform_replay)
+    set_tests_properties(conform_replay PROPERTIES
+        ENVIRONMENT "LX_PROBE_DIR=${CMAKE_BINARY_DIR}/probes;LX_BINARY=${CMAKE_BINARY_DIR}/linuxity;LX_GOLDEN_DIR=${CMAKE_SOURCE_DIR}/tests/goldens"
+        TIMEOUT 120)
+
+    # The golden RECORDER. A tool, not a test: it writes files, so ctest never
+    # runs it. Invoke deliberately on each Linux arch and commit the result --
+    # that is what lets a macOS or Windows host verify itself with no Linux
+    # kernel to compare against.
+    #
+    #   cmake --build build --target record_goldens
+    #   LX_PROBE_DIR=$PWD/build/probes ./build/tests/record_goldens
+    add_executable(record_goldens record_goldens.cpp)
+    target_link_libraries(record_goldens PRIVATE linuxity_core)
+    foreach(p IN LISTS LX_PROBES)
+        add_dependencies(record_goldens probe_${p})
+    endforeach()
 endif()
 
 set(LX_TESTS ${LX_PORTABLE_TESTS})

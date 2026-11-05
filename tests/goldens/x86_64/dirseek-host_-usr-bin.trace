@@ -1,0 +1,20 @@
+# linuxity conformance trace
+# scenario: dirseek-host
+# arch: x86_64
+# recorded-by: live Linux kernel on this host
+# kernel: Linux 7.2.14-zen1-1-zen
+openat = 3 | /usr/bin
+getdents64 = 1 | first batch is non-empty
+lseek = 1 | cursor advanced after a read
+lseek = 1 | rewind by a byte delta (the fish case)
+lseek = 1 | cursor is a byte offset, not an index
+getdents64 = 1 | readable after relative seek
+lseek = 0 | SEEK_SET 0 -- rewind
+getdents64 = 1 | rewound batch matches the first
+lseek = 1 | SEEK_SET to a reported cookie
+lseek = -EINVAL | SEEK_SET -1 must be EINVAL
+lseek = -EINVAL | bad whence must be EINVAL
+lseek = -EBADF | bad fd must be EBADF
+read = -EISDIR | read() on a dirfd must be EISDIR
+close = 0
+getdents64 = -EBADF | after close must be EBADF

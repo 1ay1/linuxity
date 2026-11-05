@@ -1,0 +1,55 @@
+# linuxity conformance trace
+# scenario: rwio
+# arch: x86_64
+# recorded-by: live Linux kernel on this host
+# kernel: Linux 7.2.14-zen1-1-zen
+openat = 1 | create the scratch file
+write = 16 | write 16 bytes
+lseek = 16 | offset after write
+lseek = 16 | SEEK_END is the size
+lseek = 0 | SEEK_SET 0 rewinds
+lseek = 100 | seek past EOF is legal
+read = 0 | read past EOF is 0
+lseek = 0 | rewind again
+read = 8 | read 8 of 16
+read = 1 @1:3031323334353637 | first 8 bytes
+read = 8 | read 32 with only 8 left short-reads to 8
+read = 0 | read at EOF is 0
+read = 0 | zero-length read is 0
+lseek = 4 | park the offset at 4
+pread64 = 4 | pread 4 at offset 12
+pread64 = 1 @1:63646566 | bytes at offset 12
+lseek = 4 | pread left the offset alone
+pwrite64 = 4 | pwrite 4 at offset 0
+lseek = 4 | pwrite left the offset alone
+pread64 = 1 | read back offset 0
+pread64 = 1 @1:5a5a5a5a | pwrite landed at offset 0
+pread64 = -EINVAL | negative pread offset is EINVAL
+lseek = 0 | rewind for readv
+readv = 10 | readv fills both buffers
+readv = 1 @1:5a5a5a5a | readv first iov
+readv = 1 @1:343536373839 | readv second iov
+readv = 0 | readv with 0 iovs is 0
+lseek = 16 | seek to end
+writev = 3 | writev 2+1 bytes
+lseek = 19 | offset advanced by 3
+read = -EBADF | read bad fd is EBADF
+write = -EBADF | write bad fd is EBADF
+openat = 1 | reopen write-only
+read = -EBADF | read from a write-only fd is EBADF
+close = 0 | close write-only
+openat = 1 | reopen read-only
+write = -EBADF | write to a read-only fd is EBADF
+close = 0 | close read-only
+openat = 1 | reopen O_APPEND
+lseek = 0 | seek to 0 on an O_APPEND fd
+write = 1 | O_APPEND write goes to the end anyway
+lseek = 20 | offset is at the new end, not 1
+close = 0 | close O_APPEND
+ftruncate = 0 | truncate to 4
+lseek = 4 | size is now 4
+ftruncate = -EINVAL | negative ftruncate is EINVAL
+ftruncate = -EBADF | ftruncate bad fd is EBADF
+close = 0 | close the scratch file
+unlinkat = 0 | unlink it
+unlinkat = -ENOENT | unlink again is ENOENT

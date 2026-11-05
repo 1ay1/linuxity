@@ -99,10 +99,13 @@ public:
 
     [[nodiscard]] bool usable() const { return runner_->linux_native(); }
 
-    [[nodiscard]] std::string_view kernel_release() const
+    // Returns by VALUE, not string_view: the runner builds the string from
+    // uname(2) on each call, so a view would dangle the moment this returns.
+    // It did -- the recorder printed garbage for the kernel version.
+    [[nodiscard]] std::string kernel_release() const
         requires KnowsKernelRelease<R>
     {
-        return runner_->kernel_release();
+        return std::string{runner_->kernel_release()};
     }
 
     // The Records capability: capture this host's behaviour as a golden, for

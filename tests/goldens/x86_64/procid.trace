@@ -1,0 +1,49 @@
+# linuxity conformance trace
+# scenario: procid
+# arch: x86_64
+# recorded-by: live Linux kernel on this host
+# kernel: Linux 7.2.14-zen1-1-zen
+getpid = 1 | a pid is positive
+gettid = 1 | a tid is positive
+gettid = 1 | tid == pid in a single thread
+getppid = 1 | a ppid is non-negative
+getppid = 1 | ppid differs from pid
+getuid = 1 | uid is valid
+geteuid = 1 | euid == uid (no setuid here)
+getgid = 1 | gid is valid
+getegid = 1 | egid == gid
+openat = 1 | read /proc/self/status
+read = 1 | status Pid: matches getpid()
+read = 1 | status PPid: matches getppid()
+read = 1 | status has a Name: field
+read = 1 | status has a Uid: field
+read = 1 | status has a Threads: field
+openat = 1 | read /proc/self/stat
+read = 1 | stat field 1 is the pid
+read = 1 | stat field 2 is (comm)
+read = 1 | stat ends with a newline
+openat = 1 | read /proc/self/cmdline
+read = 1 | cmdline names this probe
+openat = 1 | read /proc/uptime
+read = 1 | uptime has two fields
+openat = 1 | read /proc/meminfo
+read = 1 | meminfo has MemTotal:
+openat = 1 | read /proc/stat
+read = 1 | stat has a cpu line
+openat = 1 | read /proc/cpuinfo
+openat = 1 | read /proc/version
+read = 1 | version says Linux
+uname = 0 | uname succeeds
+uname = 1 | sysname is exactly Linux
+uname = 1 | nodename is non-empty
+uname = 1 | release is non-empty
+prlimit64 = 0 | prlimit64 RLIMIT_NOFILE
+prlimit64 = 1 | NOFILE soft limit is positive
+prlimit64 = 1 | hard >= soft
+prlimit64 = -EINVAL | a bogus rlimit resource is EINVAL
+sched_getaffinity = 1 | affinity returns a size
+sched_getaffinity = 1 | at least one cpu is in the mask
+sched_getaffinity = -EINVAL | a zero-size affinity mask is EINVAL
+kill = 0 | kill(self, 0) succeeds
+kill = -EINVAL | a bogus signal is EINVAL
+kill = -errno(3) | an absent pid is ESRCH

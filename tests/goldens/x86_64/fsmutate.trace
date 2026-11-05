@@ -1,0 +1,51 @@
+# linuxity conformance trace
+# scenario: fsmutate
+# arch: x86_64
+# recorded-by: live Linux kernel on this host
+# kernel: Linux 7.2.14-zen1-1-zen
+mkdirat = 0 | mkdir the scratch dir
+mkdirat = -EEXIST | mkdir an existing dir is EEXIST
+mkdirat = -ENOENT | mkdir with a missing parent is ENOENT
+mkdirat = 0 | mkdir a subdir
+openat = 1 | create f1
+openat = -EEXIST | O_EXCL on an existing file is EEXIST
+unlinkat = -errno(39) | rmdir a non-empty dir is ENOTEMPTY
+unlinkat = -ENOTDIR | rmdir on a FILE is ENOTDIR
+unlinkat = -ENOENT | rmdir a missing dir is ENOENT
+unlinkat = -EISDIR | unlink on a dir is EISDIR
+linkat = 0 | hardlink f1 -> lnk
+linkat = -EEXIST | hardlink onto an existing name is EEXIST
+linkat = -ENOENT | hardlink a missing source is ENOENT
+linkat = -EPERM | hardlink a directory is EPERM
+newfstatat = 1 | stat f1 after linking
+newfstatat = 1 | stat lnk
+symlinkat = 0 | symlink sym -> f1
+symlinkat = -EEXIST | symlink onto an existing name is EEXIST
+readlinkat = 2 | readlink the symlink returns its length
+readlinkat = 1 @2:6631 | the symlink target
+readlinkat = -EINVAL | readlink a regular file is EINVAL
+readlinkat = -EINVAL | readlink with a 0 buffer is EINVAL
+symlinkat = 0 | create a dangling symlink
+newfstatat = -ENOENT | stat a dangling symlink is ENOENT
+newfstatat = 1 | lstat a dangling symlink succeeds
+unlinkat = 0 | unlink the dangling symlink
+renameat = 0 | rename lnk -> f2
+renameat = -ENOENT | rename a missing source is ENOENT
+renameat = -EISDIR | rename a file onto a dir is EISDIR
+renameat = -ENOTDIR | rename a dir onto a file is ENOTDIR
+renameat = 0 | rename onto itself succeeds
+fchmodat = 0 | chmod 600
+newfstatat = 1 | stat after chmod
+fchmodat = -ENOENT | chmod a missing file is ENOENT
+fchownat = 0 | chown with -1/-1 is a no-op success
+truncate = 0 | truncate f1 to 2
+truncate = -EINVAL | a negative truncate is EINVAL
+truncate = -ENOENT | truncate a missing file is ENOENT
+truncate = -EISDIR | truncate a directory is EISDIR
+utimensat = 0 | utimensat with NULL times sets now
+unlinkat = 0 | unlink sym
+unlinkat = 0 | unlink f2
+unlinkat = 0 | unlink f1
+unlinkat = 0 | rmdir the subdir
+unlinkat = 0 | rmdir the scratch dir
+newfstatat = -ENOENT | the scratch dir is gone

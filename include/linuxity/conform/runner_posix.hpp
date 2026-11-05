@@ -27,6 +27,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <spawn.h>
+#include <sys/stat.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -115,6 +116,10 @@ public:
 
     [[nodiscard]] bool write_file(std::string_view path,
                                   std::string_view text) const {
+        // Goldens live under goldens/<arch>/, and that directory may not exist
+        // on a fresh checkout or for a newly added arch. Creating it here
+        // keeps the policy layer (which computes the path) free of host calls.
+        make_parent_dirs(path);
         std::FILE* f = std::fopen(std::string{path}.c_str(), "wb");
         if (f == nullptr) return false;
         const std::size_t n = std::fwrite(text.data(), 1, text.size(), f);
@@ -141,6 +146,21 @@ public:
     }
 
 private:
+    // mkdir -p for a FILE path's directory component. Best-effort: a failure
+    // surfaces as the fopen below failing, which the caller already handles.
+    static void make_parent_dirs(std::string_view path) {
+        std::string p{path};
+        const auto last = p.rfind('/');
+        if (last == std::string::npos || last == 0) return;
+        p.resize(last);
+        for (std::size_t i = 1; i <= p.size(); ++i) {
+            if (i == p.size() || p[i] == '/') {
+                const std::string part = p.substr(0, i);
+                ::mkdir(part.c_str(), 0755);   // EEXIST is the normal case
+            }
+        }
+    }
+
     // Wait for the child, killing it past the deadline. Returns false if it
     // had to be killed.
     [[nodiscard]] static bool reap_within(::pid_t pid, std::uint32_t deadline_ms,
