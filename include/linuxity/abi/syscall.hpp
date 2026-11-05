@@ -1978,6 +1978,29 @@ public:
     // so the namespace can bind the guest path to that fd (readlinkat etc.),
     // and — for a virtual directory — the entries getdents64 will enumerate.
     void note_opened_fd(std::int64_t fd) {
+        if (fd >= 0) {
+            // A newly opened fd REPLACES whatever that number meant before.
+            //
+            // close(2) is deliberately untrapped on the seccomp fast path (it
+            // fires on every fd teardown), so when a guest closes a directory
+            // fd we never hear about it -- its DirStream stays registered. The
+            // kernel then hands the SAME number to the next open(). If that
+            // open is a FILE, the stale stream turns its lseek into a virtual
+            // directory seek: the host fd never rewinds, the re-read returns
+            // the wrong bytes, and a parser sees garbage.
+            //
+            // That is exactly how `ps aux` died with SIGFPE. libproc2 opens
+            // /proc/meminfo, gets the fd a just-closed /proc dir had, and
+            // re-reads it via lseek(fd, 0, SEEK_SET). The seek was swallowed,
+            // MemTotal parsed as 0, and pr_pmem divided by it. It only became
+            // reachable once lseek was trapped (for rewinddir) -- the two fixes
+            // are correct individually and wrong together.
+            //
+            // The open is the one event we DO see, so drop the stale binding
+            // (path and dir stream) here; bind_fd/bind_dir below re-establish
+            // whatever this open actually is.
+            k_.files().unbind_fd(static_cast<int>(fd));
+        }
         if (fd >= 0 && !pending_open_.empty()) {
             k_.files().bind_fd(static_cast<int>(fd), pending_open_);
             if (pending_dir_) {
