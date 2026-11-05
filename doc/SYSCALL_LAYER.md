@@ -165,13 +165,43 @@ Each step leaves the tree compiling and green.
    for it. `test_hostcalls` pins the contract (including a negative test that
    a partial host FAILS it) and the errno regressions.
 
-4. **NEXT** Migrate the portable dispatcher's host-touching paths onto
-   `HostCalls`, with Linux's implementation forwarding as it does today. This
-   is the behaviour-neutral step that makes 5 possible.
+4. **REVISED, and the original plan was wrong.** Step 4 was "migrate the
+   portable dispatcher's host-touching paths onto `HostCalls`". Measuring it
+   first showed there are none:
 
-5. Migrate Windows' 46 duplicated cases onto the portable dispatcher,
-   deleting them from `windows/sys.hpp`. This is where the `getpid`-returns-1
-   class of bug dies.
+   ```
+   grep -E '::(read|write|open|close|clock_gettime|getentropy)\(' abi/syscall.hpp
+   -> no matches
+   ```
+
+   The portable dispatcher reaches the outside world only through
+   `k_.files()` (73 sites), `k_.procs()` (2) and `k_.machine()` (2) — all
+   subsystem concepts. It is ALREADY host-free, which is why Linux works by
+   returning `fwd()` and never calling a host primitive itself.
+
+   So `HostCalls` has exactly one real consumer: a backend with no Linux
+   kernel under it, which must IMPLEMENT what Linux forwards. That is why
+   `posix_hostcalls.hpp` was still worth building — it is the reference
+   implementation and the compile-time proof of the contract — but there is
+   nothing in `abi/` to migrate onto it. Step 4 is therefore complete as
+   written, with no dispatcher change.
+
+5. **NEXT, and now measured.** `windows/sys.hpp` is 775 lines:
+
+   | | lines | verdict |
+   |---|---|---|
+   | genuine Win32 host I/O | **13** | irreplaceable; belongs in a backend |
+   | hardcoded policy answers | **50** | duplicates `abi/`, and is WRONG |
+   | path / fd / dirent plumbing | ~700 | duplicates `kernel/` + `abi/` |
+
+   Thirteen lines of that file have any business existing. The rest is a
+   reimplementation, and a worse one: `getpid`/`gettid`/`getppid` return a
+   hardcoded `1`, so on Windows **every process sees pid 1** while the
+   portable dispatcher has returned real per-task guest pids all along.
+
+   The migration is therefore: route `WhpTrap` through `abi::Syscalls` with a
+   `WhpHostCalls` supplying those 13 lines' worth of primitives, and delete
+   the rest. That is the step that cannot be compile-verified on this host.
 
 6. No raw syscall numbers outside `abi/` — as a layout rule — once 5 lands.
 
