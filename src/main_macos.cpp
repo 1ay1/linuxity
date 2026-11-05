@@ -1002,7 +1002,7 @@ int main(int argc, char** argv) {
         init.comm = prog.substr(prog.find_last_of('/') + 1);
         for (int j = i; j < argc; ++j) {
             init.cmdline += argv[j];
-            if (j + 1 < argc) init.cmdline.push_back(' ');
+            if (j + 1 < argc) init.cmdline.push_back('\0');   // ProcInfo: NUL-joined
         }
         m.k.procs().upsert(init);
     }

@@ -677,7 +677,44 @@ private:
         std::string_view dir = at ? dir_of(static_cast<std::int64_t>(r.arg[0]))
                                   : std::string_view{};
         std::string abs = k_.files().absolutize(raw, dir);
-        return expand_proc_links(std::move(abs), follow_leaf);
+        return expand_proc_links(bind_proc_self(std::move(abs)), follow_leaf);
+    }
+
+    // /proc/self and /proc/thread-self mean "the task making THIS syscall".
+    //
+    // procfs is a producer of bytes with no idea who is asking, so it used to
+    // canonicalize /proc/self to /proc/1 unconditionally. That gave every
+    // process pid 1's view: a forked child reading /proc/self/cmdline got its
+    // PARENT's argv (10 bytes, "/tmp/argv\0") where the kernel returns its own
+    // (22 bytes, all four args), and /proc/self/stat reported pid 1 for every
+    // task. Anything that introspects itself through /proc -- argv-based
+    // re-exec, a daemon reading its own status, `ps -p $$` -- saw the wrong
+    // process.
+    //
+    // The dispatcher is the layer that KNOWS the caller (ids()), so `self` is
+    // bound here, before the path reaches procfs. procfs's own fallback stays
+    // for callers with no task context.
+    [[nodiscard]] std::string bind_proc_self(std::string abs) {
+        auto rebind = [&](std::string_view prefix, std::int32_t id) {
+            if (abs == prefix || (abs.starts_with(prefix) &&
+                                  abs.size() > prefix.size() &&
+                                  abs[prefix.size()] == '/')) {
+                abs = "/proc/" + std::to_string(id) + abs.substr(prefix.size());
+                return true;
+            }
+            return false;
+        };
+        if (!abs.starts_with("/proc/")) return abs;
+        const auto id = ids();
+        if (rebind("/proc/self", id.pid)) return abs;
+        // thread-self is a TID, not a pid: /proc/thread-self is
+        // /proc/<pid>/task/<tid> on a real kernel.
+        if (abs == "/proc/thread-self" || abs.starts_with("/proc/thread-self/")) {
+            const std::string rest = abs.substr(std::string_view{"/proc/thread-self"}.size());
+            abs = "/proc/" + std::to_string(id.pid) + "/task/" +
+                  std::to_string(id.tid) + rest;
+        }
+        return abs;
     }
     [[nodiscard]] std::string expand_proc_links(std::string abs, bool follow_leaf) {
         if (!abs.starts_with("/proc/")) return abs;
@@ -990,8 +1027,25 @@ private:
         if (pc.realm == kernel::Realm2::virtual_file) {
             // A synthesized symlink (e.g. /dev/stdin -> /proc/self/fd/0)
             // carries its target in the produced node; serve it directly.
-            if (auto vf = k_.files().produce(abs); vf && !vf->symlink_target.empty())
+            if (auto vf = k_.files().produce(abs); vf && !vf->symlink_target.empty()) {
+                // ...but NEVER the "(proc-link)" sentinel. procfs uses it to
+                // say "this is a symlink whose target only the dispatcher
+                // knows" (cwd/root/exe), expecting proc_symlink_target()
+                // above to substitute the real value. When that returns empty
+                // -- an exe we cannot name, a pid that just exited -- this
+                // line happily handed the guest the literal string
+                // "(proc-link)".
+                //
+                // glibc's _dl_get_origin readlinks /proc/self/exe and asserts
+                // linkval[0]=='/'. An 11-byte relative "(proc-link)" fails
+                // that and ABORTS the process: "Fatal glibc error:
+                // dl-origin.c:42 assertion failed", which is what killed
+                // every pacman scriptlet. ENOENT is the honest answer -- the
+                // link exists but we cannot resolve it -- and callers handle
+                // it, where they cannot handle a lie.
+                if (vf->symlink_target == "(proc-link)") return eno(Errno::enoent);
                 return write_link(buf, cap, vf->symlink_target);
+            }
             return eno(Errno::einval);   // a plain virtual file is not a symlink
         }
         return eno(pc.error);
@@ -1024,10 +1078,18 @@ private:
                 if (std::string e = mem_.exe_of_pid(pid); !e.empty()) return e;
             }
             if (const auto* pi = k_.procs().find(pid)) {
-                // cmdline is space-joined argv; the first token is argv[0].
+                // cmdline is NUL-joined argv (ProcInfo::cmdline's documented
+                // format, and the /proc wire format), so argv[0] ends at the
+                // first NUL -- not the first space. Splitting on a space here
+                // used to be right when the field was space-joined; once it
+                // became NUL-joined this returned the WHOLE command line as
+                // the exe target, so readlink("/proc/self/exe") handed glibc
+                // "/bin/prog\0arg" and _dl_get_origin aborted the process
+                // ("assertion failed: linkval[0] == '/'" is the next check
+                // after it mangles that into a relative path).
                 std::string c = pi->cmdline;
-                auto sp = c.find(' ');
-                std::string a0 = sp == std::string::npos ? c : c.substr(0, sp);
+                auto nul = c.find('\0');
+                std::string a0 = nul == std::string::npos ? c : c.substr(0, nul);
                 // Only an ABSOLUTE argv[0] is a valid exe link target; a bare
                 // name ("linuxity", "bash") or the spawn placeholder is not,
                 // so we leave the link to the host-backed /proc (redirect).

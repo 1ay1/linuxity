@@ -281,11 +281,25 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
             return ok(text_file("nodev\tproc\nnodev\tsysfs\nnodev\ttmpfs\n\text4\n"));
         // The mount table. /etc/mtab -> /proc/self/mounts, and pacman/df read
         // it to determine filesystem mount points before checking free space,
-        // so /proc/mounts AND the per-pid /proc/<pid>/mounts (self canonicalized
-        // to pid 1) must all yield it. Compare against the canonicalized `p`.
-        if (p == "/proc/mounts" || p == "/proc/1/mounts" ||
-            p == "/proc/1/mountinfo" || p == "/proc/1/mountstats") {
-            if (p == "/proc/1/mountinfo")
+        // so /proc/mounts AND every per-pid /proc/<pid>/mounts must yield it.
+        //
+        // This matched only /proc/1/{mounts,mountinfo,mountstats}, which
+        // worked solely because /proc/self used to canonicalize to /proc/1
+        // for EVERY process. Once self binds to the real caller, pid 13
+        // reading /proc/self/mounts asks for /proc/13/mounts, and that hit
+        // ENOENT -- breaking df, pacman's space check and /etc/mtab at once.
+        // All guest tasks share one mount namespace, so the table is the same
+        // for any pid; match the shape rather than the number.
+        const auto per_pid = [&](std::string_view leaf) {
+            if (!p.starts_with("/proc/") || !p.ends_with(leaf)) return false;
+            const std::string_view mid{p.data() + 6, p.size() - 6 - leaf.size()};
+            return !mid.empty() &&
+                   mid.find_first_not_of("0123456789") == std::string_view::npos;
+        };
+        const bool mountinfo = per_pid("/mountinfo");
+        if (p == "/proc/mounts" || per_pid("/mounts") || mountinfo ||
+            per_pid("/mountstats")) {
+            if (mountinfo)
                 return ok(text_file(
                     "1 1 0:1 / / rw - rootfs rootfs rw\n"
                     "2 1 0:2 / /proc rw,nosuid,nodev,noexec - proc proc rw\n"

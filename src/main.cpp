@@ -328,7 +328,7 @@ int main(int argc, char** argv) {
         init.cmdline.clear();
         for (std::size_t j = 0; j < gargv.size(); ++j) {
             init.cmdline += gargv[j];
-            if (j + 1 < gargv.size()) init.cmdline.push_back(' ');
+            if (j + 1 < gargv.size()) init.cmdline.push_back('\0');   // ProcInfo: NUL-joined
         }
         k.procs().upsert(init);
     }

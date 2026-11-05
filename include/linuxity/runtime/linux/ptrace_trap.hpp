@@ -652,9 +652,39 @@ public:
         }
     }
 
-    // Read a task's current program name from the host's /proc/<tid>/comm.
-    // Used at PTRACE_EVENT_EXEC to learn the new image's name.
-    static std::string comm_of(::pid_t tid) {
+    // A task's program name for /proc/<pid>/comm, the (comm) field of stat,
+    // and Name: in status.
+    //
+    // NOT the host's /proc/<tid>/comm. linuxity launches every dynamic guest
+    // as `ld-linux-x86-64.so.2 /bin/prog ...`, so the host kernel's comm for
+    // that task is the LOADER -- "ld-linux-x86-64" -- for every single dynamic
+    // process. That made /proc report the same name for bash, ps and ls, so
+    // `pgrep bash` found nothing while bash was running, `pstree` showed a
+    // tree of identical loaders, and `top`'s COMMAND column was useless.
+    //
+    // cmdline_of() already strips that launch artifact for /proc/PID/cmdline.
+    // comm is the same fact -- "what program is this" -- so it is derived from
+    // the same cleaned argv instead of re-reading a second, wrong source. The
+    // kernel truncates comm to TASK_COMM_LEN-1 (15) bytes; matching that keeps
+    // `ps -o comm` columns and pgrep's exact-match semantics identical to a
+    // real kernel.
+    std::string comm_of(::pid_t tid) const {
+        const std::string cmd = cmdline_of(tid);
+        if (!cmd.empty()) {
+            // argv[0] of the de-translated command line, basename only.
+            const std::string argv0 = cmd.substr(0, cmd.find('\0'));
+            const auto slash = argv0.find_last_of('/');
+            std::string base = slash == std::string::npos ? argv0
+                                                          : argv0.substr(slash + 1);
+            if (base.size() > 15) base.resize(15);   // TASK_COMM_LEN - 1
+            if (!base.empty()) return base;
+        }
+        // No usable argv (a task that cleared its own): fall back to the
+        // host's comm, which is right for a static guest with no loader.
+        return host_comm_of(tid);
+    }
+
+    static std::string host_comm_of(::pid_t tid) {
         std::string path = "/proc/" + std::to_string(tid) + "/comm";
         int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
         if (fd < 0) return {};
@@ -707,9 +737,15 @@ public:
                    base.rfind("ld.so", 0) == 0;
         };
         std::size_t start = (args.size() > 1 && is_interp(args[0])) ? 1 : 0;
+        // NUL-joined, which is ProcInfo::cmdline's documented contract and
+        // the exact /proc/<pid>/cmdline wire format. This used to join with
+        // SPACES, contradicting the field's own comment -- so a guest got
+        // "/tmp/argv C two three" where the kernel gives
+        // "/tmp/argv\0C\0two\0three", and an argument containing a space
+        // became indistinguishable from two arguments.
         std::string out;
         for (std::size_t i = start; i < args.size(); ++i) {
-            if (!out.empty()) out.push_back(' ');
+            if (i > start) out.push_back('\0');
             out += detranslate(args[i]);
         }
         return out;
