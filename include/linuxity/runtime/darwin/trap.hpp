@@ -49,6 +49,7 @@
 #include "linuxity/abi/result.hpp"
 #include "linuxity/abi/syscall.hpp"
 #include "linuxity/abi/wire/at_flags.hpp"
+#include "linuxity/abi/wire/fd_flags.hpp"
 #include "linuxity/abi/wire/dirent64.hpp"
 #include "linuxity/abi/wire/mmap.hpp"
 #include "linuxity/runtime/backend.hpp"
@@ -3103,9 +3104,8 @@ private:
                 return proc_.with_fds([&](FdTable& t) { return t.close(gfd); });
             case S::dup:   return proc_.with_fds([&](FdTable& t) { return t.dup(gfd, std::nullopt, false); });
             case S::dup3: {
-                constexpr std::uint64_t kCloexec = 02000000;
                 if (static_cast<int>(a1) == gfd) return -22;          // EINVAL
-                return proc_.with_fds([&](FdTable& t) { return t.dup(gfd, static_cast<int>(a1), (a2 & kCloexec) != 0); });
+                return proc_.with_fds([&](FdTable& t) { return t.dup(gfd, static_cast<int>(a1), (a2 & abi::wire::kOCloexec) != 0); });
             }
             case S::fcntl: return do_fcntl(gfd, a1, a2);
             case S::ioctl: {
@@ -3124,19 +3124,18 @@ private:
             // counter semantics only have to be consistent, since nothing
             // but the owner interprets the bytes.
             case S::eventfd2: {
-                constexpr std::uint64_t kNonblock = 0x800, kCloexec = 0x80000;
                 int p[2];
                 if (::pipe(p) < 0) return darwin::fail();
                 for (int e : p) {
                     ::fcntl(e, F_SETFD, FD_CLOEXEC);
-                    if (a1 & kNonblock)
+                    if (a1 & abi::wire::kONonblock)
                         ::fcntl(e, F_SETFL, ::fcntl(e, F_GETFL) | O_NONBLOCK);
                 }
                 // One guest fd, both pipe ends: a read drains, a write
                 // signals. The write end is kept alive by the EventFd record
                 // so the read end never sees EOF.
                 const int g = proc_.with_fds([&](FdTable& t) {
-                    return t.install_eventfd(p[0], p[1], (a1 & kCloexec) != 0);
+                    return t.install_eventfd(p[0], p[1], (a1 & abi::wire::kOCloexec) != 0);
                 });
                 if (g < 0) { ::close(p[0]); ::close(p[1]); return -24; }
                 if (a0) {
@@ -3156,8 +3155,11 @@ private:
                 const std::string name = ram.cstr(a0, 249);
                 const int h = make_memfd(name);
                 if (h < 0) return darwin::fail();
-                constexpr std::uint64_t kCloexec = 1;        // MFD_CLOEXEC
-                return install_or_close(h, (a1 & kCloexec) != 0);
+                // MFD_CLOEXEC is 1, NOT O_CLOEXEC's 0x80000. memfd_create has
+                // its own tiny flag space; using the open-flag bit here
+                // silently fails to set close-on-exec and the fd leaks
+                // through every later exec.
+                return install_or_close(h, (a1 & abi::wire::kMfdCloexec) != 0);
             }
             case S::memfd_secret:
                 // Memory no other process (not even the kernel) can map.
@@ -3171,8 +3173,7 @@ private:
                 int p[2];
                 if (::pipe(p) < 0) return darwin::fail();
                 for (int e : p) ::fcntl(e, F_SETFD, FD_CLOEXEC);
-                constexpr std::uint64_t kNonblock = 0x800;   // TFD_NONBLOCK
-                if (a1 & kNonblock)
+                if (a1 & abi::wire::kONonblock)
                     ::fcntl(p[0], F_SETFL, ::fcntl(p[0], F_GETFL) | O_NONBLOCK);
                 const int g = proc_.with_fds([&](FdTable& t) {
                     return t.install_eventfd(p[0], p[1], (a1 & 1) != 0);
@@ -3221,8 +3222,7 @@ private:
                 int p[2];
                 if (::pipe(p) < 0) return darwin::fail();
                 for (int e : p) ::fcntl(e, F_SETFD, FD_CLOEXEC);
-                constexpr std::uint64_t kNonblock = 0x800;
-                if (a3 & kNonblock)
+                if (a3 & abi::wire::kONonblock)
                     ::fcntl(p[0], F_SETFL, ::fcntl(p[0], F_GETFL) | O_NONBLOCK);
                 const int g = proc_.with_fds([&](FdTable& t) {
                     return t.install_eventfd(p[0], p[1], (a3 & 1) != 0);
@@ -3278,15 +3278,14 @@ private:
             case S::pipe2: {
                 // pipe2(int fds[2], flags): a real Darwin pipe, installed
                 // into the guest's table. Host ends are CLOEXEC regardless.
-                constexpr std::uint64_t kCloexec = 02000000, kNonblock = 04000;
                 int p[2];
                 if (::pipe(p) < 0) return darwin::fail();
                 for (int e : p) {
                     ::fcntl(e, F_SETFD, FD_CLOEXEC);
-                    if (a1 & kNonblock)
+                    if (a1 & abi::wire::kONonblock)
                         ::fcntl(e, F_SETFL, ::fcntl(e, F_GETFL) | O_NONBLOCK);
                 }
-                const bool cx = (a1 & kCloexec) != 0;
+                const bool cx = (a1 & abi::wire::kOCloexec) != 0;
                 // BOTH ends in ONE locked section. Two separate install()
                 // calls would also be correct here, but doing it atomically
                 // keeps the guest's fd numbering deterministic when another
@@ -3501,9 +3500,8 @@ private:
                 // close(), dup() and the fd table need no special case.
                 const int placeholder = ::open("/dev/null", O_RDWR | O_CLOEXEC);
                 if (placeholder < 0) return darwin::fail();
-                constexpr std::uint64_t kCloexec = 0x80000;     // EPOLL_CLOEXEC
                 const int g = proc_.with_fds([&](FdTable& t) {
-                    return t.install(placeholder, (a0 & kCloexec) != 0);
+                    return t.install(placeholder, (a0 & abi::wire::kOCloexec) != 0);
                 });
                 if (g < 0) { ::close(placeholder); return -24; }
                 epolls_[g] = std::move(set);
@@ -4122,8 +4120,7 @@ private:
                                 darwin::open_flags(lflags) | O_CLOEXEC,
                                 static_cast<mode_t>(lmode));
                 if (fd < 0) return darwin::fail();
-                constexpr std::uint64_t kCloexec = 02000000;
-                return proc_.with_fds([&](FdTable& t) { return t.install(fd, (lflags & kCloexec) != 0); });
+                return proc_.with_fds([&](FdTable& t) { return t.install(fd, (lflags & abi::wire::kOCloexec) != 0); });
             }
             case S::newfstatat: {
                 if (!path) return -2;

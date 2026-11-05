@@ -2,6 +2,7 @@
 // kernel ABI, so it holds on every host and needs no VM to check.
 #include "linuxity/abi/wire/at_flags.hpp"
 #include "linuxity/abi/wire/dirent64.hpp"
+#include "linuxity/abi/wire/fd_flags.hpp"
 #include "linuxity/abi/wire/iovec.hpp"
 #include "linuxity/abi/wire/mmap.hpp"
 #include "linuxity/abi/wire/open_flags.hpp"
@@ -409,6 +410,40 @@ int main() {
         check(dtype_from_mode(0) == DType::unknown, "no type bits -> DT_UNKNOWN");
         check(static_cast<std::uint32_t>(DType::dir) != bits(FileType::dir),
               "DT_DIR and S_IFDIR are genuinely different numbers");
+    }
+
+    // -- descriptor-creation flags -----------------------------------------
+    // `kCloexec` was declared FIVE times in darwin/trap.hpp with TWO
+    // different values. Four were the same number written in two bases;
+    // the fifth (MFD_CLOEXEC) was a different constant wearing the same
+    // name. Values verified against this host's headers.
+    {
+        using namespace lx::abi::wire;
+        // Octal/hex is how the duplication hid: these look unrelated.
+        check(kOCloexec == 0x80000, "O_CLOEXEC is 0x80000");
+        check(02000000 == 0x80000, "02000000 and 0x80000 are the same number");
+        check(kONonblock == 0x800, "O_NONBLOCK is 0x800");
+        check(04000 == 0x800, "04000 and 0x800 are the same number");
+
+        // The aliases share the bit on purpose, so an open-like call can
+        // pass one flag word.
+        check(kEpollCloexec == kOCloexec, "EPOLL_CLOEXEC shares O_CLOEXEC");
+        check(kSockCloexec == kOCloexec, "SOCK_CLOEXEC shares it");
+        check(kEfdCloexec == kOCloexec, "EFD_CLOEXEC shares it");
+        check(kTfdCloexec == kOCloexec, "TFD_CLOEXEC shares it");
+        check(kSockNonblock == kONonblock, "SOCK_NONBLOCK shares O_NONBLOCK");
+
+        // THE BUG THIS PREVENTS: MFD_CLOEXEC and FD_CLOEXEC are 1, NOT
+        // 0x80000. Using the open-flag bit for memfd_create silently fails
+        // to set close-on-exec, and the leaked fd survives every later exec.
+        // I hit this exact bug with a careless regex while writing this
+        // commit, which is why the assertion exists.
+        check(kMfdCloexec == 1, "MFD_CLOEXEC is 1");
+        check(kFdCloexec == 1, "FD_CLOEXEC is 1");
+        check(kMfdCloexec != kOCloexec,
+              "MFD_CLOEXEC must NOT be unified onto O_CLOEXEC");
+        check(kFdCloexec != kOCloexec,
+              "FD_CLOEXEC must NOT be unified onto O_CLOEXEC");
     }
 
     if (failures == 0) std::puts("wire: all checks passed");
