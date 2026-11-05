@@ -2,6 +2,7 @@
 // kernel ABI, so it holds on every host and needs no VM to check.
 #include "linuxity/abi/wire/dirent64.hpp"
 #include "linuxity/abi/wire/iovec.hpp"
+#include "linuxity/abi/wire/mmap.hpp"
 #include "linuxity/abi/wire/open_flags.hpp"
 #include "linuxity/abi/wire/path.hpp"
 #include "linuxity/abi/wire/stat.hpp"
@@ -296,6 +297,47 @@ int main() {
         check(sizeof(Iovec) == 16, "iovec is 16 bytes on LP64");
         check(alignof(Iovec) == 8, "iovec is 8-aligned");
         check(lx::abi::wire::kIovMax == 1024, "IOV_MAX is 1024");
+    }
+
+    // -- mmap prot / flags -------------------------------------------------
+    // Values checked against this host's <sys/mman.h> before being written
+    // down. MAP_* is a near-miss family -- 0x2000 LOCKED, 0x4000 NORESERVE,
+    // 0x8000 POPULATE -- so mistaking one for another changes mapping
+    // semantics silently instead of failing.
+    {
+        using namespace lx::abi::wire;
+        check(bits(Prot::read) == 1 && bits(Prot::write) == 2 &&
+              bits(Prot::exec) == 4, "PROT_* are 1/2/4");
+        check(bits(Prot::none) == 0, "PROT_NONE is 0, not a bit");
+        check(bits(MapFlag::shared) == 0x01, "MAP_SHARED");
+        check(bits(MapFlag::priv) == 0x02, "MAP_PRIVATE");
+        check(bits(MapFlag::fixed) == 0x10, "MAP_FIXED");
+        check(bits(MapFlag::anonymous) == 0x20, "MAP_ANONYMOUS");
+        check(bits(MapFlag::locked) == 0x2000, "MAP_LOCKED");
+        check(bits(MapFlag::noreserve) == 0x4000, "MAP_NORESERVE");
+        check(bits(MapFlag::populate) == 0x8000, "MAP_POPULATE");
+        check(bits(MapFlag::stack) == 0x20000, "MAP_STACK");
+        check(bits(MapFlag::fixed_noreplace) == 0x100000, "MAP_FIXED_NOREPLACE");
+
+        // The near-miss neighbours must stay distinct.
+        check(bits(MapFlag::locked) != bits(MapFlag::noreserve), "LOCKED != NORESERVE");
+        check(bits(MapFlag::noreserve) != bits(MapFlag::populate), "NORESERVE != POPULATE");
+
+        // An anonymous mapping ignores the fd. A backend that misses this
+        // tries to map fd -1 and fails a valid allocation.
+        check(is_anonymous(bits(MapFlag::anonymous) | bits(MapFlag::priv)),
+              "MAP_ANONYMOUS|MAP_PRIVATE is anonymous");
+        check(!is_anonymous(bits(MapFlag::priv)), "MAP_PRIVATE alone is not");
+
+        // MAP_FIXED replaces an existing mapping; MAP_FIXED_NOREPLACE returns
+        // EEXIST. Treating the second as the first is silent data loss.
+        check(wants_fixed(bits(MapFlag::fixed)), "MAP_FIXED pins the address");
+        check(wants_fixed(bits(MapFlag::fixed_noreplace)), "so does NOREPLACE");
+        check(!wants_fixed(bits(MapFlag::priv)), "MAP_PRIVATE does not");
+        check(fixed_must_not_replace(bits(MapFlag::fixed_noreplace)),
+              "NOREPLACE must not clobber an existing mapping");
+        check(!fixed_must_not_replace(bits(MapFlag::fixed)),
+              "plain MAP_FIXED may clobber");
     }
 
     if (failures == 0) std::puts("wire: all checks passed");

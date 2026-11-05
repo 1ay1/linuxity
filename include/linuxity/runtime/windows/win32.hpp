@@ -34,6 +34,7 @@
 #include <windows.h>
 
 #include "linuxity/abi/result.hpp"
+#include "linuxity/abi/wire/mmap.hpp"
 #include "linuxity/abi/wire/open_flags.hpp"
 #include "linuxity/abi/wire/stat.hpp"
 #include "linuxity/abi/wire/time.hpp"
@@ -404,9 +405,10 @@ enum : std::int32_t {
 }
 
 // -- mmap protection -------------------------------------------------------
-inline constexpr std::uint64_t kProtRead  = 1;
-inline constexpr std::uint64_t kProtWrite = 2;
-inline constexpr std::uint64_t kProtExec  = 4;
+// Guest PROT_* bits. Defined ONCE in abi/wire/mmap.hpp.
+inline constexpr std::uint64_t kProtRead  = abi::wire::bits(abi::wire::Prot::read);
+inline constexpr std::uint64_t kProtWrite = abi::wire::bits(abi::wire::Prot::write);
+inline constexpr std::uint64_t kProtExec  = abi::wire::bits(abi::wire::Prot::exec);
 
 // Linux PROT_* -> the PTE bits our page tables use. Note that x86-64 paging
 // cannot express "execute but not read": a readable page is always readable,

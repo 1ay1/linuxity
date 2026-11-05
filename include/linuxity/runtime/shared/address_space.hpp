@@ -22,6 +22,8 @@
 // interval map per backend is how the two drift apart.
 #pragma once
 
+#include "linuxity/abi/wire/mmap.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <optional>
@@ -40,14 +42,27 @@ enum class GuestProt : unsigned { none = 0, read = 1, write = 2, exec = 4 };
     return (static_cast<unsigned>(set) & static_cast<unsigned>(p)) != 0;
 }
 
-// Translate Linux PROT_* (arch-independent: 1/2/4) into GuestProt.
+// Translate Linux PROT_* into GuestProt. The bit values come from
+// abi/wire/mmap.hpp rather than the literals 1/2/4, so there is one place
+// that says what PROT_WRITE is.
 [[nodiscard]] constexpr GuestProt prot_from_linux(std::uint64_t p) noexcept {
     auto out = GuestProt::none;
-    if (p & 1) out = out | GuestProt::read;
-    if (p & 2) out = out | GuestProt::write;
-    if (p & 4) out = out | GuestProt::exec;
+    if (abi::wire::has_prot(p, abi::wire::Prot::read))  out = out | GuestProt::read;
+    if (abi::wire::has_prot(p, abi::wire::Prot::write)) out = out | GuestProt::write;
+    if (abi::wire::has_prot(p, abi::wire::Prot::exec))  out = out | GuestProt::exec;
     return out;
 }
+
+// GuestProt deliberately uses the SAME bit values as the guest's PROT_*, so
+// the translation above is a widening rather than a remap. Pinned, because a
+// future divergence would make the two silently interchangeable at the call
+// sites that pass raw integers around.
+static_assert(static_cast<unsigned>(GuestProt::read) ==
+              abi::wire::bits(abi::wire::Prot::read));
+static_assert(static_cast<unsigned>(GuestProt::write) ==
+              abi::wire::bits(abi::wire::Prot::write));
+static_assert(static_cast<unsigned>(GuestProt::exec) ==
+              abi::wire::bits(abi::wire::Prot::exec));
 
 // ELF PF_X=1, PF_W=2, PF_R=4 -> GuestProt.
 [[nodiscard]] constexpr GuestProt prot_from_elf(std::uint64_t pf) noexcept {

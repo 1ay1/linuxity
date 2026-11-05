@@ -128,6 +128,30 @@ for s in Timespec Timeval Itimerval Itimerspec Iovec; do
     done
 done
 
+# 9. Guest ABI CONSTANTS are defined in abi/wire/, not re-spelled per backend.
+#    MAP_*/PROT_* lived in windows/mm.hpp, windows/win32.hpp AND as an inline
+#    `constexpr kFixed = 0x10, kAnon = 0x20` inside a darwin function body.
+#    That last one is the tell: a constant cheap to redeclare gets redeclared
+#    at the point of use, and then there is no single place to fix it. MAP_*
+#    is also a near-miss family (0x2000 LOCKED / 0x4000 NORESERVE / 0x8000
+#    POPULATE), where picking the wrong neighbour changes mapping semantics
+#    silently rather than failing.
+#
+#    Matches a literal hex assignment to a MAP_/PROT_-ish name. A backend
+#    aliasing abi::wire::bits(...) passes; writing 0x20 again does not. The
+#    WHv* prefix is excluded: those are Win32's OWN hypervisor API constants
+#    (WHvMapGpaRangeFlagRead), not the guest's ABI, and they must stay with
+#    the API they belong to.
+hits=$(grep -rlE '(^|[^A-Za-z])(k|LINUX_|LX_)?(Map|Prot|MAP_|PROT_)[A-Za-z_]*[[:space:]]*=[[:space:]]*0x?[0-9]+' \
+       include/linuxity src 2>/dev/null \
+       | grep -v '^include/linuxity/abi/wire/' || true)
+for f in $hits; do
+    # Keep only files with a hit that ISN'T a WHv*/host-API constant.
+    grep -E '(^|[^A-Za-z])(k|LINUX_|LX_)?(Map|Prot|MAP_|PROT_)[A-Za-z_]*[[:space:]]*=[[:space:]]*0x?[0-9]+' "$f" \
+        | grep -qvE 'WHv|ExceptionType' \
+        && note "guest mmap constants defined outside abi/wire/: $f"
+done
+
 if [ "$fail" -eq 0 ]; then
     echo "runtime layout: all structural invariants hold"
 else

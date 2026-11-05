@@ -34,6 +34,7 @@
 
 #if defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__))
 
+#include "linuxity/abi/wire/mmap.hpp"
 #include "linuxity/abi/result.hpp"
 #include "linuxity/runtime/shared/address_space.hpp"
 #include "linuxity/runtime/windows/mem.hpp"
@@ -46,13 +47,15 @@
 
 namespace lx::runtime {
 
-// Linux mmap flags (x86-64 / asm-generic).
-inline constexpr std::uint64_t kMapShared    = 0x01;
-inline constexpr std::uint64_t kMapPrivate   = 0x02;
-inline constexpr std::uint64_t kMapFixed     = 0x10;
-inline constexpr std::uint64_t kMapAnonymous = 0x20;
-inline constexpr std::uint64_t kMapNoReserve = 0x4000;
-inline constexpr std::uint64_t kMapStack     = 0x20000;
+// Linux mmap flags. Defined ONCE in abi/wire/mmap.hpp -- these were spread
+// over this file, win32.hpp and an inline redeclaration in darwin/trap.hpp.
+// The names stay so call sites read unchanged.
+inline constexpr std::uint64_t kMapShared    = abi::wire::bits(abi::wire::MapFlag::shared);
+inline constexpr std::uint64_t kMapPrivate   = abi::wire::bits(abi::wire::MapFlag::priv);
+inline constexpr std::uint64_t kMapFixed     = abi::wire::bits(abi::wire::MapFlag::fixed);
+inline constexpr std::uint64_t kMapAnonymous = abi::wire::bits(abi::wire::MapFlag::anonymous);
+inline constexpr std::uint64_t kMapNoReserve = abi::wire::bits(abi::wire::MapFlag::noreserve);
+inline constexpr std::uint64_t kMapStack     = abi::wire::bits(abi::wire::MapFlag::stack);
 
 // -- Guest physical frame allocator ---------------------------------------
 // A bitmap over the pages of guest RAM. Simple and deliberately so: the

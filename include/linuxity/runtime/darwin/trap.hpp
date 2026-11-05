@@ -49,6 +49,7 @@
 #include "linuxity/abi/result.hpp"
 #include "linuxity/abi/syscall.hpp"
 #include "linuxity/abi/wire/dirent64.hpp"
+#include "linuxity/abi/wire/mmap.hpp"
 #include "linuxity/runtime/backend.hpp"
 #include "linuxity/runtime/darwin/darwin.hpp"
 #include "linuxity/runtime/darwin/epoll.hpp"
@@ -2940,11 +2941,13 @@ private:
             case S::brk:
                 return static_cast<std::int64_t>(proc_.with_space([&](AddressSpace& t) { return t.set_brk(a0); }));
             case S::mmap: {
-                constexpr std::uint64_t kFixed = 0x10, kAnon = 0x20;
-                const bool anon = (a3 & kAnon) != 0;
+                // Guest MAP_* bits come from abi/wire/mmap.hpp. These used to be
+                // redeclared inline right here (`kFixed = 0x10, kAnon = 0x20`),
+                // which is how a constant ends up with no single place to fix.
+                const bool anon = abi::wire::is_anonymous(a3);
                 const std::uint64_t len = AddressSpace::page_up(a1);
                 std::uint64_t at = proc_.with_space([&](AddressSpace& t) { return t.map(a0, a1, prot_from_linux(a2),
-                                           (a3 & kFixed) != 0, anon); });
+                                           abi::wire::wants_fixed(a3), anon); });
                 if (at == AddressSpace::kFail) return -12;          // ENOMEM
                 auto win = machine_.ram().at(at, len);
                 if (win.empty()) return -12;
