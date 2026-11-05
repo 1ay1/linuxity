@@ -261,3 +261,49 @@ path string, not just the fate), rather than guessing which path it is.
 
 Not a blocker for the syscall-layer work, and tracked here so it is not
 rediscovered from scratch.
+
+## The abi/wire layer, as it stands
+
+Ten headers. Each is the ONE definition of a piece of guest ABI, with its
+values verified against real kernel headers and its traps asserted.
+
+| header | owns | was |
+|---|---|---|
+| `dirent64.hpp` | `linux_dirent64` encoder, `DType` | 3 encoders, divergent |
+| `errno_map.hpp` | host errno → guest `Errno` | 3+, all lossy |
+| `stat.hpp` | `struct stat`/`statx` offsets, `S_IF*`, perm mask | 3 / 3 / 6 |
+| `open_flags.hpp` | `O_*` + the writable() test | 3 (octal/hex/constexpr) |
+| `mmap.hpp` | `PROT_*`, `MAP_*` | 4 |
+| `at_flags.hpp` | `AT_*`, `AT_FDCWD` | 7 |
+| `fd_flags.hpp` | `*_CLOEXEC`, `*_NONBLOCK` | 5, **two values** |
+| `time.hpp` | `timespec`/`timeval`, normalize, ms rounding | 3 |
+| `iovec.hpp` | `struct iovec`, `IOV_MAX` | 2 |
+| `path.hpp` | `.`/`..` normalization | 2, **different algorithms** |
+
+### How the remaining duplication was found
+
+Name-based grepping kept missing copies. Two shapes found the rest:
+
+1. `constexpr k[A-Z]... =` **inside a function body** — a constant cheap to
+   retype gets retyped at the point of use. This found the fifth `kCloexec`,
+   the second `AT_FDCWD`, and the `S_IF*` triple.
+2. A bare octal/hex literal in a **mask or comparison** — `& 0x100`,
+   `& 07777`. This found the two raw `AT_SYMLINK_NOFOLLOW` sites whose own
+   comments named the constant, so no name search could see them.
+
+### What is deliberately NOT shared
+
+Checked, and left alone on purpose:
+
+* `GuestRegs` — darwin's is the aarch64 register set, windows' is x86-64.
+  Verified the fields genuinely differ (`x0`/`x8`/`sp` vs `rax`/`rdi`).
+* `LinuxStat` — the layouts really do differ per ABI; both `static_assert`
+  against `stat.hpp` instead.
+* `Dirent` — `abi/wire`'s is the ABI record, `vfs/inode`'s is a VFS entry
+  (`name` + `Ino` + `FileType`). Same noun, different concepts.
+* Host→guest flag TRANSLATION (`open_flags()`, `error_to_errno`) stays in
+  each backend: Darwin's `O_CREAT` is `0x200`, Win32 has no `O_*` at all.
+  Only the guest-side definition is shared.
+* Five single-use literals (`MSG_CMSG_CLOEXEC`, `CSIZE`, `makedev`'s field
+  split, and `cpsr`'s NZCV mask — which is a CPU register, not guest ABI).
+  One use is not duplication, and a header per literal is ceremony.

@@ -3859,7 +3859,7 @@ private:
                 if (::ptsname_r(hfd, name, sizeof name) != 0) return -25;
                 const int s = ::open(name, O_RDWR | O_NOCTTY | O_CLOEXEC);
                 if (s < 0) return darwin::fail();
-                const int g = proc_.with_fds([&](FdTable& t) { return t.install(s, (arg & 02000000) != 0); });
+                const int g = proc_.with_fds([&](FdTable& t) { return t.install(s, (arg & abi::wire::kOCloexec) != 0); });
                 if (g < 0) { ::close(s); return -24; }
                 return g;
             }
@@ -4176,7 +4176,7 @@ private:
                 constexpr std::uint64_t kIfmt = 0170000, kIfifo = 0010000,
                                         kIfreg = 0100000, kIfsock = 0140000;
                 const std::uint64_t fmt = a2 & kIfmt;
-                const auto mode = static_cast<mode_t>(a2 & 07777);
+                const auto mode = static_cast<mode_t>(a2 & abi::wire::kPermMask);
                 if (fmt == kIfifo)
                     return ::mkfifo(path->c_str(), mode) < 0 ? darwin::fail() : 0;
                 if (fmt == 0 || fmt == kIfreg) {

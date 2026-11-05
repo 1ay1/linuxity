@@ -23,6 +23,7 @@
 
 #if defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__))
 
+#include "linuxity/abi/wire/at_flags.hpp"
 #include "linuxity/abi/wire/path.hpp"
 #include "linuxity/runtime/windows/fd.hpp"
 #include "linuxity/runtime/windows/mm.hpp"
@@ -373,7 +374,7 @@ public:
                 std::string gp = mem.cstr(pathp);
                 const auto w = win32::to_win_path(host_path(gp));
                 // AT_REMOVEDIR
-                if (nr == SYS_unlinkat && (a[2] & 0x200))
+                if (nr == SYS_unlinkat && abi::wire::has_at(a[2], abi::wire::AtFlag::removedir))
                     return ret(::RemoveDirectoryW(w.c_str()) ? 0 : win32::fail());
                 return ret(::DeleteFileW(w.c_str()) ? 0 : win32::fail());
             }
@@ -404,7 +405,7 @@ public:
                     case 2:  fds_.set_cloexec(int(a[0]), (a[2] & 1) != 0);         // F_SETFD
                              return ret(0);
                     case 3:  return ret(fds_.is_append(int(a[0])) ? 0x400 : 0);    // F_GETFL
-                    case 4:  fds_.set_append(int(a[0]), (a[2] & 0x400) != 0);      // F_SETFL
+                    case 4:  fds_.set_append(int(a[0]), (a[2] & abi::wire::bits(abi::wire::OpenFlag::append)) != 0);      // F_SETFL
                              return ret(0);
                     default: return ret(0);   // locks etc.: succeed benignly
                 }
