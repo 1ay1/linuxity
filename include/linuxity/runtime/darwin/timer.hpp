@@ -22,6 +22,7 @@
 
 #if defined(__APPLE__)
 
+#include "linuxity/abi/wire/time.hpp"
 #include "linuxity/runtime/darwin/signal.hpp"
 
 #include <atomic>

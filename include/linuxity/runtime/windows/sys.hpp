@@ -24,6 +24,7 @@
 #if defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__))
 
 #include "linuxity/abi/wire/at_flags.hpp"
+#include "linuxity/abi/wire/open_flags.hpp"
 #include "linuxity/abi/wire/path.hpp"
 #include "linuxity/runtime/windows/fd.hpp"
 #include "linuxity/runtime/windows/mm.hpp"

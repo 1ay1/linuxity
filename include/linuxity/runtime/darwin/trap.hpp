@@ -52,6 +52,7 @@
 #include "linuxity/abi/wire/at_flags.hpp"
 #include "linuxity/abi/wire/fd_flags.hpp"
 #include "linuxity/abi/wire/dirent64.hpp"
+#include "linuxity/abi/wire/stat.hpp"
 #include "linuxity/abi/wire/mmap.hpp"
 #include "linuxity/runtime/backend.hpp"
 #include "linuxity/runtime/darwin/darwin.hpp"

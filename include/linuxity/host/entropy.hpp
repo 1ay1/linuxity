@@ -34,6 +34,13 @@
 #else
 #  include <cerrno>
 #  include <unistd.h>
+// getentropy's declaration moved around: glibc puts it in <unistd.h>, but
+// Darwin and musl declare it in <sys/random.h>. Including both is the only
+// spelling that compiles on all three (CI's macOS job caught this -- the
+// Linux build was perfectly happy with <unistd.h> alone).
+#  if defined(__APPLE__) || defined(__linux__)
+#    include <sys/random.h>
+#  endif
 #endif
 
 namespace lx::host {
