@@ -15,3 +15,7 @@ build-*/
 archroot/
 rootfs/
 *-rootfs/
+
+# Transient lock the assistant's memory store takes while appending; the
+# memory.jsonl it guards IS tracked, but the lock never should be.
+.agentty/*.lock
