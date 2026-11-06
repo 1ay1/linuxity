@@ -356,6 +356,34 @@ inline std::string Scenario::key() const {
                     .exercising(abi::Sysno::setpriority)
                     .on(DirFlavour::virtualised));
 
+    // The current directory, filesystem info, and the newer *at forms.
+    //
+    // The cwd is the one with teeth: linuxity keeps its OWN per-process cwd
+    // (it must -- the guest's "/" is a host directory somewhere else), and
+    // every relative path the guest opens resolves against it. Drift there
+    // means relative paths silently reach the wrong file. So the probe
+    // checks relationships: getcwd reports where chdir went, fchdir lands
+    // where chdir to the same path lands, a relative open resolves in the
+    // cwd last set.
+    //
+    // statfs/sysinfo values are NOT compared -- free space moves between two
+    // runs seconds apart, and linuxity deliberately reports its own virtual
+    // machine rather than the host's. The structure is what must hold: a
+    // power-of-two block size, free <= total, ENOENT on a missing path.
+    v.push_back(Scenario{"cwdfs", "cwdfs"}
+                    .exercising(abi::Sysno::chdir)
+                    .exercising(abi::Sysno::fchdir)
+                    .exercising(abi::Sysno::getcwd)
+                    .exercising(abi::Sysno::statfs)
+                    .exercising(abi::Sysno::fstatfs)
+                    .exercising(abi::Sysno::sysinfo)
+                    .exercising(abi::Sysno::fchmod)
+                    .exercising(abi::Sysno::fchown)
+                    .exercising(abi::Sysno::faccessat2)
+                    .exercising(abi::Sysno::renameat2)
+                    .exercising(abi::Sysno::mknodat)
+                    .on(DirFlavour::host_backed));
+
     return v;
 }
 

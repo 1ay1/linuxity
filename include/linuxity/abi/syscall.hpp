@@ -1684,7 +1684,13 @@ private:
         std::string_view cwd = k_.files().cwd();
         std::size_t need = cwd.size() + 1;
         std::size_t cap = static_cast<std::size_t>(r.arg[1]);
-        if (cap < need) return eno(Errno::einval);
+        // A buffer too small for the path is ERANGE, not EINVAL. glibc's
+        // getcwd(NULL, 0) GROWS its buffer by looping while the kernel says
+        // ERANGE, so EINVAL turns that loop into an immediate failure --
+        // every caller that lets glibc size the buffer breaks. EINVAL is
+        // only for size 0 with a non-NULL buffer.
+        if (cap == 0) return eno(Errno::einval);
+        if (cap < need) return eno(Errno::erange);
         std::vector<std::byte> buf(need);
         for (std::size_t i = 0; i < cwd.size(); ++i)
             buf[i] = static_cast<std::byte>(cwd[i]);
@@ -1842,19 +1848,25 @@ private:
     [[nodiscard]] Outcome do_fchmod(const Regs& r) {
         std::string_view gp = k_.files().path_of_fd(static_cast<int>(r.arg[0]));
         std::uint32_t mode = static_cast<std::uint32_t>(r.arg[1]);
-        if (!gp.empty()) {
-            // Best-effort apply to the host inode (execute bit for execve);
-            // record in the shadow store only what the inode couldn't take.
-            auto wc = k_.files().classify(std::string{gp}, /*for_write=*/true,
-                                          /*follow=*/false, Wi::copy_leaf);
-            std::uint32_t landed = 0xffffffffu;
-            if (!wc.host_path.empty() && ::chmod(wc.host_path.c_str(), mode & wire::kPermMask) == 0) {
-                std::uint32_t got = 0;
-                if (hostcompat::host_mode_of(wc.host_path.c_str(), got))
-                    landed = got;
-            }
-            k_.files().meta().set_mode(std::string{gp}, mode, landed);
+        if (gp.empty()) {
+            // No recorded path for this fd. It may still be a perfectly good
+            // host fd (one the guest inherited, or opened before we tracked
+            // it), so the KERNEL decides: forward and let it answer EBADF
+            // for a closed fd. Returning 0 here meant fchmod on a closed fd
+            // silently succeeded -- caught by the cwdfs probe.
+            return fwd();
         }
+        // Best-effort apply to the host inode (execute bit for execve);
+        // record in the shadow store only what the inode couldn't take.
+        auto wc = k_.files().classify(std::string{gp}, /*for_write=*/true,
+                                      /*follow=*/false, Wi::copy_leaf);
+        std::uint32_t landed = 0xffffffffu;
+        if (!wc.host_path.empty() && ::chmod(wc.host_path.c_str(), mode & wire::kPermMask) == 0) {
+            std::uint32_t got = 0;
+            if (hostcompat::host_mode_of(wc.host_path.c_str(), got))
+                landed = got;
+        }
+        k_.files().meta().set_mode(std::string{gp}, mode, landed);
         return val(0);
     }
 

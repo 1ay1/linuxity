@@ -65,7 +65,8 @@ constexpr int kInterceptedHandlers = 139;
 //           *at family -- open/stat/access/chmod/rename/unlink/...).
 // 68 -> 80: the xattrs scenario (16 handlers that had zero coverage).
 // 80 -> 97: the creds scenario (credentials, sessions, process groups).
-constexpr std::size_t kVerifiedFloor = 97;
+// 97 -> 108: the cwdfs scenario (cwd model, statfs/sysinfo, newer *at forms).
+constexpr std::size_t kVerifiedFloor = 108;
 
 } // namespace
 

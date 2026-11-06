@@ -1,0 +1,47 @@
+# linuxity conformance trace
+# scenario: cwdfs
+# arch: aarch64
+# recorded-by: live Linux kernel on this host
+# kernel: Linux 6.1.162-android14-11-g9dd05ae3a1de-ab16261587
+getcwd = 1 | getcwd returns a path
+getcwd = 1 | the cwd is absolute
+getcwd = 1 | getcwd's return counts the NUL
+chdir = 0 | chdir into the scratch dir
+getcwd = 1 | getcwd after chdir
+chdir = 1 | getcwd reports where chdir went
+openat = 1 | a relative open resolves in the cwd
+chdir = 0 | a relative chdir works too
+chdir = 1 | the relative chdir landed in sub
+openat = 1 | open the dir for fchdir
+fchdir = 0 | fchdir to that fd
+fchdir = 1 | fchdir and chdir agree on the destination
+fchdir = -ENOTDIR | fchdir to a regular file is ENOTDIR
+fchdir = -EBADF | fchdir to a closed fd is EBADF
+getcwd = -ERANGE | a too-small getcwd buffer is ERANGE
+chdir = -ENOENT | chdir to a missing dir is ENOENT
+chdir = -ENOTDIR | chdir to a regular file is ENOTDIR
+statfs = 0 | statfs the scratch dir
+statfs = 1 | f_bsize is a power of two >= 512
+statfs = 1 | f_blocks is non-zero
+statfs = 1 | free blocks do not exceed total
+fstatfs = 0 | fstatfs the same dir by fd
+fstatfs = 1 | statfs and fstatfs agree on f_type
+fstatfs = 1 | statfs and fstatfs agree on f_bsize
+statfs = -ENOENT | statfs a missing path is ENOENT
+fstatfs = -EBADF | fstatfs a closed fd is EBADF
+sysinfo = 0 | sysinfo succeeds
+sysinfo = 1 | uptime is positive
+sysinfo = 1 | totalram is non-zero
+sysinfo = 1 | free memory does not exceed total
+fchmod = 0 | fchmod 600 through an fd
+fchmod = 0 | stat sees what fchmod set
+fchown = 0 | fchown -1/-1 is a no-op
+fchmod = -EBADF | fchmod a closed fd is EBADF
+faccessat2 = 0 | faccessat2 R_OK
+faccessat2 = -ENOENT | faccessat2 on a missing file is ENOENT
+renameat2 = 0 | renameat2 with no flags renames
+renameat2 = 0 | renameat2 renames it back
+renameat2 = -EEXIST | RENAME_NOREPLACE onto an existing name is EEXIST
+mknodat = -EACCES | mknodat makes a FIFO
+mknodat = -EACCES | mknodat onto an existing name is EEXIST
+unlinkat = 0 | remove the scratch dir
