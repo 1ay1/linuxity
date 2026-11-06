@@ -31,9 +31,12 @@
 #include <string.h>
 #include <sys/stat.h>
 
-#define DIR  "/tmp/lx-xattr-probe"
-#define F1   DIR "/f1"
-#define SYM  DIR "/sym"
+// The scratch paths are built at RUNTIME, not compiled in. /tmp is a tmpfs
+// under linuxity and Android mounts tmpfs without user_xattr, so every
+// setxattr came back EOPNOTSUPP there and eight checks went unverified for
+// a reason that has nothing to do with linuxity. lx_scratch() picks a
+// filesystem that supports what this probe tests.
+static char DIR[256], F1[256], SYM[256], GONE[256];
 
 #define A1   "user.lxtest"
 #define A2   "user.second"
@@ -63,6 +66,14 @@ static int in_list(const char* buf, long len, const char* name) {
 }
 
 int main(void) {
+    lx_path(DIR,  sizeof DIR,  "lx-xattr-probe");
+    {
+        char rel[64];
+        snprintf(rel, sizeof rel, "lx-xattr-probe/f1");  lx_path(F1,   sizeof F1,   rel);
+        snprintf(rel, sizeof rel, "lx-xattr-probe/sym"); lx_path(SYM,  sizeof SYM,  rel);
+        snprintf(rel, sizeof rel, "lx-xattr-probe/nope");lx_path(GONE, sizeof GONE, rel);
+    }
+
     // Clean slate; setup, not observations.
     LX_SYS3(SYS_unlinkat, AT_FDCWD, SYM, 0);
     LX_SYS3(SYS_unlinkat, AT_FDCWD, F1, 0);
@@ -93,7 +104,7 @@ int main(void) {
             "XATTR_CREATE on an existing attr is EEXIST");
     lx_emit("setxattr", LX_SYS5(SYS_setxattr, F1, "user.absent", V1, slen(V1), 2),
             "XATTR_REPLACE on a missing attr is ENODATA");
-    lx_emit("setxattr", LX_SYS5(SYS_setxattr, DIR "/nope", A1, V1, slen(V1), 0),
+    lx_emit("setxattr", LX_SYS5(SYS_setxattr, GONE, A1, V1, slen(V1), 0),
             "setxattr on a missing file is ENOENT");
     // Only user.*/trusted.*/security.* are valid namespaces.
     lx_emit("setxattr", LX_SYS5(SYS_setxattr, F1, "bogus.name", V1, slen(V1), 0),
@@ -114,7 +125,7 @@ int main(void) {
             "a too-small buffer is ERANGE");
     lx_emit("getxattr", LX_SYS4(SYS_getxattr, F1, "user.absent", buf, (long)sizeof buf),
             "getxattr of a missing attr is ENODATA");
-    lx_emit("getxattr", LX_SYS4(SYS_getxattr, DIR "/nope", A1, buf, (long)sizeof buf),
+    lx_emit("getxattr", LX_SYS4(SYS_getxattr, GONE, A1, buf, (long)sizeof buf),
             "getxattr on a missing file is ENOENT");
 
     // -- listxattr ---------------------------------------------------------
@@ -129,7 +140,7 @@ int main(void) {
             "a size query returns a positive length");
     lx_emit("listxattr", LX_SYS3(SYS_listxattr, F1, buf, 1L),
             "a too-small list buffer is ERANGE");
-    lx_emit("listxattr", LX_SYS3(SYS_listxattr, DIR "/nope", buf, (long)sizeof buf),
+    lx_emit("listxattr", LX_SYS3(SYS_listxattr, GONE, buf, (long)sizeof buf),
             "listxattr on a missing file is ENOENT");
 
     // -- the f* variants must agree with the path ones ---------------------
@@ -214,7 +225,7 @@ int main(void) {
             "it is ENODATA after removal");
     lx_emit("removexattr", LX_SYS2(SYS_removexattr, F1, A2),
             "removing it twice is ENODATA");
-    lx_emit("removexattr", LX_SYS2(SYS_removexattr, DIR "/nope", A1),
+    lx_emit("removexattr", LX_SYS2(SYS_removexattr, GONE, A1),
             "removexattr on a missing file is ENOENT");
     lx_emit("lremovexattr", LX_SYS2(SYS_lremovexattr, SYM, A1),
             "lremovexattr on a symlink");

@@ -23,6 +23,7 @@
 #define LX_PROBE_H
 
 #include <errno.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/syscall.h>
@@ -94,6 +95,41 @@ static long lx_sys(long nr, long a, long b, long c, long d, long e, long f) {
     errno = 0;
     const long r = syscall(nr, a, b, c, d, e, f);
     return r < 0 ? -errno : r;
+}
+
+// Where a probe puts its scratch files.
+//
+// /tmp is the obvious choice and the wrong one for anything that needs a
+// filesystem FEATURE. Under linuxity /tmp is a private tmpfs, and Android
+// mounts tmpfs without user_xattr -- so the whole xattr probe came back
+// EOPNOTSUPP on the device and eight checks went unverified for a reason
+// that has nothing to do with linuxity. /data/local/tmp there is f2fs with
+// user_xattr and works.
+//
+// LX_SCRATCH lets the caller say where. Probes that need no special support
+// can keep using /tmp directly; those that do should take the dir from here
+// so the same binary works on both hosts.
+static const char* lx_scratch(void) {
+    const char* e = getenv("LX_SCRATCH");
+    if (e && *e) return e;
+#if defined(__ANDROID__)
+    return "/data/local/tmp";
+#else
+    return "/tmp";
+#endif
+}
+
+// Join the scratch dir and a name into a caller-supplied buffer. Returns the
+// buffer so it can be used inline.
+static char* lx_path(char* buf, size_t cap, const char* name) {
+    const char* d = lx_scratch();
+    size_t i = 0;
+    while (d[i] && i + 1 < cap) { buf[i] = d[i]; ++i; }
+    if (i + 1 < cap && name[0] != '/') buf[i++] = '/';
+    size_t j = 0;
+    while (name[j] && i + 1 < cap) buf[i++] = name[j++];
+    buf[i] = 0;
+    return buf;
 }
 
 #define LX_SYS0(nr)                lx_sys((nr), 0, 0, 0, 0, 0, 0)
