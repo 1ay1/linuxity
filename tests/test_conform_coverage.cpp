@@ -92,6 +92,11 @@ constexpr int kInterceptedHandlers =
 // the point: the ratchet becomes a gate rather than a target.
 constexpr std::size_t kVerifiedFloor = 130;
 
+// Coverage reached 100% (every intercepted handler proven by a scenario).
+// Once true this must stay true: see the check in main(). Flipping it off
+// to make a build pass is the one thing that defeats the whole measurement.
+constexpr bool kCoverageIsComplete = true;
+
 } // namespace
 
 int main() {
@@ -156,6 +161,28 @@ int main() {
         std::fputs("FAIL: no scenario exercises a virtualised path; "
                    "host-backed ones forward to the kernel and verify "
                    "nothing about linuxity\n", stderr);
+        ++failures;
+    }
+
+    // ONCE FULL, STAY FULL. The ratchet above only catches the verified
+    // count going DOWN, which was the right gate while a gap existed. It is
+    // not enough now: adding a new intercepted handler raises the
+    // denominator without lowering the count, so coverage silently fell to
+    // 99.2% and the test still passed.
+    //
+    // kCoverageIsComplete records that the gap reached zero. Once it has,
+    // any gap at all is a regression -- and the check must NOT be written
+    // against kInterceptedHandlers, because that is exactly the number a new
+    // handler moves (the first attempt compared floor >= denominator and so
+    // disabled itself the moment it was needed).
+    if (kCoverageIsComplete && !gap.empty()) {
+        std::fputs("FAIL: coverage was complete and is not any more. These "
+                   "intercepted handlers have no scenario proving them:\n  ",
+                   stderr);
+        for (const std::string_view c : gap)
+            std::fprintf(stderr, " %s", std::string{c}.c_str());
+        std::fputs("\nAdd them to a scenario (and a probe step that exercises "
+                   "them) rather than clearing the flag.\n", stderr);
         ++failures;
     }
 
