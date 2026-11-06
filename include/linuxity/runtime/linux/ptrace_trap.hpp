@@ -21,6 +21,7 @@
 #pragma once
 
 #include "linuxity/abi/syscall.hpp"
+#include "linuxity/conform/arch.hpp"
 #include "linuxity/runtime/linux/ptrace_regs.hpp"
 #include "linuxity/abi/wire/errno_map.hpp"
 #include "linuxity/runtime/trap.hpp"
@@ -52,6 +53,13 @@ namespace lx::runtime {
 // The per-arch register view (ptrace_regs.hpp). Named locally so the state
 // machine below reads the same on x86-64 and aarch64.
 using Regs = linux_regs::Regs;
+
+// The arch whose syscall numbering the tracee uses. Same reason as Regs:
+// every decode below reads this instead of naming a machine, so there is one
+// place to change and none to forget. A wrong arch here does not fail to
+// compile -- it silently names OTHER syscalls, so it must not be spelled
+// twice.
+inline constexpr abi::Arch kTraceeArch = conform::host_arch();
 
 class PtraceTrap {
 public:
@@ -281,8 +289,10 @@ public:
                 // mis-resolve it. Run that one exec natively; every guest exec
                 // after the image is live goes through the dispatcher.
                 std::uint64_t sysno = rr.nr();
+                const abi::Sysno boot_sc = abi::decode(kTraceeArch, sysno);
                 if (!booted_root_ && w == root_pid_ &&
-                    (sysno == 59 || sysno == 322)) {
+                    (boot_sc == abi::Sysno::execve ||
+                     boot_sc == abi::Sysno::execveat)) {
                     // Let this bootstrap execve run NATIVELY. At a
                     // PTRACE_EVENT_SECCOMP stop the kernel has parked rax at
                     // -ENOSYS as the "skip unless the tracer re-arms it"
@@ -338,8 +348,10 @@ public:
                     // natively; its PTRACE_EVENT_EXEC sets booted_root_ and
                     // every later guest exec is dispatched normally.
                     std::uint64_t sysno = rr.nr();
+                    const abi::Sysno bsc = abi::decode(kTraceeArch, sysno);
                     if (!booted_root_ && w == root_pid_ &&
-                        (sysno == 59 || sysno == 322)) {
+                        (bsc == abi::Sysno::execve ||
+                         bsc == abi::Sysno::execveat)) {
                         t.in_call = true;
                         ::ptrace(PTRACE_SYSCALL, w, 0, 0);   // run exec to exit
                         continue;
@@ -382,7 +394,8 @@ public:
     // pid to its host tid; the reaped pid is translated back at the exit stop
     // (returns_pid). pid<=0 (any child / process group) passes through.
     void translate_entry_args(::pid_t w, Regs& rr, Task& t) {
-        if (rr.nr() == 61 /*wait4*/) {
+        const abi::Sysno sc = abi::decode(kTraceeArch, rr.nr());
+        if (sc == abi::Sysno::wait4) {
             auto gpid = static_cast<std::int32_t>(static_cast<long long>(rr.arg(0)));
             if (gpid > 0) {
                 ::pid_t host = host_tid_of(gpid);
@@ -394,7 +407,7 @@ public:
                     rr = wr;
                 }
             }
-        } else if (rr.nr() == 247 /*waitid*/) {
+        } else if (sc == abi::Sysno::waitid) {
             // waitid(idtype /*rdi*/, id /*rsi*/, siginfo* /*rdx*/, opts /*r10*/).
             // Kernel idtype enum: P_ALL=0, P_PID=1, P_PGID=2, P_PIDFD=3. For
             // P_PID/P_PGID the `id` is a GUEST pid/pgid we map to a host tid;
@@ -443,7 +456,7 @@ public:
             // stepped to the syscall EXIT just to write rax there: 7 ptrace
             // calls and 2 waits per answered syscall, measured. Now 3 and 1.
             r.set_ret(static_cast<std::int64_t>(ret));
-            (void)r.store(cur_);
+            if (!store_and_skip(r)) return err(Errno::eio);
             t.action = Action::none;
             t.in_call = false;
             const int sig = t.pending_sig;
@@ -453,7 +466,7 @@ public:
         }
         // PTRACE_SYSCALL fallback (no seccomp): at an ordinary entry stop the
         // kernel still owes us the exit stop, so write rax there.
-        (void)r.store(cur_);
+        if (!store_and_skip(r)) return err(Errno::eio);
         t.action = Action::set_ret;
         t.ret = ret;
         // A one-shot PTRACE_SYSCALL runs the (neutralized) call to its EXIT
@@ -463,6 +476,18 @@ public:
         // matching exit. After finalize we return to the free-running CONT.
         ::ptrace(PTRACE_SYSCALL, cur_, 0, 0);
         return ok();
+    }
+
+    // Writing the general registers is only HALF of neutralizing a syscall.
+    // On aarch64 the kernel latches the syscall number before the tracer
+    // stop, so x8 is advisory by then and the original call still runs --
+    // NT_ARM_SYSTEM_CALL is the register set that actually selects it. Both
+    // steps, in order, in one place, because doing the store without the
+    // commit silently runs the syscall we meant to answer ourselves (seen as
+    // a virtualized uname returning EFAULT: the handler's reply was
+    // overwritten by the real one).
+    [[nodiscard]] bool store_and_skip(const Regs& r) const {
+        return r.store(cur_) && r.commit_skip(cur_);
     }
 
     // FORWARD: let the host kernel run this syscall in the task. We report the
@@ -482,7 +507,7 @@ public:
     // lgetxattr, close and getdents64 alone are 77K of the 150K traps in one
     // `ls -lR /usr/include`.
     [[nodiscard]] static bool owes_exit_stop(unsigned long long nr) {
-        return returns_pid(nr) || abi::decode(abi::Arch::x86_64, nr) ==
+        return returns_pid(nr) || abi::decode(kTraceeArch, nr) ==
                                       abi::Sysno::waitid;
     }
 
@@ -1316,7 +1341,7 @@ private:
             // through untouched.
             Regs r{};
             (void)Regs::fetch(w, r);
-            if (r.nr() == 247 /*waitid*/) {
+            if (abi::decode(kTraceeArch, r.nr()) == abi::Sysno::waitid) {
                 // waitid returns 0 in RAX (not a pid) and instead fills a
                 // siginfo_t (guest ptr in rdx at entry, preserved at exit)
                 // whose si_pid holds the reaped child — as a HOST tid. Rust's
@@ -1361,12 +1386,12 @@ private:
     // never sees a host pid.
     //
     // Decoded through the generated Sysno table rather than matched against
-    // literal x86-64 numbers: the literals (56/57/58/435/61) are correct only
-    // on x86-64, so on aarch64 they would silently name OTHER syscalls and
-    // translate the return value of something that isn't a pid. sysno.hpp is
-    // the single source of truth for this mapping.
+    // literal numbers: the same syscall has different numbers per arch, so a
+    // literal would silently name a DIFFERENT syscall elsewhere and translate
+    // the return value of something that isn't a pid. sysno.hpp is the single
+    // source of truth for this mapping, and kTraceeArch picks the column.
     static bool returns_pid(unsigned long long nr) {
-        switch (abi::decode(abi::Arch::x86_64, nr)) {
+        switch (abi::decode(kTraceeArch, nr)) {
             case abi::Sysno::clone:
             case abi::Sysno::fork:
             case abi::Sysno::vfork:

@@ -90,11 +90,16 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     endforeach()
 endif()
 
+# Linux-only UNIT tests: they include <linux/*.h> (seccomp, audit) but run no
+# guest, so they belong with the fast tests rather than LX_LIVE_TESTS.
+set(LX_LINUX_UNIT_TESTS seccomp_arch)
+
 set(LX_TESTS ${LX_PORTABLE_TESTS})
 if(NOT WIN32)
     list(APPEND LX_TESTS ${LX_POSIX_HOST_TESTS})
 endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    list(APPEND LX_TESTS ${LX_LINUX_UNIT_TESTS})
     list(APPEND LX_TESTS ${LX_LIVE_TESTS})
 endif()
 

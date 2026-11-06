@@ -69,6 +69,8 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include "linuxity/runtime/linux/seccomp_arch.hpp"
+
 namespace lx::runtime {
 
 // The x86-64 syscall numbers linuxity INTERCEPTS. Every one is virtualized,
@@ -298,8 +300,20 @@ inline constexpr int kTrappedX86_64[] = {
     if (::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0)
         return false;
 
-    constexpr std::uint32_t kArch = AUDIT_ARCH_X86_64;
-    constexpr std::size_t nTrapped = sizeof(kTrappedX86_64) / sizeof(int);
+    // Everything arch-specific comes from seccomp_arch.hpp, derived from the
+    // one trapped list above. Getting kArch wrong is invisible until a guest
+    // runs, then it ENOSYS-es every syscall and spins.
+    constexpr abi::Arch kHostArch = conform::host_arch();
+    constexpr std::uint32_t kArch = seccomp_audit_arch(kHostArch);
+    constexpr auto kTrappedAll = trapped_for(kHostArch, kTrappedX86_64);
+
+    // Drop the syscalls this arch doesn't have (aarch64 has no open/stat/
+    // fork), so the filter has no dead compares.
+    std::vector<std::uint32_t> trapped;
+    trapped.reserve(kTrappedAll.size());
+    for (const std::uint64_t nr : kTrappedAll)
+        if (nr != kNoSysno) trapped.push_back(static_cast<std::uint32_t>(nr));
+    const std::size_t nTrapped = trapped.size();
 
     // Program layout (leaves LAST, so every match is a simple forward jump):
     //
@@ -324,6 +338,10 @@ inline constexpr int kTrappedX86_64[] = {
     // liburing users and runtimes (Go, Node, Rust tokio-uring) all fall back
     // to plain syscalls on ENOSYS.
     //
+    // The x32 gate is emitted only where that personality exists, and the
+    // io_uring numbers are translated like every other number, so neither is
+    // an x86-64 literal leaking into an aarch64 filter.
+    //
     // For the JEQ at position (7 + i), the TRACE leaf is at 7+n+1.
     // Statements strictly after this JEQ and before TRACE are:
     //   remaining JEQs (n-1-i) + the ALLOW leaf (1)  => jt = (n-1-i) + 1.
@@ -335,26 +353,48 @@ inline constexpr int kTrappedX86_64[] = {
     f.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kArch, 1, 0)); // 1
     constexpr std::uint32_t kEnosys = SECCOMP_RET_ERRNO | 38u;  // ENOSYS
     constexpr std::uint32_t kX32Bit = 0x40000000u;
-    constexpr std::uint32_t kUringFirst = 425, kUringLast = 427;
+    // io_uring_setup/enter/register are contiguous on both arches; take the
+    // span from the numbering authority rather than hardcoding 425..427.
+    constexpr std::uint64_t kUringSetup =
+        encode(kHostArch, abi::Sysno::io_uring_setup);
+    constexpr std::uint64_t kUringRegister =
+        encode(kHostArch, abi::Sysno::io_uring_register);
     f.push_back(BPF_STMT(BPF_RET | BPF_K, kEnosys));            // 2 (foreign arch)
     f.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
                          offsetof(seccomp_data, nr)));          // 3
-    // Jump distances to the ENOSYS leaf (index 7+n+2) from idx 4, 5, 6.
+
+    // The gates between `A = nr` and the first JEQ. Emitting them
+    // conditionally would shift every later index, so count them first and
+    // let the jump arithmetic read the count.
+    const bool emit_x32 = has_x32_personality(kHostArch);
+    const bool emit_uring =
+        kUringSetup != kNoSysno && kUringRegister != kNoSysno;
+    const std::size_t nGates =
+        (emit_x32 ? 1u : 0u) + (emit_uring ? 2u : 0u);
+    const std::size_t firstJeq = 4 + nGates;
+
+    // Jump distance to the ENOSYS leaf, which sits after the n JEQs plus the
+    // ALLOW and TRACE leaves.
     const auto to_enosys = [&](std::size_t idx) {
-        return static_cast<std::uint8_t>((7 + nTrapped + 2) - idx - 1);
+        return static_cast<std::uint8_t>((firstJeq + nTrapped + 2) - idx - 1);
     };
-    f.push_back(BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, kX32Bit,
-                         to_enosys(4), 0));                     // 4
-    // nr >= first ? (fall to 6) : (skip 6)
-    f.push_back(BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, kUringFirst, 0, 1)); // 5
-    // nr > last ? (continue at 7) : ENOSYS
-    f.push_back(BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K, kUringLast,
-                         0, to_enosys(6)));                     // 6
+    if (emit_x32) {
+        f.push_back(BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, kX32Bit,
+                             to_enosys(f.size()), 0));
+    }
+    if (emit_uring) {
+        // nr >= setup ? (fall through to the upper bound) : (skip it)
+        f.push_back(BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K,
+                             static_cast<std::uint32_t>(kUringSetup), 0, 1));
+        // nr > register ? (continue to the JEQs) : ENOSYS
+        f.push_back(BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K,
+                             static_cast<std::uint32_t>(kUringRegister), 0,
+                             to_enosys(f.size())));
+    }
     for (std::size_t i = 0; i < nTrapped; ++i) {
         std::uint8_t jt = static_cast<std::uint8_t>((nTrapped - 1 - i) + 1);
         f.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
-                             static_cast<std::uint32_t>(kTrappedX86_64[i]),
-                             jt, 0));                            // 7 + i
+                             trapped[i], jt, 0));                // firstJeq + i
     }
     f.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));  // 7 + n
     f.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE));  // 7 + n + 1

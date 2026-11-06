@@ -20,6 +20,8 @@
 #include <cstdint>
 #include <ctime>
 #include <string>
+
+#include "linuxity/conform/arch.hpp"
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #include <unistd.h>
@@ -40,7 +42,10 @@ public:
     // -- Identity ----------------------------------------------------------
     std::string   release{"6.6.0-linuxity"};   // uname -r, /proc/version
     std::string   nodename{"linuxity"};        // hostname
-    std::string   machine_arch{"x86_64"};      // uname -m
+    // uname -m. The guest runs natively, so this IS the host's ISA -- a
+    // literal here told an aarch64 guest it was on x86_64, which breaks any
+    // build system that picks a target triple from uname.
+    std::string   machine_arch{conform::arch_name(conform::host_arch())};
     std::string   cpu_model{"linuxity native CPU"};   // /proc/cpuinfo model name
     std::string   cpu_part{"000"};             // arm64 MIDR part number (hex)
 

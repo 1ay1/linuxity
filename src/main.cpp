@@ -6,6 +6,7 @@
 // syscalls trap back into the runtime, where our subsystems service them.
 // This is the whole thesis, made runnable: no VM, no emulation, native code,
 // our kernel.
+#include "linuxity/conform/arch.hpp"
 #include "linuxity/host/posix_host.hpp"
 #include "linuxity/kernel/kernel.hpp"
 #include "linuxity/kernel/resources.hpp"
@@ -535,7 +536,7 @@ int main(int argc, char** argv) {
         auto ipc = k.files().classify(interp_abs);
         std::string interp_host = interp;
         if (ipc.realm == kernel::Realm2::host_backed) interp_host = ipc.host_path;
-        // ld.so <host-prog> <original-args...>; keep gargv[0] as argv[1] so the
+        // ld.so <guest-prog> <original-args...>; keep gargv[0] as argv[1] so the
         // guest program's own argv[0] is preserved by the loader.
         child_argv.clear();
         child_argv.push_back(interp_host);   // the interpreter to exec (host path)
@@ -594,7 +595,13 @@ int main(int argc, char** argv) {
 
     // PtraceTrap is BOTH the trap backend and the guest-memory accessor
     // (it shares the child's real pages via process_vm_readv/writev).
-    runtime::Cpu cpu{trap, k, trap, abi::Arch::x86_64};
+    //
+    // The guest runs natively, so its syscall numbering IS the host's. Naming
+    // a literal arch here is how the dispatcher came to decode aarch64's
+    // openat(56) as an x86-64 number and forward it untranslated -- the guest
+    // then loaded host libraries, or failed to load any. conform::host_arch()
+    // is the one place that answers this.
+    runtime::Cpu cpu{trap, k, trap, conform::host_arch()};
 
     auto rc = cpu.run(uaddr(0), uaddr(0));
 
