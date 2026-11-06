@@ -54,6 +54,12 @@
 #include <sys/ptrace.h>
 #include <sys/uio.h>
 #include <sys/user.h>
+#if defined(__aarch64__)
+// aarch64's register struct is user_pt_regs, and glibc's <sys/user.h> does
+// NOT declare it -- only the kernel header does. (Bionic does, which is why
+// an NDK build compiled and a cross-glibc build did not.)
+#include <asm/ptrace.h>
+#endif
 
 #include "linuxity/abi/syscall.hpp"
 

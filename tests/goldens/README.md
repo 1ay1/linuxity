@@ -25,14 +25,35 @@ a change detector, not a conformance check.
 ## Layout
 
 ```
-goldens/<arch>/<scenario-key>.trace
+goldens/<platform->?<arch>/<scenario-key>.trace
 ```
 
-The arch is part of the **identity**, not metadata. The two Linux ABIs are not
-interchangeable: 56 syscalls exist on x86-64 and not on aarch64 (`open`,
-`fork`, `stat`, `lstat`, `arch_prctl`; aarch64 has only `openat`, `clone`,
-`newfstatat`). An x86-64 golden replayed on aarch64 would compare against a
-trace that cannot occur there.
+Two axes, both part of the **identity**, not metadata.
+
+The **arch** comes first because the two Linux ABIs are not interchangeable:
+56 syscalls exist on x86-64 and not on aarch64 (`open`, `fork`, `stat`,
+`lstat`, `arch_prctl`; aarch64 has only `openat`, `clone`, `newfstatat`). An
+x86-64 golden replayed on aarch64 would compare against a trace that cannot
+occur there.
+
+The **platform** prefix exists because the same ABI can still disagree about
+what a syscall RETURNS. Android is aarch64 Linux plus an SELinux policy that
+denies the `shell` domain things a desktop kernel allows, and the denial
+arrives *before* the kernel's own check — so the errno differs, not just the
+verdict. Measured on a Pixel 6a against this laptop:
+
+| step | desktop x86-64 | Android aarch64 |
+|---|---|---|
+| `TCGETS2` on a pty slave | `0` | `-EACCES` |
+| `TIOCGSID` before we own the tty | `-ENOTTY` | `-EACCES` |
+| `TIOCNOTTY` on our pty | `-ENOTTY` | `-EACCES` |
+
+If both lived in `aarch64/`, recording on a desktop arm64 kernel would flip
+those to `-ENOTTY` and the diff would read as a linuxity regression. They are
+separate recordings of two real kernels, and both must hold.
+
+`Platform::linux_` renders as the empty prefix, so a desktop set keeps the
+plain `x86_64/` and `aarch64/` names and nothing moves when the axis is added.
 
 ## Recording
 
@@ -47,14 +68,32 @@ LX_PROBE_DIR=$PWD/build/probes ./build/tests/record_goldens
 `record_goldens` refuses to run on a non-Linux host rather than producing a
 golden with no kernel behind it.
 
-### Recording the aarch64 set
+### Recording the Android set
 
-The aarch64 goldens in this tree were recorded on a **real Android device**
-(Linux 6.1, arm64), not an emulator or a cross-build. That matters more than
-it sounds: Android is not just "Linux on arm64", it is Linux plus an SELinux
-policy that denies things a desktop kernel allows, and those denials are part
-of the behaviour a guest kernel has to cope with. The `ioctls` golden records
-one directly --
+The `android-aarch64` goldens were recorded on a **real Android device**
+(Pixel 6a, Linux 6.1 GKI, arm64, domain `u:r:shell:s0`), not an emulator or a
+cross-build. Two things make that non-negotiable:
+
+- **qemu-user cannot do it.** linuxity is a ptrace supervisor, and qemu-user
+  services guest syscalls itself, so there is no real trap for
+  `PTRACE_SYSCALL` to intercept — linuxity hangs with no output. Tried,
+  measured, dead end.
+- **A desktop arm64 VM is the wrong kernel.** It boots and runs fine, but it
+  reproduces none of the SELinux denials, so its goldens describe a platform
+  the guest will not meet on a phone.
+
+To re-record, build with the NDK (which defines `__ANDROID__`, so the platform
+tags itself) and run on the device:
+
+```sh
+cmake --build build-android --target record_goldens
+adb push build-android/tests/record_goldens build-android/probes /data/local/tmp/lxconf/
+adb shell 'cd /data/local/tmp/lxconf && \
+  LX_PROBE_DIR=$PWD/probes LX_GOLDEN_DIR=$PWD/goldens ./record_goldens'
+adb pull /data/local/tmp/lxconf/goldens/android-aarch64 tests/goldens/
+```
+
+The `ioctls` golden pins the denials directly --
 
 ```
 ioctl = -EACCES | TCGETS2 on the pty slave

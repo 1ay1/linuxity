@@ -33,6 +33,7 @@
 #include "linuxity/conform/arch.hpp"
 #include "linuxity/conform/observation.hpp"
 #include "linuxity/conform/oracle.hpp"
+#include "linuxity/conform/platform.hpp"
 #include "linuxity/conform/probe_runner.hpp"
 #include "linuxity/conform/scenario.hpp"
 #include "linuxity/conform/trace_text.hpp"
@@ -51,20 +52,34 @@ namespace lx::conform {
 // goldens, and macOS arm64 would then replay whichever job finished last --
 // comparing against a trace that cannot occur on its ABI. So the arch is part
 // of a golden's IDENTITY, not metadata inside it.
+//
+// AND THE PLATFORM, for the same reason one step further out. Android is the
+// same aarch64 ABI as a desktop arm64 kernel but a DIFFERENT policy: its
+// SELinux rules deny the shell domain TCGETS2/TIOCGSID/TIOCNOTTY on a pty
+// that a desktop allows (measured, see platform.hpp). Sharing a directory
+// would make each platform's recording look like a regression to the other.
+// Platform::linux_ renders empty, so every golden committed before this axis
+// existed keeps its exact path.
 struct OraclePaths {
     std::string probe_dir;   // built probe binaries
     std::string golden_dir;  // checked-in reference traces
     abi::Arch   arch{host_arch()};
+    Platform    platform{host_platform()};
 
     [[nodiscard]] std::string probe(std::string_view name) const {
         return probe_dir + "/" + std::string{name};
     }
-    // Derived from the scenario KEY and the arch, never stored, so neither a
-    // renamed scenario nor a different ABI can keep matching an old
-    // recording.
+    // The directory a golden for this (platform, arch) lives in. Android
+    // aarch64 is `android-aarch64`; desktop aarch64 stays `aarch64`.
+    [[nodiscard]] std::string golden_subdir() const {
+        return std::string{platform_prefix(platform)} +
+               std::string{arch_name(arch)};
+    }
+    // Derived from the scenario KEY, the arch and the platform, never stored,
+    // so neither a renamed scenario nor a different ABI nor a different
+    // policy can keep matching an old recording.
     [[nodiscard]] std::string golden(const Scenario& s) const {
-        return golden_dir + "/" + std::string{arch_name(arch)} + "/" +
-               s.key() + ".trace";
+        return golden_dir + "/" + golden_subdir() + "/" + s.key() + ".trace";
     }
 };
 
@@ -242,17 +257,21 @@ private:
                                            const Trace& t) const {
         if (t.steps.empty()) return "golden has no steps";
 
-        // A golden naming a syscall this ABI does not have was recorded for
-        // the other one. The path carries the arch, so this should be
-        // unreachable -- but a hand-edited or wrongly-committed golden would
-        // otherwise be judged as truth, reporting ABI differences as linuxity
-        // bugs. Cheap check, and it fails in the right direction.
-        for (const Observation& o : t.steps)
-            if (!arch_has(paths_.arch, o.call))
-                return "golden names a syscall this ABI lacks (recorded for "
-                       "the other arch?)";
-
+        // NOT CHECKED: whether every step names a syscall this ABI has.
+        // A step LABEL names the contract under test, not the syscall the
+        // probe issued -- fdops labels a step "dup2" on aarch64, which has
+        // no dup2, because dup2-onto-the-same-fd must succeed where dup3
+        // gives EINVAL. Judging labels by arch_has rejected 7 of 19
+        // freshly-recorded aarch64 goldens. The arch in the PATH is the real
+        // guard against a cross-arch recording.
+        //
+        // `expects`, below, IS a list of syscalls the probe must issue, so
+        // arch_has is the right question there -- but only for the ones this
+        // ABI has. legacy exists to pin the x86-64-only path (open, stat,
+        // access, creat), and aarch64 reaches those contracts through
+        // openat/newfstatat instead.
         for (const abi::Sysno want : s.expects) {
+            if (!arch_has(paths_.arch, want)) continue;
             bool seen = false;
             for (const Observation& o : t.steps)
                 if (o.call == want) seen = true;

@@ -7,6 +7,8 @@
 
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
+#include <stdlib.h>   // mkstemp: bionic declares it here, not in <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <unistd.h>

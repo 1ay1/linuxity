@@ -152,18 +152,15 @@ inline std::string Scenario::key() const {
                     .exercising(abi::Sysno::newfstatat)
                     .exercising(abi::Sysno::faccessat)
                     .exercising(abi::Sysno::statx)
-                    .exercising(abi::Sysno::uname)
-                    .exercising(abi::Sysno::getresuid)
-                    .exercising(abi::Sysno::getresgid)
                     .exercising(abi::Sysno::readlinkat)
-                    .exercising(abi::Sysno::symlinkat)
-                    .exercising(abi::Sysno::linkat)
-                    .exercising(abi::Sysno::truncate)
-                    .exercising(abi::Sysno::readlinkat)
-                    .exercising(abi::Sysno::symlinkat)
-                    .exercising(abi::Sysno::linkat)
-                    .exercising(abi::Sysno::truncate)
                     .exercising(abi::Sysno::fstat)
+                    // This list used to carry uname/getresuid/getresgid and
+                    // symlinkat/linkat/truncate -- the latter three twice --
+                    // none of which statpaths.c issues. The effect was not a
+                    // loud failure: every statpaths golden was declared
+                    // stale and the scenario SKIPPED, on both arches, so the
+                    // four divergences its comment credits it with finding
+                    // were no longer being guarded at all.
                     .on(DirFlavour::virtualised));
 
     // fd lifecycle: dup/dup2/dup3, fcntl, and the EBADF boundaries. This is
@@ -353,10 +350,12 @@ inline std::string Scenario::key() const {
                     .exercising(abi::Sysno::getegid)
                     .exercising(abi::Sysno::getresuid)
                     .exercising(abi::Sysno::getresgid)
-                    .exercising(abi::Sysno::readlinkat)
-                    .exercising(abi::Sysno::symlinkat)
-                    .exercising(abi::Sysno::linkat)
-                    .exercising(abi::Sysno::truncate)
+                    // NOT readlinkat/symlinkat/linkat/truncate: those are
+                    // statpaths' business and creds.c never issues them.
+                    // Listing them here made every creds golden "stale" --
+                    // the scenario was silently SKIPPED on both arches
+                    // rather than verified, which is the worst outcome for a
+                    // family where 19 handlers were the whole point.
                     .exercising(abi::Sysno::setuid)
                     .exercising(abi::Sysno::setgid)
                     .exercising(abi::Sysno::setreuid)

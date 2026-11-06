@@ -173,64 +173,49 @@ int main() {
     // meet, bash gave up with "no job control in background", and that turns
     // OFF line editing -- arrow keys echo as ^[[A instead of walking history.
     //
-    // These FORWARD rather than answering outright, because only the kernel
-    // knows whether the fd is our controlling terminal (a pty slave opened
-    // O_NOCTTY is a tty but still ENOTTY here, and /dev/null is ENOTTY too).
-    // The substituted value rides on the fate, applied only if the kernel
-    // allowed the call -- so what this asserts is the value we WOULD write.
+    // These answer OUTRIGHT rather than forwarding. They used to forward so
+    // the kernel could vet the fd, but the guest's controlling terminal is
+    // OUR bookkeeping and the host knows nothing about it -- on Android the
+    // forward came back ENOTTY for the guest's own pty and bash lost job
+    // control. So the fd is vetted against ProcessTable's ctty instead.
+    //
+    // Here no ctty has been claimed, so the session ioctls must REFUSE. That
+    // is the half that has to stay true: a fabricated success on a
+    // non-terminal is exactly what the ioctls probe caught before.
     {
         constexpr std::uint64_t kTIOCGPGRP = 0x540f;
         constexpr std::uint64_t kTIOCSPGRP = 0x5410;
-        auto tcgetpgrp = [&] {
+        constexpr std::uint64_t kTIOCGSID  = 0x5429;
+        constexpr std::uint64_t kTIOCNOTTY = 0x5422;
+
+        auto session_ioctl = [&](std::uint64_t req) {
             abi::Regs io; io.nr = 16;
-            io.arg[0] = 255; io.arg[1] = kTIOCGPGRP; io.arg[2] = 0x8000;
-            const auto out = sys.dispatch(io);
-            const auto* ar = out.template get_if<abi::ArgRewrite>();
-            assert(ar && "TIOCGPGRP forwards with a substituted answer");
-            assert(ar->to == kTIOCGPGRP &&
-                   "the request is UNCHANGED -- only the result is patched");
-            assert(ar->convert == abi::ArgRewrite::Convert::own_pgrp);
-            return static_cast<std::int64_t>(ar->subst);
+            io.arg[0] = 255; io.arg[1] = req; io.arg[2] = 0x8000;
+            return virt_ret(sys.dispatch(io));
         };
+
+        // With no controlling terminal every one of them is ENOTTY, and none
+        // of them reaches the host.
+        const auto enotty = -static_cast<std::int64_t>(Errno::enotty);
+        assert(session_ioctl(kTIOCGPGRP) == enotty &&
+               "TIOCGPGRP without a ctty must not invent an answer");
+        assert(session_ioctl(kTIOCSPGRP) == enotty &&
+               "TIOCSPGRP without a ctty must not pretend to succeed");
+        assert(session_ioctl(kTIOCGSID) == enotty &&
+               "TIOCGSID without a ctty must not invent a session");
+        assert(session_ioctl(kTIOCNOTTY) == enotty &&
+               "TIOCNOTTY with nothing to release is ENOTTY");
+
+        // getpgrp still tracks setpgid, which is the other half of the loop
+        // bash spins on and is independent of owning a terminal.
         auto getpgrp = [&] {
             abi::Regs p; p.nr = 111;             // x86-64 getpgrp
             return virt_ret(sys.dispatch(p));
         };
-
-        // Before any setpgid the two already agree, each being the pid.
-        assert(tcgetpgrp() == getpgrp());
-
-        // After setpgid(0, N) -- bash making itself a group leader -- they
-        // must STILL agree, now on N.
         abi::Regs sp; sp.nr = 109;               // x86-64 setpgid
         sp.arg[0] = 0; sp.arg[1] = 4242;
         (void)sys.dispatch(sp);
         assert(getpgrp() == 4242 && "setpgid must be visible to getpgrp");
-        assert(tcgetpgrp() == 4242 &&
-               "tcgetpgrp must report the group setpgid just set");
-
-        // And tcsetpgrp() must stick too, for the same reason. It is
-        // rewritten to TIOCGPGRP rather than forwarded as-is: the kernel has
-        // to vet the fd (a non-tty is ENOTTY), but the guest's pgid must NOT
-        // reach it -- pid 1 does not exist on the host, so a real TIOCSPGRP
-        // would be EPERM and the shell would drop job control. The group is
-        // recorded here, and the buffer is restored so the caller's input is
-        // not clobbered by what the probe read.
-        std::uint32_t want = 777;
-        std::memcpy(mem.at(0x8000), &want, sizeof want);
-        abi::Regs io; io.nr = 16;
-        io.arg[0] = 255; io.arg[1] = kTIOCSPGRP; io.arg[2] = 0x8000;
-        const auto setfate = sys.dispatch(io);
-        const auto* ar = setfate.template get_if<abi::ArgRewrite>();
-        assert(ar && "TIOCSPGRP probes the fd via an ArgRewrite");
-        assert(ar->to == kTIOCGPGRP &&
-               "rewritten to the read-only sibling, so no guest pgid reaches "
-               "the kernel");
-        assert(ar->convert == abi::ArgRewrite::Convert::restore_u32 &&
-               "the caller's buffer is put back after the probe");
-        assert(ar->subst == 777 && "restored to what the guest asked for");
-        assert(tcgetpgrp() == 777 &&
-               "tcgetpgrp must report the group tcsetpgrp just set");
     }
 
     std::puts("all runtime type-algebra tests passed");

@@ -28,6 +28,14 @@ ioctl = -ENOTTY | TIOCGPGRP on the pty slave
 ioctl = 2 | tcgetpgrp == getpgrp (a shell loops until this holds)
 setpgid = 0 | setpgid(0,0) makes us a group leader
 ioctl = 2 | tcgetpgrp == getpgrp AFTER setpgid
+ioctl = -ENOTTY | TIOCGSID before we own the terminal
+setsid = -EPERM | setsid before claiming a controlling terminal
+ioctl = -EPERM | TIOCSCTTY claims the pty as our controlling terminal
+ioctl = -ENOTTY | TIOCGSID after the claim
+ioctl = -ENOTTY | TIOCNOTTY releases the controlling terminal
+ioctl = -ENOTTY | TIOCGPGRP after TIOCNOTTY
 ioctl = -ENOTTY | an unknown ioctl request fails
 ioctl = -ENOTTY | TCGETS on a non-tty is ENOTTY
 ioctl = -EBADF | TCGETS on a closed fd is EBADF
+ioctl = -ENOTTY | TIOCGPGRP on a non-tty is ENOTTY
+ioctl = -ENOTTY | TIOCNOTTY on a non-tty is ENOTTY

@@ -47,6 +47,9 @@
 #define R_TIOCGWINSZ 0x5413UL
 #define R_TIOCSWINSZ 0x5414UL
 #define R_TIOCGPGRP  0x540fUL
+#define R_TIOCSCTTY  0x540eUL
+#define R_TIOCNOTTY  0x5422UL
+#define R_TIOCGSID   0x5429UL
 #define R_TIOCSPGRP  0x5410UL
 #define R_TIOCGPTN   0x80045430UL
 #define R_TIOCSPTLCK 0x40045431UL
@@ -265,6 +268,41 @@ int main(void) {
                 "tcgetpgrp == getpgrp AFTER setpgid");
     }
 
+    // -- who OWNS the terminal ---------------------------------------------
+    // The session ioctls, which decide whether a shell gets job control at
+    // all. These are policy-sensitive: Android's SELinux denies the shell
+    // domain TIOCGSID and TIOCNOTTY on a pty that a desktop kernel allows,
+    // so the golden pins whatever THIS kernel does and linuxity has to agree
+    // with it rather than with an assumption.
+    //
+    // Order matters. TIOCGSID is asked BEFORE any claim, so the trace
+    // records the not-our-terminal answer too, not just the happy path.
+    {
+        int sid = 0;
+        lx_emit("ioctl", LX_SYS3(SYS_ioctl, s, R_TIOCGSID, &sid),
+                "TIOCGSID before we own the terminal");
+
+        // A session leader may claim the pty. setsid() fails if we are
+        // already a group leader (the setpgid above made us one), so the
+        // emitted value pins whichever answer this kernel gives.
+        const long sd = LX_SYS0(SYS_setsid);
+        lx_emit("setsid", sd, "setsid before claiming a controlling terminal");
+
+        lx_emit("ioctl", LX_SYS3(SYS_ioctl, s, R_TIOCSCTTY, 0),
+                "TIOCSCTTY claims the pty as our controlling terminal");
+
+        int sid2 = 0;
+        const long gs = LX_SYS3(SYS_ioctl, s, R_TIOCGSID, &sid2);
+        lx_emit("ioctl", gs, "TIOCGSID after the claim");
+
+        // Giving it up must stick: the session ioctls go back to refusing.
+        lx_emit("ioctl", LX_SYS3(SYS_ioctl, s, R_TIOCNOTTY, 0),
+                "TIOCNOTTY releases the controlling terminal");
+        int pg3 = 0;
+        lx_emit("ioctl", LX_SYS3(SYS_ioctl, s, R_TIOCGPGRP, &pg3),
+                "TIOCGPGRP after TIOCNOTTY");
+    }
+
     // -- the error boundaries ----------------------------------------------
     // An unknown request and a non-tty fd must fail the same way on both
     // sides. These pin that linuxity's default arm forwards rather than
@@ -281,6 +319,19 @@ int main(void) {
 
     lx_emit("ioctl", LX_SYS3(SYS_ioctl, 9999, R_TCGETS, a),
             "TCGETS on a closed fd is EBADF");
+
+    // The session ioctls must reject a non-tty the same way, not fabricate a
+    // success. linuxity answers these from its own bookkeeping, so this is
+    // the arm that catches it saying yes to a plain file.
+    {
+        const long f = LX_SYS3(SYS_openat, AT_FDCWD, "/dev/null", O_RDONLY);
+        int pg = 0;
+        lx_emit("ioctl", f < 0 ? f : LX_SYS3(SYS_ioctl, f, R_TIOCGPGRP, &pg),
+                "TIOCGPGRP on a non-tty is ENOTTY");
+        lx_emit("ioctl", f < 0 ? f : LX_SYS3(SYS_ioctl, f, R_TIOCNOTTY, 0),
+                "TIOCNOTTY on a non-tty is ENOTTY");
+        if (f >= 0) LX_SYS1(SYS_close, f);
+    }
 
     LX_SYS1(SYS_close, s);
     LX_SYS1(SYS_close, m);

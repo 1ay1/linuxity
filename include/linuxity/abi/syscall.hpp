@@ -3719,7 +3719,7 @@ private:
             }
             case kTIOCNOTTY: {
                 const std::int32_t me = ids().pid;
-                if (k_.procs().ctty_of(me) < 0) return eno(Errno::enotty);
+                if (k_.procs().ctty_of(me) < 0) return ctty_refusal(r);
                 k_.procs().clear_ctty(me);
                 return val(0);
             }
@@ -3750,9 +3750,16 @@ private:
             // nothing about it. On Android the forward answered ENOTTY for
             // the guest's own terminal and bash lost job control. So vet it
             // against OUR bookkeeping, which is the authority.
+            //
+            // But only once we OWN the fd. If it is a terminal we have not
+            // claimed, the host gets asked after all: its answer may be a
+            // POLICY denial that outranks the tty question entirely, and
+            // Android proves it -- SELinux returns EACCES for TIOCGSID on a
+            // pty where a desktop kernel returns ENOTTY. Answering ENOTTY
+            // ourselves hid that, and the on-device golden caught it.
             case kTIOCGPGRP: {
                 if (!fd_is_our_ctty(static_cast<int>(r.arg[0])))
-                    return eno(Errno::enotty);
+                    return ctty_refusal(r);
                 // Whoever TIOCSPGRP last handed the terminal to; the caller's
                 // own group until someone claims it. Always answering the
                 // caller's own group is what bash needs at the prompt (it
@@ -3768,7 +3775,7 @@ private:
             }
             case kTIOCGSID: {
                 if (!fd_is_our_ctty(static_cast<int>(r.arg[0])))
-                    return eno(Errno::enotty);
+                    return ctty_refusal(r);
                 const std::int32_t sid = k_.procs().sid_of(ids().pid);
                 if (!put_u32(r.arg[2], static_cast<std::uint32_t>(sid)))
                     return eno(Errno::efault);
@@ -3794,7 +3801,7 @@ private:
             // group is updated only if it said yes.
             case kTIOCSPGRP: {
                 if (!fd_is_our_ctty(static_cast<int>(r.arg[0])))
-                    return eno(Errno::enotty);
+                    return ctty_refusal(r);
                 const std::uint32_t want = get_u32(r.arg[2]);
                 // Record the FOREGROUND group. Writing flat_pgrp_ here moved
                 // the caller itself into the group it was handing the tty to.
@@ -4075,6 +4082,26 @@ public:
             tgt[k] = '\0';
             return lx::vfs::pty_slave_number(tgt);
         }
+    }
+
+    // How to refuse a session ioctl on an fd we do not own.
+    //
+    // Two different refusals, and picking the wrong one is a conformance bug:
+    //
+    //   - a real TERMINAL that is not ours: FORWARD, and let the host say
+    //     why. Its reason may outrank "not your controlling terminal" --
+    //     Android's SELinux answers EACCES for TIOCGSID on a pty where a
+    //     desktop kernel answers ENOTTY, and only the host knows which.
+    //     Answering ENOTTY from here hid the denial, and the on-device
+    //     golden caught it at `ioctls` step 25.
+    //   - anything else (a plain file, a pipe, a closed fd): ENOTTY from
+    //     here. ENOTTY is the kernel's answer for those on every host, and
+    //     forwarding an fd we never tracked risks acting on the wrong thing.
+    [[nodiscard]] Outcome ctty_refusal(const Regs& r) {
+        const int fd = static_cast<int>(r.arg[0]);
+        if (pty_slave_of_fd(fd) >= 0 || host_fd_slave_no(fd) >= 0)
+            return fwd();
+        return eno(Errno::enotty);
     }
 
     [[nodiscard]] bool put_u32(std::uint64_t addr, std::uint32_t v) {
