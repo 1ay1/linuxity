@@ -156,6 +156,7 @@ inline std::string Scenario::key() const {
                     .exercising(abi::Sysno::getresuid)
                     .exercising(abi::Sysno::getresgid)
                     .exercising(abi::Sysno::readlinkat)
+                    .exercising(abi::Sysno::readlinkat)
                     .exercising(abi::Sysno::fstat)
                     .on(DirFlavour::virtualised));
 
@@ -346,6 +347,7 @@ inline std::string Scenario::key() const {
                     .exercising(abi::Sysno::getegid)
                     .exercising(abi::Sysno::getresuid)
                     .exercising(abi::Sysno::getresgid)
+                    .exercising(abi::Sysno::readlinkat)
                     .exercising(abi::Sysno::setuid)
                     .exercising(abi::Sysno::setgid)
                     .exercising(abi::Sysno::setreuid)
@@ -386,6 +388,7 @@ inline std::string Scenario::key() const {
                     .exercising(abi::Sysno::uname)
                     .exercising(abi::Sysno::getresuid)
                     .exercising(abi::Sysno::getresgid)
+                    .exercising(abi::Sysno::readlinkat)
                     .exercising(abi::Sysno::fchmod)
                     .exercising(abi::Sysno::fchown)
                     .exercising(abi::Sysno::faccessat2)

@@ -256,6 +256,69 @@ int main(void) {
         }
         lx_emit("read", LX_CHECK(n > 0, shaped), "...and the first line is an address range");
     }
+    // -- procfs SYMLINKS ---------------------------------------------------
+    // /proc/self/{exe,cwd,root} are synthesized links, and stat through them
+    // takes a different path from lstat on them -- one resolves to the
+    // target, the other describes the link. Four separate blocks of that
+    // code had no coverage.
+    //
+    // A procfs symlink reports st_size 0, unlike a real symlink whose size
+    // is its target's length. linuxity reported the target length, which
+    // `find -type l -size` and archivers that preallocate from st_size can
+    // see. The MODE is the other half: lstat must say S_IFLNK where stat
+    // says whatever the target is.
+    {
+        static unsigned char st[160];
+        // st_mode is at offset 24 and st_size at 48 on x86-64; on aarch64
+        // they are 16 and 48. Only the mode offset differs.
+#if defined(__x86_64__)
+        const int mode_off = 24;
+#else
+        const int mode_off = 16;
+#endif
+        const int size_off = 48;
+
+        // lstat: the LINK itself.
+        memset(st, 0, sizeof st);
+        const long l = LX_SYS4(SYS_newfstatat, AT_FDCWD, "/proc/self/exe", st,
+                               0x100 /*AT_SYMLINK_NOFOLLOW*/);
+        unsigned mode = 0; unsigned long long size = 0;
+        memcpy(&mode, st + mode_off, 4);
+        memcpy(&size, st + size_off, 8);
+        lx_emit("newfstatat", l, "lstat /proc/self/exe");
+        lx_emit("newfstatat", LX_CHECK(l == 0, (mode & 0170000) == 0120000),
+                "...reports S_IFLNK");
+        lx_emit("newfstatat", LX_CHECK(l == 0, size == 0),
+                "...and a procfs symlink has st_size 0");
+
+        // stat: FOLLOWS to the executable, which is a regular file.
+        memset(st, 0, sizeof st);
+        const long s = LX_SYS4(SYS_newfstatat, AT_FDCWD, "/proc/self/exe", st, 0);
+        memcpy(&mode, st + mode_off, 4);
+        lx_emit("newfstatat", s, "stat /proc/self/exe follows the link");
+        lx_emit("newfstatat", LX_CHECK(s == 0, (mode & 0170000) == 0100000),
+                "...and lands on a regular file");
+
+        // /proc/self/cwd follows to a DIRECTORY.
+        memset(st, 0, sizeof st);
+        const long c = LX_SYS4(SYS_newfstatat, AT_FDCWD, "/proc/self/cwd", st, 0);
+        memcpy(&mode, st + mode_off, 4);
+        lx_emit("newfstatat", LX_CHECK(c == 0, (mode & 0170000) == 0040000),
+                "stat /proc/self/cwd lands on a directory");
+
+        // readlink must give an absolute path for each of them.
+        static char lb[256];
+        for (int k = 0; k < 2; ++k) {
+            const char* p = k ? "/proc/self/root" : "/proc/self/exe";
+            memset(lb, 0, sizeof lb);
+            const long n = LX_SYS4(SYS_readlinkat, AT_FDCWD, p, lb, 255);
+            lx_emit("readlinkat", n > 0 ? 1 : n, k ? "readlink /proc/self/root"
+                                                   : "readlink /proc/self/exe");
+            lx_emit("readlinkat", LX_CHECK(n > 0, lb[0] == '/'),
+                    "...and the target is absolute");
+        }
+    }
+
     // -- sysinfo -----------------------------------------------------------
     // struct sysinfo: uptime(8) loads(24) totalram(8) freeram(8) ...
     // Uptime and free memory differ between runs by nature; totals do not.

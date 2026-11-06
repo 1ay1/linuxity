@@ -1303,8 +1303,13 @@ private:
             }
             if (!vf) return eno(vf.error());
             UAddr sb = at ? uaddr(r.arg[2]) : uaddr(r.arg[1]);
-            return write_statbuf(sb, vf->is_dir, vf->symlink_target.empty()
-                                     ? vf->bytes.size() : vf->symlink_target.size(),
+            // A PROCFS symlink reports st_size 0, unlike a real one whose
+            // size is its target's length. These are all procfs links
+            // (/proc/self/{exe,cwd,root}, /proc/<pid>/fd/N), so reporting
+            // the target length was wrong in a way `find -type l -size` and
+            // archivers that preallocate from st_size can see.
+            return write_statbuf(sb, vf->is_dir,
+                                 vf->symlink_target.empty() ? vf->bytes.size() : 0,
                                  !vf->symlink_target.empty());
         }
         return eno(pc.error);
@@ -1364,7 +1369,10 @@ private:
                                             uaddr(r.arg[4]), tgt});
                         }
                     }
-                    return write_statx(uaddr(r.arg[4]), false, tgt.size(), true);
+                    // size 0: a PROCFS symlink reports st_size 0, unlike a
+                    // real one whose size is its target's length. Same rule
+                    // as the stat path above.
+                    return write_statx(uaddr(r.arg[4]), false, 0, true);
                 }
             }
             if (!vf) return eno(vf.error());
