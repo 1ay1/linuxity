@@ -295,6 +295,10 @@ int main(int argc, char** argv) {
 
     host::PosixHost hw;
     kernel::Kernel<host::PosixHost> k{hw};
+    // Before any mount: the base mount_host() resolves relative host paths
+    // against (`--root ./arch`, `--persist ./upper`, `--bind ./src`).
+    if (char cwd[4096]; ::getcwd(cwd, sizeof cwd) != nullptr)
+        k.files().set_host_cwd(cwd);
 
     // The virtual machine exposes as many logical CPUs as the host has online
     // (native execution means the guest genuinely runs on them). procfs and

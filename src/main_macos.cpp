@@ -133,6 +133,10 @@ struct Machine {
     kernel::Kernel<host::PosixHost> k{hw};
 
     explicit Machine(const Options& o, bool fork_child = false) {
+        // Before any mount, as in main.cpp: relative --root/--persist/--bind
+        // paths are resolved against where the tool was launched.
+        if (char cwd[4096]; ::getcwd(cwd, sizeof cwd) != nullptr)
+            k.files().set_host_cwd(cwd);
         k.files().set_fork_child(fork_child);
         kernel::MachineSpec spec;
         const long n = ::sysconf(_SC_NPROCESSORS_ONLN);

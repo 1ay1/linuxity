@@ -366,8 +366,37 @@ int main() {
         assert(uc.host_path == "/usr");
     }
 
+    // Relative host paths handed to mount_host come out ABSOLUTE, resolved
+    // against the supervisor's cwd. A relative upper like `--persist
+    // ./arch-upper` used to be stored as-is, and the host path classify()
+    // hands out is spliced into the guest's registers for a REDIRECT -- where
+    // the kernel resolves it against the GUEST's dirfd. rm -rf (fts unlinks
+    // relative to an open dirfd) then removed nothing and failed ENOTEMPTY.
+    // Found on Android, where --root/--persist are naturally relative.
+    {
+        kernel::FileNamespace rf;
+        rf.set_host_cwd("/data/local/tmp");
+        rf.mount_host("/", "./arch", "./arch-upper");
+        const auto rc = rf.classify("/var/lib/x", /*for_write=*/true, false);
+        assert(rc.realm == Realm2::host_backed);
+        assert(!rc.host_path.empty() && rc.host_path.front() == '/');
+        assert(rc.host_path.rfind("/data/local/tmp/arch-upper/", 0) == 0);
+
+        // An already-absolute path is untouched apart from normalization.
+        kernel::FileNamespace af;
+        af.set_host_cwd("/elsewhere");
+        af.mount_host("/", "/srv/root//", "/srv/up/");
+        const auto ac = af.classify("/f", true, false);
+        assert(ac.host_path.rfind("/srv/up/", 0) == 0);
+
+        // `..` in a relative path resolves lexically, not by escaping.
+        assert(rf.absolute_host("../x") == "/data/local/x");
+        assert(rf.absolute_host("").empty());
+    }
+
     std::puts("file_namespace: mount table, normalization, realm "
               "classification, synthesized /proc, cross-mount symlinks, "
-              "root-mount host paths, and copy-up overlay correct");
+              "root-mount host paths, relative mount paths, and copy-up "
+              "overlay correct");
     return 0;
 }

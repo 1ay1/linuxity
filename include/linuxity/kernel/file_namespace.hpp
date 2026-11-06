@@ -132,6 +132,26 @@ public:
     void mount_host(std::string prefix, std::string host_base,
                     std::string upper = {}) {
         if (prefix.size() > 1 && prefix.back() == '/') prefix.pop_back();
+        // Every host path in the mount table is ABSOLUTE, made so here -- the
+        // one door every host path comes through (--root, --persist, --bind,
+        // the private /tmp, any future caller).
+        //
+        // A relative one is not just untidy, it is a live bug: the host path
+        // classify() hands out is used by the SUPERVISOR's own calls (the
+        // one-stop stat, whiteouts, the meta journal) AND spliced into the
+        // guest's registers for a REDIRECT, which the kernel then resolves
+        // against the GUEST's cwd and dirfd, not ours. With `--persist
+        // ./arch-upper` on Android, rm -rf's fts unlinks relative to an open
+        // dirfd, so "./arch-upper/.../f" resolved under the guest's directory
+        // and removed nothing. The trace showed REDIRECT to the right-looking
+        // path, the file stayed on disk, and rmdir failed ENOTEMPTY. The same
+        // run with absolute --root/--persist was clean.
+        //
+        // Lexical, not realpath(): this file is the portable core and makes
+        // no host calls. The base is the supervisor's cwd at mount time,
+        // passed in by the backend that knows it.
+        host_base = absolute_host(std::move(host_base));
+        upper     = absolute_host(std::move(upper));
         // Strip a trailing slash, but never reduce "/" to "": an empty
         // host_base makes join_host(base, "") return "", so classify("/")
         // handed the dispatcher an empty host path and stat("/") came back
@@ -169,6 +189,22 @@ public:
     // host stat results, so a uid-0 world round-trips coherently.
     [[nodiscard]] MetaStore& meta() noexcept { return meta_; }
     [[nodiscard]] const MetaStore& meta() const noexcept { return meta_; }
+
+    // The SUPERVISOR's cwd at startup -- the base mount_host() uses to make a
+    // relative host path absolute. Set once by the backend, before mounting;
+    // unset means "/". Distinct from every guest cwd on purpose: those live in
+    // cwds_ and are what the GUEST sees, this is where the host tool ran.
+    void set_host_cwd(std::string c) { host_cwd_ = normalize(std::move(c)); }
+
+    // A host path made absolute against host_cwd_. Lexical only: the portable
+    // core makes no host calls, so no realpath().
+    [[nodiscard]] std::string absolute_host(std::string p) const {
+        if (p.empty()) return p;
+        if (p.front() == '/') return normalize(p);
+        std::string base = host_cwd_.empty() ? std::string{"/"} : host_cwd_;
+        if (base.back() != '/') base += '/';
+        return normalize(base + p);
+    }
 
     // Mount a virtual producer at an absolute guest prefix ("/proc", "/sys").
     void mount_virtual(std::string prefix, Producer prod) {
@@ -983,6 +1019,8 @@ private:
     // cwd for a pid with no record and no recorded parent: "/" for the root
     // process, the parent's cwd in a forked child (import_process_state).
     std::string inherited_cwd_{"/"};
+    // The SUPERVISOR's cwd (not any guest's), for absolute_host().
+    std::string host_cwd_;
     // The cwd of the most recently seen task, used to seed a task whose parent
     // link is not known yet (see set_current_pid). Mutable for the same reason
     // cwds_ is: set_current_pid is const because it only updates bookkeeping.
