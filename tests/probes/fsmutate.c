@@ -592,6 +592,40 @@ int main(void) {
     lx_emit("renameat", LX_SYS4(SYS_renameat, AT_FDCWD, F1 "/bad", AT_FDCWD, DIR "/"),
             "rename through a FILE prefix is ENOTDIR, not ENOTEMPTY");
 
+    // -- rename and link act on the NAME, not what it points to -----------
+    // A dangling symlink is a perfectly good rename source and an occupied
+    // link destination: the operation touches the directory entry, not the
+    // target. Probing with access(F_OK) FOLLOWS the link, so a dangling one
+    // read as "missing" -- rename answered ENOENT for a name plainly there,
+    // and link fell past its EEXIST into the no-directory-links EPERM.
+    LX_SYS3(SYS_symlinkat, "nowhere-at-all", AT_FDCWD, DIR "/dang3");
+    // WHICH refusal varies by host -- mainline says ENOTEMPTY (the
+    // destination is the source's own parent), Android's f2fs says ENOTDIR --
+    // and the portable fact is the one the bug was about: NOT ENOENT, i.e.
+    // the dangling source was found. Collapse it the way creds.c does.
+    {
+        const long rc = LX_SYS4(SYS_renameat, AT_FDCWD, DIR "/dang3",
+                                AT_FDCWD, DIR "/");
+        lx_emit("renameat", (rc < 0 && rc != -ENOENT) ? 1 : rc,
+                "rename of a DANGLING source is refused, but not for ENOENT");
+    }
+    lx_emit("linkat",
+            LX_SYS5(SYS_linkat, AT_FDCWD, DIR "/", AT_FDCWD, DIR "/dang3", 0),
+            "link onto a DANGLING name is EEXIST, not EPERM");
+    LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/dang3", 0);
+
+    // readlink checks its bufsiz BEFORE resolving the path, so a
+    // non-positive one is EINVAL even when the path could not be walked.
+    LX_SYS3(SYS_mkdirat, AT_FDCWD, DIR "/nox5", 0755);
+    LX_SYS3(SYS_mkdirat, AT_FDCWD, DIR "/nox5/d", 0755);
+    LX_SYS4(SYS_fchmodat, AT_FDCWD, DIR "/nox5", 0644, 0);
+    lx_emit("readlinkat",
+            LX_SYS4(SYS_readlinkat, AT_FDCWD, DIR "/nox5/d/../x", (char[64]){0}, 0),
+            "bufsiz 0 is EINVAL even through an unsearchable dir");
+    LX_SYS4(SYS_fchmodat, AT_FDCWD, DIR "/nox5", 0755, 0);
+    LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/nox5/d", 0x200);
+    LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/nox5", 0x200);
+
     // -- teardown, observing each removal ----------------------------------
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, SYM, 0), "unlink sym");
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, F2, 0), "unlink f2");

@@ -1197,6 +1197,21 @@ private:
         return e == Errno::enoent ? fallback : e;
     }
 
+    // Does this NAME exist, without following a final symlink? rename and
+    // unlink act on the link itself, so a dangling one is still there as far
+    // as they are concerned -- an F_OK probe would call it missing.
+    [[nodiscard]] static bool host_lexists(const std::string& p,
+                                           Errno* why = nullptr) noexcept {
+        if (p.empty()) {
+            if (why != nullptr) *why = Errno::enoent;
+            return false;
+        }
+        struct ::stat st{};
+        if (::lstat(p.c_str(), &st) == 0) return true;
+        if (why != nullptr) *why = access_errno();
+        return false;
+    }
+
     // Does the PARENT of this host path resolve at all (symlinks followed)?
     // A dangling link used as a path component is ENOENT, which the kernel
     // reports before anything about what is being linked. `why` separates
@@ -1804,6 +1819,13 @@ private:
         std::string raw0 =
             read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)]));
         if (raw0.empty()) return at ? fwd() : eno(Errno::enoent);
+        // A non-positive bufsiz is EINVAL, and the kernel checks it BEFORE it
+        // resolves the path -- so it outranks every lookup error, including
+        // the EACCES an unsearchable component would give. (bufsiz is the
+        // register after the buffer, which is after the path.)
+        if (static_cast<std::int64_t>(
+                r.arg[static_cast<std::size_t>(path_arg) + 2]) <= 0)
+            return eno(Errno::einval);
         // A "."/".." component does not excuse the components before it: an
         // unsearchable directory mid-path is EACCES, ahead of the EINVAL
         // that "this is not a symlink" would give.
@@ -2752,16 +2774,19 @@ private:
                 read_cstr(uaddr(r.arg[static_cast<std::size_t>(a2)]));
             const bool slash1 = path_syntax(raw1) == PathSyntax::needs_dir;
             const bool slash2 = path_syntax(raw2) == PathSyntax::needs_dir;
+            Errno src_why = Errno::ok;
             if (slash1 || slash2) {
                 // The SOURCE is judged first: a missing one is ENOENT and a
                 // file used as its directory component is ENOTDIR, both
                 // ahead of anything about the destination. Checking the
                 // ancestor rule first answered ENOTEMPTY for all of them.
-                if (Errno why = Errno::ok;
-                    !host_target_exists(ps.host_path, &why))
-                    return eno(why == Errno::enoent && !parent_is_dir(ps.host_path)
-                                   ? Errno::enotdir
-                                   : why);
+                //
+                // LSTAT, not access: rename moves the LINK, so a dangling
+                // symlink source is perfectly renameable. Following it
+                // reported ENOENT for a name that is plainly there.
+                if (!parent_is_dir(ps.host_path)) return eno(Errno::enotdir);
+                if (!host_lexists(ps.host_path, &src_why))
+                    return eno(src_why);
                 // ...then a destination that is an ANCESTOR of the source:
                 // the move would absorb a directory containing itself, which
                 // the kernel reports as ENOTEMPTY. Any other existing-
@@ -2790,12 +2815,17 @@ private:
             const bool slash1 = path_syntax(raw1) == PathSyntax::needs_dir;
             const bool slash2 = path_syntax(raw2) == PathSyntax::needs_dir;
             if (slash1 || slash2) {
+                // LSTAT throughout: link acts on the NAME, so a dangling
+                // symlink is both a valid source and an occupied destination.
                 if (Errno why = Errno::ok;
-                    !host_target_exists(ps.host_path, &why))
+                    !host_lexists(ps.host_path, &why))
                     return eno(why);
                 if (slash1 && !host_path_is_dir(ps.host_path))
                     return eno(Errno::enotdir);
-                if (host_target_exists(pd.host_path)) return eno(Errno::eexist);
+                // LSTAT: a DANGLING symlink still occupies the name, so
+                // linking onto it is EEXIST. Following it reported ENOENT and
+                // then fell through to the no-directory-links EPERM.
+                if (host_lexists(pd.host_path)) return eno(Errno::eexist);
                 // Unsearchable comes before "does not resolve": an F_OK probe
                 // fails for both reasons, and the permission is what the
                 // kernel hits first.
