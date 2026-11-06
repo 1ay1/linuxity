@@ -234,6 +234,31 @@ rerun tools/gen_sysno_names.py"
     fi
 fi
 
+# ---- the Linux ptrace backend must stay ARCH-neutral --------------------
+#
+# ptrace_regs.hpp owns the per-arch register view (x86-64's
+# user_regs_struct/orig_rax/rax, aarch64's user_pt_regs/regs[8]/regs[0] and
+# its NT_ARM_SYSTEM_CALL quirk). ptrace_trap.hpp -- the state machine, pid
+# translation, fd and cwd bookkeeping, the fast paths -- must go through that
+# seam, or the backend becomes x86-64-only again by accident. It WAS: 73 sites
+# reached into user_regs_struct directly, and compiling for aarch64 said
+# "no member named 'orig_rax'".
+#
+# Checked here because the failure is invisible on an x86-64 CI box: the build
+# stays green and only an arm64 host finds out.
+for f in include/linuxity/runtime/linux/*.hpp; do
+    [ -e "$f" ] || continue
+    case "$(basename "$f")" in
+        ptrace_regs.hpp) continue ;;   # the sanctioned per-arch seam
+    esac
+    # Strip comments before looking: these names are fine in prose, and the
+    # commit that introduced the seam explains the mapping in comments.
+    if sed 's,//.*,,' "$f" | grep -qE '\b(orig_rax|user_regs_struct|user_pt_regs)\b|\.(rax|rdi|rsi|rdx|r10|rsp|rip)\b|PTRACE_[GS]ETREGS\b'; then
+        note "$f names a machine register directly; go through \
+runtime/linux/ptrace_regs.hpp so the backend builds on aarch64 too"
+    fi
+done
+
 if [ "$fail" -eq 0 ]; then
     echo "runtime layout: all structural invariants hold"
 else

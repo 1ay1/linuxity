@@ -21,6 +21,7 @@
 #pragma once
 
 #include "linuxity/abi/syscall.hpp"
+#include "linuxity/runtime/linux/ptrace_regs.hpp"
 #include "linuxity/abi/wire/errno_map.hpp"
 #include "linuxity/runtime/trap.hpp"
 #include "linuxity/runtime/linux/seccomp_filter.hpp"
@@ -48,6 +49,10 @@
 
 namespace lx::runtime {
 
+// The per-arch register view (ptrace_regs.hpp). Named locally so the state
+// machine below reads the same on x86-64 and aarch64.
+using Regs = linux_regs::Regs;
+
 class PtraceTrap {
 public:
     PtraceTrap(std::string path, std::vector<std::string> argv,
@@ -65,7 +70,7 @@ public:
         Action action{Action::none};
         std::int64_t ret{0};
         int pending_sig{0};    // a signal held during a redirect, to re-inject
-        struct user_regs_struct regs{};
+        Regs regs{};
     };
 
     [[nodiscard]] Status start(UAddr, UAddr) {
@@ -269,13 +274,13 @@ public:
             // fires BEFORE the syscall runs). Non-filtered syscalls never get
             // here — they ran natively without stopping.
             if (event == PTRACE_EVENT_SECCOMP) {
-                struct user_regs_struct rr{};
-                ::ptrace(PTRACE_GETREGS, w, 0, &rr);
+                Regs rr{};
+                (void)Regs::fetch(w, rr);
                 // The ROOT's bootstrap execve targets path_, already a resolved
                 // HOST path; path_exec expects a GUEST path and would
                 // mis-resolve it. Run that one exec natively; every guest exec
                 // after the image is live goes through the dispatcher.
-                std::uint64_t sysno = rr.orig_rax;
+                std::uint64_t sysno = rr.nr();
                 if (!booted_root_ && w == root_pid_ &&
                     (sysno == 59 || sysno == 322)) {
                     // Let this bootstrap execve run NATIVELY. At a
@@ -286,7 +291,7 @@ public:
                     // (orig_rax = the exec nr) so the syscall is re-armed, then
                     // resume -- the exec proceeds and its PTRACE_EVENT_EXEC
                     // sets booted_root_.
-                    ::ptrace(PTRACE_SETREGS, w, 0, &rr);
+                    (void)rr.store(w);
                     resume_run(w, 0);
                     continue;
                 }
@@ -320,10 +325,10 @@ public:
             // and the exit, distinguished by the -ENOSYS-primed RAX.
             if (sig == (SIGTRAP | 0x80)) {
                 Task& t = tasks_[w];
-                struct user_regs_struct rr{};
-                ::ptrace(PTRACE_GETREGS, w, 0, &rr);
+                Regs rr{};
+                (void)Regs::fetch(w, rr);
                 bool is_entry = !seccomp_
-                    && (static_cast<long long>(rr.rax) == -38 /*ENOSYS*/)
+                    && (static_cast<long long>(rr.ret()) == -38 /*ENOSYS*/)
                     && !t.in_call;
                 if (is_entry) {
                     // Same bootstrap exemption as the seccomp path, for the
@@ -332,7 +337,7 @@ public:
                     // path_exec would mis-resolve as a guest path. Forward it
                     // natively; its PTRACE_EVENT_EXEC sets booted_root_ and
                     // every later guest exec is dispatched normally.
-                    std::uint64_t sysno = rr.orig_rax;
+                    std::uint64_t sysno = rr.nr();
                     if (!booted_root_ && w == root_pid_ &&
                         (sysno == 59 || sysno == 322)) {
                         t.in_call = true;
@@ -361,12 +366,12 @@ public:
     }
 
     // Fill the arch-neutral TrapFrame from x86-64 registers at a syscall stop.
-    static void fill_frame(TrapFrame& f, const struct user_regs_struct& rr) {
-        f.regs.nr     = rr.orig_rax;
-        f.regs.arg[0] = rr.rdi; f.regs.arg[1] = rr.rsi;
-        f.regs.arg[2] = rr.rdx; f.regs.arg[3] = rr.r10;
-        f.regs.arg[4] = rr.r8;  f.regs.arg[5] = rr.r9;
-        f.pc          = rr.rip;
+    static void fill_frame(TrapFrame& f, const Regs& rr) {
+        f.regs.nr     = rr.nr();
+        f.regs.arg[0] = rr.arg(0); f.regs.arg[1] = rr.arg(1);
+        f.regs.arg[2] = rr.arg(2); f.regs.arg[3] = rr.arg(3);
+        f.regs.arg[4] = rr.arg(4);  f.regs.arg[5] = rr.arg(5);
+        f.pc          = rr.pc();
     }
 
     // At a syscall-ENTRY stop, translate any GUEST pid arguments to host tids
@@ -376,32 +381,32 @@ public:
     // guest pid would wait on nothing and return -1/ECHILD. Rewrite a positive
     // pid to its host tid; the reaped pid is translated back at the exit stop
     // (returns_pid). pid<=0 (any child / process group) passes through.
-    void translate_entry_args(::pid_t w, struct user_regs_struct& rr, Task& t) {
-        if (rr.orig_rax == 61 /*wait4*/) {
-            auto gpid = static_cast<std::int32_t>(static_cast<long long>(rr.rdi));
+    void translate_entry_args(::pid_t w, Regs& rr, Task& t) {
+        if (rr.nr() == 61 /*wait4*/) {
+            auto gpid = static_cast<std::int32_t>(static_cast<long long>(rr.arg(0)));
             if (gpid > 0) {
                 ::pid_t host = host_tid_of(gpid);
                 if (host > 0) {
-                    struct user_regs_struct wr = rr;
-                    wr.rdi = static_cast<unsigned long long>(host);
-                    ::ptrace(PTRACE_SETREGS, w, 0, &wr);
+                    Regs wr = rr;
+                    wr.set_arg(0, static_cast<std::uint64_t>(host));
+                    (void)wr.store(w);
                     t.regs = wr;
                     rr = wr;
                 }
             }
-        } else if (rr.orig_rax == 247 /*waitid*/) {
+        } else if (rr.nr() == 247 /*waitid*/) {
             // waitid(idtype /*rdi*/, id /*rsi*/, siginfo* /*rdx*/, opts /*r10*/).
             // Kernel idtype enum: P_ALL=0, P_PID=1, P_PGID=2, P_PIDFD=3. For
             // P_PID/P_PGID the `id` is a GUEST pid/pgid we map to a host tid;
             // P_ALL and P_PIDFD carry no guest pid.
-            auto idtype = static_cast<unsigned>(rr.rdi);
-            auto gid = static_cast<std::int32_t>(static_cast<long long>(rr.rsi));
+            auto idtype = static_cast<unsigned>(rr.arg(0));
+            auto gid = static_cast<std::int32_t>(static_cast<long long>(rr.arg(1)));
             if ((idtype == 1 /*P_PID*/ || idtype == 2 /*P_PGID*/) && gid > 0) {
                 ::pid_t host = host_tid_of(gid);
                 if (host > 0) {
-                    struct user_regs_struct wr = rr;
-                    wr.rsi = static_cast<unsigned long long>(host);
-                    ::ptrace(PTRACE_SETREGS, w, 0, &wr);
+                    Regs wr = rr;
+                    wr.set_arg(1, static_cast<std::uint64_t>(host));
+                    (void)wr.store(w);
                     t.regs = wr;
                     rr = wr;
                 }
@@ -429,16 +434,16 @@ public:
     // VIRTUALIZE: neutralize the syscall now; write `ret` into RAX at exit.
     [[nodiscard]] Status resume(std::int64_t ret) {
         Task& t = tasks_[cur_];
-        struct user_regs_struct r = t.regs;
-        r.orig_rax = static_cast<unsigned long long>(-1);
+        Regs r = t.regs;
+        r.skip_call();
         if (seccomp_) {
             // Fast path: one stop, not two. At a PTRACE_EVENT_SECCOMP stop,
             // orig_rax = -1 skips the call and the kernel returns whatever we
             // leave in rax (seccomp(2), SECCOMP_RET_TRACE). The old path
             // stepped to the syscall EXIT just to write rax there: 7 ptrace
             // calls and 2 waits per answered syscall, measured. Now 3 and 1.
-            r.rax = static_cast<unsigned long long>(ret);
-            ::ptrace(PTRACE_SETREGS, cur_, 0, &r);
+            r.set_ret(static_cast<std::int64_t>(ret));
+            (void)r.store(cur_);
             t.action = Action::none;
             t.in_call = false;
             const int sig = t.pending_sig;
@@ -448,7 +453,7 @@ public:
         }
         // PTRACE_SYSCALL fallback (no seccomp): at an ordinary entry stop the
         // kernel still owes us the exit stop, so write rax there.
-        ::ptrace(PTRACE_SETREGS, cur_, 0, &r);
+        (void)r.store(cur_);
         t.action = Action::set_ret;
         t.ret = ret;
         // A one-shot PTRACE_SYSCALL runs the (neutralized) call to its EXIT
@@ -492,7 +497,7 @@ public:
         // it as fork-ret != child-getpid) and the two drive modes diverged
         // (run_seccomp, 15 vs 0). The exit stop is where that translation
         // happens, so skipping it is only safe per-syscall.
-        if (seccomp_ && !owes_exit_stop(t.regs.orig_rax)) {
+        if (seccomp_ && !owes_exit_stop(t.regs.nr())) {
             t.in_call = false;
             resume_run(cur_, 0);
             return ok(std::int64_t{0});
@@ -511,9 +516,9 @@ public:
         Task& t = tasks_[cur_];
         t.action = Action::none;
         if (!step_to_exit(cur_)) return ok(std::int64_t{-1});   // task exited
-        struct user_regs_struct rr{};
-        ::ptrace(PTRACE_GETREGS, cur_, 0, &rr);
-        std::int64_t ret = static_cast<std::int64_t>(rr.rax);
+        Regs rr{};
+        (void)Regs::fetch(cur_, rr);
+        std::int64_t ret = static_cast<std::int64_t>(rr.ret());
         tasks_[cur_].in_call = false;
         if (post_exit) post_exit(ret);
         resume_task(cur_);
@@ -533,7 +538,7 @@ public:
                                                 int path_arg2 = -1,
                                                 const std::string& host_path2 = {}) {
         Task& t = tasks_[cur_];
-        struct user_regs_struct r = t.regs;
+        Regs r = t.regs;
         // Park the translated path in the child's own stack, below the red
         // zone. The child is stopped at its syscall-ENTRY; on resume the
         // kernel copies this pathname from userspace via copy_from_user.
@@ -547,7 +552,7 @@ public:
         // path, which IS ordered against the tracee's own memory accesses.
         std::size_t need = host_path.size() + 1;
         std::uint64_t scratch =
-            (t.regs.rsp - 256 - need) & ~std::uint64_t{15};
+            (t.regs.sp() - 256 - need) & ~std::uint64_t{15};
         if (!poke_path(scratch, host_path, /*dead_scratch=*/true)) {
             // The path could not be written into this task's memory at all
             // (PTRACE_POKEDATA -> EIO and process_vm_writev -> EPERM). This
@@ -560,11 +565,11 @@ public:
             // the rootfs, so an in-rootfs path resolves correctly as-is, and
             // even an overlay/bind path fails no worse than before. Restore the
             // entry registers and forward.
-            ::ptrace(PTRACE_SETREGS, cur_, 0, &t.regs);
+            (void)t.regs.store(cur_);
             if (!step_to_exit(cur_)) return ok(std::int64_t{-1});
-            struct user_regs_struct rr0{};
-            ::ptrace(PTRACE_GETREGS, cur_, 0, &rr0);
-            std::int64_t ret0 = static_cast<std::int64_t>(rr0.rax);
+            Regs rr0{};
+            (void)Regs::fetch(cur_, rr0);
+            std::int64_t ret0 = static_cast<std::int64_t>(rr0.ret());
             tasks_[cur_].in_call = false;
             if (post_exit) post_exit(ret0);
             resume_task(cur_);
@@ -583,11 +588,11 @@ public:
                 return err<std::int64_t>(Errno::efault);
             set_arg(r, path_arg2, scratch2);
         }
-        ::ptrace(PTRACE_SETREGS, cur_, 0, &r);
+        (void)r.store(cur_);
         if (!step_to_exit(cur_)) return ok(std::int64_t{-1});   // task exited
-        struct user_regs_struct rr{};
-        ::ptrace(PTRACE_GETREGS, cur_, 0, &rr);
-        std::int64_t ret = static_cast<std::int64_t>(rr.rax);
+        Regs rr{};
+        (void)Regs::fetch(cur_, rr);
+        std::int64_t ret = static_cast<std::int64_t>(rr.ret());
         tasks_[cur_].in_call = false;
         // Run the caller's post-exit patch WHILE the task is still stopped at
         // its syscall-exit (e.g. scrub a stat buffer the kernel just filled).
@@ -614,11 +619,11 @@ public:
                                           int len_arg,
                                           std::uint64_t new_len) {
         Task& t = tasks_[cur_];
-        struct user_regs_struct r = t.regs;
+        Regs r = t.regs;
         if (!poke_path(value(path_addr), host_path))
             return err(Errno::efault);
         set_arg(r, len_arg, new_len);
-        ::ptrace(PTRACE_SETREGS, cur_, 0, &r);
+        (void)r.store(cur_);
         t.action = Action::none;
         ::ptrace(PTRACE_SYSCALL, cur_, 0, 0);   // run the real bind/connect
         return ok();
@@ -641,7 +646,7 @@ public:
             const std::vector<std::string>& prefix = {},
             const std::vector<std::string>& extra_args = {}) {
         Task& t = tasks_[cur_];
-        struct user_regs_struct r = t.regs;
+        Regs r = t.regs;
         int argv_reg = path_arg + 1;
         std::uint64_t argv_ptr = reg_arg(r, argv_reg);
 
@@ -667,7 +672,7 @@ public:
         for (const auto& s : prefix) strbytes += s.size() + 1;
         for (const auto& s : extra_args) strbytes += s.size() + 1;
         std::size_t block = strbytes + arr_bytes + 64;
-        std::uint64_t base = (t.regs.rsp - 512 - block) & ~std::uint64_t{15};
+        std::uint64_t base = (t.regs.sp() - 512 - block) & ~std::uint64_t{15};
 
         std::uint64_t cursor = base;
         auto put = [&](const std::string& s) -> std::uint64_t {
@@ -704,7 +709,7 @@ public:
 
         set_arg(r, path_arg, p_interp);   // exec the interpreter
         set_arg(r, argv_reg, arr);        // with the rebuilt argv
-        ::ptrace(PTRACE_SETREGS, cur_, 0, &r);
+        (void)r.store(cur_);
         // Forward: the kernel runs the (rewritten) execve; on success it
         // replaces the image and we get a PTRACE_EVENT_EXEC. Don't step here.
         t.action = Action::none;
@@ -712,13 +717,9 @@ public:
         return ok(std::int64_t{0});
     }
 
-    static std::uint64_t reg_arg(const struct user_regs_struct& r, int n) {
-        switch (n) {
-            case 0: return r.rdi; case 1: return r.rsi; case 2: return r.rdx;
-            case 3: return r.r10; case 4: return r.r8;  case 5: return r.r9;
-            default: return 0;
-        }
-    }
+    // Thin wrappers kept so existing call sites read unchanged; the arch
+    // detail now lives in ptrace_regs.hpp.
+    static std::uint64_t reg_arg(const Regs& r, int n) { return r.arg(n); }
 
     [[nodiscard]] bool write_cstr(std::uint64_t at, const std::string& s) {
         std::vector<std::byte> b(s.size() + 1);
@@ -726,14 +727,7 @@ public:
         return static_cast<bool>(copy_out(uaddr(at), b));
     }
 
-    static void set_arg(struct user_regs_struct& r, int n, std::uint64_t v) {
-        switch (n) {
-            case 0: r.rdi = v; break;  case 1: r.rsi = v; break;
-            case 2: r.rdx = v; break;  case 3: r.r10 = v; break;
-            case 4: r.r8  = v; break;  case 5: r.r9  = v; break;
-            default: break;
-        }
-    }
+    static void set_arg(Regs& r, int n, std::uint64_t v) { r.set_arg(n, v); }
 
     // A task's program name for /proc/<pid>/comm, the (comm) field of stat,
     // and Name: in status.
@@ -1305,10 +1299,10 @@ private:
     // At a task's syscall-EXIT stop, apply the action recorded at entry.
     void finalize_exit(::pid_t w, Task& t) {
         if (t.action == Action::set_ret) {
-            struct user_regs_struct r{};
-            ::ptrace(PTRACE_GETREGS, w, 0, &r);
-            r.rax = static_cast<unsigned long long>(t.ret);
-            ::ptrace(PTRACE_SETREGS, w, 0, &r);
+            Regs r{};
+            (void)Regs::fetch(w, r);
+            r.set_ret(static_cast<std::int64_t>(t.ret));
+            (void)r.store(w);
         } else {
             // A FORWARDED syscall ran natively. The process-management calls
             // (fork/vfork/clone, wait4/waitid, getpgid/getsid/tcgetpgrp done
@@ -1320,9 +1314,9 @@ private:
             // way a PID-namespace container does. Only positive returns are
             // pids; negative (errno) and 0 (the child side of fork) pass
             // through untouched.
-            struct user_regs_struct r{};
-            ::ptrace(PTRACE_GETREGS, w, 0, &r);
-            if (r.orig_rax == 247 /*waitid*/) {
+            Regs r{};
+            (void)Regs::fetch(w, r);
+            if (r.nr() == 247 /*waitid*/) {
                 // waitid returns 0 in RAX (not a pid) and instead fills a
                 // siginfo_t (guest ptr in rdx at entry, preserved at exit)
                 // whose si_pid holds the reaped child — as a HOST tid. Rust's
@@ -1330,8 +1324,8 @@ private:
                 // from fork; an untranslated host pid there makes fish's job
                 // control panic ("Unexpected waitpid() return"). Rewrite
                 // si_pid (offset 16 in the x86-64 siginfo_t) to the guest pid.
-                auto ret = static_cast<long long>(r.rax);
-                std::uint64_t infop = r.rdx;
+                auto ret = static_cast<long long>(r.ret());
+                std::uint64_t infop = r.arg(2);
                 if (ret == 0 && infop != 0) {
                     errno = 0;
                     long word = ::ptrace(PTRACE_PEEKDATA, w,
@@ -1350,11 +1344,11 @@ private:
                         }
                     }
                 }
-            } else if (returns_pid(r.orig_rax)) {
-                auto host = static_cast<::pid_t>(static_cast<long long>(r.rax));
+            } else if (returns_pid(r.nr())) {
+                auto host = static_cast<::pid_t>(static_cast<long long>(r.ret()));
                 if (host > 0) {
-                    r.rax = static_cast<unsigned long long>(gpid_of(host));
-                    ::ptrace(PTRACE_SETREGS, w, 0, &r);
+                    r.set_ret(static_cast<std::int64_t>(gpid_of(host)));
+                    (void)r.store(w);
                 }
             }
         }
