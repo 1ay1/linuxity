@@ -757,6 +757,27 @@ int main(void) {
             "...but a REAL directory there is not refused for that reason");
     LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/dlnk", 0);
 
+    // -- link stops at a missing source; rename does not -------------------
+    // link only READS its source, so the lookup ends on that ENOENT and the
+    // destination is never walked. rename has to write BOTH ends, so a
+    // problem with the destination -- here an unsearchable directory --
+    // surfaces first. The guest reported the destination's EACCES for both.
+    LX_SYS3(SYS_mkdirat, AT_FDCWD, DIR "/nox7", 0755);
+    LX_SYS4(SYS_fchmodat, AT_FDCWD, DIR "/nox7", 0644, 0);
+    lx_emit("linkat",
+            LX_SYS5(SYS_linkat, AT_FDCWD, DIR "/absent7", AT_FDCWD,
+                    DIR "/nox7/x", 0),
+            "link with a MISSING source is ENOENT, not the dst EACCES");
+    lx_emit("renameat",
+            LX_SYS4(SYS_renameat, AT_FDCWD, DIR "/absent7", AT_FDCWD,
+                    DIR "/nox7/x"),
+            "...but rename reports the destination EACCES");
+    lx_emit("linkat",
+            LX_SYS5(SYS_linkat, AT_FDCWD, F1, AT_FDCWD, DIR "/nox7/x", 0),
+            "...and with the source PRESENT, link reports it too");
+    LX_SYS4(SYS_fchmodat, AT_FDCWD, DIR "/nox7", 0755, 0);
+    LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/nox7", 0x200);
+
     // -- teardown, observing each removal ----------------------------------
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, SYM, 0), "unlink sym");
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, F2, 0), "unlink f2");

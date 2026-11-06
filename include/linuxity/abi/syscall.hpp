@@ -2799,8 +2799,19 @@ private:
             return eno(e1);
         if (const Errno e = guest_prefix_loop(src); e != Errno::ok)
             return eno(e);
-        if (const Errno e2 = dot_prefix_error(r, a2, at); e2 != Errno::ok)
-            return eno(e2);
+        // A LINK whose source is not there never walks the destination at
+        // all: link only READS the source, so the lookup ends on that ENOENT.
+        // rename must write BOTH ends, so its destination errors do surface.
+        // Measured both ways. Deliberately narrow -- it suppresses only the
+        // destination's EACCES paths, because procfs and whiteouts have their
+        // own notion of "absent source" that a host lstat cannot see.
+        const bool link_src_gone =
+            !move_meta && !ps.host_path.empty() &&
+            ps.realm == kernel::Realm2::host_backed &&
+            !host_lexists(ps.host_path);
+        if (!link_src_gone)
+            if (const Errno e2 = dot_prefix_error(r, a2, at); e2 != Errno::ok)
+                return eno(e2);
         {
             const std::string raw1 =
                 read_cstr(uaddr(r.arg[static_cast<std::size_t>(a1)]));
@@ -2814,11 +2825,13 @@ private:
                 return eno(Errno::eacces);
             if (!host_dir_searchable(ps.host_path))
                 return eno(Errno::eacces);
-            // Now the destination.
-            if (dot_traversal_denied(raw2, pd.host_path))
-                return eno(Errno::eacces);
-            if (!host_dir_searchable(pd.host_path))
-                return eno(Errno::eacces);
+            // Now the destination, same exemption as above.
+            if (!link_src_gone) {
+                if (dot_traversal_denied(raw2, pd.host_path))
+                    return eno(Errno::eacces);
+                if (!host_dir_searchable(pd.host_path))
+                    return eno(Errno::eacces);
+            }
             // A symlink cycle the walk must pass THROUGH is ELOOP. Both
             // classify calls above use follow=false (link and rename act on
             // the NAME), which is exactly what skips the cycle detector, and
