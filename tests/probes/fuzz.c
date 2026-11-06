@@ -186,8 +186,21 @@ int main(void) {
     // The campaign. 400 operations is enough to cover the argument pools
     // several times over while keeping the trace readable and the run under
     // a second.
+    //
+    // LX_FUZZ_OPS shortens it, which is what makes triage possible: a
+    // divergence is mostly CASCADE (once one operation has a different
+    // effect, every later one sees different state), so tools/fuzz-triage.sh
+    // binary-searches the count for the smallest prefix that still diverges.
+    // The last operation of that prefix is the actual cause.
     static char buf[4096];
-    const int kOps = 400;
+    int kOps = 400;
+    {
+        const char* o = getenv("LX_FUZZ_OPS");
+        if (o && *o) {
+            const long v = strtol(o, 0, 0);
+            if (v > 0 && v < 100000) kOps = (int)v;
+        }
+    }
     for (int i = 0; i < kOps; ++i) {
         switch (pick(14)) {
         case 0: {   // openat -- and keep the fd, so later ops have real ones

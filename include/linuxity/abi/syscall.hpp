@@ -2292,6 +2292,36 @@ private:
         // so an empty target is fine while an empty name is ENOENT. Checking
         // the wrong one of the two is why this needs saying.
         if (empty_path_arg(r, link_arg)) return eno(Errno::enoent);
+        // A TRAILING SLASH means "this must be a directory", and a symlink
+        // being created never is -- so the kernel refuses whatever the
+        // target. WHICH refusal depends on what is already there: an
+        // existing name is EEXIST (you cannot create over it), a missing one
+        // is ENOENT (the slash demands a directory that is not there).
+        // linuxity normalized the slash away and created the link, which
+        // `tar -x` and install scripts hit because they write
+        // trailing-slash paths routinely. Found by the differential fuzzer
+        // as the FIRST generated operation, with every later divergence in
+        // that run cascading from this one link existing where it should
+        // not -- and the first fix here returned a blanket ENOENT, which
+        // the fuzzer then caught again for the existing-name case.
+        if (path_syntax(read_cstr(uaddr(r.arg[static_cast<std::size_t>(link_arg)])))
+                == PathSyntax::needs_dir) {
+            std::string probe = at ? resolve_second(r, link_arg, true)
+                                   : k_.files().absolutize(
+                                         read_cstr(uaddr(r.arg[static_cast<std::size_t>(link_arg)])),
+                                         k_.files().cwd());
+            // Probe the name WITHOUT the slash -- classify() resolves a
+            // path, and the trailing slash is the very thing being asked
+            // about, so leaving it on makes the lookup fail and every case
+            // look like ENOENT.
+            while (probe.size() > 1 && probe.back() == '/') probe.pop_back();
+            auto pc = k_.files().classify(probe, false, false);
+            if (pc.realm == kernel::Realm2::virtual_file) return eno(Errno::eexist);
+            if (pc.realm == kernel::Realm2::host_backed && !pc.host_path.empty())
+                if constexpr (requires { mem_.stat_host_path(pc.host_path); })
+                    if (mem_.stat_host_path(pc.host_path)) return eno(Errno::eexist);
+            return eno(Errno::enoent);
+        }
         std::string link = at ? resolve_second(r, link_arg, true)
                               : k_.files().absolutize(
                                     read_cstr(uaddr(r.arg[static_cast<std::size_t>(link_arg)])),
