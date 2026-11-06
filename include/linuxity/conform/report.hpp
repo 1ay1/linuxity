@@ -384,6 +384,24 @@ inline std::string Scenario::key() const {
                     .exercising(abi::Sysno::mknodat)
                     .on(DirFlavour::host_backed));
 
+    // The W^X JIT sequence: mmap W, write code, mprotect X, flush, call.
+    //
+    // `memory` exercises mmap/mprotect as memory management but never
+    // EXECUTES from a mapping it made, and that is the contract every JIT
+    // depends on -- Java, V8, .NET, LuaJIT, every node process. It is more
+    // fragile on arm64 than x86-64: the architecture does not guarantee
+    // i-cache/d-cache coherence, so the flush is mandatory rather than
+    // advisory, and arm64 has arch-private syscalls in the 0xf0000 range
+    // (__ARM_NR_cacheflush) the generic decoder does not know.
+    //
+    // Also covers re-protecting a LIVE mapping, which is how a JIT patches
+    // code in place -- the case where stale bookkeeping would show up.
+    v.push_back(Scenario{"jitwx", "jitwx"}
+                    .exercising(abi::Sysno::mmap)
+                    .exercising(abi::Sysno::mprotect)
+                    .exercising(abi::Sysno::munmap)
+                    .on(DirFlavour::host_backed));
+
     return v;
 }
 

@@ -100,5 +100,7 @@ static long lx_sys(long nr, long a, long b, long c, long d, long e, long f) {
 #define LX_SYS3(nr, a, b, c)       lx_sys((nr), (long)(a), (long)(b), (long)(c), 0, 0, 0)
 #define LX_SYS4(nr, a, b, c, d)    lx_sys((nr), (long)(a), (long)(b), (long)(c), (long)(d), 0, 0)
 #define LX_SYS5(nr, a, b, c, d, e) lx_sys((nr), (long)(a), (long)(b), (long)(c), (long)(d), (long)(e), 0)
+// mmap is the one call that genuinely needs all six.
+#define LX_SYS6(nr, a, b, c, d, e, f) lx_sys((nr), (long)(a), (long)(b), (long)(c), (long)(d), (long)(e), (long)(f))
 
 #endif // LX_PROBE_H

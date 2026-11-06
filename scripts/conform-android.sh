@@ -74,6 +74,9 @@ targets=(linuxity record_goldens test_conform_diff)
 while read -r p; do targets+=("probe_$p"); done < <(
     sed -n 's/.*set(LX_PROBES \(.*\))/\1/p' "$REPO/tests/CMakeLists.txt" | tr ' ' '\n'
 )
+# A new probe means a target the existing cache has never heard of, so
+# re-run cmake before building rather than failing with "no rule to make".
+cmake -S "$REPO" -B "$BUILD" >/dev/null 2>&1 || true
 cmake --build "$BUILD" --target "${targets[@]}" -j"$(nproc)" >/dev/null ||
     die "build failed"
 

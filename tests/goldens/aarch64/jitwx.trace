@@ -1,0 +1,13 @@
+# linuxity conformance trace
+# scenario: jitwx
+# arch: aarch64
+# recorded-by: live Linux kernel on this host
+# kernel: Linux 6.1.162-android14-11-g9dd05ae3a1de-ab16261587
+mmap = -ENOSYS | arm64 __ARM_NR_cacheflush answers the same as the host
+mmap = 1 | mmap an anonymous RW page for code
+mprotect = 0 | mprotect the code page W -> X
+mprotect = 1 | code written to a fresh mapping executes
+mprotect = 0 | mprotect back X -> W to patch
+mprotect = 0 | mprotect W -> X again
+mprotect = 1 | the repatched page executes the NEW code
+munmap = 0 | unmap the code page
