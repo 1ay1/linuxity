@@ -60,7 +60,18 @@ target_compile_features(linuxity_core INTERFACE cxx_std_23)
 # The core above is header-only and host-agnostic. The executable needs a
 # trap backend; today those are ptrace (Linux), Hypervisor.framework
 # (macOS/arm64) and WHP (Windows/x86-64).
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+#
+# ANDROID IS A PTRACE HOST. The NDK sets CMAKE_SYSTEM_NAME to "Android", not
+# "Linux", so matching only "Linux" silently defined no `linuxity` target at
+# all -- the build succeeded and produced nothing, which is a worse failure
+# than an error. Android has the same kernel, the same ptrace ABI and the same
+# seccomp; what differs (bionic vs glibc, no /etc/resolv.conf, SELinux policy)
+# is handled behind the seams in runtime/ and kernel/, not here.
+#
+# One list, so a new Linux-ABI platform is one entry rather than a condition
+# repeated per target.
+set(LX_PTRACE_HOSTS Linux Android)
+if(CMAKE_SYSTEM_NAME IN_LIST LX_PTRACE_HOSTS)
     add_subdirectory(src/host)
     add_executable(linuxity src/main.cpp)
     target_link_libraries(linuxity PRIVATE linuxity_core linuxity_host)

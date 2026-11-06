@@ -32,7 +32,10 @@ set(LX_LIVE_TESTS
 # Probes are C, built with raw syscalls and no libc conveniences -- glibc
 # caches (telldir), retries (EINTR) and emulates (open->openat), so a libc
 # call observes glibc's opinion of the kernel rather than the kernel.
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+# LX_PTRACE_HOSTS comes from the top-level CMakeLists -- the ONE place that
+# says which platforms have the Linux ptrace ABI (Linux and Android). These
+# live tests spawn a real guest, so they need exactly that set.
+if(CMAKE_SYSTEM_NAME IN_LIST LX_PTRACE_HOSTS)
     # Probes are C; the project is C++-only, so enable C just for them.
     enable_language(C)
     set(LX_PROBES dirseek statpaths fdops rwio procid fsmutate memory signals)
@@ -98,7 +101,7 @@ set(LX_TESTS ${LX_PORTABLE_TESTS})
 if(NOT WIN32)
     list(APPEND LX_TESTS ${LX_POSIX_HOST_TESTS})
 endif()
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+if(CMAKE_SYSTEM_NAME IN_LIST LX_PTRACE_HOSTS)
     list(APPEND LX_TESTS ${LX_LINUX_UNIT_TESTS})
     list(APPEND LX_TESTS ${LX_LIVE_TESTS})
 endif()
@@ -123,7 +126,7 @@ endif()
 # This shape has caused four bugs (lseek/rewinddir, fchmodat2, creat,
 # set_tid_address) -- two of them sandbox escapes -- so it is a test, not a
 # convention. Linux-only: the filter is the ptrace backend's.
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+if(CMAKE_SYSTEM_NAME IN_LIST LX_PTRACE_HOSTS)
     add_test(NAME syscall_coverage
              COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/../tools/check_syscall_coverage.sh)
 endif()
