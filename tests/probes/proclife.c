@@ -54,6 +54,16 @@ static long do_fork(void) {
 #endif
 }
 
+// Sleep until a signal arrives. SYS_pause exists only on x86-64, so the
+// portable spelling is a no-fd ppoll with an infinite timeout.
+static void park(void) {
+#ifdef SYS_pause
+    LX_SYS0(SYS_pause);
+#else
+    LX_SYS5(SYS_ppoll, 0, 0, 0, 0, 0);
+#endif
+}
+
 // Reap one child; returns its wait status via *st.
 static long reap(long pid, int* st) {
     return LX_SYS4(SYS_wait4, pid, st, 0, 0);
@@ -273,6 +283,60 @@ int main(void) {
         lx_emit("rt_sigsuspend",
                 LX_CHECK(w > 0, exited_with(st) == 0 || killed_by(st) == 14),
                 "rt_sigsuspend returns EINTR or the signal kills us");
+    }
+
+    // -- process GROUPS ----------------------------------------------------
+    // A shell builds a job by forking, then setpgid-ing the members into one
+    // group, then waiting on that group. Three things were wrong, and all
+    // three are what made fish panic in tty_handoff.rs ("Job should not have
+    // fish's pgroup") after a few `help` invocations:
+    //
+    //   getpgid(other) echoed the pid back, so every task looked like its own
+    //     group leader and a fresh child reported the wrong group;
+    //   setpgid recorded only the CALLER's group, so a shell setting its
+    //     CHILD's group had the write dropped;
+    //   wait4(-pgid) passed a GUEST pgid to the host untranslated, so the
+    //     host found no such group and answered ECHILD -- the shell never
+    //     reaped its job.
+    {
+        const long a = do_fork();
+        if (a == 0) { park(); LX_SYS1(SYS_exit_group, 0); }
+        // NOT ASSERTED YET: "a fresh child is in its parent's process group".
+        // The fix for it (ProcInfo::pgid + inheritance through ppid) is in
+        // place and correct on x86-64, but the aarch64 guest still answers
+        // the child's own pid, and I have not isolated why -- glibc's fork()
+        // is clone(SIGCHLD) there, so the spawn-event path differs, and
+        // keying on the tgid instead of the ptrace event was not enough.
+        // A step that is green on one arch only is worse than no step, so
+        // this stays out until the aarch64 side is understood.
+        const long my_pgrp = LX_SYS1(SYS_getpgid, 0);
+        const long b = do_fork();
+        if (b == 0) { park(); LX_SYS1(SYS_exit_group, 0); }
+        lx_emit("setpgid", LX_SYS2(SYS_setpgid, a, a),
+                "setpgid makes the first job member a group leader");
+        lx_emit("setpgid", LX_SYS2(SYS_setpgid, b, a),
+                "setpgid joins the second member to that same group");
+        lx_emit("getpgid", LX_CHECK(1, LX_SYS1(SYS_getpgid, a) == a),
+                "the leader's group is its own pid");
+        lx_emit("getpgid", LX_CHECK(1, LX_SYS1(SYS_getpgid, b) == a),
+                "BOTH members report the SAME group, not one each");
+        lx_emit("getpgid", LX_CHECK(1, LX_SYS1(SYS_getpgid, a) != my_pgrp),
+                "and the job's group differs from the shell's own");
+        LX_SYS2(SYS_kill, a, 9);
+        LX_SYS2(SYS_kill, b, 9);
+        int st = 0;
+        LX_SYS4(SYS_wait4, -1, &st, 0, 0);
+        LX_SYS4(SYS_wait4, -1, &st, 0, 0);
+    }
+    {
+        // wait4(-pgid) must reap a member of that group, not answer ECHILD.
+        const long c = do_fork();
+        if (c == 0) LX_SYS1(SYS_exit_group, 7);
+        LX_SYS2(SYS_setpgid, c, c);
+        int st = 0;
+        const long w = LX_SYS4(SYS_wait4, -c, &st, 0, 0);
+        lx_emit("wait4", LX_CHECK(w == c, exited_with(st) == 7),
+                "wait4(-pgid) reaps a member of that process group");
     }
 
     // -- wait4 error boundaries --------------------------------------------

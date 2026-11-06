@@ -228,8 +228,19 @@ public:
             case Sysno::getpgid:
                 if constexpr (requires { mem_.models_process_groups(); }) return fwd();
                 if (!flat_pid_exists(r.arg[0])) return eno(Errno::esrch);
-                return val(r.arg[0] ? static_cast<std::int64_t>(r.arg[0])
-                                    : flat_pgrp());
+                // The group of the NAMED process, from the process table.
+                // This used to echo the pid back for any non-zero argument,
+                // i.e. "every task is its own group leader". Two consequences,
+                // both wrong: a freshly forked child reported its own pid
+                // instead of the parent's group (a child INHERITS the group),
+                // and the two halves of a shell pipeline -- which setpgid puts
+                // in ONE group -- read back as two. fish asserts that a job's
+                // group differs from its own, and panicked in tty_handoff.rs
+                // as soon as the numbering collided.
+                return val(r.arg[0]
+                               ? k_.procs().pgid_of(
+                                     static_cast<std::int32_t>(r.arg[0]))
+                               : flat_pgrp());
             case Sysno::getsid:
                 if constexpr (requires { mem_.models_process_groups(); }) return fwd();
                 if (!flat_pid_exists(r.arg[0])) return eno(Errno::esrch);
@@ -238,20 +249,24 @@ public:
             case Sysno::setpgid: {
                 if constexpr (requires { mem_.models_process_groups(); }) return fwd();
                 // setpgid(pid, pgid): either argument may be 0, meaning "the
-                // caller". Only the CALLER's own group is tracked -- that is
-                // all tcgetpgrp needs, and it keeps this a pure bookkeeping
-                // note rather than a second process-group model.
+                // caller". Record it against the TARGET -- a shell always
+                // moves its CHILD into a new group, never itself, so tracking
+                // only the caller's own group dropped every write a shell
+                // makes and left the answer to come out of the bogus
+                // "pid is its own leader" default.
                 if (!flat_pid_exists(r.arg[0])) return eno(Errno::esrch);
                 const std::int32_t who = static_cast<std::int32_t>(r.arg[0]);
-                if (who == 0 || who == ids().pid) {
-                    const std::int32_t grp = static_cast<std::int32_t>(r.arg[1]);
-                    flat_pgrp_ = grp ? grp : ids().pid;
-                }
-                return val(0);                     // accepted, flat model
+                const std::int32_t target = who ? who : ids().pid;
+                const std::int32_t grp = static_cast<std::int32_t>(r.arg[1]);
+                k_.procs().set_pgid(target, grp ? grp : target);
+                if (target == ids().pid)
+                    flat_pgrp_ = grp ? grp : ids().pid;   // keep tcgetpgrp in step
+                return val(0);
             }
             case Sysno::setsid:
                 if constexpr (requires { mem_.models_process_groups(); }) return fwd();
                 flat_pgrp_ = ids().pid;            // a new session resets it
+                k_.procs().set_pgid(ids().pid, ids().pid);
                 return val(ids().pid);             // new session == pid
             // nice 0 for everything, but the KERNEL still validates `which`:
             // only PRIO_PROCESS/PRIO_PGRP/PRIO_USER (0/1/2) exist and
@@ -825,8 +840,20 @@ private:
     // The caller's process group under the flat model: whatever setpgid last
     // asked for, defaulting to its own pid (every task its own leader). Only
     // meaningful when the backend does NOT model real groups; those forward.
+    // The CALLER's process group. Goes through the same table as
+    // getpgid(other): two sources of truth for "my group" vs "their group"
+    // disagreed the moment one of them was updated, which is what made a
+    // freshly forked child compare unequal to its own parent's group.
     [[nodiscard]] std::int32_t flat_pgrp() {
-        return flat_pgrp_ ? flat_pgrp_ : ids().pid;
+        if (flat_pgrp_) {
+            // Mirror it into the table. A child inherits through its ppid
+            // chain, so if the caller's group lives only in this scalar the
+            // child resolves to pid 1's (unset) group instead of ours -- the
+            // two models then disagree about the SAME process.
+            k_.procs().set_pgid(ids().pid, flat_pgrp_);
+            return flat_pgrp_;
+        }
+        return k_.procs().pgid_of(ids().pid);
     }
     std::int32_t flat_pgrp_{0};
 

@@ -30,6 +30,17 @@ namespace lx::kernel {
 struct ProcInfo {
     std::int32_t pid{1};
     std::int32_t ppid{0};
+    // Process GROUP. 0 means "not set yet, so it is my own pid" -- resolved
+    // through ProcessTable::pgid_of rather than stored eagerly, because a
+    // fork-time snapshot does not always know the parent's group yet.
+    //
+    // This has to live WITH the process: a single scalar for "the caller's
+    // group" cannot answer getpgid(other_pid), and answering `pid` for every
+    // other pid made each task look like its own leader. A shell then saw
+    // the two halves of a pipeline land in DIFFERENT groups, and fish's
+    // tty_handoff assertion ("Job should not have fish's pgroup") fired
+    // whenever the numbering happened to collide.
+    std::int32_t pgid{0};
     std::string  comm{"linuxity"};   // short name (/proc/<pid>/comm, stat)
     std::string  cmdline{"linuxity"};// full argv, NUL-joined for /proc/.../cmdline
     char         state{'R'};         // R/S/D/Z/T (running by default)
@@ -54,7 +65,36 @@ public:
         if (p.cmdline.empty()) p.cmdline = std::move(comm);
     }
     void add(std::int32_t pid, std::int32_t ppid) {
-        ProcInfo p; p.pid = pid; p.ppid = ppid; procs_[pid] = p;
+        ProcInfo p; p.pid = pid; p.ppid = ppid;
+        // A child INHERITS its parent's process group -- it does not start a
+        // group of its own. Getting this wrong is what made a fresh child
+        // report getpgid(child) == child instead of the parent's group.
+        p.pgid = pgid_of(ppid);
+        procs_[pid] = p;
+    }
+
+    // The process group of `pid`, resolving the "0 means my own pid" default.
+    // An unknown pid answers its own number, which is what a flat model would
+    // have said and keeps callers from having to special-case it.
+    [[nodiscard]] std::int32_t pgid_of(std::int32_t pid) const {
+        if (pid <= 0) return pid;
+        const ProcInfo* p = find(pid);
+        if (p == nullptr) return pid;
+        if (p->pgid) return p->pgid;
+        // No group recorded for this pid. It does NOT lead its own group --
+        // it inherits its parent's, which is the whole bug this field fixes.
+        // Walk up until a pid with a recorded group, or pid 1. Terminates
+        // because ppid is strictly closer to 1, whose record is seeded.
+        if (p->ppid != 0 && p->ppid != p->pid) return pgid_of(p->ppid);
+        return p->pid;
+    }
+
+    // setpgid(pid, pgid). Records the group against the TARGET, which is the
+    // whole point: a shell always sets its CHILD's group, never its own.
+    void set_pgid(std::int32_t pid, std::int32_t pgid) {
+        auto& p = procs_[pid];
+        if (p.pid == 0) p.pid = pid;          // first mention of this pid
+        p.pgid = pgid ? pgid : pid;
     }
     void remove(std::int32_t pid) { if (pid != 1) procs_.erase(pid); }
 
@@ -86,6 +126,14 @@ public:
         if (live_ && live_->alive(pid)) {
             ProcInfo p = live_->info(pid);
             p.pid = pid;
+            // A record synthesized from the live table has no group of its
+            // own, and leaving it 0 means pgid_of falls back to the pid --
+            // i.e. "every task leads its own group", which is the bug this
+            // field exists to fix. A process INHERITS its parent's group, so
+            // walk up to a pid we do know about. (The recursion terminates:
+            // ppid is strictly closer to pid 1, whose record is always seeded.)
+            if (p.pgid == 0 && p.ppid != 0 && p.ppid != pid)
+                p.pgid = pgid_of(p.ppid);
             return &(scratch_[pid] = std::move(p));
         }
         return nullptr;

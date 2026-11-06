@@ -496,6 +496,24 @@ public:
                     t.regs = wr;
                     rr = wr;
                 }
+            } else if (gpid < -1) {
+                // wait4(-pgid): "any member of process group pgid". This used
+                // to pass through, handing the host a GUEST pgid -- the host
+                // found no such group and answered ECHILD, so a shell waiting
+                // on a job never reaped it (fish's `help` left its pager
+                // stuck). Groups are not modelled here (see the kill note
+                // below), and kill approximates a group with the guest
+                // process TREE; do the same and wait on the leader's host
+                // tid, which is the member a shell is waiting for. pid 0 and
+                // -1 are genuinely group-free and still pass through.
+                const ::pid_t host = host_tid_of(-gpid);
+                if (host > 0) {
+                    Regs wr = rr;
+                    wr.set_arg(0, static_cast<std::uint64_t>(host));
+                    (void)wr.store(w);
+                    t.regs = wr;
+                    rr = wr;
+                }
             }
         } else if (sc == abi::Sysno::waitid) {
             // waitid(idtype /*rdi*/, id /*rsi*/, siginfo* /*rdx*/, opts /*r10*/).
