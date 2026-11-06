@@ -1095,7 +1095,28 @@ private:
                 n = i + 1;
             }
         }
-        if (first_dot == std::string::npos || first_dot == 0) return Errno::ok;
+        if (first_dot == std::string::npos) return Errno::ok;
+        // A dot as the FIRST component has no prefix to walk, but it still
+        // resolves THROUGH the directory it starts from -- so that directory
+        // must be searchable. readlink(".") in an unsearchable cwd is EACCES,
+        // not the EINVAL "not a symlink" would give.
+        //
+        // Only when the dot is the WHOLE path, though: for "./f1" the leaf is
+        // what is being asked about, and if it is reachable the answer is
+        // about the leaf (EINVAL for "not a symlink"), not the walk.
+        if (first_dot == 0) {
+            if (comps.size() > 1) return Errno::ok;
+            const std::string base =
+                (!raw.empty() && raw.front() == '/') ? std::string{"/"}
+                                                     : dir_base(r, at);
+            auto pc = k_.files().classify(base, /*for_write=*/false,
+                                          /*follow=*/true);
+            if (pc.realm == kernel::Realm2::host_backed &&
+                !pc.host_path.empty() &&
+                ::access(pc.host_path.c_str(), X_OK) != 0 && errno == EACCES)
+                return Errno::eacces;
+            return Errno::ok;
+        }
 
         // Rebuild the guest path one component at a time, up to the dot, and
         // require each to be a real directory.
@@ -1412,6 +1433,18 @@ private:
              wire::has(flags, wire::OpenFlag::trunc)))
             open_wi = Wi::parents_only;
         auto pc = k_.files().classify(abs, for_write, /*follow=*/true, open_wi);
+        // A TRAILING SLASH asserts the path is a directory, and that
+        // assertion is judged BEFORE O_EXCL's "the name is taken": so
+        // open("d/", O_CREAT|O_EXCL) on an existing directory is EISDIR,
+        // while the same call without the slash is EEXIST. The slash was
+        // normalized away, so both came back EEXIST.
+        if (wire::has(flags, wire::OpenFlag::creat) &&
+            wire::has(flags, wire::OpenFlag::excl) &&
+            path_syntax(read_cstr(
+                uaddr(r.arg[static_cast<std::size_t>(path_arg)]))) ==
+                PathSyntax::needs_dir &&
+            host_path_is_dir(pc.host_path))
+            return eno(Errno::eisdir);
         // A "."/".." component was normalized away during resolution, but
         // traversing it needs +x on that directory. Only matters when we are
         // CREATING: a plain open of an unsearchable dir is refused by the
@@ -1720,6 +1753,11 @@ private:
         std::string raw0 =
             read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)]));
         if (raw0.empty()) return at ? fwd() : eno(Errno::enoent);
+        // A "."/".." component does not excuse the components before it: the
+        // kernel walks the path, so access("gone/..") is ENOENT even though
+        // the normalized form is a directory that exists.
+        if (const Errno e = dot_prefix_error(r, path_arg, at); e != Errno::ok)
+            return eno(e);
         std::string abs = resolve_arg(r, path_arg, at);
         auto pc = k_.files().classify(abs);
         if (pc.realm == kernel::Realm2::host_backed) {
@@ -1766,6 +1804,11 @@ private:
         std::string raw0 =
             read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)]));
         if (raw0.empty()) return at ? fwd() : eno(Errno::enoent);
+        // A "."/".." component does not excuse the components before it: an
+        // unsearchable directory mid-path is EACCES, ahead of the EINVAL
+        // that "this is not a symlink" would give.
+        if (const Errno e = dot_prefix_error(r, path_arg, at); e != Errno::ok)
+            return eno(e);
 
         // /proc/self and /proc/thread-self ARE symlinks -- to "<pid>" and
         // "<pid>/task/<tid>". readlink must see them as such, but resolve_arg
@@ -2656,6 +2699,16 @@ private:
         // Traversal comes first: if the kernel cannot search its way to the
         // name, EACCES is the answer and none of the slash/dot reasoning
         // below is ever reached.
+        //
+        // dot_prefix_error walks the COMPONENTS before a dot, which is what
+        // catches an unsearchable directory in the middle of the path --
+        // `link sub/../f1 d/` with sub at 0644 is EACCES, and testing only
+        // the leaf's own parent answered EEXIST. The other path handlers all
+        // go through the same walker.
+        if (const Errno e1 = dot_prefix_error(r, a1, at); e1 != Errno::ok)
+            return eno(e1);
+        if (const Errno e2 = dot_prefix_error(r, a2, at); e2 != Errno::ok)
+            return eno(e2);
         {
             const std::string raw1 =
                 read_cstr(uaddr(r.arg[static_cast<std::size_t>(a1)]));
@@ -2700,13 +2753,19 @@ private:
             const bool slash1 = path_syntax(raw1) == PathSyntax::needs_dir;
             const bool slash2 = path_syntax(raw2) == PathSyntax::needs_dir;
             if (slash1 || slash2) {
-                // ...but a destination that is an ANCESTOR of the source is
-                // judged first: the move would have to absorb a directory
-                // containing itself, which the kernel reports as ENOTEMPTY.
-                // Any other existing-directory destination just fails the
-                // slash assertion with ENOTDIR. (Verified both ways against
-                // the live kernel -- "dst is a non-empty dir" alone is NOT
-                // the rule, it has to contain the source.)
+                // The SOURCE is judged first: a missing one is ENOENT and a
+                // file used as its directory component is ENOTDIR, both
+                // ahead of anything about the destination. Checking the
+                // ancestor rule first answered ENOTEMPTY for all of them.
+                if (Errno why = Errno::ok;
+                    !host_target_exists(ps.host_path, &why))
+                    return eno(why == Errno::enoent && !parent_is_dir(ps.host_path)
+                                   ? Errno::enotdir
+                                   : why);
+                // ...then a destination that is an ANCESTOR of the source:
+                // the move would absorb a directory containing itself, which
+                // the kernel reports as ENOTEMPTY. Any other existing-
+                // directory destination just fails the slash assertion.
                 if (host_path_is_dir(pd.host_path) &&
                     path_is_ancestor(pd.host_path, ps.host_path))
                     return eno(Errno::enotempty);
@@ -2907,6 +2966,12 @@ private:
         // so it outranks the trailing-slash rule below: symlink("",
         // "existing-dir/") is ENOENT, not the EEXIST the name alone gives.
         if (empty_path_arg(r, target_arg)) return eno(Errno::enoent);
+        // A "."/".." in the link name does not excuse the components before
+        // it: an unsearchable directory mid-path is EACCES, and a missing one
+        // ENOENT, both ahead of anything about the name being taken. Same
+        // walker every other path handler uses.
+        if (const Errno e = dot_prefix_error(r, link_arg, at); e != Errno::ok)
+            return eno(e);
         // A TRAILING SLASH means "this must be a directory", and a symlink
         // being created never is -- so the kernel refuses whatever the
         // target. WHICH refusal depends on what is already there: an
@@ -2935,6 +3000,12 @@ private:
             if (pc.realm == kernel::Realm2::host_backed && !pc.host_path.empty())
                 if constexpr (requires { mem_.stat_host_path(pc.host_path); })
                     if (mem_.stat_host_path(pc.host_path)) return eno(Errno::eexist);
+            // Neither existing nor plainly missing: an unsearchable parent
+            // means we could not LOOK, which the kernel reports as EACCES
+            // before any slash reasoning.
+            if (pc.realm == kernel::Realm2::host_backed &&
+                !host_dir_searchable(pc.host_path))
+                return eno(Errno::eacces);
             return eno(Errno::enoent);
         }
         std::string link = at ? resolve_second(r, link_arg, true)

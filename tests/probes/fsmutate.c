@@ -548,6 +548,50 @@ int main(void) {
             LX_SYS4(SYS_newfstatat, AT_FDCWD, DIR "/gone3", (char[512]){0}, 0),
             "...and that parent was not invented either");
 
+    // -- a trailing slash outranks O_EXCL ----------------------------------
+    // open("d/", O_CREAT|O_EXCL) on an existing directory is EISDIR: the
+    // slash asserts "this is a directory" and that is judged BEFORE O_EXCL's
+    // "the name is taken". Without the slash the same call is EEXIST. The
+    // guest normalized the slash away, so both answered EEXIST.
+    lx_emit("openat",
+            LX_SYS4(SYS_openat, AT_FDCWD, SUB "/", O_WRONLY | O_CREAT | O_EXCL, 0644),
+            "O_EXCL on a trailing-slash directory is EISDIR");
+    lx_emit("openat",
+            LX_SYS4(SYS_openat, AT_FDCWD, SUB, O_WRONLY | O_CREAT | O_EXCL, 0644),
+            "...but without the slash it is EEXIST");
+
+    // An unsearchable directory is EACCES for every path that traverses it,
+    // including via a dot component, and that outranks the EINVAL readlink
+    // would give for "not a symlink" and the ENOTEMPTY/EEXIST the slash
+    // rules would reach.
+    LX_SYS3(SYS_mkdirat, AT_FDCWD, DIR "/nox4", 0755);
+    {
+        const long t = LX_SYS4(SYS_openat, AT_FDCWD, DIR "/nox4/t",
+                               O_WRONLY | O_CREAT, 0644);
+        if (t >= 0) LX_SYS1(SYS_close, t);
+    }
+    LX_SYS3(SYS_mkdirat, AT_FDCWD, DIR "/nox4/d", 0755);
+    LX_SYS4(SYS_fchmodat, AT_FDCWD, DIR "/nox4", 0644, 0);
+    lx_emit("readlinkat",
+            LX_SYS4(SYS_readlinkat, AT_FDCWD, DIR "/nox4/d/../t", (char[64]){0}, 64),
+            "readlink through an unsearchable dir is EACCES, not EINVAL");
+    lx_emit("faccessat", LX_SYS3(SYS_faccessat, AT_FDCWD, DIR "/nox4/d/..", 0),
+            "access through an unsearchable dir is EACCES");
+    lx_emit("symlinkat", LX_SYS3(SYS_symlinkat, "x", AT_FDCWD, DIR "/nox4/d/"),
+            "symlink onto a trailing-slash name there is EACCES");
+    LX_SYS4(SYS_fchmodat, AT_FDCWD, DIR "/nox4", 0755, 0);
+    LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/nox4/d", 0x200);
+    LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/nox4/t", 0);
+    LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/nox4", 0x200);
+
+    // rename's source is judged before the destination: a missing source is
+    // ENOENT and a file used as its directory component is ENOTDIR, both
+    // ahead of the ancestor ENOTEMPTY.
+    lx_emit("renameat", LX_SYS4(SYS_renameat, AT_FDCWD, DIR "/nope9", AT_FDCWD, DIR "/"),
+            "rename of a MISSING source is ENOENT, not ENOTEMPTY");
+    lx_emit("renameat", LX_SYS4(SYS_renameat, AT_FDCWD, F1 "/bad", AT_FDCWD, DIR "/"),
+            "rename through a FILE prefix is ENOTDIR, not ENOTEMPTY");
+
     // -- teardown, observing each removal ----------------------------------
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, SYM, 0), "unlink sym");
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, F2, 0), "unlink f2");
