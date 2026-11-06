@@ -1473,6 +1473,19 @@ private:
                 PathSyntax::needs_dir &&
             host_path_is_dir(pc.host_path))
             return eno(Errno::eisdir);
+        // O_EXCL asks about the NAME, not what it resolves to: a dangling
+        // symlink occupies the name, so creating through it is EEXIST. We
+        // classify with follow=true, which resolves the link to its absent
+        // target -- so the overlay happily CREATED that target, a file the
+        // caller had explicitly asked not to create.
+        if (wire::has(flags, wire::OpenFlag::creat) &&
+            wire::has(flags, wire::OpenFlag::excl)) {
+            auto named = k_.files().classify(abs, /*for_write=*/false,
+                                             /*follow=*/false);
+            if (named.realm == kernel::Realm2::host_backed &&
+                host_lexists(named.host_path))
+                return eno(Errno::eexist);
+        }
         // A "."/".." component was normalized away during resolution, but
         // traversing it needs +x on that directory. Only matters when we are
         // CREATING: a plain open of an unsearchable dir is refused by the
@@ -2740,8 +2753,16 @@ private:
         // `link sub/../f1 d/` with sub at 0644 is EACCES, and testing only
         // the leaf's own parent answered EEXIST. The other path handlers all
         // go through the same walker.
+        //
+        // And strictly SOURCE-then-DESTINATION: the kernel resolves the first
+        // operand completely before it looks at the second, so a cycle in the
+        // source's prefix is reported even when the destination's directory
+        // is unsearchable. Interleaving the two let the destination's EACCES
+        // mask it.
         if (const Errno e1 = dot_prefix_error(r, a1, at); e1 != Errno::ok)
             return eno(e1);
+        if (const Errno e = guest_prefix_loop(src); e != Errno::ok)
+            return eno(e);
         if (const Errno e2 = dot_prefix_error(r, a2, at); e2 != Errno::ok)
             return eno(e2);
         {
@@ -2749,11 +2770,18 @@ private:
                 read_cstr(uaddr(r.arg[static_cast<std::size_t>(a1)]));
             const std::string raw2 =
                 read_cstr(uaddr(r.arg[static_cast<std::size_t>(a2)]));
-            if (dot_traversal_denied(raw1, ps.host_path) ||
-                dot_traversal_denied(raw2, pd.host_path))
+            // The SOURCE is resolved before the destination is touched at
+            // all, so every failure on its path is reported first. Checking
+            // both operands together made the destination's unsearchable
+            // directory mask a symlink cycle in the source's prefix.
+            if (dot_traversal_denied(raw1, ps.host_path))
                 return eno(Errno::eacces);
-            if (!host_dir_searchable(ps.host_path) ||
-                !host_dir_searchable(pd.host_path))
+            if (!host_dir_searchable(ps.host_path))
+                return eno(Errno::eacces);
+            // Now the destination.
+            if (dot_traversal_denied(raw2, pd.host_path))
+                return eno(Errno::eacces);
+            if (!host_dir_searchable(pd.host_path))
                 return eno(Errno::eacces);
             // A symlink cycle the walk must pass THROUGH is ELOOP. Both
             // classify calls above use follow=false (link and rename act on
@@ -2764,9 +2792,7 @@ private:
             //
             // The LEAF is exempt -- renaming a self-link is legal, verified
             // against the kernel -- and a MISSING SOURCE outranks a cycle in
-            // the destination, so the source is settled first.
-            if (const Errno e = guest_prefix_loop(src); e != Errno::ok)
-                return eno(e);
+            // the destination.
             if (host_lexists(ps.host_path))
                 if (const Errno e = guest_prefix_loop(dst); e != Errno::ok)
                     return eno(e);
@@ -2785,8 +2811,17 @@ private:
                 read_cstr(uaddr(r.arg[static_cast<std::size_t>(a2)]));
             if (dot_tail(raw1) != DotTail::none ||
                 dot_tail(raw2) != DotTail::none) {
+                // The PREFIX is walked before the dot is refused: a missing
+                // component is ENOENT and a file used as one is ENOTDIR.
+                // (A missing LEAF is not -- rename("gone", "d/.") is still
+                // EBUSY, because the dot is rejected before the leaf is
+                // looked up. Hence parent_resolves, not host_lexists.)
                 if (!parent_is_dir(ps.host_path) || !parent_is_dir(pd.host_path))
                     return eno(Errno::enotdir);
+                if (Errno why = Errno::ok; !parent_resolves(ps.host_path, &why))
+                    return eno(why);
+                if (Errno why = Errno::ok; !parent_resolves(pd.host_path, &why))
+                    return eno(why);
                 return eno(Errno::ebusy);
             }
         }
@@ -2863,6 +2898,11 @@ private:
                     !parent_resolves(pd.host_path, &why))
                     return eno(why);
                 if (!parent_is_dir(pd.host_path)) return eno(Errno::enotdir);
+                // A trailing slash on the DESTINATION asserts a directory
+                // that is not there, and that ENOENT comes before the
+                // no-directory-links EPERM -- which only applies when the
+                // caller named the destination without a slash.
+                if (slash2) return eno(Errno::enoent);
                 if (host_path_is_dir(ps.host_path)) return eno(Errno::eperm);
                 return eno(Errno::enoent);
             }

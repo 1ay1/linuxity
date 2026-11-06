@@ -662,6 +662,54 @@ int main(void) {
     LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/cyc2", 0);
     LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/cycsrc", 0);
 
+    // -- a DANGLING symlink occupies its name ------------------------------
+    // O_EXCL asks about the NAME, not what it resolves to. open resolves
+    // with follow=true, which turns a dangling link into its absent target --
+    // so the overlay CREATED that target, a file the caller had explicitly
+    // asked not to create, and reported success.
+    LX_SYS3(SYS_symlinkat, "nowhere-either", AT_FDCWD, DIR "/dang4");
+    lx_emit("openat",
+            LX_SYS4(SYS_openat, AT_FDCWD, DIR "/dang4", O_WRONLY | O_CREAT | O_EXCL, 0644),
+            "O_EXCL on a dangling symlink is EEXIST, and creates nothing");
+    lx_emit("newfstatat",
+            LX_SYS4(SYS_newfstatat, AT_FDCWD, DIR "/nowhere-either", (char[512]){0}, 0),
+            "...the target was not created");
+    lx_emit("mkdirat", LX_SYS3(SYS_mkdirat, AT_FDCWD, DIR "/dang4", 0755),
+            "mkdir over a dangling symlink is EEXIST");
+    LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/dang4", 0);
+
+    // Error ORDER for the two-path forms: the kernel resolves the SOURCE
+    // completely before it looks at the destination, so a failure on the
+    // source's path is reported even when the destination is worse off.
+    // Interleaving the operand checks let the destination mask the source.
+    LX_SYS3(SYS_symlinkat, DIR "/cyc3", AT_FDCWD, DIR "/cyc3");
+    LX_SYS3(SYS_mkdirat, AT_FDCWD, DIR "/nox6", 0755);
+    LX_SYS4(SYS_fchmodat, AT_FDCWD, DIR "/nox6", 0644, 0);
+    lx_emit("linkat",
+            LX_SYS5(SYS_linkat, AT_FDCWD, DIR "/cyc3/bad", AT_FDCWD,
+                    DIR "/nox6/x", 0),
+            "a cycle in the SOURCE prefix beats an unsearchable destination");
+    LX_SYS4(SYS_fchmodat, AT_FDCWD, DIR "/nox6", 0755, 0);
+    LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/nox6", 0x200);
+    LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/cyc3", 0);
+
+    // A trailing slash on an ABSENT destination is ENOENT, ahead of the
+    // no-directory-hardlinks EPERM -- which only applies when the caller
+    // named the destination without one.
+    lx_emit("linkat", LX_SYS5(SYS_linkat, AT_FDCWD, DIR "/", AT_FDCWD, DIR "/gone4/", 0),
+            "link a DIR to a slashed absent name is ENOENT, not EPERM");
+    lx_emit("linkat", LX_SYS5(SYS_linkat, AT_FDCWD, DIR "/", AT_FDCWD, DIR "/gone4", 0),
+            "...without the slash it IS EPERM");
+
+    // A missing path COMPONENT outranks the dot refusal; a missing leaf does
+    // not, because the dot is rejected before the leaf is looked up.
+    lx_emit("renameat",
+            LX_SYS4(SYS_renameat, AT_FDCWD, DIR "/gone5/bad", AT_FDCWD, DIR "/."),
+            "a missing COMPONENT outranks the dot EBUSY");
+    lx_emit("renameat",
+            LX_SYS4(SYS_renameat, AT_FDCWD, DIR "/gone5", AT_FDCWD, DIR "/."),
+            "...but a missing LEAF is still EBUSY");
+
     // -- teardown, observing each removal ----------------------------------
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, SYM, 0), "unlink sym");
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, F2, 0), "unlink f2");
