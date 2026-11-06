@@ -47,8 +47,10 @@ namespace lx::vfs {
 // pty. Left null, /dev/tty falls back to the host node, which is right for
 // the simple case where the guest inherited the host's own terminal.
 [[nodiscard]] inline kernel::FileNamespace::Producer make_devfs(
-    std::function<int()> ctty = nullptr) {
-    return [ctty = std::move(ctty)](std::string_view abs) -> Result<kernel::VirtualFile> {
+    std::function<int()> ctty = nullptr,
+    std::string shm_dir = "/dev/shm") {
+    return [ctty = std::move(ctty), shm = std::move(shm_dir)]
+           (std::string_view abs) -> Result<kernel::VirtualFile> {
         // The character devices we pass straight through to the host. Each is
         // a genuine host device node with the exact semantics the guest wants.
         static constexpr std::array<std::string_view, 7> kChar = {
@@ -156,7 +158,7 @@ namespace lx::vfs {
                 n == "." || n == "..")
                 return err<kernel::VirtualFile>(Errno::enoent);
             kernel::VirtualFile vf;
-            vf.redirect_host = "/dev/shm/" + std::string{n};
+            vf.redirect_host = shm + "/" + std::string{n};
             return ok(std::move(vf));
         }
 
@@ -165,12 +167,17 @@ namespace lx::vfs {
         // shm_open depends on. It used to be a synthesized empty directory
         // with no storage behind it, so every create in it failed ENOENT --
         // LTP's whole suite TBROK'd on open(/dev/shm/...) before running a
-        // single assertion. Redirect to the host's tmpfs, which is
-        // world-writable (drwxrwxrwt) so this needs no privilege.
+        // single assertion.
+        //
+        // The host's own /dev/shm when it has one. Android does NOT -- it
+        // uses ashmem/memfd and ships no shm tmpfs at all -- so main.cpp
+        // hands us a directory it made instead. Without that,
+        // multiprocessing.Queue and every ProcessPoolExecutor died with
+        // FileNotFoundError from sem_open.
         if (leaf == "shm") {
             kernel::VirtualFile vf;
             vf.is_dir = true;
-            vf.redirect_host = "/dev/shm";
+            vf.redirect_host = shm;
             return ok(std::move(vf));
         }
 

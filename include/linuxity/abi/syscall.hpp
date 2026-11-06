@@ -2901,7 +2901,51 @@ private:
                          wire::AtFlag::empty_path)) {
             std::string_view gp =
                 k_.files().path_of_fd(static_cast<int>(r.arg[0]));
-            if (gp.empty()) return fwd();
+            // An O_TMPFILE's recorded path is the DIRECTORY it was opened
+            // on, not a file -- the file has no name until this very call
+            // gives it one. So "no usable source" means empty OR a path that
+            // names a directory while the fd is a regular file. Testing only
+            // for empty missed it, and the link then targeted /dev/shm
+            // itself, which is why sem_open stayed ENOENT.
+            bool tmpfile_src = gp.empty();
+            if (!tmpfile_src) {
+                const int probe = open_tracee_fd(static_cast<int>(r.arg[0]));
+                if (probe >= 0) {
+                    struct ::stat fst{};
+                    const auto pc = k_.files().classify(std::string{gp}, false,
+                                                        false);
+                    tmpfile_src = ::fstat(probe, &fst) == 0 &&
+                                  S_ISREG(fst.st_mode) &&
+                                  pc.realm == kernel::Realm2::host_backed &&
+                                  host_path_is_dir(pc.host_path);
+                    ::close(probe);
+                }
+            }
+            if (tmpfile_src) {
+                // No tracked path: an O_TMPFILE, which has none BY DESIGN --
+                // the file exists only as an fd until linkat gives it a
+                // name. glibc's sem_open does exactly this, so every
+                // multiprocessing.Lock died here with ENOENT on a host that
+                // forbids link(2).
+                //
+                // Forwarding cannot work there, and neither can the
+                // path-based emulation: /proc/<tid>/fd/<n> renders an
+                // O_TMPFILE as "/dir/#1234 (deleted)", which is not
+                // openable. The DESCRIPTOR is the only handle, so copy from
+                // it -- reopening the tracee's fd through /proc gives us one
+                // we can pread.
+                std::string dstp = resolve_second(r, a2, at);
+                auto pdt = k_.files().classify(dstp, true, false,
+                                               Wi::parents_only);
+                if (pdt.realm != kernel::Realm2::host_backed) return fwd();
+                if (host_links_work(pdt.host_path)) return fwd();
+                const int sfd = open_tracee_fd(static_cast<int>(r.arg[0]));
+                if (sfd < 0) return fwd();
+                const Errno e =
+                    k_.files().emulate_link_from_fd(sfd, pdt.host_path);
+                ::close(sfd);
+                return e == Errno::ok ? val(0) : eno(e);
+            }
             src_from_fd = std::string{gp};
         }
         // BOTH operands. Checking only the source left symlinkat(x, "") and
@@ -3097,7 +3141,17 @@ private:
         // Crossing between a synthesized path and a real one is a genuine
         // cross-mount move, which rename/link report as EXDEV.
         if (sv != dv) return eno(Errno::exdev);
-        if (sv) {
+        // Both ends under a virtual mount -- but "virtual" is about who
+        // ANSWERS the path, not whether anything is behind it. /dev/shm is
+        // served by devfs and yet redirects to real storage, so a link there
+        // is an ordinary link between two real files and must be allowed.
+        // Treating every virtual mount as procfs returned ENOENT for it,
+        // which is where glibc's sem_open died -- and with it every
+        // multiprocessing.Lock, Queue and ProcessPoolExecutor.
+        const bool both_real = ps.realm == kernel::Realm2::host_backed &&
+                               !ps.host_path.empty() &&
+                               !pd.host_path.empty();
+        if (sv && !both_real) {
             // Both ends inside procfs. An absent source is ENOENT before
             // anything else is considered.
             if (ps.realm == kernel::Realm2::absent) return eno(Errno::enoent);
@@ -3991,8 +4045,8 @@ private:
     // the ctty rule: opening a tty WITHOUT O_NOCTTY in a session that has
     // none makes it the controlling terminal.
     std::uint64_t pending_flags_{0};
-    // Tri-state cache for host_links_work: -1 unknown, 0 no, 1 yes.
-    int links_work_{-1};
+    // Per-filesystem answer to "does link(2) work here", keyed by st_dev.
+    std::unordered_map<std::uint64_t, bool> links_work_;
     bool pending_dir_{false};    // the pending open is a virtual directory
     std::string pending_lazy_;   // overlaid host dir: union built on 1st getdents
     std::vector<kernel::VirtualDirent> pending_entries_;
@@ -4253,6 +4307,25 @@ public:
         return eno(Errno::enotty);
     }
 
+    // Open the tracee's fd `fd` for reading, as a descriptor of OURS.
+    //
+    // /proc/<tid>/fd/<n> is a magic link: opening it reopens the underlying
+    // inode, even when the link TEXT is unusable. That is what makes an
+    // O_TMPFILE reachable -- its text renders "/dir/#1234 (deleted)", which
+    // no open() would accept, while opening the magic link itself works.
+    //
+    // Returns -1 when the backend exposes no host tid, or the open fails.
+    [[nodiscard]] int open_tracee_fd(int fd) {
+        if constexpr (!requires { mem_.host_tid(); }) {
+            return -1;
+        } else {
+            char link[64];
+            std::snprintf(link, sizeof link, "/proc/%d/fd/%d",
+                          mem_.host_tid(), fd);
+            return ::open(link, O_RDONLY | O_CLOEXEC);
+        }
+    }
+
     // Was this guest fd opened O_PATH?
     //
     // Read it from the tracee's /proc rather than tracking it ourselves: the
@@ -4285,22 +4358,31 @@ public:
     // /data for every process, so probing per-call would cost two syscalls
     // on every hardlink for an answer that never changes.
     [[nodiscard]] bool host_links_work(const std::string& near) {
-        if (links_work_ != -1) return links_work_ == 1;
-        links_work_ = 0;
         const std::size_t slash = near.find_last_of('/');
         if (slash == std::string::npos) return false;
         const std::string dir = near.substr(0, slash);
+        // Keyed by the DIRECTORY's filesystem, not cached once globally.
+        // One answer for the whole run was wrong: the probe ran first on a
+        // path where links work and the result was then reused for
+        // /dev/shm, where they do not, so glibc's sem_open got a forwarded
+        // link(2) and EACCES. st_dev names the filesystem exactly.
+        struct ::stat dst{};
+        if (::stat(dir.c_str(), &dst) != 0) return false;
+        if (const auto it = links_work_.find(dst.st_dev);
+            it != links_work_.end())
+            return it->second;
         const std::string a = dir + "/.lx-linkprobe-a";
         const std::string b = dir + "/.lx-linkprobe-b";
         ::unlink(a.c_str());
         ::unlink(b.c_str());
         const int fd = ::open(a.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
-        if (fd < 0) return false;          // can't tell; assume not
+        if (fd < 0) return false;   // unwritable: do not cache a guess
         ::close(fd);
-        links_work_ = ::link(a.c_str(), b.c_str()) == 0 ? 1 : 0;
+        const bool works = ::link(a.c_str(), b.c_str()) == 0;
         ::unlink(a.c_str());
         ::unlink(b.c_str());
-        return links_work_ == 1;
+        links_work_[dst.st_dev] = works;
+        return works;
     }
 
     [[nodiscard]] bool put_u64(std::uint64_t addr, std::uint64_t v) {

@@ -467,6 +467,36 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Where /dev/shm gets its STORAGE.
+    //
+    // The host's own tmpfs when it has one: world-writable (drwxrwxrwt), so
+    // this needs no privilege and shared memory is really shared. Android
+    // ships no /dev/shm at all -- it uses ashmem/memfd -- and the guest
+    // cannot create one, since /dev is a read-only tmpfs there. So fall back
+    // to a directory of our own, which is on real storage rather than RAM
+    // but satisfies everything that matters: sem_open, shm_open and
+    // mmap(MAP_SHARED) all work on a plain file.
+    //
+    // Without this, python's multiprocessing died constructing any
+    // ProcessPoolExecutor -- FileNotFoundError straight out of sem_open --
+    // and LTP could not stage a single shm test. Chosen BEFORE the devfs
+    // mounts below, which capture it.
+    std::string shm_dir = "/dev/shm";
+    {
+        struct ::stat sst{};
+        const bool host_has = ::stat("/dev/shm", &sst) == 0 &&
+                              S_ISDIR(sst.st_mode) &&
+                              ::access("/dev/shm", W_OK) == 0;
+        if (!host_has) {
+            // Same convention and location as the private /tmp below: named
+            // with the SUPERVISOR's pid, since the guest's is always 1.
+            shm_dir = "/tmp/linuxity-shm-" +
+                      std::to_string(static_cast<long>(::getpid()));
+            (void)::mkdir(shm_dir.c_str(), 01777);
+            (void)::chmod(shm_dir.c_str(), 01777);
+        }
+    }
+
     // Build the guest's filesystem namespace. When --root is given, the
     // rootfs directory becomes the guest '/' via PATH TRANSLATION (no chroot,
     // no privilege): every guest path the program names is rewritten to the
@@ -501,7 +531,8 @@ int main(int argc, char** argv) {
         k.files().mount_virtual("/proc", vfs::make_procfs(k.procs(), k.machine()));
         k.files().mount_virtual("/sys", vfs::make_sysfs(k.machine()));
         k.files().mount_virtual("/dev", vfs::make_devfs(
-            [&k] { return k.procs().ctty_of(k.files().current_pid()); }));
+            [&k] { return k.procs().ctty_of(k.files().current_pid()); },
+            shm_dir));
     } else {
         // No rootfs: the guest lives in the real host tree (paths translate
         // 1:1), but /proc and /sys are STILL synthesized so uname/pid/mounts
@@ -510,7 +541,8 @@ int main(int argc, char** argv) {
         k.files().mount_virtual("/proc", vfs::make_procfs(k.procs(), k.machine()));
         k.files().mount_virtual("/sys", vfs::make_sysfs(k.machine()));
         k.files().mount_virtual("/dev", vfs::make_devfs(
-            [&k] { return k.procs().ctty_of(k.files().current_pid()); }));
+            [&k] { return k.procs().ctty_of(k.files().current_pid()); },
+            shm_dir));
     }
 
     // Private /tmp (see `private_tmp` above). Registered BEFORE --bind so an

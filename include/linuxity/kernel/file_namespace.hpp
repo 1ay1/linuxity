@@ -549,7 +549,45 @@ public:
         return out;
     }
 
-    // -- Guest fd table ----------------------------------------------------
+    // Materialize `dst` from an OPEN FD's contents.
+    //
+    // The O_TMPFILE case: the file exists only as a descriptor and has no
+    // path at all, so emulate_hardlink's stat/open of a source path cannot
+    // work. /proc/<tid>/fd/<n> renders it "/dir/#1234 (deleted)", which is
+    // not openable either. The fd itself is the only handle, and reading
+    // from it is enough -- glibc's sem_open writes the semaphore's initial
+    // state into the temp file BEFORE linking it into place, so the bytes
+    // are already there.
+    [[nodiscard]] Errno emulate_link_from_fd(int fd,
+                                             const std::string& dst) const {
+        struct ::stat st{};
+        if (::fstat(fd, &st) != 0) return static_cast<Errno>(errno);
+        struct ::stat dt{};
+        if (::lstat(dst.c_str(), &dt) == 0) return Errno::eexist;
+        const int out = ::open(dst.c_str(),
+                               O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+                               st.st_mode & 07777);
+        if (out < 0) return static_cast<Errno>(errno);
+        // Read from offset 0 without disturbing the caller's file position:
+        // the guest still holds this fd and will keep using it.
+        char buf[65536];
+        ::off_t off = 0;
+        for (;;) {
+            const ssize_t n = ::pread(fd, buf, sizeof buf, off);
+            if (n == 0) break;
+            if (n < 0 || ::write(out, buf, static_cast<std::size_t>(n)) != n) {
+                const int e = errno;
+                ::close(out);
+                ::unlink(dst.c_str());
+                return static_cast<Errno>(e);
+            }
+            off += n;
+        }
+        ::close(out);
+        (void)::chmod(dst.c_str(), st.st_mode & 07777);
+        return Errno::ok;
+    }
+
     // Copy `src` to `dst` to stand in for a hardlink the host refused.
     //
     // Returns ok, or the errno the kernel would have given. The content and
@@ -595,6 +633,7 @@ public:
         return Errno::ok;
     }
 
+    // -- Guest fd table ----------------------------------------------------
     // Records the guest path bound to a real (forwarded) fd, so readlinkat,
     // getdents, and fd-relative openat can recover the path. The fd number is
     // the REAL host fd the child holds (redirect/inject both yield real fds).
