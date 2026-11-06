@@ -517,6 +517,20 @@ int main(void) {
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/loop", 0),
             "and the loop can still be unlinked");
 
+    // -- a creation must not INVENT its parent directory -------------------
+    // The overlay pre-creates a parent chain so a write can land in the upper
+    // layer, but that is for mirroring a directory the read-only lower
+    // already has -- not for conjuring one. symlink opted in by mistake, so
+    // `ln -s t d/missing/link` CREATED missing/ and reported success, and a
+    // regular file in that position gave EEXIST instead of ENOTDIR.
+    lx_emit("symlinkat", LX_SYS3(SYS_symlinkat, "t", AT_FDCWD, DIR "/absent/lnk"),
+            "symlink under a MISSING parent is ENOENT, and creates nothing");
+    lx_emit("newfstatat",
+            LX_SYS4(SYS_newfstatat, AT_FDCWD, DIR "/absent", (char[512]){0}, 0),
+            "...the parent was not invented");
+    lx_emit("symlinkat", LX_SYS3(SYS_symlinkat, "t", AT_FDCWD, F1 "/lnk"),
+            "symlink under a FILE is ENOTDIR, not EEXIST");
+
     // -- teardown, observing each removal ----------------------------------
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, SYM, 0), "unlink sym");
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, F2, 0), "unlink f2");

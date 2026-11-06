@@ -2949,7 +2949,14 @@ private:
             return eno(virtual_mut_errno(link, VMut::exists));
         if (pc.host_path.empty()) return eno(pc.error);
         // Rewrite ONLY the linkpath; `target` stays guest-literal.
-        return Redirect{PathArg{link_arg, std::move(pc.host_path)}}.parents();
+        //
+        // NO .parents(): creating the chain is for mirroring a directory that
+        // already exists in the read-only lower layer, not for inventing one.
+        // `ln -s t d/missing/link` was CREATING `missing/` and succeeding,
+        // where the kernel says ENOENT -- and with a FILE in that position it
+        // said EEXIST instead of ENOTDIR. Same rule mkdir/mknod opt into with
+        // strict_parent; let the host kernel judge the translated path.
+        return Redirect{PathArg{link_arg, std::move(pc.host_path)}};
     }
 
     // Resolve the SECOND path of an *at two-operand syscall. Its dirfd is the
