@@ -3194,8 +3194,20 @@ private:
         // 2, which is the part that made this look unacceptable at first.
         // Probe the host once per tree rather than per call.
         if (!move_meta && !host_links_work(pd.host_path)) {
+            // glibc's sem_open writes a temp named sem.XXXXXX, links it to
+            // the real name, then unlinks the temp -- so the link is really
+            // a MOVE, and the two names are never both live. Saying so lets
+            // the emulation rename instead of copy, which keeps ONE inode.
+            // A copy gave parent and child separate semaphores, and python
+            // died with "semaphore or lock released too many times".
+            const std::size_t slash = src.find_last_of('/');
+            const std::string_view leaf =
+                slash == std::string::npos ? std::string_view{src}
+                                           : std::string_view{src}.substr(slash + 1);
+            const bool sem_temp = leaf.starts_with("sem.");
             const Errno e = k_.files().emulate_hardlink(ps.host_path,
-                                                        pd.host_path);
+                                                        pd.host_path,
+                                                        sem_temp);
             if (e != Errno::ok) return eno(e);
             // A real link(2) bumps the count on EVERY name sharing the
             // inode, not just the two in this call -- so join the source's
@@ -3264,6 +3276,30 @@ private:
         if (k_.files().socket_ns() == kernel::SocketNs::abstract) {
             const std::string name = kernel::abstract_name_for(
                 guest_path, k_.files().instance_id());
+            // A BIND also has to leave the NAME behind. The socket itself
+            // lives in the abstract namespace, where nothing is on disk --
+            // but a guest that binds a path expects to find it there
+            // afterwards, and the next thing it does is usually chmod or
+            // stat it. python's multiprocessing forkserver does exactly
+            // that (os.chmod(address, 0o600) right after bind) and died
+            // with ENOENT on a socket that had bound successfully.
+            //
+            // So drop a real, empty file at the translated path. It is not
+            // the socket -- connect still goes through the abstract name,
+            // which both peers derive from the same GUEST path -- it is the
+            // name, which is the part the guest can observe.
+            if (for_bind) {
+                auto pc = k_.files().classify(guest_path, /*for_write=*/true,
+                                              /*follow=*/false,
+                                              Wi::parents_only);
+                if (pc.realm == kernel::Realm2::host_backed &&
+                    !pc.host_path.empty()) {
+                    (void)::unlink(pc.host_path.c_str());
+                    const int fd = ::open(pc.host_path.c_str(),
+                                          O_WRONLY | O_CREAT | O_EXCL, 0600);
+                    if (fd >= 0) ::close(fd);
+                }
+            }
             // An abstract address is a leading NUL then the name, and its
             // LENGTH is what delimits it -- there is no terminator. Hand the
             // trap the exact bytes to poke.

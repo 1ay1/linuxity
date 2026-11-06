@@ -590,17 +590,31 @@ public:
 
     // Copy `src` to `dst` to stand in for a hardlink the host refused.
     //
-    // Returns ok, or the errno the kernel would have given. The content and
-    // mode match, which is what a package manager's aliases need; the inode
-    // is not shared, so the caller records st_nlink in the shadow store.
+    // Returns ok, or the errno the kernel would have given.
+    //
+    // RENAME FIRST, copy only if that fails. A copy gives two independent
+    // inodes, and for a file that is only ever a NAME that is fine -- but
+    // glibc's sem_open creates a temp, links it, then unlinks the temp, so
+    // the two names are never both live and the link is really a move. With
+    // a copy the child re-opening the semaphore by name got a DIFFERENT
+    // inode, so parent and child never shared it and python died with
+    // "semaphore or lock released too many times". A rename keeps one inode,
+    // which is what shared memory requires.
+    //
+    // Safe because the caller only reaches this when the host refuses
+    // link(2) outright: if the source survives the call the copy below is
+    // still the right answer, and rename only wins when it does not.
     [[nodiscard]] Errno emulate_hardlink(const std::string& src,
-                                         const std::string& dst) const {
+                                         const std::string& dst,
+                                         bool src_is_temp = false) const {
         struct ::stat st{};
         if (::stat(src.c_str(), &st) != 0) return static_cast<Errno>(errno);
         if (S_ISDIR(st.st_mode)) return Errno::eperm;   // link(2) on a dir
         // link(2) does NOT overwrite; EEXIST is the kernel's answer.
         struct ::stat dt{};
         if (::lstat(dst.c_str(), &dt) == 0) return Errno::eexist;
+        if (src_is_temp && ::rename(src.c_str(), dst.c_str()) == 0)
+            return Errno::ok;
         const int in = ::open(src.c_str(), O_RDONLY | O_CLOEXEC);
         if (in < 0) return static_cast<Errno>(errno);
         const int out = ::open(dst.c_str(),

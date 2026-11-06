@@ -39,6 +39,7 @@
 #include <cerrno>
 
 #include <optional>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -93,6 +94,23 @@ public:
         if (pid < 0) return err(Errno::eagain);
         if (pid == 0) {
             if (seccomp_pipe[0] >= 0) ::close(seccomp_pipe[0]);
+            // A fresh process starts with NOTHING blocked. The mask is
+            // inherited across fork and survives execve, so whatever the
+            // launching shell had set would otherwise become the guest's --
+            // and Android's adb shell blocks signal 32 (SigBlk 0x80000000).
+            // glibc reserves 32 as SIGCANCEL, so python then rejected its
+            // own mask ("invalid signal number 32") the moment
+            // multiprocessing called pthread_sigmask. No real Linux hands a
+            // new process that mask.
+            //
+            // The RAW syscall, not sigprocmask(3): libc's wrapper only
+            // covers signals 1-31, and 32 is above that -- it would have
+            // left the one bit that matters untouched.
+            {
+                std::uint64_t none = 0;
+                (void)::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &none,
+                                nullptr, sizeof none);
+            }
             if (!root_.empty()) {
                 if (::chroot(root_.c_str()) == 0) (void)::chdir("/");
             }
@@ -192,7 +210,35 @@ public:
     [[nodiscard]] Result<bool> next(TrapFrame& f) {
         for (;;) {
             int st = 0;
-            ::pid_t w = ::waitpid(-1, &st, __WALL);
+            ::pid_t w;
+            if (draining_) {
+                // After pid 1 exits: keep serving the survivors, but never
+                // block past the grace deadline -- a daemon that ignores
+                // SIGTERM and sleeps in the kernel would otherwise hold the
+                // runtime open forever. Wait on the actual event (SIGCHLD,
+                // blocked in begin_drain so it pends instead of being lost
+                // between the waitpid and the wait) rather than polling.
+                w = ::waitpid(-1, &st, __WALL | WNOHANG);
+                if (w == 0) {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now >= drain_deadline_) {
+                        kill_remaining();
+                        exited_ = true;
+                        return ok(false);
+                    }
+                    const auto ns = std::chrono::duration_cast<
+                        std::chrono::nanoseconds>(drain_deadline_ - now).count();
+                    ::timespec ts{static_cast<::time_t>(ns / 1000000000),
+                                  static_cast<long>(ns % 1000000000)};
+                    ::sigset_t chld;
+                    ::sigemptyset(&chld);
+                    ::sigaddset(&chld, SIGCHLD);
+                    (void)::sigtimedwait(&chld, nullptr, &ts);
+                    continue;
+                }
+            } else {
+                w = ::waitpid(-1, &st, __WALL);
+            }
             if (w < 0) return ok(false);
 
             if (WIFEXITED(st) || WIFSIGNALED(st)) {
@@ -220,9 +266,11 @@ public:
                 // its pipe EOF: waiting for live_==0 would hang the runtime
                 // forever. On a real host such a daemon survives reparented to
                 // init; here linuxity OWNS the tree, so the faithful behaviour
-                // is to reap the session and let PTRACE_O_EXITKILL take the
-                // orphans down with us. Tear the tree down and return.
-                if (w == root_pid_) { reap_tree(); exited_ = true; return ok(false); }
+                // is to shut the session down -- but through begin_drain(),
+                // which keeps translating the survivors' syscalls until they
+                // exit or the grace deadline passes. Releasing them
+                // untraced was a sandbox escape.
+                if (w == root_pid_) begin_drain();
                 if (live_ <= 0) { exited_ = true; return ok(false); }
                 continue;
             }
@@ -1415,79 +1463,51 @@ public:
     }
 
 private:
-    // Bring the whole traced tree down after the root/session leader exited.
-    // Any surviving task is a detached daemon (gpg-agent/dirmngr etc.) that the
-    // guest orphaned, OR a foreground child (e.g. pacman mid-transaction) that
-    // was still running when the session leader exited. We must take the whole
-    // tree down, but NOT with an immediate SIGKILL: a package manager killed
-    // uncatchably leaves a stale db.lck and a half-written local-DB entry
-    // (dir + mtree but no desc), which then poisons every later transaction.
-    // So we do what a real machine's shutdown does -- deliver a CATCHABLE
-    // SIGTERM first (via PTRACE_CONT, since a ptrace-stopped task only receives
-    // an injected signal on resume), give the tree a bounded grace window to
-    // run its own cleanup handlers (pacman removes the lock and rolls back the
-    // partial transaction), then ESCALATE to SIGKILL for anything that ignores
-    // SIGTERM (detached gpg-agent/dirmngr). PTRACE_O_EXITKILL still backstops
-    // us if we exit before the drain completes. Best-effort throughout: a task
-    // may already be gone (ESRCH) between the snapshot and each step.
-    void reap_tree() {
-        std::vector<::pid_t> victims;
-        victims.reserve(tasks_.size());
-        for (const auto& [tid, _] : tasks_) victims.push_back(tid);
-
-        // Phase 1: graceful. Resume each stopped task delivering SIGTERM, so
-        // its handler runs (SIGCONT first in case it was group-stopped). This
-        // lets pacman's signal handler unlink db.lck and undo the in-progress
-        // transaction, exactly as on native Linux.
-        std::unordered_set<::pid_t> alive;
-        for (::pid_t tid : victims) {
+    // pid 1 exited: shut the rest of the tree down WITHOUT leaving the
+    // dispatch loop.
+    //
+    // The survivors are detached daemons (gpg-agent, dirmngr) or foreground
+    // children still running when the session leader exited -- pacman
+    // mid-transaction, say. They get a CATCHABLE SIGTERM first, so pacman can
+    // unlink db.lck and roll back instead of leaving a half-written local DB,
+    // then SIGKILL after a 2s grace window for anything that ignores it.
+    //
+    // That grace window used to resume every task with PTRACE_CONT. Under
+    // seccomp a syscall stop resumed that way runs the call NATIVELY,
+    // untranslated, against the host filesystem -- so for two seconds after
+    // init died every guest process was outside its root. python's
+    // forkserver child, mid-import, opened /usr/lib/python3.14/threading.py
+    // on the HOST and died with "No module named 'threading'", and pacman's
+    // own cleanup was unlinking a host path instead of its lock. Now next()
+    // keeps serving the survivors normally until they exit or the deadline
+    // passes, and kill_remaining() ends it.
+    void begin_drain() {
+        draining_ = true;
+        drain_deadline_ = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(2000);
+        // Block SIGCHLD so next() can sigtimedwait for it: a blocked signal
+        // pends even under the default (ignore) disposition, so a state
+        // change can never slip in unnoticed between waitpid and the wait.
+        ::sigset_t chld;
+        ::sigemptyset(&chld);
+        ::sigaddset(&chld, SIGCHLD);
+        (void)::pthread_sigmask(SIG_BLOCK, &chld, nullptr);
+        for (const auto& [tid, _] : tasks_) {
             ::kill(tid, SIGCONT);
-            // Inject SIGTERM through the ptrace resume so a stopped tracee
-            // actually receives it; also kill(2) it in case it is running.
-            if (::ptrace(PTRACE_CONT, tid, 0, SIGTERM) != 0)
-                ::kill(tid, SIGTERM);
-            alive.insert(tid);
+            ::kill(tid, SIGTERM);
         }
+    }
 
-        // Phase 2: bounded drain. Reap any task that exits on its own within
-        // the grace window. Poll waitpid(WNOHANG) across all victims for up to
-        // ~2s (pacman's rollback is sub-second); resume any that re-stop under
-        // ptrace so the pending SIGTERM keeps propagating. As soon as the tree
-        // is empty we stop early.
-        constexpr int kGraceMs = 2000;
-        constexpr int kStepMs = 20;
-        for (int waited = 0; waited < kGraceMs && !alive.empty(); waited += kStepMs) {
-            bool progressed = false;
-            for (auto it = alive.begin(); it != alive.end();) {
-                ::pid_t tid = *it;
-                int st = 0;
-                ::pid_t r = ::waitpid(tid, &st, __WALL | WNOHANG);
-                if (r == tid && (WIFEXITED(st) || WIFSIGNALED(st))) {
-                    it = alive.erase(it); progressed = true; continue;
-                }
-                if (r == tid && WIFSTOPPED(st)) {
-                    // Re-stopped (e.g. group-stop or trap): resume, keep the
-                    // SIGTERM heading its way.
-                    ::ptrace(PTRACE_CONT, tid, 0, SIGTERM);
-                    progressed = true;
-                }
-                if (r < 0) { it = alive.erase(it); progressed = true; continue; }
-                ++it;
-            }
-            if (!progressed)
-                ::usleep(static_cast<useconds_t>(kStepMs) * 1000);
-        }
-
-        // Phase 3: escalate. Anything still alive ignored SIGTERM (detached
-        // daemons); force it down and drain its exit so no zombie is left.
-        for (::pid_t tid : alive) {
+    // Grace window over: force down whatever ignored SIGTERM (a detached
+    // daemon) and drain its exit so no zombie is left behind.
+    void kill_remaining() {
+        for (const auto& [tid, _] : tasks_) {
             ::ptrace(PTRACE_KILL, tid, 0, 0);
             ::kill(tid, SIGKILL);
             for (;;) {
                 int st = 0;
-                ::pid_t r = ::waitpid(tid, &st, __WALL);
-                if (r <= 0) break;
-                if (WIFEXITED(st) || WIFSIGNALED(st)) break;
+                const ::pid_t r = ::waitpid(tid, &st, __WALL);
+                if (r <= 0 || WIFEXITED(st) || WIFSIGNALED(st)) break;
                 ::ptrace(PTRACE_CONT, tid, 0, SIGKILL);
             }
         }
@@ -1744,6 +1764,10 @@ private:
     int exit_code_{0};
     int live_{0};
     bool exited_{false};
+    // Set once pid 1 exits: the survivors are being shut down but are still
+    // served through the normal dispatch path until drain_deadline_.
+    bool draining_{false};
+    std::chrono::steady_clock::time_point drain_deadline_{};
     bool seccomp_{false};          // trap filter active -> drive with PTRACE_CONT
     std::unordered_map<::pid_t, Task> tasks_;
 };
