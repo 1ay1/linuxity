@@ -19,7 +19,7 @@ set(LX_POSIX_HOST_TESTS hostfs loader hostcalls)
 set(LX_LIVE_TESTS
     run_native run_rootfs run_multiproc run_signal run_identity run_stat_owner
     run_open_procfs run_mutate run_dev run_socket run_daemon run_shebang
-    run_tty_jobcontrol run_pid_namespace run_seccomp run_meta run_bind
+    run_tty_jobcontrol run_ttyname run_pid_namespace run_seccomp run_meta run_bind
     run_foreign_exec run_untranslated run_empty_path run_rewinddir run_fd_reuse run_proc_self run_proc_link run_path_escape)
 
 # ---- differential conformance -------------------------------------------

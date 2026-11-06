@@ -835,6 +835,23 @@ private:
         };
         if (!abs.starts_with("/proc/")) return abs;
         const auto id = ids();
+        // The caller's OWN fds stay in (or are folded into) /proc/self/fd form.
+        // The guest is a real host process, so the host kernel's
+        // /proc/self/fd/N, resolved in the guest's context, IS the guest's fd
+        // N -- procfs redirects that form to the host on purpose. Rebinding it
+        // to /proc/<pid>/fd/N first made that redirect dead code: the pid arm
+        // has no fd/N, so readlink("/proc/self/fd/0") was ENOENT, ttyname()
+        // failed, and `script -c tty` printed "Inappropriate ioctl for device"
+        // on a perfectly good pty. Same for open("/proc/self/fd/1").
+        {
+            const std::string own = "/proc/" + std::to_string(id.pid);
+            for (const std::string_view who : {std::string_view{"/proc/self"},
+                                               std::string_view{own}}) {
+                const std::string fd_prefix = std::string{who} + "/fd";
+                if (abs == fd_prefix || abs.starts_with(fd_prefix + "/"))
+                    return "/proc/self/fd" + abs.substr(fd_prefix.size());
+            }
+        }
         if (rebind("/proc/self", id.pid)) return abs;
         // thread-self is a TID, not a pid: /proc/thread-self is
         // /proc/<pid>/task/<tid> on a real kernel.
@@ -2057,6 +2074,15 @@ private:
     fast_stat(const std::string& host_path, const std::string& guest_path) {
         if constexpr (requires { mem_.stat_host_path(host_path); }) {
             if (k_.files().meta().lookup(guest_path)) return std::nullopt;
+            // NEVER for a host /proc path. The supervisor stats it in ITS OWN
+            // context, and /proc is the one tree where that changes the
+            // answer: /proc/self/fd/0 is the supervisor's fd 0, as a symlink,
+            // not the guest's terminal. ttyname() stats exactly that path and
+            // got "symbolic link 0:0" back, so script(1)'s child was "not a
+            // tty". Redirecting lets the kernel resolve it in the GUEST, which
+            // is right by construction. Cheap to give up: these are rare.
+            if (host_path == "/proc" || host_path.starts_with("/proc/"))
+                return std::nullopt;
             return mem_.stat_host_path(host_path);
         } else {
             return std::nullopt;
@@ -2117,6 +2143,25 @@ private:
         sx.stx_ctime   = {static_cast<std::int64_t>(h.ctime_ns / 1'000'000'000ull),
                           static_cast<std::uint32_t>(h.ctime_ns % 1'000'000'000ull), 0};
         sx.stx_btime   = sx.stx_ctime;
+        // Device numbers. statx carries them split into major/minor, and
+        // these were simply never written -- so the one-stop stat reported
+        // EVERY device as 0:0. That broke ttyname(): glibc stats the
+        // /dev/pts/N it found and compares st_rdev against fd 0's, and 0:0
+        // never matched the real 136:N, so script(1)'s child got "not a tty".
+        // Split with the kernel's own new_decode_dev() layout, the inverse of
+        // makedev(): major in bits 8-19 and 32-43, minor in bits 0-7 and 20-31.
+        const auto major_of = [](std::uint64_t d) {
+            return static_cast<std::uint32_t>(((d >> 8) & 0xfffu) |
+                                              ((d >> 32) & 0xfffff000u));
+        };
+        const auto minor_of = [](std::uint64_t d) {
+            return static_cast<std::uint32_t>((d & 0xffu) |
+                                              ((d >> 12) & 0xffffff00u));
+        };
+        sx.stx_rdev_major = major_of(h.rdev);
+        sx.stx_rdev_minor = minor_of(h.rdev);
+        sx.stx_dev_major  = major_of(h.dev);
+        sx.stx_dev_minor  = minor_of(h.dev);
         if (!mem_.copy_out(buf, {reinterpret_cast<const std::byte*>(&sx), sizeof sx}))
             return eno(Errno::efault);
         return val(0);
