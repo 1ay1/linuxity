@@ -1066,6 +1066,77 @@ private:
         return ::access(host_path.c_str(), X_OK) != 0 && errno == EACCES;
     }
 
+    // Lexically normalizing "."/".." DROPS the requirement that whatever
+    // came before them exists. The kernel WALKS a path, so "gone/.." fails at
+    // `gone` even though the rewritten path is a perfectly good parent --
+    // without this, `stat gone/../f1` succeeded and `mkdir gone/../x`
+    // actually created the directory.
+    //
+    // So: every component that appears BEFORE a dot component must itself
+    // resolve to a directory. Returns the errno that walk would produce, or
+    // Errno::ok if the path is fine (including when it has no dot at all, the
+    // common case, which costs one find()).
+    [[nodiscard]] Errno dot_prefix_error(const Regs& r, int path_arg, bool at) {
+        const std::string raw =
+            read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)]));
+        if (raw.find('.') == std::string::npos) return Errno::ok;
+
+        // Split into components, remembering where the first dot sits.
+        std::vector<std::string> comps;
+        std::size_t first_dot = std::string::npos;
+        for (std::size_t i = 0, n = 0; i <= raw.size(); ++i) {
+            if (i == raw.size() || raw[i] == '/') {
+                if (n < i) {
+                    std::string c = raw.substr(n, i - n);
+                    if ((c == "." || c == "..") && first_dot == std::string::npos)
+                        first_dot = comps.size();
+                    comps.push_back(std::move(c));
+                }
+                n = i + 1;
+            }
+        }
+        if (first_dot == std::string::npos || first_dot == 0) return Errno::ok;
+
+        // Rebuild the guest path one component at a time, up to the dot, and
+        // require each to be a real directory.
+        std::string cur = (!raw.empty() && raw.front() == '/')
+                              ? std::string{"/"}
+                              : std::string{dir_base(r, at)};
+        for (std::size_t i = 0; i < first_dot; ++i) {
+            if (cur.empty() || cur.back() != '/') cur += '/';
+            cur += comps[i];
+            auto pc = k_.files().classify(kernel::FileNamespace::normalize(cur),
+                                          /*for_write=*/false, /*follow=*/true);
+            if (pc.realm != kernel::Realm2::host_backed) continue;
+            if (pc.host_path.empty()) continue;
+            struct ::stat st{};
+            if (::stat(pc.host_path.c_str(), &st) != 0) {
+                // A prefix we cannot even stat because a directory above it
+                // denies search is EACCES, not ENOENT -- the kernel stops at
+                // the permission, before it can discover what is there.
+                if (errno == EACCES) return Errno::eacces;
+                return Errno::enoent;
+            }
+            if (!S_ISDIR(st.st_mode)) return Errno::enotdir;
+            // The component exists and is a directory, but a dot AFTER it
+            // still has to be traversed INTO, which needs +x.
+            if (::access(pc.host_path.c_str(), X_OK) != 0 && errno == EACCES)
+                return Errno::eacces;
+        }
+        return Errno::ok;
+    }
+
+    // The directory a relative path starts from: the dirfd for an *at form,
+    // otherwise the cwd.
+    [[nodiscard]] std::string dir_base(const Regs& r, bool at) {
+        if (at) {
+            std::string_view d = dir_of(static_cast<std::int64_t>(r.arg[0]));
+            if (!d.empty()) return std::string{d};
+        }
+        std::string_view c = k_.files().cwd();
+        return c.empty() ? std::string{"/"} : std::string{c};
+    }
+
     // Is the PARENT directory of this host path searchable? A name cannot be
     // looked up or created without +x on the directory holding it, and that
     // check precedes the structural ones (slash, dot, exists).
@@ -1263,6 +1334,10 @@ private:
             if (raw0.empty())
                 return wire::has_at(flags, wire::AtFlag::empty_path) ? fwd() : eno(Errno::enoent);
         }
+        // A "."/".." component does not excuse the components before it:
+        // the kernel walks the path, so open("gone/../f1") is ENOENT.
+        if (const Errno e = dot_prefix_error(r, path_arg, at); e != Errno::ok)
+            return eno(e);
         std::string abs = resolve_arg(r, path_arg, at);
         // Write intent (O_WRONLY / O_RDWR / O_CREAT / O_TRUNC) selects the
         // overlay upper layer.
@@ -1439,6 +1514,12 @@ private:
         // wrong directory; the host owns the real fd table, so let it answer.
         if (at && at_dirfd_unresolvable(r, raw)) return fwd();
 
+        // A "."/".." component does not excuse the components before it: the
+        // kernel walks the path, so stat("gone/..") is ENOENT even though the
+        // normalized form is a directory that exists.
+        if (const Errno e = dot_prefix_error(r, path_arg, at); e != Errno::ok)
+            return eno(e);
+
         std::string abs = resolve_raw(r, raw, at, follow);
         auto pc = k_.files().classify(abs, /*for_write=*/false, follow);
 
@@ -1545,6 +1626,9 @@ private:
         }
         bool nofollow = wire::has_at(flags, wire::AtFlag::symlink_nofollow);
         if (empty_path_arg(r, 1)) return eno(Errno::enoent);
+        // A "."/".." component does not excuse the components before it.
+        if (const Errno e = dot_prefix_error(r, 1, /*at=*/true); e != Errno::ok)
+            return eno(e);
         std::string abs = resolve_arg(r, 1, true, /*follow_leaf=*/!nofollow);
         // Honor AT_SYMLINK_NOFOLLOW (0x100): coreutils `stat`/`ls -la` statx a
         // symlink with this flag and expect S_IFLNK; following it reported the
@@ -2162,6 +2246,9 @@ private:
                                    bool strict_parent = false,
                                    bool rmdir_syscall = false) {
         if (empty_path_arg(r, path_arg)) return eno(Errno::enoent);
+        // A "."/".." component does not excuse the components before it.
+        if (const Errno e = dot_prefix_error(r, path_arg, at); e != Errno::ok)
+            return eno(e);
         // A removal has to see the path as WRITTEN: resolve_arg normalizes
         // "."/".." away, which would turn `rmdir d/.` into a removal of d
         // and `rmdir d/..` into a removal of its PARENT. The kernel refuses
@@ -2267,6 +2354,9 @@ private:
     // and coherent regardless of host privilege.
     [[nodiscard]] Outcome do_chmod(const Regs& r, int path_arg, bool at, Wi /*wi*/) {
         if (empty_path_arg(r, path_arg)) return eno(Errno::enoent);
+        // A "."/".." component does not excuse the components before it.
+        if (const Errno e = dot_prefix_error(r, path_arg, at); e != Errno::ok)
+            return eno(e);
         std::string abs = resolve_arg(r, path_arg, at);
         std::uint32_t mode = static_cast<std::uint32_t>(
             r.arg[static_cast<std::size_t>(path_arg) + 1]);

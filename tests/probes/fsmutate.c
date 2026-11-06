@@ -404,6 +404,37 @@ int main(void) {
     lx_emit("linkat", LX_SYS5(SYS_linkat, AT_FDCWD, F1, AT_FDCWD, SUB "/", 0),
             "...and an existing destination is EEXIST, slash or not");
 
+    // -- a dot does not excuse the components before it --------------------
+    // The kernel WALKS a path. "gone/.." fails at `gone`, even though the
+    // lexically normalized form is a directory that plainly exists. The guest
+    // rewrote the string first, so the missing component was never looked up:
+    // stat("gone/../f1") SUCCEEDED and mkdir("gone/../x") actually created
+    // the directory. A file before the dot is ENOTDIR, and a prefix hidden
+    // behind an unsearchable directory is EACCES rather than ENOENT.
+    lx_emit("mkdirat", LX_SYS3(SYS_mkdirat, AT_FDCWD, DIR "/gone/..", 0700),
+            "mkdir past a MISSING component is ENOENT, not EEXIST");
+    lx_emit("newfstatat",
+            LX_SYS4(SYS_newfstatat, AT_FDCWD, DIR "/gone/..", (char[512]){0}, 0),
+            "stat past a missing component is ENOENT");
+    lx_emit("mkdirat", LX_SYS3(SYS_mkdirat, AT_FDCWD, DIR "/gone/../x", 0700),
+            "...and the directory is NOT created");
+    lx_emit("openat", LX_SYS4(SYS_openat, AT_FDCWD, DIR "/gone/../f1", O_RDONLY, 0),
+            "open past a missing component is ENOENT");
+    lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/gone/..", 0x200),
+            "rmdir past a missing component is ENOENT");
+    lx_emit("fchmodat", LX_SYS4(SYS_fchmodat, AT_FDCWD, DIR "/gone/..", 0755, 0),
+            "chmod past a missing component is ENOENT");
+    lx_emit("mkdirat", LX_SYS3(SYS_mkdirat, AT_FDCWD, DIR "/gone/.", 0700),
+            "a single dot past a missing component is ENOENT too");
+    lx_emit("mkdirat", LX_SYS3(SYS_mkdirat, AT_FDCWD, F1 "/..", 0700),
+            "a FILE before the dot is ENOTDIR");
+    lx_emit("newfstatat",
+            LX_SYS4(SYS_newfstatat, AT_FDCWD, F1 "/..", (char[512]){0}, 0),
+            "stat with a file before the dot is ENOTDIR");
+    lx_emit("newfstatat",
+            LX_SYS4(SYS_newfstatat, AT_FDCWD, DIR "/x/../f1", (char[512]){0}, 0),
+            "the x/.. did not create anything either");
+
     // -- teardown, observing each removal ----------------------------------
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, SYM, 0), "unlink sym");
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, F2, 0), "unlink f2");
