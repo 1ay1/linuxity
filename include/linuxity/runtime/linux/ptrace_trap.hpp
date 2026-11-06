@@ -456,10 +456,38 @@ public:
     // forward); the real value lands in the guest's RAX by the kernel itself.
     // A one-shot PTRACE_SYSCALL steps to the EXIT stop so finalize_exit can
     // translate a returned host pid (fork/wait) to a guest pid before the
-    // guest reads it; for non-pid forwards the exit stop is a cheap no-op.
+    // guest reads it -- but only for the calls that need it, see below.
+    // Does a FORWARDED syscall still owe us its EXIT stop? True exactly when
+    // finalize_exit has something to do there -- translating a returned host
+    // pid, or rewriting waitid's si_pid. Derived from returns_pid, the SSOT
+    // for the pid-returning set, so adding a syscall there cannot forget this.
+    //
+    // Everything else (read, close, lgetxattr, getdents64, ...) gets nothing
+    // from the exit stop, and that stop is not free: it is a wait4 and a pair
+    // of context switches. A plain forward is the most common fate there is --
+    // lgetxattr, close and getdents64 alone are 77K of the 150K traps in one
+    // `ls -lR /usr/include`.
+    [[nodiscard]] static bool owes_exit_stop(unsigned long long nr) {
+        return returns_pid(nr) || abi::decode(abi::Arch::x86_64, nr) ==
+                                      abi::Sysno::waitid;
+    }
+
     [[nodiscard]] Result<std::int64_t> forward() {
         Task& t = tasks_[cur_];
         t.action = Action::none;
+        // Under seccomp a call with no exit work can run FREE to its next
+        // filtered syscall instead of stopping again at this one's exit.
+        //
+        // Only when nothing is owed. A blanket CONT here broke two things at
+        // once: fork handed the guest a raw HOST pid (run_pid_namespace caught
+        // it as fork-ret != child-getpid) and the two drive modes diverged
+        // (run_seccomp, 15 vs 0). The exit stop is where that translation
+        // happens, so skipping it is only safe per-syscall.
+        if (seccomp_ && !owes_exit_stop(t.regs.orig_rax)) {
+            t.in_call = false;
+            resume_run(cur_, 0);
+            return ok(std::int64_t{0});
+        }
         ::ptrace(PTRACE_SYSCALL, cur_, 0, 0);   // run the real syscall to exit
         return ok(std::int64_t{0});
     }
