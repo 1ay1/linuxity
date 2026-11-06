@@ -67,16 +67,19 @@ classic ioctl), and the `HostPolicyMayDeny` law is what permits that one
 direction: succeed where the host denied by policy, never the reverse.
 
 With only an x86-64 golden, every Android-specific path had no reference at
-all -- which is how four tty bugs shipped in a day. To re-record:
+all -- which is how four tty bugs shipped in a day. There is a script for the
+whole cycle, because a procedure that lives only in someone's shell history
+is a procedure that stops being run:
 
 ```sh
-# build for the device, push the probes + recorder, run it there
-cmake --build <android-build> --target record_goldens
-adb push <android-build>/probes/* /data/local/tmp/cf/probes/
-adb push <android-build>/tests/record_goldens /data/local/tmp/cf/
-adb shell 'cd /data/local/tmp/cf && LX_PROBE_DIR=$PWD/probes ./record_goldens'
-adb pull /data/local/tmp/cf/tests/goldens/aarch64 tests/goldens/
+scripts/conform-android.sh            # build, push, diff against the device
+scripts/conform-android.sh --record   # ...and re-record the goldens
 ```
+
+It builds for the device, pushes linuxity and every probe, runs the probes
+twice (natively and under linuxity) on the phone, and diffs. Each device step
+has a hard deadline, so a guest that hangs fails the run instead of wedging
+it. Exit status is meaningful, so it can gate CI.
 
 A probe must emit the SAME NUMBER OF STEPS on every host, because traces are
 compared step by step: a check skipped after a failure shortens the trace and

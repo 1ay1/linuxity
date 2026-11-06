@@ -95,6 +95,24 @@ ctest --test-dir build
 #   -> Linux version 6.6.0-linuxity (linuxity@linuxity) ...  (SYNTHESIZED)
 ```
 
+### Verifying on Android / arm64
+
+`ctest` proves linuxity agrees with the kernel it was built on. Android is a
+different kernel in ways that matter -- an SELinux policy that denies
+syscalls a desktop kernel allows, bionic instead of glibc, a loader named
+`linker64` -- and each of those has produced a real bug here. So the same
+differential suite runs on a real device, against that device's own kernel:
+
+```sh
+scripts/conform-android.sh            # build, push, diff on the phone
+scripts/conform-android.sh --record   # ...and re-record tests/goldens/aarch64
+```
+
+Needs `adb` with a device attached and an NDK (`ANDROID_NDK_HOME`). Every
+probe runs twice on the device -- natively and under linuxity -- and the two
+traces are diffed. Each device step has a hard deadline, so a guest that
+hangs fails the run instead of wedging it, and the exit status gates CI.
+
 ### Windows
 
 Builds with MSYS2/UCRT64 or MSVC. The Windows backend intercepts guest
