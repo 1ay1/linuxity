@@ -24,6 +24,7 @@
 #pragma once
 
 #include "linuxity/kernel/file_namespace.hpp"
+#include "linuxity/vfs/pty_names.hpp"
 
 #include <array>
 #include <cstdio>
@@ -105,17 +106,17 @@ namespace lx::vfs {
             }
         }
 
-        // /dev/pts/N -> the host slave /dev/ttysNNN (Darwin's naming; the
-        // number is the one TIOCGPTN reported). Every guest-created pty --
-        // tmux, script, expect, python pty, ssh -- opens its slave here.
+        // /dev/pts/N -> the host's name for that slave, which is NOT
+        // universal (vfs/pty_names.hpp: identity on Linux/Android,
+        // /dev/ttysNNN on Darwin). Every guest-created pty -- tmux, script,
+        // expect, python pty, ssh -- opens its slave here, and so does a
+        // guest that simply INHERITED the terminal it was launched from.
         if (abs.starts_with("/dev/pts/")) {
             const std::string_view n = abs.substr(std::string_view{"/dev/pts/"}.size());
             if (n.empty() || n.find_first_not_of("0123456789") != std::string_view::npos)
                 return err<kernel::VirtualFile>(Errno::enoent);
-            char name[32];
-            std::snprintf(name, sizeof name, "/dev/ttys%03d", std::atoi(std::string{n}.c_str()));
             kernel::VirtualFile vf;
-            vf.redirect_host = name;
+            vf.redirect_host = pty_slave_path(std::atoi(std::string{n}.c_str()));
             return ok(std::move(vf));
         }
 
