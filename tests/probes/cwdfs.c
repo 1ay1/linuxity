@@ -158,6 +158,57 @@ int main(void) {
     lx_emit("statfs", LX_SYS2(SYS_statfs, GONE, cwd), "statfs a missing path is ENOENT");
     lx_emit("fstatfs", LX_SYS2(SYS_fstatfs, 9999, cwd), "fstatfs a closed fd is EBADF");
 
+    // -- statfs on a VIRTUAL mount -----------------------------------------
+    // /proc and /sys are synthesized, so this is linuxity answering rather
+    // than forwarding -- a branch nothing else reached. f_type is the field
+    // that matters: a program decides whether a path IS procfs by comparing
+    // it against PROC_SUPER_MAGIC (systemd, util-linux and container
+    // runtimes all do this before trusting /proc), so reporting tmpfs for
+    // everything was a real answer to a real question, and wrong.
+    {
+        static unsigned char sf[128];
+        const long p = LX_SYS2(SYS_statfs, "/proc", sf);
+        lx_emit("statfs", p, "statfs /proc");
+        unsigned long long ty = 0;
+        memcpy(&ty, sf, 8);
+        lx_emit("statfs", LX_CHECK(p == 0, ty == 0x9fa0ull),
+                "/proc reports PROC_SUPER_MAGIC");
+
+        memset(sf, 0, sizeof sf);
+        const long y = LX_SYS2(SYS_statfs, "/sys", sf);
+        lx_emit("statfs", y, "statfs /sys");
+        memcpy(&ty, sf, 8);
+        lx_emit("statfs", LX_CHECK(y == 0, ty == 0x62656572ull),
+                "/sys reports SYSFS_MAGIC");
+
+        // The block counts must still be self-consistent on a synthesized
+        // filesystem -- df divides by them.
+        unsigned long long bsize = 0, blocks = 0, bfree = 0;
+        memset(sf, 0, sizeof sf);
+        if (LX_SYS2(SYS_statfs, "/proc", sf) == 0) {
+            memcpy(&bsize,  sf + 8,  8);
+            memcpy(&blocks, sf + 16, 8);
+            memcpy(&bfree,  sf + 24, 8);
+        }
+        lx_emit("statfs", (bsize >= 512 && (bsize & (bsize - 1)) == 0) ? 1 : 0,
+                "a virtual mount still has a sane block size");
+        lx_emit("statfs", (bfree <= blocks) ? 1 : 0,
+                "...and free does not exceed total");
+    }
+
+    // statx on a virtual FILE, which is a different path again from statfs
+    // on its mount: procfs synthesizes the bytes, so the size and mode come
+    // from linuxity rather than any inode.
+    {
+        static unsigned char stx[256];
+        const long r = LX_SYS5(SYS_statx, AT_FDCWD, "/proc/version", 0, 0x7ff, stx);
+        lx_emit("statx", r, "statx a synthesized /proc file");
+        unsigned short mode = 0;
+        memcpy(&mode, stx + 28, 2);            // stx_mode
+        lx_emit("statx", LX_CHECK(r == 0, (mode & 0170000) == 0100000),
+                "...and it is a regular file");
+    }
+
     // -- sysinfo -----------------------------------------------------------
     // struct sysinfo: uptime(8) loads(24) totalram(8) freeram(8) ...
     // Uptime and free memory differ between runs by nature; totals do not.

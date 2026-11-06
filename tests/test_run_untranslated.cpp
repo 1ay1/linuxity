@@ -3,7 +3,7 @@
 // with the raw (untranslated) guest path — leaking the host filesystem into
 // the rootfs. This test proves they now route through path translation:
 //
-//   * statfs("/proc")   -> synthesized tmpfs statfs (f_type == TMPFS_MAGIC),
+//   * statfs("/proc")   -> synthesized procfs statfs (f_type == PROC_SUPER_MAGIC),
 //                          NOT the host's real backing-fs magic.
 //   * statfs("/etc")    -> REDIRECTED to the overlay; succeeds (host fills
 //                          the buffer for the rootfs mount).
@@ -45,9 +45,14 @@ static const char* kSrc =
     "#include <sys/syscall.h>\n"
     "int main(void){\n"
     "  struct statfs sf;\n"
-    "  /* /proc must be the synthesized tmpfs, not the host backing fs. */\n"
+    // /proc must be our SYNTHESIZED procfs, not the host backing fs.
+    // f_type used to be TMPFS_MAGIC for every virtual mount, which was wrong
+    // -- a program decides whether a path IS procfs by comparing this
+    // against PROC_SUPER_MAGIC -- so the sentinel moved with it. What is
+    // still caught is a LEAK: falling through to the host would report the
+    // real backing filesystem (ext4/btrfs/...), never 0x9fa0 on an overlay.
     "  if (statfs(\"/proc\", &sf) != 0) return 2;\n"
-    "  if (sf.f_type != 0x01021994) return 3;   /* TMPFS_MAGIC */\n"
+    "  if (sf.f_type != 0x9fa0) return 3;   /* PROC_SUPER_MAGIC */\n"
     "  /* /etc statfs must succeed (redirected to the overlay). */\n"
     "  if (statfs(\"/etc\", &sf) != 0) return 4;\n"
     "  /* openat2 the rootfs marker; its contents must be the ROOTFS bytes. */\n"

@@ -379,6 +379,7 @@ inline std::string Scenario::key() const {
                     .exercising(abi::Sysno::statfs)
                     .exercising(abi::Sysno::fstatfs)
                     .exercising(abi::Sysno::sysinfo)
+                    .exercising(abi::Sysno::statx)
                     .exercising(abi::Sysno::fchmod)
                     .exercising(abi::Sysno::fchown)
                     .exercising(abi::Sysno::faccessat2)

@@ -1747,7 +1747,7 @@ private:
             return Redirect{PathArg{0, std::move(pc.host_path)}};   // host fills arg[1] with the real overlay-fs statfs
         }
         if (pc.realm == kernel::Realm2::virtual_file)
-            return write_statfs(uaddr(r.arg[1]));
+            return write_statfs(uaddr(r.arg[1]), abs);
         return eno(pc.error);
     }
 
@@ -2477,11 +2477,19 @@ private:
     }
 
     // Synthesize a `struct statfs` for a VIRTUAL path (procfs/sysfs), which
-    // has no backing block device. We report a tmpfs-like filesystem so `df`
-    // and statvfs on /proc or /sys return coherent numbers instead of the
-    // host's real device stats. The layout is the x86-64 kernel `struct
-    // statfs` (64-bit fields; f_type..f_spare) used by statfs(2)/fstatfs(2).
-    [[nodiscard]] Outcome write_statfs(UAddr buf) {
+    // has no backing block device. We report a plausible in-memory
+    // filesystem so `df` and statvfs on /proc or /sys return coherent
+    // numbers instead of the host's real device stats. The layout is the
+    // x86-64 kernel `struct statfs` (64-bit fields; f_type..f_spare) used by
+    // statfs(2)/fstatfs(2).
+    //
+    // f_type MUST match the mount. It was TMPFS_MAGIC for everything, so
+    // statfs("/proc") reported tmpfs where the kernel says PROC_SUPER_MAGIC
+    // -- and f_type is exactly what a program branches on to decide whether
+    // a path is procfs (systemd, util-linux and container runtimes all do
+    // this before trusting /proc). Caught by diffing against the live
+    // kernel once the statfs path had a probe at all.
+    [[nodiscard]] Outcome write_statfs(UAddr buf, std::string_view path) {
         struct Statfs {
             std::int64_t  f_type;
             std::int64_t  f_bsize;
@@ -2493,8 +2501,15 @@ private:
             std::int64_t  f_flags;
             std::int64_t  f_spare[4];
         } sf{};
-        constexpr std::int64_t kTmpfsMagic = 0x01021994;   // TMPFS_MAGIC
-        sf.f_type    = kTmpfsMagic;
+        // The magic each of these filesystems really reports.
+        constexpr std::int64_t kProcMagic  = 0x9fa0;
+        constexpr std::int64_t kSysfsMagic = 0x62656572;
+        constexpr std::int64_t kDevtmpfs   = 0x01021994;   // devtmpfs IS tmpfs
+        constexpr std::int64_t kTmpfsMagic = 0x01021994;
+        sf.f_type    = path.starts_with("/proc") ? kProcMagic
+                     : path.starts_with("/sys")  ? kSysfsMagic
+                     : path.starts_with("/dev")  ? kDevtmpfs
+                                                 : kTmpfsMagic;
         sf.f_bsize   = 4096;
         sf.f_frsize  = 4096;
         sf.f_namelen = 255;
