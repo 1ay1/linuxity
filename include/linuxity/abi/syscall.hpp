@@ -213,22 +213,41 @@ public:
             //    group as a unit: `timeout` calls setpgid(0,0) and then
             //    signals its group, and under the flat model that group
             //    silently included the shell that launched it.
+            //
+            //    The flat model still has to be SELF-CONSISTENT. setpgid is
+            //    discarded, but bash's job-control setup then loops on
+            //    "tcgetpgrp(tty) == getpgrp()" -- so if getpgrp reports the
+            //    group bash just asked for while TIOCGPGRP reports the pid,
+            //    the two never meet, bash gives up with "no job control" and
+            //    turns OFF line editing (arrow keys echo as ^[[A). So record
+            //    the group the guest set and answer BOTH from it.
             case Sysno::getpgrp:
                 if constexpr (requires { mem_.models_process_groups(); }) return fwd();
-                return val(ids().pid);
+                return val(flat_pgrp());
             case Sysno::getpgid:
                 if constexpr (requires { mem_.models_process_groups(); }) return fwd();
                 return val(r.arg[0] ? static_cast<std::int64_t>(r.arg[0])
-                                    : ids().pid);
+                                    : flat_pgrp());
             case Sysno::getsid:
                 if constexpr (requires { mem_.models_process_groups(); }) return fwd();
                 return val(r.arg[0] ? static_cast<std::int64_t>(r.arg[0])
                                     : ids().pid);
-            case Sysno::setpgid:
+            case Sysno::setpgid: {
                 if constexpr (requires { mem_.models_process_groups(); }) return fwd();
+                // setpgid(pid, pgid): either argument may be 0, meaning "the
+                // caller". Only the CALLER's own group is tracked -- that is
+                // all tcgetpgrp needs, and it keeps this a pure bookkeeping
+                // note rather than a second process-group model.
+                const std::int32_t who = static_cast<std::int32_t>(r.arg[0]);
+                if (who == 0 || who == ids().pid) {
+                    const std::int32_t grp = static_cast<std::int32_t>(r.arg[1]);
+                    flat_pgrp_ = grp ? grp : ids().pid;
+                }
                 return val(0);                     // accepted, flat model
+            }
             case Sysno::setsid:
                 if constexpr (requires { mem_.models_process_groups(); }) return fwd();
+                flat_pgrp_ = ids().pid;            // a new session resets it
                 return val(ids().pid);             // new session == pid
             case Sysno::getpriority: return val(0);       // nice 0
             case Sysno::setpriority: return val(0);
@@ -658,6 +677,14 @@ private:
         return Outcome::raise_at(pid, signum);
     }
     static Outcome eno(Errno e) { return Outcome::error(e); }
+
+    // The caller's process group under the flat model: whatever setpgid last
+    // asked for, defaulting to its own pid (every task its own leader). Only
+    // meaningful when the backend does NOT model real groups; those forward.
+    [[nodiscard]] std::int32_t flat_pgrp() {
+        return flat_pgrp_ ? flat_pgrp_ : ids().pid;
+    }
+    std::int32_t flat_pgrp_{0};
 
     // The trapped task's guest identity. When the memory backend also exposes
     // the live task map (the ptrace trap does), report that task's real
@@ -2411,18 +2438,32 @@ private:
             // Report the caller's OWN pgrp as the terminal's foreground group
             // (and its own sid as the session): the guest owns its tty, so the
             // shell settles at the prompt instead of looping to acquire it.
+            //
+            // TIOCGPGRP must agree with getpgrp, so it reports the group
+            // setpgid last set rather than the bare pid. They disagreed once
+            // bash called setpgid (discarded by the flat model, but getpgrp
+            // reported it), so bash's "loop until tcgetpgrp == getpgrp" never
+            // converged, it gave up with "no job control", and that turns off
+            // line editing -- arrow keys echo as ^[[A. The session id is a
+            // different question and stays the pid.
             case kTIOCGPGRP:
             case kTIOCGSID: {
-                std::int32_t pgrp = ids().pid;
+                std::int32_t pgrp =
+                    request == kTIOCGSID ? ids().pid : flat_pgrp();
                 std::array<std::byte, sizeof pgrp> buf{};
                 std::memcpy(buf.data(), &pgrp, sizeof pgrp);
                 if (!mem_.copy_out(uaddr(r.arg[2]), buf))
                     return eno(Errno::efault);
                 return val(0);
             }
-            // Accept a foreground-group change vacuously.
-            case kTIOCSPGRP:
+            // Accept a foreground-group change, and REMEMBER it: the next
+            // tcgetpgrp has to report what was just set or the shell decides
+            // it lost the terminal.
+            case kTIOCSPGRP: {
+                const std::uint32_t want = get_u32(r.arg[2]);
+                if (want != 0) flat_pgrp_ = static_cast<std::int32_t>(want);
                 return val(0);
+            }
             default:
                 return fwd();   // real host tty/device ioctl
         }

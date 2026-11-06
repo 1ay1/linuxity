@@ -167,6 +167,50 @@ int main() {
         assert(is_forward(sys.dispatch(io)));
     }
 
+    // tcgetpgrp() must report whatever setpgid() last asked for. Bash's
+    // job-control setup loops until tcgetpgrp(tty) == getpgrp(); the flat
+    // model discards setpgid but getpgrp reported it, so the two could never
+    // meet, bash gave up with "no job control in background", and that turns
+    // OFF line editing -- arrow keys echo as ^[[A instead of walking history.
+    {
+        constexpr std::uint64_t kTIOCGPGRP = 0x540f;
+        constexpr std::uint64_t kTIOCSPGRP = 0x5410;
+        auto tcgetpgrp = [&] {
+            abi::Regs io; io.nr = 16;
+            io.arg[0] = 255; io.arg[1] = kTIOCGPGRP; io.arg[2] = 0x8000;
+            const auto out = sys.dispatch(io);
+            assert(!is_forward(out) && "the flat model answers this itself");
+            std::uint32_t got = 0;
+            std::memcpy(&got, mem.at(0x8000), sizeof got);
+            return static_cast<std::int64_t>(got);
+        };
+        auto getpgrp = [&] {
+            abi::Regs p; p.nr = 111;             // x86-64 getpgrp
+            return virt_ret(sys.dispatch(p));
+        };
+
+        // Before any setpgid the two already agree, each being the pid.
+        assert(tcgetpgrp() == getpgrp());
+
+        // After setpgid(0, N) -- bash making itself a group leader -- they
+        // must STILL agree, now on N.
+        abi::Regs sp; sp.nr = 109;               // x86-64 setpgid
+        sp.arg[0] = 0; sp.arg[1] = 4242;
+        (void)sys.dispatch(sp);
+        assert(getpgrp() == 4242 && "setpgid must be visible to getpgrp");
+        assert(tcgetpgrp() == 4242 &&
+               "tcgetpgrp must report the group setpgid just set");
+
+        // And tcsetpgrp() must stick too, for the same reason.
+        std::uint32_t want = 777;
+        std::memcpy(mem.at(0x8000), &want, sizeof want);
+        abi::Regs io; io.nr = 16;
+        io.arg[0] = 255; io.arg[1] = kTIOCSPGRP; io.arg[2] = 0x8000;
+        (void)sys.dispatch(io);
+        assert(tcgetpgrp() == 777 &&
+               "tcgetpgrp must report the group tcsetpgrp just set");
+    }
+
     std::puts("all runtime type-algebra tests passed");
     return 0;
 }
