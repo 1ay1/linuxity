@@ -550,6 +550,51 @@ public:
     }
 
     // -- Guest fd table ----------------------------------------------------
+    // Copy `src` to `dst` to stand in for a hardlink the host refused.
+    //
+    // Returns ok, or the errno the kernel would have given. The content and
+    // mode match, which is what a package manager's aliases need; the inode
+    // is not shared, so the caller records st_nlink in the shadow store.
+    [[nodiscard]] Errno emulate_hardlink(const std::string& src,
+                                         const std::string& dst) const {
+        struct ::stat st{};
+        if (::stat(src.c_str(), &st) != 0) return static_cast<Errno>(errno);
+        if (S_ISDIR(st.st_mode)) return Errno::eperm;   // link(2) on a dir
+        // link(2) does NOT overwrite; EEXIST is the kernel's answer.
+        struct ::stat dt{};
+        if (::lstat(dst.c_str(), &dt) == 0) return Errno::eexist;
+        const int in = ::open(src.c_str(), O_RDONLY | O_CLOEXEC);
+        if (in < 0) return static_cast<Errno>(errno);
+        const int out = ::open(dst.c_str(),
+                               O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+                               st.st_mode & 07777);
+        if (out < 0) {
+            // The create's OWN errno, not a blanket EACCES. The kernel
+            // reports what it found -- ENOENT for a missing parent, ENOTDIR
+            // for a non-directory component, EROFS, ENOSPC -- and a guest
+            // that gets EACCES for all of them is not Linux. The fsmutate
+            // probe's "hardlink under a MISSING parent is ENOENT" step
+            // caught exactly this.
+            const int e = errno;
+            ::close(in);
+            return static_cast<Errno>(e);
+        }
+        char buf[65536];
+        for (;;) {
+            const ssize_t n = ::read(in, buf, sizeof buf);
+            if (n == 0) break;
+            if (n < 0 || ::write(out, buf, static_cast<std::size_t>(n)) != n) {
+                ::close(in); ::close(out); ::unlink(dst.c_str());
+                return Errno::eio;
+            }
+        }
+        ::close(in);
+        ::close(out);
+        // mkdir/open mask the mode through umask; set it exactly.
+        (void)::chmod(dst.c_str(), st.st_mode & 07777);
+        return Errno::ok;
+    }
+
     // Records the guest path bound to a real (forwarded) fd, so readlinkat,
     // getdents, and fd-relative openat can recover the path. The fd number is
     // the REAL host fd the child holds (redirect/inject both yield real fds).

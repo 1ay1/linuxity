@@ -85,13 +85,21 @@ struct StatLayout {
     // u32 here; statx uses u16. The scrub has to know, because reading 4
     // bytes where the ABI has 2 picks up the next field.
     std::size_t mode_width;
+    // st_nlink, which the two ABIs disagree about in BOTH position and
+    // width: u64 before st_mode on x86-64, u32 after it on asm-generic (see
+    // the layouts above). Only read when a hardlink was emulated, but then
+    // writing the wrong 4 or 8 bytes would corrupt st_mode or st_uid.
+    std::size_t nlink;
+    std::size_t nlink_width;
 };
 
 inline constexpr StatLayout kStatX86_64{
     .size = 144, .mode = 24, .uid = 28, .gid = 32, .mode_width = 4,
+    .nlink = 16, .nlink_width = 8,
 };
 inline constexpr StatLayout kStatGeneric{   // aarch64 / asm-generic
     .size = 128, .mode = 16, .uid = 24, .gid = 28, .mode_width = 4,
+    .nlink = 20, .nlink_width = 4,
 };
 
 // -- struct statx ----------------------------------------------------------
@@ -100,6 +108,9 @@ inline constexpr StatLayout kStatGeneric{   // aarch64 / asm-generic
 //   u32 stx_uid; u32 stx_gid; u16 stx_mode; u16 pad; u64 stx_ino; ...
 inline constexpr StatLayout kStatx{
     .size = 256, .mode = 28, .uid = 20, .gid = 24, .mode_width = 2,
+    // statx is arch-independent, so one offset serves both ABIs. Verified
+    // against the host headers: stx_nlink is u32 at 16.
+    .nlink = 16, .nlink_width = 4,
 };
 
 // The layout for a guest `struct stat` on this ABI.

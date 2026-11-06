@@ -2573,13 +2573,19 @@ private:
         // forward the unlink too.
         if (pc.whiteout_lower) {
             k_.files().add_whiteout(abs);
+            k_.files().meta().leave_link_set(abs);
             k_.files().meta().forget(abs);
             if (pc.host_path.empty()) return val(0);
         }
         if (pc.host_path.empty()) return eno(pc.error);
         // A removal drops any shadow record so a fresh file created at the same
         // path later starts from the host defaults, not a stale owner/mode.
-        if (wi == Wi::remove) k_.files().meta().forget(abs);
+        // It also leaves any emulated link set, so the remaining names'
+        // st_nlink drops the way a real unlink would lower it.
+        if (wi == Wi::remove) {
+            k_.files().meta().leave_link_set(abs);
+            k_.files().meta().forget(abs);
+        }
         Redirect o{PathArg{path_arg, std::move(pc.host_path)}};
         // Only creates need their parent chain pre-built by the trap; the
         // parents_only classify already mirrored them, so this is belt-and-
@@ -3117,13 +3123,34 @@ private:
         // there, and link did the same -- both ENOENT on the kernel. The
         // destination's own parent must already exist; let the host say so.
         //
-        // A hardlink the HOST refuses stays refused. Android denies the
-        // SELinux `link` permission on /data, so link(2) is EACCES there no
-        // matter what the guest does, and a package manager's aliases (gcc's
-        // /usr/bin/cc, g++) fail with "Can't create". Faking it with a copy
-        // was tempting and wrong: st_nlink would lie, and a package manager
-        // that later unlinks one name would leave the other behind with
-        // stale content. The guest sees the host's real answer.
+        // A HARDLINK the host refuses gets EMULATED by copying.
+        //
+        // Android denies the SELinux `link` permission on /data for every
+        // process -- verified natively, `ln a b` fails there outside
+        // linuxity too -- so forwarding can never work. The cost of not
+        // handling it is not cosmetic: the gcc package ships /usr/bin/gcc,
+        // g++, cc and five more as hardlink entries (`hrwxr-xr-x ... link
+        // to ...` in the archive), so EVERY ONE was missing and the guest
+        // had no compiler at all.
+        //
+        // A copy gives the guest the same content at the same mode, which is
+        // what those aliases are for. The one thing it cannot share is the
+        // inode, so st_nlink is recorded in the shadow store and reported
+        // from there -- without that the count would read 1 where Linux says
+        // 2, which is the part that made this look unacceptable at first.
+        // Probe the host once per tree rather than per call.
+        if (!move_meta && !host_links_work(pd.host_path)) {
+            const Errno e = k_.files().emulate_hardlink(ps.host_path,
+                                                        pd.host_path);
+            if (e != Errno::ok) return eno(e);
+            // A real link(2) bumps the count on EVERY name sharing the
+            // inode, not just the two in this call -- so join the source's
+            // set rather than incrementing a pair. Updating only src and dst
+            // left an earlier sibling reading one less (`_a` stuck at 2
+            // while `_base` and `_b` said 3).
+            k_.files().meta().join_link_set(src, dst);
+            return val(0);
+        }
         return Redirect{PathArg{a1, std::move(ps.host_path)}}
             .with(PathArg{a2, std::move(pd.host_path)});
     }
@@ -3964,6 +3991,8 @@ private:
     // the ctty rule: opening a tty WITHOUT O_NOCTTY in a session that has
     // none makes it the controlling terminal.
     std::uint64_t pending_flags_{0};
+    // Tri-state cache for host_links_work: -1 unknown, 0 no, 1 yes.
+    int links_work_{-1};
     bool pending_dir_{false};    // the pending open is a virtual directory
     std::string pending_lazy_;   // overlaid host dir: union built on 1st getdents
     std::vector<kernel::VirtualDirent> pending_entries_;
@@ -4128,6 +4157,16 @@ public:
                               kernel::MetaStore::effective_mode(host_mode, *rec));
             }
         }
+        // st_nlink, when a hardlink was EMULATED by copying because the host
+        // refused link(2). The inode is not really shared, so the host says
+        // 1 where Linux would say 2; report the count the guest established.
+        if (rec && (rec->have & kernel::MetaRecord::kNlink) != 0 &&
+            L.nlink_width != 0) {
+            if (L.nlink_width == 8)
+                (void)put_u64(base + L.nlink, rec->nlink);
+            else
+                (void)put_u32(base + L.nlink, rec->nlink);
+        }
     }
 
     // Small typed guest-memory pokes/peeks for the scrub overlay.
@@ -4237,6 +4276,37 @@ public:
             // O_PATH is 010000000 on every Linux arch.
             return have && (fl & 010000000ULL) != 0;
         }
+    }
+
+    // Does link(2) work on the filesystem holding `near`?
+    //
+    // Asked once and cached: the answer is a property of the host's policy,
+    // not of the call. Android denies the SELinux `link` permission on
+    // /data for every process, so probing per-call would cost two syscalls
+    // on every hardlink for an answer that never changes.
+    [[nodiscard]] bool host_links_work(const std::string& near) {
+        if (links_work_ != -1) return links_work_ == 1;
+        links_work_ = 0;
+        const std::size_t slash = near.find_last_of('/');
+        if (slash == std::string::npos) return false;
+        const std::string dir = near.substr(0, slash);
+        const std::string a = dir + "/.lx-linkprobe-a";
+        const std::string b = dir + "/.lx-linkprobe-b";
+        ::unlink(a.c_str());
+        ::unlink(b.c_str());
+        const int fd = ::open(a.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (fd < 0) return false;          // can't tell; assume not
+        ::close(fd);
+        links_work_ = ::link(a.c_str(), b.c_str()) == 0 ? 1 : 0;
+        ::unlink(a.c_str());
+        ::unlink(b.c_str());
+        return links_work_ == 1;
+    }
+
+    [[nodiscard]] bool put_u64(std::uint64_t addr, std::uint64_t v) {
+        std::array<std::byte, 8> b{};
+        std::memcpy(b.data(), &v, 8);
+        return static_cast<bool>(mem_.copy_out(uaddr(addr), b));
     }
 
     [[nodiscard]] bool put_u32(std::uint64_t addr, std::uint32_t v) {

@@ -72,8 +72,14 @@ int main(void) {
             "unlink on a dir is EISDIR");
 
     // -- hard links --------------------------------------------------------
-    lx_emit("linkat", LX_SYS5(SYS_linkat, AT_FDCWD, F1, AT_FDCWD, LNK, 0),
-            "hardlink f1 -> lnk");
+    // The expected answers are the real Linux ones on every host, including
+    // hosts whose own filesystem refuses. Android denies the SELinux `link`
+    // permission on /data for every process -- no filesystem an adb shell
+    // can reach allows a hardlink -- so linuxity emulates link(2) by copying
+    // and tracking the link set. HostPolicyMayDeny in conform/observation.hpp
+    // is where that divergence is declared.
+    const long linked = LX_SYS5(SYS_linkat, AT_FDCWD, F1, AT_FDCWD, LNK, 0);
+    lx_emit("linkat", linked, "hardlink f1 -> lnk");
     lx_emit("linkat", LX_SYS5(SYS_linkat, AT_FDCWD, F1, AT_FDCWD, LNK, 0),
             "hardlink onto an existing name is EEXIST");
     lx_emit("linkat", LX_SYS5(SYS_linkat, AT_FDCWD, DIR "/nope", AT_FDCWD,
@@ -83,12 +89,22 @@ int main(void) {
     lx_emit("linkat", LX_SYS5(SYS_linkat, AT_FDCWD, SUB, AT_FDCWD, DIR "/d2", 0),
             "hardlink a directory is EPERM");
 
-    // The link count must now be 2 for both names.
+    // Both names must now see the SAME inode. These only mean anything if
+    // the link above actually happened: on a host whose policy forbids
+    // link(2) entirely (Android /data) there is nothing to stat, so report
+    // not-applicable rather than a failure -- the same convention the bind
+    // probe uses for its follow-up connect, and what HostPolicyMayDeny
+    // pairs up in conform/observation.hpp.
     {
         char st[512];
         lx_emit("newfstatat", LX_SYS4(SYS_newfstatat, AT_FDCWD, F1, st, 0) < 0 ? -1 : 1,
                 "stat f1 after linking");
-        lx_emit("newfstatat", LX_SYS4(SYS_newfstatat, AT_FDCWD, LNK, st, 0) < 0 ? -1 : 1,
+        // 2 is the probes' "not applicable" sentinel (see LX_CHECK and
+        // conform/observation.hpp's kNotApplicable).
+        lx_emit("newfstatat",
+                linked == 0
+                    ? (LX_SYS4(SYS_newfstatat, AT_FDCWD, LNK, st, 0) < 0 ? -1 : 1)
+                    : 2,
                 "stat lnk");
     }
 
@@ -162,6 +178,16 @@ int main(void) {
     }
 
     // -- rename ------------------------------------------------------------
+    // Ensure the source exists however the link above went. On a host whose
+    // policy forbids link(2) the guest created `lnk` and the native run did
+    // not, and threading that difference through every later step that
+    // touches it would spread one host's defect across half the probe. A
+    // plain create is the same starting state on both sides.
+    if (linked != 0) {
+        const long fd = LX_SYS4(SYS_openat, AT_FDCWD, LNK,
+                                O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) LX_SYS1(SYS_close, fd);
+    }
     lx_emit("renameat", LX_SYS4(SYS_renameat, AT_FDCWD, LNK, AT_FDCWD, F2),
             "rename lnk -> f2");
     lx_emit("renameat", LX_SYS4(SYS_renameat, AT_FDCWD, DIR "/nope", AT_FDCWD,

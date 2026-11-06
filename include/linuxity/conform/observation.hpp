@@ -372,24 +372,33 @@ private:
 //
 //   * only EACCES/EPERM -- the errnos a policy layer produces. A real ENOTTY
 //     or EBADF from the kernel must still be matched exactly.
-//   * only in the direction native-failed / guest-succeeded. If the guest
-//     fails where the host succeeded, that is a regression and is reported.
+//   * only in the direction native-failed / guest-succeeded, or native-denied
+//     / guest-failed-differently. If the guest fails where the host SUCCEEDED,
+//     that is a regression and is reported.
 //   * only for the syscalls a host security policy actually filters: ioctl
-//     (SELinux's per-command whitelist) and bind (Android forbids a
-//     filesystem AF_UNIX bind in every directory an app can write, so
-//     linuxity falls back to the abstract namespace -- which is the whole
-//     reason the guest's sockets work there at all).
+//     (SELinux's per-command whitelist), bind (Android forbids a filesystem
+//     AF_UNIX bind in every directory an app can write, so linuxity falls
+//     back to the abstract namespace -- which is the whole reason the
+//     guest's sockets work there at all), and link/linkat (Android denies
+//     the `link` permission on /data for EVERY process, and no filesystem an
+//     adb shell can reach allows a hardlink at all -- so linuxity emulates
+//     it by copying and tracking the link set, which is the only reason a
+//     package that ships hardlinked aliases installs. gcc ships /usr/bin/gcc,
+//     g++, cc and five more that way, so without it there is no compiler).
 //
 // The effect: the aarch64 golden still RECORDS the denial as the kernel's
 // truth, and the guest is still held to every other observation.
 class HostPolicyMayDeny {
 public:
     [[nodiscard]] static constexpr bool filtered(abi::Sysno c) noexcept {
-        // connect rides along with bind: if the host refused the bind there
-        // is nothing to connect TO, so the probe marks the follow-up not
-        // applicable while the guest -- whose bind succeeded -- answers it.
+        // connect rides along with bind, and newfstatat with link: if the
+        // host refused the bind there is nothing to connect TO, and if it
+        // refused the link there is nothing to stat -- so the probe marks
+        // the follow-up not applicable while the guest, whose call
+        // succeeded, answers it. Clause (b) below pairs the two up.
         return c == abi::Sysno::ioctl || c == abi::Sysno::bind ||
-               c == abi::Sysno::connect;
+               c == abi::Sysno::connect || c == abi::Sysno::link ||
+               c == abi::Sysno::linkat || c == abi::Sysno::newfstatat;
     }
     [[nodiscard]] bool exempt(const Observation& n,
                               const Observation& g) const noexcept {
@@ -412,16 +421,33 @@ public:
                 [](std::int64_t v) { return v == kNotApplicable; },
                 [](std::int32_t) { return false; });
         };
-        return na(n) != na(g);
+        if (na(n) != na(g)) return true;
+        // (c) a policy denial that MASKS the real error. When the host
+        //     refuses a call outright, every answer it gives for that call
+        //     is its own EACCES rather than what Linux would say -- so the
+        //     guest reporting a DIFFERENT failure is the guest being right,
+        //     not a disagreement. Android's link(2) is the case: Linux
+        //     answers EEXIST for a link onto a taken name, and the host says
+        //     EACCES because it never got as far as looking.
+        //
+        //     Still narrow: only when the NATIVE side carries the policy
+        //     errno. If the host answered properly and the guest invented
+        //     some other failure, that is a real divergence and is reported.
+        return n.returned.match(
+            [](std::int64_t) { return false; },
+            [&](std::int32_t e) {
+                return (e == EACCES || e == EPERM) && !g.returned.is_ok();
+            });
     }
     [[nodiscard]] static constexpr std::string_view reason() noexcept {
         return "the host denied a policy-filtered syscall (EACCES/EPERM) and "
                "linuxity served it anyway -- Android's SELinux whitelist "
-               "rejects TCGETS2 on a pty slave and forbids a filesystem "
-               "AF_UNIX bind, both of which the guest kernel is there to "
-               "paper over. Covers the denied call and any invariant the "
-               "probe marked not-applicable because of it; the reverse "
-               "direction, and any two answered results, are never exempt";
+               "rejects TCGETS2 on a pty slave, forbids a filesystem "
+               "AF_UNIX bind, and denies link(2) on /data outright, all of "
+               "which the guest kernel is there to paper over. Covers the "
+               "denied call and any invariant the probe marked "
+               "not-applicable because of it; the reverse direction, and any "
+               "two answered results, are never exempt";
     }
 };
 

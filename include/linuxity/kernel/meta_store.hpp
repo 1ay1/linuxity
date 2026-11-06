@@ -38,6 +38,7 @@
 #include "linuxity/abi/wire/stat.hpp"
 #include "linuxity/host/win_posix.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <optional>
@@ -57,7 +58,13 @@ struct MetaRecord {
     std::uint32_t mode{0};
     std::uint32_t uid{0};
     std::uint32_t gid{0};
-    enum Have : std::uint8_t { kMode = 1, kUid = 2, kGid = 4 };
+    // st_nlink, when a hardlink had to be EMULATED. Some hosts refuse
+    // link(2) outright -- Android denies the SELinux `link` permission on
+    // /data, for every process -- so linuxity copies the content instead and
+    // records here how many names the guest believes share the inode. Zero
+    // means "ask the host", which is the normal case.
+    std::uint32_t nlink{0};
+    enum Have : std::uint8_t { kMode = 1, kUid = 2, kGid = 4, kNlink = 8 };
     std::uint8_t have{0};
 };
 
@@ -157,12 +164,98 @@ public:
         append(guest_path, r);
     }
 
+    // Add `dst` to the emulated link set `src` belongs to, and refresh the
+    // count on every member.
+    //
+    // A real link(2) raises st_nlink on ALL names sharing the inode, so
+    // bumping only the two paths in the call left an earlier sibling one
+    // short. The set is tracked explicitly because a copy does not share an
+    // inode for the host to count for us.
+    void join_link_set(const std::string& src, const std::string& dst) {
+        auto& set = link_set_for(src);
+        if (std::find(set.begin(), set.end(), src) == set.end())
+            set.push_back(src);
+        if (std::find(set.begin(), set.end(), dst) == set.end())
+            set.push_back(dst);
+        const auto n = static_cast<std::uint32_t>(set.size());
+        // Point every member at the same vector, so the next join sees the
+        // whole set from whichever name it starts at.
+        for (const std::string& p : set) {
+            link_sets_[p] = set;
+            set_nlink(p, n);
+        }
+    }
+
+    // Drop a name from its link set (unlink), lowering the others' count.
+    void leave_link_set(const std::string& path) {
+        const auto it = link_sets_.find(path);
+        if (it == link_sets_.end()) return;
+        std::vector<std::string> rest;
+        for (const std::string& p : it->second)
+            if (p != path) rest.push_back(p);
+        link_sets_.erase(path);
+        const auto n = static_cast<std::uint32_t>(rest.size());
+        for (const std::string& p : rest) {
+            link_sets_[p] = rest;
+            if (n <= 1) { forget_nlink(p); } else { set_nlink(p, n); }
+        }
+    }
+
+    // The emulated link count for a path, or 1 if none was recorded (a file
+    // with one name, which is what the host would report anyway).
+    [[nodiscard]] std::uint32_t nlink_of(const std::string& guest_path) const {
+        const auto it = table_.find(guest_path);
+        if (it == table_.end()) return 1;
+        if ((it->second.have & MetaRecord::kNlink) == 0) return 1;
+        return it->second.nlink;
+    }
+
+    // Record an EMULATED hardlink's count on a path. Used when the host
+    // refused link(2) and the content was copied instead: both names then
+    // report the same st_nlink, so `ls -l` and anything checking the count
+    // before unlinking still see a shared inode.
+    void set_nlink(const std::string& guest_path, std::uint32_t n) {
+        auto& r = table_[guest_path];
+        r.nlink = n;
+        r.have |= MetaRecord::kNlink;
+        append(guest_path, r);
+    }
+
+    // Emulated link sets: every name that shares a copied "inode", keyed by
+    // each member so a join starting from any name sees the whole set.
+    //
+    // NOT journaled. A link set only matters while the guest is running --
+    // st_nlink after a restart reads 1, which is what the host itself
+    // reports for the copies, so the view is at worst as accurate as the
+    // filesystem underneath. Journaling it would need reference counting
+    // across crashes for very little gain.
+    std::unordered_map<std::string, std::vector<std::string>> link_sets_;
+
+    [[nodiscard]] std::vector<std::string>& link_set_for(const std::string& p) {
+        return link_sets_[p];
+    }
+
+    // Drop a recorded link count, leaving any mode/owner bits alone.
+    void forget_nlink(const std::string& guest_path) {
+        const auto it = table_.find(guest_path);
+        if (it == table_.end()) return;
+        it->second.nlink = 0;
+        it->second.have &= static_cast<std::uint8_t>(~MetaRecord::kNlink);
+        if (is_redundant(it->second)) {
+            table_.erase(it);
+            append_tombstone(guest_path);
+            return;
+        }
+        append(guest_path, it->second);
+    }
+
     // A record that says nothing the default view doesn't already: owner
     // root (or unset) and no mode. Such records are dropped.
     [[nodiscard]] static bool is_redundant(const MetaRecord& r) noexcept {
         const bool owner_default = (!(r.have & MetaRecord::kUid) || r.uid == 0) &&
                                    (!(r.have & MetaRecord::kGid) || r.gid == 0);
-        return owner_default && !(r.have & MetaRecord::kMode);
+        return owner_default && !(r.have & MetaRecord::kMode) &&
+               !(r.have & MetaRecord::kNlink);
     }
 
     // On rename/link the metadata should travel with the file. Move any record
@@ -217,8 +310,15 @@ private:
         if (journal_path_.empty()) return;
         std::FILE* fp = std::fopen(journal_path_.c_str(), "a");
         if (!fp) return;
-        std::fprintf(fp, "%o %u %u %u %s\n", r.mode, r.uid, r.gid,
-                     static_cast<unsigned>(r.have), path.c_str());
+        // nlink goes LAST and only when set, so a journal written before this
+        // field existed still parses (the reader asks for 4 fields and takes
+        // a 5th if it is there) and the common record stays the same size.
+        if ((r.have & MetaRecord::kNlink) != 0)
+            std::fprintf(fp, "%o %u %u %u %u %s\n", r.mode, r.uid, r.gid,
+                         static_cast<unsigned>(r.have), r.nlink, path.c_str());
+        else
+            std::fprintf(fp, "%o %u %u %u %s\n", r.mode, r.uid, r.gid,
+                         static_cast<unsigned>(r.have), path.c_str());
         std::fclose(fp);
     }
 
@@ -244,17 +344,24 @@ private:
             ++lines;
             unsigned mode = 0, uid = 0, gid = 0, have = 0;
             int off = 0;
-            // "%o %u %u %u " then the rest (which may contain spaces) is the path.
+            // "%o %u %u %u " then the rest (which may contain spaces) is the
+            // path -- unless `have` says a 5th number (nlink) comes first.
             if (std::sscanf(line, "%o %u %u %u %n", &mode, &uid, &gid, &have,
                             &off) < 4)
                 continue;
+            unsigned nlink = 0;
+            if (have != 255u && (have & MetaRecord::kNlink) != 0) {
+                int off2 = 0;
+                if (std::sscanf(line + off, "%u %n", &nlink, &off2) == 1)
+                    off += off2;
+            }
             std::string path = line + off;
             while (!path.empty() && (path.back() == '\n' || path.back() == '\r'))
                 path.pop_back();
             if (path.empty()) continue;
             if (have == 255u) { table_.erase(path); continue; }  // tombstone
             MetaRecord r;
-            r.mode = mode; r.uid = uid; r.gid = gid;
+            r.mode = mode; r.uid = uid; r.gid = gid; r.nlink = nlink;
             r.have = static_cast<std::uint8_t>(have);
             if (is_redundant(r)) { table_.erase(path); continue; }
             table_[path] = r;   // last line for a path wins
