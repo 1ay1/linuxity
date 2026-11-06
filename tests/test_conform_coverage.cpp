@@ -92,9 +92,19 @@ constexpr int kInterceptedHandlers =
 // the point: the ratchet becomes a gate rather than a target.
 constexpr std::size_t kVerifiedFloor = 130;
 
-// Coverage reached 100% (every intercepted handler proven by a scenario).
-// Once true this must stay true: see the check in main(). Flipping it off
-// to make a build pass is the one thing that defeats the whole measurement.
+// State the status plainly, whichever way it falls. The gap message was
+// written when there was always a gap; now that there can be none, the
+// report has to be able to say so without overclaiming. "Every intercepted
+// handler is differentially verified" is a precise claim: each one is
+// exercised by a scenario that ran natively and under linuxity on this
+// kernel and agreed.
+//
+// It does NOT mean every behaviour is covered. A handler counts as proven
+// if ONE probe step touches it once, and `tools/coverage.sh` measures the
+// other thing -- line coverage inside the dispatcher, ~80%. The remainder
+// is mostly error paths the probes cannot stage (an EFAULT on a copy that
+// does not fail) plus per-program compatibility shims. The two numbers
+// together are the honest picture; either alone overstates.
 constexpr bool kCoverageIsComplete = true;
 
 } // namespace
@@ -198,8 +208,9 @@ int main() {
         if (gap.empty()) {
             std::printf("conform_coverage: all %zu intercepted handlers are "
                         "differentially verified against a live kernel. "
-                        "Coverage is per-handler, not per-behaviour: the "
-                        "scenarios' step counts are the finer measure.\n",
+                        "Per-HANDLER, not per-behaviour: tools/coverage.sh "
+                        "reports ~80%% of dispatcher lines, and the gap is "
+                        "the error paths probes cannot stage.\n",
                         proven.size());
         } else {
             std::printf("conform_coverage: ratchet holds at %zu verified. "
