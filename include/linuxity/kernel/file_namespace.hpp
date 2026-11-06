@@ -630,6 +630,16 @@ public:
         return &it->second;
     }
 
+    // Is this guest path one of our mount points? umount2 of something that
+    // was never mounted is EINVAL, and that is how a program tests whether
+    // it holds a mount -- answering 0 to everything told it yes always.
+    [[nodiscard]] bool is_mount_point(std::string_view abs) const {
+        const std::string n = normalize(abs);
+        for (const Mount& m : mounts_)
+            if (m.prefix == n) return true;
+        return false;
+    }
+
     // Is this absolute path one WE produced -- i.e. already a host-side path
     // inside one of our mount roots, rather than a guest path to translate?
     //

@@ -461,6 +461,49 @@ inline std::string Scenario::key() const {
                     .exercising(abi::Sysno::open_by_handle_at)
                     .on(DirFlavour::host_backed));
 
+    // The mount API and the admin syscalls, inside a user namespace.
+    //
+    // These were the last group with no coverage, and they resisted for a
+    // real reason: they are privileged AND destructive, so proving mount
+    // works means mounting something, which must not happen on the host.
+    //
+    // unshare(CLONE_NEWUSER|CLONE_NEWNS) is the way in. It gives an
+    // unprivileged process genuine CAP_SYS_ADMIN over a mount tree that is
+    // its own -- invisible to the host, gone when the process exits -- so
+    // mount(2) really runs and can be compared. It happens in a forked
+    // child because joining a mount namespace is irreversible.
+    //
+    // Android cannot do this at all: user namespaces are compiled out and
+    // unshare returns EINVAL. The probe detects that and reports every step
+    // not-applicable, which keeps the traces the same length and tells the
+    // truth -- on that host these syscalls are UNPROVEN rather than agreed.
+    v.push_back(Scenario{"mountns", "mountns"}
+                    .exercising(abi::Sysno::unshare)
+                    .exercising(abi::Sysno::openat)
+                    .exercising(abi::Sysno::mount)
+                    .exercising(abi::Sysno::umount2)
+                    .exercising(abi::Sysno::pivot_root)
+                    .exercising(abi::Sysno::chroot)
+                    .exercising(abi::Sysno::fsopen)
+                    .exercising(abi::Sysno::fsconfig)
+                    .exercising(abi::Sysno::fsmount)
+                    .exercising(abi::Sysno::fspick)
+                    .exercising(abi::Sysno::move_mount)
+                    .exercising(abi::Sysno::open_tree)
+                    .exercising(abi::Sysno::open_tree_attr)
+                    .exercising(abi::Sysno::mount_setattr)
+                    .exercising(abi::Sysno::listns)
+                    .exercising(abi::Sysno::file_getattr)
+                    .exercising(abi::Sysno::file_setattr)
+                    .exercising(abi::Sysno::ustat)
+                    .exercising(abi::Sysno::statmount)
+                    .exercising(abi::Sysno::listmount)
+                    .exercising(abi::Sysno::swapon)
+                    .exercising(abi::Sysno::swapoff)
+                    .exercising(abi::Sysno::quotactl)
+                    .exercising(abi::Sysno::acct)
+                    .on(DirFlavour::host_backed));
+
     return v;
 }
 

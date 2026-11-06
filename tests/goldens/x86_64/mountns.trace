@@ -1,0 +1,36 @@
+# linuxity conformance trace
+# scenario: mountns
+# arch: x86_64
+# recorded-by: live Linux kernel on this host
+# kernel: Linux 7.2.14-zen1-1-zen
+unshare = 1 | unshare a user+mount namespace
+mount = 1 | mount a private tmpfs
+openat = 1 | the tmpfs is writable
+mount = 1 | mount --bind a directory onto itself
+mount = 1 | MS_PRIVATE on the bind
+umount2 = 1 | umount2 the bind with MNT_DETACH
+umount2 = 1 | umount2 something that is not a mount is EINVAL
+mount = 1 | mount with a bogus filesystem type is ENODEV
+mount = 1 | mount of a missing source is ENOENT
+umount2 = 1 | umount2 the tmpfs
+fsopen = 1 | fsopen works, or is cleanly ENOSYS
+fsopen = 1 | fsopen of a bogus type is refused
+fsconfig = 1 | fsconfig is refused the same way
+fsmount = 1 | fsmount is refused the same way
+fspick = 1 | fspick is refused the same way
+move_mount = 1 | move_mount is refused the same way
+open_tree = 1 | open_tree is refused the same way
+open_tree_attr = 1 | open_tree_attr is refused the same way
+mount_setattr = 1 | mount_setattr is refused the same way
+listns = 1 | listns is refused the same way
+file_getattr = 1 | file_getattr is refused the same way
+file_setattr = 1 | file_setattr is refused the same way
+ustat = 1 | ustat is refused the same way
+statmount = 1 | statmount on a bogus mount id is refused
+listmount = 1 | listmount on a bogus mount id is refused
+pivot_root = 1 | pivot_root with bad arguments is refused
+chroot = 1 | chroot into a directory we own
+swapon = 1 | swapon of a regular file is refused
+swapoff = 1 | swapoff of something not swapped is refused
+quotactl = 1 | quotactl with a bogus command is refused
+acct = 1 | acct(NULL) without CAP_SYS_PACCT is refused

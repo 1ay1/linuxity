@@ -1,0 +1,36 @@
+# linuxity conformance trace
+# scenario: mountns
+# arch: aarch64
+# recorded-by: live Linux kernel on this host
+# kernel: Linux 6.1.162-android14-11-g9dd05ae3a1de-ab16261587
+unshare = 0 | unshare a user+mount namespace
+mount = 2 | mount a private tmpfs
+openat = 2 | the tmpfs is writable
+mount = 2 | mount --bind a directory onto itself
+mount = 2 | MS_PRIVATE on the bind
+umount2 = 2 | umount2 the bind with MNT_DETACH
+umount2 = 2 | umount2 something that is not a mount is EINVAL
+mount = 2 | mount with a bogus filesystem type is ENODEV
+mount = 2 | mount of a missing source is ENOENT
+umount2 = 2 | umount2 the tmpfs
+fsopen = 2 | fsopen works, or is cleanly ENOSYS
+fsopen = 2 | fsopen of a bogus type is refused
+fsconfig = 2 | fsconfig is refused the same way
+fsmount = 2 | fsmount is refused the same way
+fspick = 2 | fspick is refused the same way
+move_mount = 2 | move_mount is refused the same way
+open_tree = 2 | open_tree is refused the same way
+open_tree_attr = 2 | open_tree_attr is refused the same way
+mount_setattr = 2 | mount_setattr is refused the same way
+listns = 2 | listns is refused the same way
+file_getattr = 2 | file_getattr is refused the same way
+file_setattr = 2 | file_setattr is refused the same way
+ustat = 2 | ustat is refused the same way
+statmount = 2 | statmount on a bogus mount id is refused
+listmount = 2 | listmount on a bogus mount id is refused
+pivot_root = 2 | pivot_root with bad arguments is refused
+chroot = 2 | chroot into a directory we own
+swapon = 2 | swapon of a regular file is refused
+swapoff = 2 | swapoff of something not swapped is refused
+quotactl = 2 | quotactl with a bogus command is refused
+acct = 2 | acct(NULL) without CAP_SYS_PACCT is refused

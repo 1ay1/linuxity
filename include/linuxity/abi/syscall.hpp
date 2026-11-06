@@ -32,6 +32,7 @@
 #include "linuxity/host/win_posix.hpp"
 #include <optional>
 #include <span>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -490,9 +491,64 @@ public:
             //    /proc etc. proceed instead of aborting on EPERM. A real
             //    block-device mount has no backing here — still accepted
             //    vacuously (the guest sees its target directory unchanged).
-            case Sysno::mount:
-            case Sysno::umount2:
+            case Sysno::mount: {
+                // Accepted as a satisfied no-op, but NOT unconditionally. The
+                // kernel validates arguments before it ever consults
+                // privilege, and a guest told that mounting "nosuchfs"
+                // succeeded will go on to use a filesystem that is not there.
+                // Same mistake as the landlock no-op: say yes to the request,
+                // not to nonsense.
+                //
+                // Only the filesystem TYPE is checked, against the names our
+                // /proc/filesystems advertises. The source and target are
+                // not: a mount's target is routinely a directory the guest is
+                // about to populate, and second-guessing that is how a
+                // working init script starts failing.
+                const std::string type = read_cstr(uaddr(r.arg[2]));
+                if (!type.empty() && !known_fs_type(type))
+                    return eno(Errno::enodev);
+                // A BIND mount's source is a real path that must exist --
+                // unlike a filesystem mount, where the source is a device
+                // name or ignored entirely. Accepting a bind from a missing
+                // directory tells the guest its tree is in two places when
+                // it is in neither.
+                constexpr std::uint64_t kMsBind = 0x1000;
+                if (r.arg[3] & kMsBind) {
+                    const std::string src = read_cstr(uaddr(r.arg[0]));
+                    if (!src.empty()) {
+                        const auto pc = k_.files().classify(
+                            k_.files().absolutize(src, k_.files().cwd()));
+                        if (pc.realm == kernel::Realm2::absent)
+                            return eno(pc.error);
+                        if (pc.realm == kernel::Realm2::host_backed &&
+                            !pc.host_path.empty())
+                            if constexpr (requires { mem_.stat_host_path(pc.host_path); })
+                                if (!mem_.stat_host_path(pc.host_path))
+                                    return eno(Errno::enoent);
+                    }
+                }
+                // REMEMBER it. The mount is a no-op on our side, but the
+                // guest now believes something is mounted there, and the
+                // matching umount2 has to agree -- otherwise a program that
+                // mounts and then unmounts its own scratch tree gets EINVAL
+                // for an unmount that should obviously work.
+                if (const std::string tgt = read_cstr(uaddr(r.arg[1])); !tgt.empty())
+                    guest_mounts_.insert(k_.files().absolutize(tgt, k_.files().cwd()));
                 return val(0);
+            }
+            case Sysno::umount2: {
+                // Unmounting something that was never mounted is EINVAL, and
+                // that is how a program tests whether it holds a mount. Both
+                // OUR mounts and the ones the guest asked for count.
+                const std::string raw = read_cstr(uaddr(r.arg[0]));
+                if (raw.empty()) return eno(Errno::efault);
+                const std::string tgt =
+                    k_.files().absolutize(raw, k_.files().cwd());
+                if (!guest_mounts_.erase(tgt) &&
+                    !k_.files().is_mount_point(tgt))
+                    return eno(Errno::einval);
+                return val(0);
+            }
 
             // -- privileged system-administration ops with no coherent guest
             //    meaning. pivot_root swaps the root mount; swapon/swapoff
@@ -710,6 +766,21 @@ public:
     }
 
 private:
+    // Mount points the GUEST asked for. Its mounts are no-ops on our side,
+    // but it believes they exist, so the matching umount2 must succeed --
+    // a program that mounts and then unmounts its own scratch tree should
+    // not get EINVAL. Only the targets are kept; nothing is really mounted.
+    std::set<std::string> guest_mounts_;
+
+    // Is this a filesystem type our namespace actually offers? The set is
+    // the one /proc/filesystems advertises, so a guest that reads that file
+    // and a guest that calls mount(2) are told the same story.
+    [[nodiscard]] static bool known_fs_type(std::string_view t) noexcept {
+        return t == "proc" || t == "sysfs" || t == "tmpfs" || t == "ext4" ||
+               t == "devtmpfs" || t == "devpts" || t == "overlay" ||
+               t == "ramfs" || t == "bind" || t == "none";
+    }
+
     // The four shorthands every handler returns through. They now just name
     // a fate, so no handler touches a flag or a payload field directly.
     static Outcome val(std::int64_t v) { return Outcome::value(v); }

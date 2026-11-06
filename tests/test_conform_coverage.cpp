@@ -85,7 +85,12 @@ constexpr int kInterceptedHandlers =
 // History, against the real denominator of 130 intercepted handlers:
 //   ioctls, legacy, xattrs, creds, cwdfs, jitwx, proclife -> 90
 //   syscalls2 (fs tail, sockets, notify, landlock, handles)  -> 108
-constexpr std::size_t kVerifiedFloor = 108;
+//   mountns (the mount API + admin, inside a user namespace) -> 130
+//
+// 130 of 130. The floor is now the whole set, so any new intercepted
+// handler added without a scenario to prove it fails this test -- which is
+// the point: the ratchet becomes a gate rather than a target.
+constexpr std::size_t kVerifiedFloor = 130;
 
 } // namespace
 
@@ -154,13 +159,27 @@ int main() {
         ++failures;
     }
 
-    // State the gap plainly. This is not a failure -- it is the honest status,
-    // and printing it is what keeps "100% conformant" from being asserted.
+    // State the status plainly, whichever way it falls. The gap message was
+    // written when there was always a gap; now that there can be none, the
+    // report has to be able to say so without overclaiming. "Every
+    // intercepted handler is differentially verified" is a precise claim:
+    // each one is exercised by a scenario that ran natively and under
+    // linuxity on this kernel and agreed. It does NOT mean every behaviour
+    // of every syscall is covered -- that is what the step counts inside
+    // each scenario are for.
     if (failures == 0) {
-        std::printf("conform_coverage: ratchet holds at %zu verified. "
-                    "%zu intercepted handlers remain unverified -- linuxity is "
-                    "NOT yet differentially proven on those.\n",
-                    proven.size(), gap.size());
+        if (gap.empty()) {
+            std::printf("conform_coverage: all %zu intercepted handlers are "
+                        "differentially verified against a live kernel. "
+                        "Coverage is per-handler, not per-behaviour: the "
+                        "scenarios' step counts are the finer measure.\n",
+                        proven.size());
+        } else {
+            std::printf("conform_coverage: ratchet holds at %zu verified. "
+                        "%zu intercepted handlers remain unverified -- "
+                        "linuxity is NOT yet differentially proven on those.\n",
+                        proven.size(), gap.size());
+        }
     }
     return failures ? 1 : 0;
 }
