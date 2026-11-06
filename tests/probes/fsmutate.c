@@ -435,6 +435,27 @@ int main(void) {
             LX_SYS4(SYS_newfstatat, AT_FDCWD, DIR "/x/../f1", (char[512]){0}, 0),
             "the x/.. did not create anything either");
 
+    // -- rename's error ORDER, which is not the obvious one ----------------
+    // A dot component is EBUSY and outranks everything structural. Then a
+    // destination that is an ANCESTOR of the source is ENOTEMPTY (the move
+    // would absorb a directory containing itself) -- note that is about
+    // containment, NOT about the destination merely being a non-empty
+    // directory, which is only ENOTDIR. Each of these was wrong in a
+    // different direction before.
+    LX_SYS3(SYS_mkdirat, AT_FDCWD, DIR "/anc", 0755);
+    LX_SYS3(SYS_mkdirat, AT_FDCWD, DIR "/anc/kid", 0755);
+    lx_emit("renameat",
+            LX_SYS4(SYS_renameat, AT_FDCWD, DIR "/anc/", AT_FDCWD, DIR "/anc/.."),
+            "a dot component is EBUSY, ahead of the ancestor rule");
+    lx_emit("renameat",
+            LX_SYS4(SYS_renameat, AT_FDCWD, DIR "/anc/kid", AT_FDCWD, DIR "/anc/"),
+            "renaming into the source's own parent is ENOTEMPTY");
+    lx_emit("renameat",
+            LX_SYS4(SYS_renameat, AT_FDCWD, F1, AT_FDCWD, DIR "/anc/"),
+            "...but an unrelated non-empty dir is only ENOTDIR");
+    LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/anc/kid", 0x200);
+    LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/anc", 0x200);
+
     // -- teardown, observing each removal ----------------------------------
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, SYM, 0), "unlink sym");
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, F2, 0), "unlink f2");

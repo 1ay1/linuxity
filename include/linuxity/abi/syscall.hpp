@@ -1156,6 +1156,17 @@ private:
         return ::access(parent.c_str(), X_OK) == 0;
     }
 
+    // Is `anc` a prefix DIRECTORY of `p` -- i.e. would moving p into anc mean
+    // absorbing a directory that contains it? The kernel answers ENOTEMPTY
+    // for that, distinct from the plain "destination is a directory" case.
+    [[nodiscard]] static bool path_is_ancestor(const std::string& anc,
+                                               const std::string& p) noexcept {
+        if (anc.empty() || p.empty()) return false;
+        if (p.size() <= anc.size()) return false;
+        if (p.compare(0, anc.size(), anc) != 0) return false;
+        return p[anc.size()] == '/' || (anc.back() == '/');
+    }
+
     // Is this host path itself a directory? Used where a trailing slash
     // asserts the name is one. An unmapped path answers false, so the
     // trailing-slash assertion fails and the host call reports the rest.
@@ -2582,6 +2593,25 @@ private:
                 !host_dir_searchable(pd.host_path))
                 return eno(Errno::eacces);
         }
+        // A rename cannot name "." or ".." on either side -- they are not
+        // entries you can move, and the kernel reports EBUSY. But it resolves
+        // BOTH paths first, so a structurally bad path wins: rename(".",
+        // "f1/bad") is ENOTDIR because f1 is a file being used as a
+        // directory, not EBUSY. classify() maps for creation and never stats
+        // the prefix, so ask the host whether each parent is really a
+        // directory before refusing on the dot.
+        if (move_meta) {
+            const std::string raw1 =
+                read_cstr(uaddr(r.arg[static_cast<std::size_t>(a1)]));
+            const std::string raw2 =
+                read_cstr(uaddr(r.arg[static_cast<std::size_t>(a2)]));
+            if (dot_tail(raw1) != DotTail::none ||
+                dot_tail(raw2) != DotTail::none) {
+                if (!parent_is_dir(ps.host_path) || !parent_is_dir(pd.host_path))
+                    return eno(Errno::enotdir);
+                return eno(Errno::ebusy);
+            }
+        }
         // A TRAILING SLASH asserts "this name is a directory". For rename
         // that is checked against BOTH operands before the move: renaming a
         // regular file to "new/" is ENOTDIR, and so is renaming "f1/" to
@@ -2594,8 +2624,20 @@ private:
                 read_cstr(uaddr(r.arg[static_cast<std::size_t>(a2)]));
             const bool slash1 = path_syntax(raw1) == PathSyntax::needs_dir;
             const bool slash2 = path_syntax(raw2) == PathSyntax::needs_dir;
-            if ((slash1 || slash2) && !host_path_is_dir(ps.host_path))
-                return eno(Errno::enotdir);
+            if (slash1 || slash2) {
+                // ...but a destination that is an ANCESTOR of the source is
+                // judged first: the move would have to absorb a directory
+                // containing itself, which the kernel reports as ENOTEMPTY.
+                // Any other existing-directory destination just fails the
+                // slash assertion with ENOTDIR. (Verified both ways against
+                // the live kernel -- "dst is a non-empty dir" alone is NOT
+                // the rule, it has to contain the source.)
+                if (host_path_is_dir(pd.host_path) &&
+                    path_is_ancestor(pd.host_path, ps.host_path))
+                    return eno(Errno::enotempty);
+                if (!host_path_is_dir(ps.host_path))
+                    return eno(Errno::enotdir);
+            }
         } else {
             // A hardlink is never a directory, so a trailing slash can never
             // be satisfied -- but only after the checks that outrank it.
@@ -2619,25 +2661,6 @@ private:
                     return eno(Errno::enotdir);
                 if (host_target_exists(pd.host_path)) return eno(Errno::eexist);
                 return eno(Errno::enoent);
-            }
-        }
-        // A rename cannot name "." or ".." on either side -- they are not
-        // entries you can move, and the kernel reports EBUSY. But it resolves
-        // BOTH paths first, so a structurally bad path wins: rename(".",
-        // "f1/bad") is ENOTDIR because f1 is a file being used as a
-        // directory, not EBUSY. classify() maps for creation and never stats
-        // the prefix, so ask the host whether each parent is really a
-        // directory before refusing on the dot.
-        if (move_meta) {
-            const std::string raw1 =
-                read_cstr(uaddr(r.arg[static_cast<std::size_t>(a1)]));
-            const std::string raw2 =
-                read_cstr(uaddr(r.arg[static_cast<std::size_t>(a2)]));
-            if (dot_tail(raw1) != DotTail::none ||
-                dot_tail(raw2) != DotTail::none) {
-                if (!parent_is_dir(ps.host_path) || !parent_is_dir(pd.host_path))
-                    return eno(Errno::enotdir);
-                return eno(Errno::ebusy);
             }
         }
         bool sv = k_.files().under_virtual_mount(src);
