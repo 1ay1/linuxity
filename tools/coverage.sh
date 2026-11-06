@@ -50,8 +50,18 @@ for d in /proc /sys /etc; do
 done
 
 cd "$BUILD"
-gcov -o ./CMakeFiles/linuxity.dir/src/ \
-        ./CMakeFiles/linuxity.dir/src/main.cpp.gcda >/dev/null 2>&1
+gcov -b -o ./CMakeFiles/linuxity.dir/src/ \
+        ./CMakeFiles/linuxity.dir/src/main.cpp.gcda >/tmp/lx-gcov-summary.txt 2>&1
+
+# BRANCH coverage is the number that says something about handler
+# correctness. Line coverage asks "did this line run"; branch coverage asks
+# "did this DECISION go both ways", and a conditional that has only ever
+# been false is an untested answer. The two differ sharply here -- ~85% of
+# lines, ~49% of branches -- and the gap is where bugs live: the
+# virtual_file arm of 25 realm checks had never executed, which is how
+# open("/proc/version", O_WRONLY) returned a working fd.
+awk '/syscall\.hpp/{f=1} f&&/Lines executed|Branches executed|Taken at least once/{print "  " $0; n++} n==3{exit}' \
+    /tmp/lx-gcov-summary.txt || true
 
 python3 - "${1:-}" <<'PY'
 import sys, collections

@@ -319,6 +319,71 @@ int main(void) {
         }
     }
 
+    // -- MUTATING a virtual path -------------------------------------------
+    // Nearly every probe works on host-backed files, so the virtual_file
+    // branch of each mutation handler was dead code -- gcov showed 25
+    // realm checks that had only ever gone one way. procfs is a VIEW of
+    // kernel state, so these must all be refused, and WHICH refusal matters:
+    // a program that gets EACCES retries as root, one that gets 0 believes
+    // it worked. open("/proc/version", O_WRONLY) did exactly that -- it
+    // returned a usable fd and accepted a write that went nowhere.
+    {
+        lx_emit("mkdirat", LX_SYS3(SYS_mkdirat, AT_FDCWD, "/proc/lxtest", 0755),
+                "mkdir in /proc is refused");
+        lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, "/proc/version", 0),
+                "unlink a /proc file is refused");
+        lx_emit("renameat", LX_SYS4(SYS_renameat, AT_FDCWD, "/proc/version",
+                                    AT_FDCWD, "/proc/v2"),
+                "rename a /proc file is refused");
+        lx_emit("symlinkat", LX_SYS3(SYS_symlinkat, "x", AT_FDCWD, "/proc/lxlink"),
+                "symlink into /proc is refused");
+        lx_emit("linkat", LX_SYS5(SYS_linkat, AT_FDCWD, "/proc/version",
+                                  AT_FDCWD, "/proc/v3", 0),
+                "hard link in /proc is refused");
+        // Mainline procfs says EPERM (no setattr for the mode); Android's
+        // SELinux denies it earlier and says EACCES. Assert the refusal.
+        {
+            const long cm = LX_SYS4(SYS_fchmodat, AT_FDCWD, "/proc/version", 0666, 0);
+            lx_emit("fchmodat", (cm == -EPERM || cm == -EACCES) ? 1 : cm,
+                    "chmod a /proc file is refused");
+        }
+        lx_emit("truncate", LX_SYS2(SYS_truncate, "/proc/version", 0),
+                "truncate a /proc file is refused");
+
+        // Opening one for WRITE is the case that was wrong. All three
+        // spellings mutate, including O_TRUNC with O_RDONLY.
+        {
+            const long w = LX_SYS3(SYS_openat, AT_FDCWD, "/proc/version", O_WRONLY);
+            lx_emit("openat", w, "open /proc/version for write is EACCES");
+            if (w >= 0) LX_SYS1(SYS_close, w);
+        }
+        {
+            const long w = LX_SYS3(SYS_openat, AT_FDCWD, "/proc/version", O_RDWR);
+            lx_emit("openat", w, "...and O_RDWR too");
+            if (w >= 0) LX_SYS1(SYS_close, w);
+        }
+        {
+            const long w = LX_SYS3(SYS_openat, AT_FDCWD, "/proc/version",
+                                   O_RDONLY | O_TRUNC);
+            lx_emit("openat", w, "...and O_TRUNC, which mutates despite O_RDONLY");
+            if (w >= 0) LX_SYS1(SYS_close, w);
+        }
+        // But /proc/<pid>/comm IS writable -- it renames the thread, and a
+        // blanket refusal would break every runtime that names threads
+        // through the file rather than prctl.
+        {
+            const long c = LX_SYS3(SYS_openat, AT_FDCWD, "/proc/self/comm", O_WRONLY);
+            lx_emit("openat", c < 0 ? c : 1, "/proc/self/comm IS writable");
+            if (c >= 0) LX_SYS1(SYS_close, c);
+        }
+        // Reading stays allowed, which is the other half of the rule.
+        {
+            const long rd = LX_SYS3(SYS_openat, AT_FDCWD, "/proc/version", O_RDONLY);
+            lx_emit("openat", rd < 0 ? rd : 1, "reading /proc/version still works");
+            if (rd >= 0) LX_SYS1(SYS_close, rd);
+        }
+    }
+
     // -- sysinfo -----------------------------------------------------------
     // struct sysinfo: uptime(8) loads(24) totalram(8) freeram(8) ...
     // Uptime and free memory differ between runs by nature; totals do not.

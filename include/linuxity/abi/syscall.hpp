@@ -964,6 +964,49 @@ private:
         return PathSyntax::ok;
     }
 
+    // Which synthesized files accept a write? Almost none: procfs is a view
+    // of kernel state, and the handful that are writable are the ones that
+    // SET state rather than report it. /proc/<pid>/comm is the one a guest
+    // actually uses -- it renames the thread, the same fact PR_SET_NAME
+    // writes -- so refusing it would break every runtime that names its
+    // threads through the file rather than the prctl.
+    [[nodiscard]] static bool virtual_is_writable(std::string_view p) noexcept {
+        return p.ends_with("/comm");
+    }
+
+    // What a mutation of a synthesized path reports. EROFS is the intuitive
+    // answer and the wrong one: procfs is not mounted read-only, so the error
+    // comes from the missing inode OP, and which one is missing depends on
+    // the operation. Checked against the live kernel:
+    //   create a new name -> ENOENT. procfs dirs have no mkdir/symlink/mknod/
+    //     create op, so the VFS cannot even make the name exist. Holds even
+    //     when the parent is there, which is why it is not EPERM.
+    //   create over a name that DOES exist -> EEXIST. The existence check
+    //     runs before the missing-op one, so this wins over the ENOENT above;
+    //     it is the only answer the virtual_file branch of a creation handler
+    //     can give, since that branch means the leaf resolved.
+    //   set metadata (mode, owner) -> EPERM, the classic "no such inode op",
+    //     at any depth.
+    //   remove or modify CONTENT (truncate, utimes) -> EPERM too, EXCEPT
+    //     directly under /proc, where write permission on the root directory
+    //     is checked first and denies with EACCES before the missing inode op
+    //     is ever reached.
+    enum class VMut { create, exists, remove, meta };
+    [[nodiscard]] static Errno virtual_mut_errno(std::string_view abs,
+                                                 VMut op) noexcept {
+        if (op == VMut::create) return Errno::enoent;
+        if (op == VMut::exists) return Errno::eexist;
+        if (op == VMut::meta) return Errno::eperm;
+        // Depth 2 ("/proc/version") is refused by the root's own permissions;
+        // deeper ("/proc/self/comm") reaches the inode.
+        auto body = abs;
+        while (!body.empty() && body.front() == '/') body.remove_prefix(1);
+        auto slash = body.find('/');
+        bool at_root = slash == std::string_view::npos ||
+                       body.find('/', slash + 1) == std::string_view::npos;
+        return at_root ? Errno::eacces : Errno::eperm;
+    }
+
     // An EMPTY path argument is ENOENT for every path syscall, and that is
     // not a detail -- it is how a caller distinguishes "nothing supplied"
     // from "the current directory". Only openat and stat checked it, so the
@@ -1159,6 +1202,22 @@ private:
             return Redirect{PathArg{path_arg, std::move(pc.host_path)}};
         }
         if (pc.realm == kernel::Realm2::virtual_file) {
+            // A virtual file is SYNTHESIZED -- for most of procfs there is
+            // nothing to write to. The branch ignored the open mode, so
+            // open("/proc/version", O_WRONLY) returned a usable fd and the
+            // write that followed reported success and went nowhere. A
+            // program told its write worked when it did not is worse off
+            // than one that is refused, so these are EACCES like the kernel.
+            //
+            // NOT everything, though: /proc/<pid>/comm is genuinely writable
+            // (it is how a process renames itself, and PR_SET_NAME's twin),
+            // and blanket-refusing it broke that. The rule is the kernel's:
+            // refuse unless this particular file accepts writes.
+            //
+            // O_TRUNC counts even with O_RDONLY since it mutates, which is
+            // why writable() is the test rather than the access-mode bits.
+            const std::string& vpw = pc.virtual_path.empty() ? abs : pc.virtual_path;
+            if (for_write && !virtual_is_writable(vpw)) return eno(Errno::eacces);
             // Follow a cross-mount symlink to the RESOLVED virtual path (e.g.
             // /etc/mtab -> /proc/self/mounts); produce that, not the link.
             const std::string& vp = pc.virtual_path.empty() ? abs : pc.virtual_path;
@@ -1948,8 +2007,19 @@ private:
         if (empty_path_arg(r, path_arg)) return eno(Errno::enoent);
         std::string abs = resolve_arg(r, path_arg, at);
         auto pc = k_.files().classify(abs, /*for_write=*/true, /*follow=*/false, wi);
-        if (pc.realm == kernel::Realm2::virtual_file)
-            return eno(Errno::erofs);
+        if (pc.realm == kernel::Realm2::virtual_file) {
+            // This branch means the leaf RESOLVED, so a creating op (mkdir,
+            // mknod) is refused for the name being taken, before procfs's
+            // missing create op is ever consulted.
+            if (wi == Wi::parents_only)
+                return eno(virtual_mut_errno(abs, VMut::exists));
+            // A writable virtual file (comm) accepts content changes, the way
+            // the kernel's does.
+            if (wi == Wi::copy_leaf && virtual_is_writable(abs)) return val(0);
+            // remove and copy_leaf share the rule: both need write access to
+            // the containing directory before reaching the inode op.
+            return eno(virtual_mut_errno(abs, VMut::remove));
+        }
         // A removal whose target lives ONLY in the read-only lower layer:
         // forwarding the unlink would destroy the pristine rootfs. Record a
         // whiteout (hides the lower file in the overlay view) and report
@@ -2004,7 +2074,10 @@ private:
         std::uint32_t mode = static_cast<std::uint32_t>(
             r.arg[static_cast<std::size_t>(path_arg) + 1]);
         auto pc = k_.files().classify(abs, /*for_write=*/false, /*follow=*/false);
-        if (pc.realm == kernel::Realm2::virtual_file) return eno(Errno::erofs);
+        if (pc.realm == kernel::Realm2::virtual_file)
+            // Even comm, which accepts writes, refuses a mode change: procfs
+            // inodes have no setattr for the mode.
+            return eno(virtual_mut_errno(abs, VMut::meta));
         if (pc.realm == kernel::Realm2::absent)       return eno(pc.error);
         // ALSO apply the mode to the real host inode, best-effort. The shadow
         // store makes the FULL guest-intended mode authoritative at stat time,
@@ -2093,7 +2166,10 @@ private:
         if (empty_path_arg(r, path_arg)) return eno(Errno::enoent);
         std::string abs = resolve_arg(r, path_arg, at);
         auto pc = k_.files().classify(abs, /*for_write=*/false, follow);
-        if (pc.realm == kernel::Realm2::virtual_file) return eno(Errno::erofs);
+        if (pc.realm == kernel::Realm2::virtual_file) {
+            if (virtual_is_writable(abs)) return val(0);
+            return eno(virtual_mut_errno(abs, VMut::meta));
+        }
         if (pc.realm == kernel::Realm2::absent)       return eno(pc.error);
         // classify() MAPS a path, it does not test for existence: a plain
         // host mount returns host_backed for a name that is not there, since
@@ -2157,9 +2233,23 @@ private:
         std::string dst = resolve_second(r, a2, at);
         auto ps = k_.files().classify(src, true, false, Wi::copy_leaf);
         auto pd = k_.files().classify(dst, true, false, Wi::parents_only);
-        if (ps.realm == kernel::Realm2::virtual_file ||
-            pd.realm == kernel::Realm2::virtual_file)
-            return eno(Errno::erofs);
+        bool sv = k_.files().under_virtual_mount(src);
+        bool dv = k_.files().under_virtual_mount(dst);
+        // Crossing between a synthesized path and a real one is a genuine
+        // cross-mount move, which rename/link report as EXDEV.
+        if (sv != dv) return eno(Errno::exdev);
+        if (sv) {
+            // Both ends inside procfs. An absent source is ENOENT before
+            // anything else is considered.
+            if (ps.realm == kernel::Realm2::absent) return eno(Errno::enoent);
+            // link checks the destination name first, so a taken name is
+            // EEXIST; rename replaces instead, so it reaches the missing
+            // rename inode op and reports EPERM. (move_meta marks rename.)
+            if (pd.realm == kernel::Realm2::virtual_file)
+                return eno(move_meta ? Errno::eperm : Errno::eexist);
+            // Destination name does not exist and cannot be created here.
+            return eno(Errno::enoent);
+        }
         if (ps.host_path.empty() || pd.host_path.empty())
             return eno(ps.host_path.empty() ? ps.error : pd.error);
         // rename carries the shadow metadata with the file (a hardlink/link
@@ -2328,7 +2418,8 @@ private:
                                     k_.files().cwd());
         auto pc = k_.files().classify(link, true, false, Wi::parents_only);
         if (pc.realm == kernel::Realm2::virtual_file)
-            return eno(Errno::erofs);
+            // Reached only when the link name RESOLVED, so the name is taken.
+            return eno(virtual_mut_errno(link, VMut::exists));
         if (pc.host_path.empty()) return eno(pc.error);
         // Rewrite ONLY the linkpath; `target` stays guest-literal.
         return Redirect{PathArg{link_arg, std::move(pc.host_path)}}.parents();

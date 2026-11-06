@@ -215,6 +215,89 @@ int main(void) {
     lx_emit("utimensat", LX_SYS4(SYS_utimensat, AT_FDCWD, DIR "/nope", 0, 0),
             "utimensat on a missing file is ENOENT");
 
+    // -- mutating a SYNTHESIZED path ---------------------------------------
+    // procfs is not a read-only mount, so none of these is EROFS. The errno
+    // comes from the inode op the filesystem lacks, and which op is missing
+    // depends on the operation -- so each class has to be asked separately.
+    //
+    // Creating a name: procfs dirs have no mkdir/symlink/mknod/create op, so
+    // the VFS cannot make the name exist at all -> ENOENT, even when the
+    // parent directory is right there.
+    lx_emit("mkdirat", LX_SYS3(SYS_mkdirat, AT_FDCWD, "/proc/lxnew", 0755),
+            "mkdir in /proc is ENOENT, not EROFS");
+    lx_emit("mkdirat", LX_SYS3(SYS_mkdirat, AT_FDCWD, "/proc/self/lxnew", 0755),
+            "mkdir under an existing procfs dir is still ENOENT");
+    lx_emit("symlinkat", LX_SYS3(SYS_symlinkat, "x", AT_FDCWD, "/proc/self/lxlink"),
+            "symlink into procfs is ENOENT");
+    lx_emit("mknodat", LX_SYS4(SYS_mknodat, AT_FDCWD, "/proc/self/lxnod", 0100644, 0),
+            "mknod into procfs is ENOENT");
+
+    // Creating over a name that DOES exist: the existence check runs first,
+    // so EEXIST wins over the missing-create-op ENOENT above. These reach a
+    // different branch than the cases above (the leaf resolves), which is
+    // exactly where a blanket EROFS used to hide.
+    lx_emit("symlinkat", LX_SYS3(SYS_symlinkat, "x", AT_FDCWD, "/proc/self/comm"),
+            "symlink over an existing procfs file is EEXIST");
+    lx_emit("mkdirat", LX_SYS3(SYS_mkdirat, AT_FDCWD, "/proc/self/comm", 0755),
+            "mkdir over an existing procfs file is EEXIST");
+    lx_emit("mknodat", LX_SYS4(SYS_mknodat, AT_FDCWD, "/proc/version", 0100644, 0),
+            "mknod over an existing procfs file is EEXIST");
+
+    // Removing or truncating needs write permission on the containing
+    // directory, checked BEFORE the missing inode op. The /proc root denies
+    // it (EACCES); deeper dirs allow it so the inode refuses instead (EPERM).
+    lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, "/proc/version", 0),
+            "unlink directly under /proc is EACCES");
+    lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, "/proc/self/comm", 0),
+            "unlink deeper in procfs is EPERM");
+    lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, "/proc/self/fd", AT_REMOVEDIR),
+            "rmdir of a procfs dir is EPERM");
+    lx_emit("truncate", LX_SYS2(SYS_truncate, "/proc/version", 0),
+            "truncate under /proc is EACCES");
+
+    // No setattr for the mode -> refused. WHICH refusal varies by host and
+    // the guest cannot know which kernel it faces: mainline procfs has no
+    // setattr for the mode and says EPERM, while Android's SELinux denies
+    // the change at the permission layer first and says EACCES. Both are
+    // correct for their kernel, so collapse them the way creds.c does and
+    // assert the portable fact -- it is refused, and not with EROFS.
+    {
+        const long c1 = LX_SYS4(SYS_fchmodat, AT_FDCWD, "/proc/version", 0666, 0);
+        lx_emit("fchmodat", (c1 == -EPERM || c1 == -EACCES) ? 1 : c1,
+                "chmod on procfs is refused with EPERM or EACCES");
+        const long c2 = LX_SYS4(SYS_fchmodat, AT_FDCWD, "/proc/self/comm", 0666, 0);
+        lx_emit("fchmodat", (c2 == -EPERM || c2 == -EACCES) ? 1 : c2,
+                "chmod is refused even on a writable procfs file");
+    }
+
+    // rename/link: inside procfs the destination name cannot be created, so
+    // ENOENT; crossing between procfs and a real filesystem is a genuine
+    // cross-mount move and reports EXDEV.
+    lx_emit("renameat",
+            LX_SYS4(SYS_renameat, AT_FDCWD, "/proc/self/comm", AT_FDCWD, "/proc/self/c2"),
+            "rename within procfs is ENOENT");
+    lx_emit("linkat",
+            LX_SYS5(SYS_linkat, AT_FDCWD, "/proc/self/comm", AT_FDCWD, "/proc/self/c3", 0),
+            "link within procfs is ENOENT");
+    // With the destination ALSO existing, rename and link part ways: link
+    // refuses the taken name (EEXIST), rename replaces and so hits the
+    // missing rename inode op (EPERM).
+    lx_emit("renameat",
+            LX_SYS4(SYS_renameat, AT_FDCWD, "/proc/self/comm", AT_FDCWD, "/proc/version"),
+            "rename onto an existing procfs name is EPERM");
+    lx_emit("linkat",
+            LX_SYS5(SYS_linkat, AT_FDCWD, "/proc/version", AT_FDCWD, "/proc/self/comm", 0),
+            "link onto an existing procfs name is EEXIST");
+    lx_emit("renameat",
+            LX_SYS4(SYS_renameat, AT_FDCWD, "/proc/nope", AT_FDCWD, "/proc/nope2"),
+            "rename of an absent procfs source is ENOENT");
+    lx_emit("renameat",
+            LX_SYS4(SYS_renameat, AT_FDCWD, "/proc/self/comm", AT_FDCWD, F2),
+            "rename out of procfs is EXDEV");
+    lx_emit("renameat",
+            LX_SYS4(SYS_renameat, AT_FDCWD, F1, AT_FDCWD, "/proc/self/comm"),
+            "rename into procfs is EXDEV");
+
     // -- teardown, observing each removal ----------------------------------
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, SYM, 0), "unlink sym");
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, F2, 0), "unlink f2");

@@ -212,6 +212,22 @@ public:
         mounts_.push_back(Mount{std::move(prefix), {}, {}, std::move(prod)});
     }
 
+    // Does this path LIVE in a virtual mount, whether or not the leaf exists?
+    // classify() answers about the leaf, so a name procfs does not produce
+    // comes back `absent` -- which makes a rename inside /proc look like it
+    // crosses a mount boundary. Callers that need the mount, not the file,
+    // ask here.
+    [[nodiscard]] bool under_virtual_mount(std::string_view abs) const {
+        for (const auto& m : mounts_) {
+            if (!m.producer) continue;
+            if (abs.size() >= m.prefix.size() &&
+                abs.compare(0, m.prefix.size(), m.prefix) == 0 &&
+                (abs.size() == m.prefix.size() || abs[m.prefix.size()] == '/'))
+                return true;
+        }
+        return false;
+    }
+
     [[nodiscard]] std::string_view cwd() const noexcept { return cwd_of(cur_pid_); }
     void set_cwd(std::string c) { cwds_[cur_pid_] = normalize(c); last_cwd_ = cwds_[cur_pid_]; }
 
