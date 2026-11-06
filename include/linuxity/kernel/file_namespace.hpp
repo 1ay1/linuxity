@@ -1244,10 +1244,15 @@ private:
                 }
             }
             if (::mkdir(sub.c_str(), mode) != 0) continue;   // EEXIST: leave it
-            // mkdir masks the mode through umask, and the sticky/setgid bits
-            // never survive it, so set them explicitly on the one we created.
-            if ((mode & ~static_cast<::mode_t>(0777)) != 0 || (mode & 0077) != 0)
-                (void)::chmod(sub.c_str(), mode);
+            // Always chmod the one we just created. mkdir's mode is masked by
+            // the HOST's umask, which linuxity does not control -- Android's
+            // adb shell runs with umask 000, a desktop with 022, so the same
+            // mirror produced different modes on different hosts. The
+            // sticky/setgid bits never survive mkdir either. Setting it
+            // explicitly makes the mirror exact instead of
+            // umask-dependent, which is what "directory permissions differ
+            // on /etc/" was reporting.
+            (void)::chmod(sub.c_str(), mode);
         }
     }
 

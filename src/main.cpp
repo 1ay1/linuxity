@@ -325,6 +325,22 @@ int main(int argc, char** argv) {
         set_env("LOGNAME", "root");
         set_env("HOME", "/root");
         set_env("SHELL", "/bin/bash");
+        // A DISTRO umask, for the same reason as the environment above: the
+        // guest is a Linux distro, not this host's shell session. Every
+        // distro ships 022 (via /etc/profile or pam_umask); Android's adb
+        // shell runs 000, and the guest inherits whatever it finds.
+        //
+        // That is not cosmetic. `mkdir -p` asks the kernel for 0777 and
+        // lets umask subtract -- so under 000 every directory a package
+        // manager creates really is world-writable, and pacman then reports
+        // "directory permissions differ on /etc/, filesystem: 777 package:
+        // 755" against its own manifest. Verified not to be a linuxity bug:
+        // native Android `mkdir -p` gives 777 too. The guest just needs the
+        // mask its own userland would have set.
+        //
+        // It is only a DEFAULT: umask(2) is not intercepted, so a guest
+        // profile or program that sets its own still wins.
+        (void)::umask(022);
         // PATH belongs to the ROOTFS, not the host. Inheriting it works by
         // luck on a Linux host (/usr/bin is /usr/bin either way) and fails
         // completely on Android, where the host PATH is /system/bin:/apex/...

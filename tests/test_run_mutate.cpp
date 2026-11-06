@@ -136,6 +136,15 @@ static const char* kSrc =
     "  if (uf2 < 0) return 47;\n"
     "  if (write(uf2, \"again\\n\", 6) != 6) return 48;\n"
     "  close(uf2);\n"
+    // Writing under a lower-only directory MIRRORS its ancestors into the
+    // upper layer. They must arrive with the mode they have in the LOWER
+    // layer, not a hardcoded 0755 masked by whatever umask the host happens
+    // to run with -- Android's adb shell is umask 000, a desktop 022, so the
+    // same mirror produced different modes per host and pacman reported
+    // "directory permissions differ on /etc/, filesystem: 777 package: 755".
+    "  int pf = open(\"/priv/sub/f\", O_WRONLY|O_CREAT|O_TRUNC, 0644);\n"
+    "  if (pf < 0) return 49;\n"
+    "  close(pf);\n"
     "  return 42;\n}\n";
 
 int main() {
@@ -148,6 +157,7 @@ int main() {
     // the whiteout and O_EXCL-over-lower fixtures.
     const auto tree = lxtest::make_tree("mutate", /*overlay=*/true,
         "mkdir -p /tmp/lx_mutate_root/base"
+        " && mkdir -p -m 750 /tmp/lx_mutate_root/priv/sub"
         " && printf lower > /tmp/lx_mutate_root/lower_only"
         " && printf old > /tmp/lx_mutate_root/excl_lower"
         " && printf pristine > /tmp/lx_mutate_root/unlink_excl_lower");
@@ -187,6 +197,15 @@ int main() {
     // contents in the upper, and the pristine lower untouched throughout.
     bool unlink_excl_new   = read1(upper + "/unlink_excl_lower") == "again\n";
     bool unlink_excl_lower = read1(root  + "/unlink_excl_lower") == "pristine";
+    // The mirrored ancestors must carry the LOWER layer's mode, exactly.
+    auto mode_of = [](const std::string& p) -> unsigned {
+        struct ::stat st{};
+        return ::stat(p.c_str(), &st) == 0 ? (st.st_mode & 07777u) : 0u;
+    };
+    const unsigned priv_lower = mode_of(root  + "/priv");
+    const unsigned priv_upper = mode_of(upper + "/priv");
+    const unsigned sub_lower  = mode_of(root  + "/priv/sub");
+    const unsigned sub_upper  = mode_of(upper + "/priv/sub");
 
     lxtest::remove_tree(tree);
 
@@ -223,6 +242,16 @@ int main() {
         std::puts("run_mutate: FAIL O_CREAT|O_EXCL overwrite of a lower-only "
                   "file did not materialize fresh contents in the upper "
                   "(copy-up-then-O_EXCL would EEXIST: 'Can't create <path>')");
+        return 1;
+    }
+    if (priv_upper != priv_lower || sub_upper != sub_lower) {
+        std::printf("run_mutate: FAIL a mirrored directory did not keep the "
+                    "lower layer's mode: /priv %04o -> %04o, /priv/sub "
+                    "%04o -> %04o. mkdir's mode is masked by the HOST umask "
+                    "(000 under adb, 022 on a desktop), so a hardcoded 0755 "
+                    "lands differently per host \u2014 pacman reads it back and "
+                    "warns \"directory permissions differ\"\n",
+                    priv_lower, priv_upper, sub_lower, sub_upper);
         return 1;
     }
     if (!unlink_excl_new || !unlink_excl_lower) {
