@@ -154,6 +154,30 @@ int main(int argc, char** argv) {
     // distro is mounted (the bootstrap rootfs has orphan library files that
     // would otherwise abort installs). --no-pacman-overwrite disables it.
     bool pacman_overwrite = true;
+    // A PRIVATE /tmp, on by default.
+    //
+    // The guest's top process is pid 1, correctly -- it is the guest's init.
+    // But a shared /tmp turns that into a collision: anything that derives a
+    // filename from getpid() gets the SAME name every run. GNU make names its
+    // jobserver FIFO /tmp/GMfifo<pid>, so one interrupted `make -j` strands
+    // /tmp/GMfifo1 and every later build fails with
+    //
+    //     make: jobserver mkfifo: /tmp/GMfifo1: File exists
+    //
+    // Natively pids are 7 digits and effectively never recur, which is why
+    // this is invisible outside a pid namespace. A real container gets a
+    // private /tmp for exactly this reason.
+    //
+    // Costs nothing at runtime: it is one more entry in the mount table the
+    // path translator already walks for every syscall, not a namespace or a
+    // mount. --shared-tmp opts out for workflows that hand files to the host
+    // through /tmp.
+    bool private_tmp = true;
+    // Where that private /tmp landed, so it can be torn down on exit.
+    std::string private_tmp_dir;
+    // The EPHEMERAL overlay upper, likewise. Empty with --persist, which must
+    // survive the run.
+    std::string ephemeral_upper;
     kernel::ResourceSpec res;
     // --bind host[:guest] mounts a real host directory into the guest tree at
     // `guest` (default: same path). Thin wrapper over FileNamespace::mount_host
@@ -174,6 +198,8 @@ int main(int argc, char** argv) {
         else if (f == "--persist" || f == "--upper") { persist = need("--persist"); }
         else if (f == "--no-pacman-overwrite") { pacman_overwrite = false; }
         else if (f == "--pacman-overwrite")    { pacman_overwrite = true; }
+        else if (f == "--shared-tmp")  { private_tmp = false; }
+        else if (f == "--private-tmp") { private_tmp = true; }
         else if (f == "--cpus")        { res.cpus = std::atof(need("--cpus")); }
         else if (f == "--memory" || f == "-m") {
             if (auto b = kernel::parse_bytes(need("--memory"))) res.mem_max = *b;
@@ -214,6 +240,9 @@ int main(int argc, char** argv) {
             "  --root <dir>        mount an extracted distro rootfs as guest '/'\n"
             "  --persist <dir>     durable overlay upper: installs/writes survive\n"
             "                      across runs (default: ephemeral per-run)\n"
+            "  --shared-tmp        share the host's /tmp (default: private, so a\n"
+            "                      pid-derived name like make's GMfifo<pid>\n"
+            "                      cannot collide across runs)\n"
             "  --no-pacman-overwrite  don't auto-pass pacman --overwrite \"*\"\n"
             "                      (default: on with --root, so a bootstrap\n"
             "                      rootfs's orphan lib files never block installs)\n"
@@ -347,6 +376,7 @@ int main(int argc, char** argv) {
         std::string upper = persist.empty()
             ? "/tmp/linuxity-upper-" + std::to_string(::getpid())
             : persist;
+        if (persist.empty()) ephemeral_upper = upper;
         if (!persist.empty()) {
             // Create the persistent tree (and its parents) if new; existing
             // contents are reused as-is so prior installs are visible.
@@ -374,6 +404,30 @@ int main(int argc, char** argv) {
         k.files().mount_virtual("/proc", vfs::make_procfs(k.procs(), k.machine()));
         k.files().mount_virtual("/sys", vfs::make_sysfs(k.machine()));
         k.files().mount_virtual("/dev", vfs::make_devfs());
+    }
+
+    // Private /tmp (see `private_tmp` above). Registered BEFORE --bind so an
+    // explicit `--bind /tmp` still wins by longest-prefix, and before the
+    // guest starts so nothing has looked at /tmp yet.
+    //
+    // Named with the SUPERVISOR's pid, which is what makes it unique -- the
+    // guest's own pid cannot, since it is always 1. Same convention as the
+    // overlay upper dir above.
+    if (private_tmp) {
+        const std::string gt = "/tmp/linuxity-tmp-" + std::to_string(::getpid());
+        // 1777, like a real /tmp: world-writable with the sticky bit. 0700 is
+        // wrong here even though only one guest uses it -- the guest presents
+        // as root while the directory is owned by the invoking uid, so a
+        // 0700 dir denied every guest write. That showed up as gcc failing
+        // with "Assembler messages: Fatal error: can't create s3.o: Permission
+        // denied" under `make -j`, because gcc puts its assembler temporaries
+        // in TMPDIR.
+        (void)::mkdir(gt.c_str(), 01777);
+        // mkdir's mode is masked by umask, and the sticky bit often does not
+        // survive it, so set it explicitly.
+        (void)::chmod(gt.c_str(), 01777);
+        k.files().mount_host("/tmp", gt);
+        private_tmp_dir = gt;
     }
 
     // --bind mounts: expose real host directories at guest prefixes. Registered
@@ -543,6 +597,26 @@ int main(int argc, char** argv) {
     runtime::Cpu cpu{trap, k, trap, abi::Arch::x86_64};
 
     auto rc = cpu.run(uaddr(0), uaddr(0));
+
+    // Remove this run's throwaway dirs under /tmp. The upper-layer comment
+    // above has always claimed these are "torn down each run" and nothing
+    // actually did it -- this host had 119 /tmp/linuxity-upper-* left over.
+    // Adding a private /tmp would have made that worse, so both get cleaned
+    // here, on every exit path.
+    //
+    // Shelling out to rm -rf rather than walking the tree: these are our own
+    // paths (we built the names), the guest is gone by now, and a hand-rolled
+    // recursive unlink is a lot of code to get a temp dir removed. A --persist
+    // upper is NEVER touched, only the per-pid one we created.
+    const auto sweep = [](const std::string& d) {
+        if (d.empty()) return;
+        if (d.rfind("/tmp/linuxity-", 0) != 0) return;   // ours, or nothing
+        std::string cmd = "rm -rf -- '" + d + "' 2>/dev/null";
+        (void)!std::system(cmd.c_str());
+    };
+    sweep(private_tmp_dir);
+    sweep(ephemeral_upper);
+
     if (!rc) {
         std::fprintf(stderr, "linuxity: runtime error %d\n", int(rc.error()));
         return 1;
