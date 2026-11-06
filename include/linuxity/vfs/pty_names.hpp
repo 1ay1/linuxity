@@ -17,6 +17,7 @@
 
 #include <cstdio>
 #include <string>
+#include <string_view>
 
 namespace lx::vfs {
 
@@ -37,6 +38,27 @@ namespace lx::vfs {
     std::snprintf(buf, sizeof buf, "/dev/pts/%d", n);
 #endif
     return buf;
+}
+
+// The slave NUMBER behind a host path, or -1 if it is not a pty slave.
+//
+// The inverse of pty_slave_path, and it lives next to it so a host with its
+// own spelling is still a single edit. Needed to identify an fd we never saw
+// opened: /proc/<pid>/fd/<n> gives the host's name, and this turns it back
+// into the number the guest's ctty bookkeeping is keyed on.
+[[nodiscard]] inline int pty_slave_number(std::string_view host_path) {
+#if defined(__APPLE__)
+    constexpr std::string_view kPre = "/dev/ttys";
+#else
+    constexpr std::string_view kPre = "/dev/pts/";
+#endif
+    if (!host_path.starts_with(kPre)) return -1;
+    const std::string_view n = host_path.substr(kPre.size());
+    if (n.empty() || n.find_first_not_of("0123456789") != std::string_view::npos)
+        return -1;
+    int v = 0;
+    for (char c : n) v = v * 10 + (c - '0');
+    return v;
 }
 
 }  // namespace lx::vfs

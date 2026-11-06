@@ -398,6 +398,27 @@ int main(int argc, char** argv) {
             if (j + 1 < gargv.size()) init.cmdline.push_back('\0');   // ProcInfo: NUL-joined
         }
         k.procs().upsert(init);
+
+        // An INHERITED terminal is already our controlling one, and the guest
+        // will never call TIOCSCTTY for it -- a shell launched from a
+        // terminal just expects /dev/tty and tcgetpgrp to work on fd 0. So
+        // seed the ctty from whatever stdin is, when stdin is a pty.
+        //
+        // The std fds also need their PATHS bound, not just the ctty. bash
+        // reaches the terminal as dup(2)->9, dup3(9,255) and then does every
+        // job-control ioctl on fd 255; the dup mirror copies fd 2's path, so
+        // if fd 2 has none the whole chain is pathless and the ioctl cannot
+        // tell it is looking at the terminal. That is what made bash say
+        // "cannot set terminal process group (-1)" on Android.
+        for (int fd = 0; fd <= 2; ++fd) {
+            if (::isatty(fd) == 0) continue;
+            const char* n = ::ttyname(fd);
+            if (n == nullptr) continue;
+            constexpr std::string_view kPre = "/dev/pts/";
+            if (!std::string_view{n}.starts_with(kPre)) continue;
+            k.files().bind_fd(fd, n);
+            k.procs().set_ctty(1, std::atoi(n + kPre.size()));
+        }
     }
 
     // Build the guest's filesystem namespace. When --root is given, the
@@ -433,7 +454,8 @@ int main(int argc, char** argv) {
         k.files().mount_host("/", root, upper);
         k.files().mount_virtual("/proc", vfs::make_procfs(k.procs(), k.machine()));
         k.files().mount_virtual("/sys", vfs::make_sysfs(k.machine()));
-        k.files().mount_virtual("/dev", vfs::make_devfs());
+        k.files().mount_virtual("/dev", vfs::make_devfs(
+            [&k] { return k.procs().ctty_of(k.files().current_pid()); }));
     } else {
         // No rootfs: the guest lives in the real host tree (paths translate
         // 1:1), but /proc and /sys are STILL synthesized so uname/pid/mounts
@@ -441,7 +463,8 @@ int main(int argc, char** argv) {
         k.files().mount_host("/", "/");
         k.files().mount_virtual("/proc", vfs::make_procfs(k.procs(), k.machine()));
         k.files().mount_virtual("/sys", vfs::make_sysfs(k.machine()));
-        k.files().mount_virtual("/dev", vfs::make_devfs());
+        k.files().mount_virtual("/dev", vfs::make_devfs(
+            [&k] { return k.procs().ctty_of(k.files().current_pid()); }));
     }
 
     // Private /tmp (see `private_tmp` above). Registered BEFORE --bind so an

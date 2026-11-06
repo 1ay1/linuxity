@@ -253,6 +253,10 @@ public:
     // chdir/fchdir/getcwd and every relative-path absolutize act on the RIGHT
     // process's cwd. A pid with no record inherits the tree default "/".
     void set_current_pid(std::int32_t pid) const noexcept { cur_pid_ = pid; }
+    // The pid whose syscall is being served right now. A virtual-file producer
+    // needs it to answer per-process questions (/dev/tty is "MY controlling
+    // terminal"), and the producer signature carries only the path.
+    [[nodiscard]] std::int32_t current_pid() const noexcept { return cur_pid_; }
     // Select the active pid AND, if this pid has no cwd record yet, seed it
     // from its parent's cwd (a freshly forked child inherits the parent's
     // directory). Called by the dispatcher with (pid, ppid) it already knows,

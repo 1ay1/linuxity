@@ -85,8 +85,11 @@ static const char* kProbe =
     "}\n";
 
 int main() {
-#if !defined(__linux__) || !defined(__x86_64__)
-    std::puts("run_termios2: skipped (needs Linux/x86-64 host)");
+// This bug was found ON Android/aarch64, so gating the test to x86-64 meant
+// it never ran where it reproduces. The termios2 request numbers are the
+// same on both arches (unlike the open flags), so the probe is portable.
+#if !defined(__linux__) || (!defined(__x86_64__) && !defined(__aarch64__))
+    std::puts("run_termios2: skipped (needs Linux/x86-64 or aarch64 host)");
     return 0;
 #else
     const auto tree = lxtest::make_tree("termios2", /*overlay=*/false, "",

@@ -1101,6 +1101,12 @@ public:
     }
 
     struct TaskIds { std::int32_t pid, tid, ppid; };
+
+    // The HOST tid of the task whose syscall is being served. The dispatcher
+    // needs it to read the tracee's own /proc (e.g. /proc/<tid>/fd/<n> to
+    // identify an fd it never saw opened); guest pids do not exist there.
+    [[nodiscard]] int host_tid() const noexcept { return cur_; }
+
     // The GUEST-namespace identity of the task that trapped: its pid, its
     // thread id (== pid for the main thread; a distinct host tid otherwise),
     // and its parent's guest pid. The dispatcher answers getpid/gettid/getppid

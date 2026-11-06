@@ -46,6 +46,10 @@ struct ProcInfo {
     // every pid, i.e. every task its own session leader -- wrong the same way
     // pgid was, and a job-control shell checks both.
     std::int32_t sid{0};
+    // The CONTROLLING TERMINAL, as the pty slave number the session leader
+    // claimed with TIOCSCTTY (-1 = none). Sessions own a ctty, not processes,
+    // so this is only ever read through ctty_of, which walks to the session.
+    std::int32_t ctty{-1};
     std::string  comm{"linuxity"};   // short name (/proc/<pid>/comm, stat)
     std::string  cmdline{"linuxity"};// full argv, NUL-joined for /proc/.../cmdline
     char         state{'R'};         // R/S/D/Z/T (running by default)
@@ -127,6 +131,46 @@ public:
         if (p.pid == 0) p.pid = pid;
         p.sid = pid;
         p.pgid = pid;
+        // A new session starts with NO controlling terminal, even though the
+        // caller had one a moment ago -- that is the whole point of setsid,
+        // and it is why a daemon calls it.
+        p.ctty = -1;
+    }
+
+    // The controlling terminal of `pid`'s SESSION, or -1 for none.
+    //
+    // Stored on the session leader, because that is who claims it, but every
+    // member of the session shares it -- so resolve by walking to the leader
+    // rather than reading the caller's own field.
+    [[nodiscard]] std::int32_t ctty_of(std::int32_t pid) const {
+        if (pid <= 0) return -1;
+        const std::int32_t leader = sid_of(pid);
+        if (const ProcInfo* l = find(leader); l != nullptr && l->ctty >= 0)
+            return l->ctty;
+        // Not on the leader: a process that claimed a ctty before any setsid
+        // still has one, so fall back to its own record.
+        const ProcInfo* p = find(pid);
+        return p != nullptr ? p->ctty : -1;
+    }
+
+    // TIOCSCTTY: make pty slave `n` the ctty of `pid`'s session.
+    void set_ctty(std::int32_t pid, std::int32_t n) {
+        const std::int32_t leader = sid_of(pid);
+        auto& l = procs_[leader];
+        if (l.pid == 0) l.pid = leader;
+        l.ctty = n;
+        // Record it on the caller too, so a caller that is not (yet) the
+        // leader still sees its own claim.
+        auto& p = procs_[pid];
+        if (p.pid == 0) p.pid = pid;
+        p.ctty = n;
+    }
+
+    // TIOCNOTTY: drop the ctty for the whole session.
+    void clear_ctty(std::int32_t pid) {
+        const std::int32_t leader = sid_of(pid);
+        for (auto& [who, p] : procs_)
+            if (sid_of(who) == leader) p.ctty = -1;
     }
 
     // setpgid(pid, pgid). Records the group against the TARGET, which is the

@@ -51,8 +51,8 @@ static const char* kProbe =
     "}\n";
 
 int main() {
-#if !defined(__linux__) || !defined(__x86_64__)
-    std::puts("run_ttyname: skipped (needs Linux/x86-64 host)");
+#if !defined(__linux__) || (!defined(__x86_64__) && !defined(__aarch64__))
+    std::puts("run_ttyname: skipped (needs Linux/x86-64 or aarch64 host)");
     return 0;
 #else
     const auto tree = lxtest::make_tree("ttyname", /*overlay=*/false, "",

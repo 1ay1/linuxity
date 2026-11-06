@@ -29,6 +29,7 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <string>
 #include <string_view>
 
@@ -37,8 +38,17 @@ namespace lx::vfs {
 // Build a /dev producer. Character devices redirect to the host's real nodes;
 // stdio/fd links resolve into the guest's /proc. The set is exactly what real
 // userspace (busybox, musl/glibc, package managers, build tools) reaches for.
-[[nodiscard]] inline kernel::FileNamespace::Producer make_devfs() {
-    return [](std::string_view abs) -> Result<kernel::VirtualFile> {
+//
+// `ctty` answers "which pty slave is the calling guest's controlling
+// terminal" (-1 = none). /dev/tty MUST go through it rather than redirecting
+// to the host's /dev/tty: the host's controlling terminal is linuxity's, not
+// the guest's, and under adb or any daemon the host has none at all -- so the
+// redirect answered ENXIO for a guest that was sitting on a perfectly good
+// pty. Left null, /dev/tty falls back to the host node, which is right for
+// the simple case where the guest inherited the host's own terminal.
+[[nodiscard]] inline kernel::FileNamespace::Producer make_devfs(
+    std::function<int()> ctty = nullptr) {
+    return [ctty = std::move(ctty)](std::string_view abs) -> Result<kernel::VirtualFile> {
         // The character devices we pass straight through to the host. Each is
         // a genuine host device node with the exact semantics the guest wants.
         static constexpr std::array<std::string_view, 7> kChar = {
@@ -85,6 +95,20 @@ namespace lx::vfs {
 
         std::string_view leaf = abs;
         leaf.remove_prefix(std::string_view{"/dev/"}.size());
+
+        // /dev/tty -- "my controlling terminal", by name.
+        //
+        // Resolve it to the slave the guest actually claimed, because the
+        // host's /dev/tty is a DIFFERENT terminal (linuxity's) or none at
+        // all. With no ctty the kernel's answer is ENXIO, and that is what a
+        // daemon after setsid expects to see.
+        if (leaf == "tty" && ctty) {
+            const int n = ctty();
+            if (n < 0) return err<kernel::VirtualFile>(Errno::enxio);
+            kernel::VirtualFile vf;
+            vf.redirect_host = pty_slave_path(n);
+            return ok(std::move(vf));
+        }
 
         // A redirected character device: hand back the real host node so the
         // guest opens the TRUE device (native sink/source/CSPRNG semantics).

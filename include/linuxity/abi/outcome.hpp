@@ -255,31 +255,16 @@ struct ArgRewrite {
     enum class Convert : std::uint8_t {
         none,
         termios_to_termios2,   // widen: host filled termios, guest wants termios2
-        // Overwrite the pgrp/sid the kernel reported with the guest's own.
-        // The REQUEST is unchanged for these -- the point is not to change
-        // what runs but to let the kernel decide whether it may run at all
-        // (ENOTTY on a non-controlling terminal, EBADF on a closed fd) and
-        // only then substitute an answer in the guest's namespace.
-        own_pgrp,
-        own_sid,
-        // Put a value BACK after the probe call clobbered it. A setter that
-        // is rewritten to its read-only sibling (so the kernel can vet the
-        // fd) would otherwise have the caller's input overwritten by what
-        // the getter wrote.
-        restore_u32,
     };
 
     int           arg;              // which argument register to replace
     std::uint64_t to;               // what to put in it
     Convert       convert{Convert::none};
     UAddr         buf{};            // the guest buffer `convert` operates on
-    std::int32_t  subst{0};         // the value own_pgrp / own_sid write
 
     ArgRewrite(int a, std::uint64_t v) noexcept : arg{a}, to{v} {}
     ArgRewrite(int a, std::uint64_t v, Convert c, UAddr b) noexcept
         : arg{a}, to{v}, convert{c}, buf{b} {}
-    ArgRewrite(int a, std::uint64_t v, Convert c, UAddr b, std::int32_t s) noexcept
-        : arg{a}, to{v}, convert{c}, buf{b}, subst{s} {}
 };
 
 // EXITED - the guest asked to terminate. Carries the status, nothing else.

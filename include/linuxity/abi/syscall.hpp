@@ -24,6 +24,7 @@
 #include "linuxity/abi/wire/open_flags.hpp"
 #include "linuxity/abi/wire/stat.hpp"
 #include "linuxity/loader/interp.hpp"
+#include "linuxity/vfs/pty_names.hpp"
 
 #include <array>
 #include <cstdint>
@@ -1556,6 +1557,7 @@ private:
                         return eno(Errno::eloop);
                     // O_PATH|O_NOFOLLOW: hand the LINK to the host.
                     pending_open_ = abs;
+                    pending_flags_ = 0;   // O_PATH never acquires a ctty
                     return Redirect{PathArg{path_arg,
                                             std::move(named.host_path)}};
                 }
@@ -1574,6 +1576,7 @@ private:
         if (pc.realm == kernel::Realm2::host_backed) {
             // Remember the guest path for this fd after the trap assigns it.
             pending_open_ = abs;
+            pending_flags_ = flags;
             // If this opens a directory that is overlaid (writable upper over
             // the read-only rootfs lower), enumerate the UNION of both layers
             // and serve THAT from getdents64 on the resulting fd — otherwise a
@@ -1632,6 +1635,7 @@ private:
                         reinterpret_cast<const std::byte*>(m.data()),
                         reinterpret_cast<const std::byte*>(m.data() + m.size()));
             pending_open_ = vp;
+            pending_flags_ = 0;   // a virtual file is never a terminal
             // A virtual DIRECTORY: stash its entries so getdents64 on the
             // resulting fd enumerates them (the backing temp node is a real
             // empty directory so O_DIRECTORY opens succeed).
@@ -3631,6 +3635,8 @@ private:
     // outright ("cannot set terminal process group"). The stable contract is a
     // fully virtualized job-control view.
     [[nodiscard]] Outcome do_ioctl(const Regs& r) {
+        constexpr std::uint64_t kTIOCSCTTY = 0x540E;  // claim as ctty
+        constexpr std::uint64_t kTIOCNOTTY = 0x5422;  // give up the ctty
         constexpr std::uint64_t kTIOCGPGRP = 0x540F;  // get fg process group
         constexpr std::uint64_t kTIOCSPGRP = 0x5410;  // set fg process group
         constexpr std::uint64_t kTIOCGSID  = 0x5429;  // get session id
@@ -3683,6 +3689,41 @@ private:
             if (request == kTIOCGPGRP || request == kTIOCSPGRP || request == kTIOCGSID)
                 return fwd();
         switch (request) {
+            // TIOCSCTTY / TIOCNOTTY: who owns the terminal.
+            //
+            // These cannot be forwarded. The kernel only lets a SESSION
+            // LEADER claim a ctty, and in host terms the guest's tasks are
+            // not session leaders -- linuxity's own process is. So the host
+            // said EPERM, the guest never acquired a controlling terminal,
+            // and everything downstream unravelled: the TIOCGPGRP probe
+            // below (which asks the kernel to vet the fd) answered ENOTTY,
+            // so bash printed "cannot set terminal process group" and then
+            // "no job control in this shell". Caught on Android, where the
+            // host refuses TIOCSCTTY every time.
+            //
+            // The session bookkeeping is already ours, so answer from it.
+            case kTIOCSCTTY: {
+                const std::int32_t n = pty_slave_of_fd(static_cast<int>(r.arg[0]));
+                if (n < 0) return eno(Errno::enotty);   // not a pty at all
+                const std::int32_t me = ids().pid;
+                // Only a session leader may claim one. getsid == pid is the
+                // definition, and it is what setsid just arranged.
+                if (k_.procs().sid_of(me) != me) return eno(Errno::eperm);
+                const std::int32_t have = k_.procs().ctty_of(me);
+                // Already ours is success; a DIFFERENT terminal is EPERM
+                // unless arg is 1 (steal), which is what the kernel does.
+                if (have >= 0 && have != n && r.arg[2] != 1)
+                    return eno(Errno::eperm);
+                k_.procs().set_ctty(me, n);
+                return val(0);
+            }
+            case kTIOCNOTTY: {
+                const std::int32_t me = ids().pid;
+                if (k_.procs().ctty_of(me) < 0) return eno(Errno::enotty);
+                k_.procs().clear_ctty(me);
+                return val(0);
+            }
+
             // Report the caller's OWN pgrp as the terminal's foreground group
             // (and its own sid as the session): the guest owns its tty, so the
             // shell settles at the prompt instead of looping to acquire it.
@@ -3701,9 +3742,17 @@ private:
             // EBADF -- the ioctls probe caught both by diffing against the
             // live kernel. "Is it a tty" is not the test either: a pty slave
             // opened O_NOCTTY IS a terminal but is not OUR controlling one,
-            // and the kernel still says ENOTTY. Only the kernel knows, so ask
-            // it: forward, and rewrite the answer only if it succeeded.
-            case kTIOCGPGRP:
+            // and the kernel still says ENOTTY.
+            //
+            // We used to forward and let the KERNEL vet the fd. That read
+            // well but was wrong off Linux-with-a-real-tty: the guest's
+            // ctty is ours, claimed via TIOCSCTTY above, and the host knows
+            // nothing about it. On Android the forward answered ENOTTY for
+            // the guest's own terminal and bash lost job control. So vet it
+            // against OUR bookkeeping, which is the authority.
+            case kTIOCGPGRP: {
+                if (!fd_is_our_ctty(static_cast<int>(r.arg[0])))
+                    return eno(Errno::enotty);
                 // Whoever TIOCSPGRP last handed the terminal to; the caller's
                 // own group until someone claims it. Always answering the
                 // caller's own group is what bash needs at the prompt (it
@@ -3712,14 +3761,19 @@ private:
                 // takes the terminal back. But it must not be true while a
                 // JOB holds the tty, or a shell can never tell that the job
                 // is in the foreground and not itself.
-                return ArgRewrite{1, request,
-                                  ArgRewrite::Convert::own_pgrp,
-                                  uaddr(r.arg[2]),
-                                  fg_pgrp_ ? fg_pgrp_ : flat_pgrp()};
-            case kTIOCGSID:
-                return ArgRewrite{1, request,
-                                  ArgRewrite::Convert::own_sid,
-                                  uaddr(r.arg[2]), ids().pid};
+                const std::int32_t fg = fg_pgrp_ ? fg_pgrp_ : flat_pgrp();
+                if (!put_u32(r.arg[2], static_cast<std::uint32_t>(fg)))
+                    return eno(Errno::efault);
+                return val(0);
+            }
+            case kTIOCGSID: {
+                if (!fd_is_our_ctty(static_cast<int>(r.arg[0])))
+                    return eno(Errno::enotty);
+                const std::int32_t sid = k_.procs().sid_of(ids().pid);
+                if (!put_u32(r.arg[2], static_cast<std::uint32_t>(sid)))
+                    return eno(Errno::efault);
+                return val(0);
+            }
             // Accept a foreground-group change and REMEMBER it: the next
             // tcgetpgrp has to report what was just set or the shell decides
             // it lost the terminal.
@@ -3739,17 +3793,13 @@ private:
             // whether this fd is our controlling terminal, and the recorded
             // group is updated only if it said yes.
             case kTIOCSPGRP: {
+                if (!fd_is_our_ctty(static_cast<int>(r.arg[0])))
+                    return eno(Errno::enotty);
                 const std::uint32_t want = get_u32(r.arg[2]);
                 // Record the FOREGROUND group. Writing flat_pgrp_ here moved
                 // the caller itself into the group it was handing the tty to.
                 if (want != 0) fg_pgrp_ = static_cast<std::int32_t>(want);
-                // Convert::none: TIOCGPGRP writes the host's pgrp into the
-                // buffer, but this is a SETTER and that buffer is the
-                // caller's input -- leave it exactly as the guest wrote it.
-                // Only the kernel's verdict on the fd is wanted.
-                return ArgRewrite{1, kTIOCGPGRP,
-                                  ArgRewrite::Convert::restore_u32,
-                                  uaddr(r.arg[2]), static_cast<std::int32_t>(want)};
+                return val(0);
             }
             default:
                 return fwd();   // real host tty/device ioctl
@@ -3801,6 +3851,10 @@ private:
     M& mem_;
     Arch arch_;
     std::string pending_open_;   // guest path awaiting fd assignment by trap
+    // The open flags that go with pending_open_, so note_opened_fd can apply
+    // the ctty rule: opening a tty WITHOUT O_NOCTTY in a session that has
+    // none makes it the controlling terminal.
+    std::uint64_t pending_flags_{0};
     bool pending_dir_{false};    // the pending open is a virtual directory
     std::string pending_lazy_;   // overlaid host dir: union built on 1st getdents
     std::vector<kernel::VirtualDirent> pending_entries_;
@@ -3834,6 +3888,21 @@ public:
         }
         if (fd >= 0 && !pending_open_.empty()) {
             k_.files().bind_fd(static_cast<int>(fd), pending_open_);
+
+            // The OTHER way to get a controlling terminal, besides
+            // TIOCSCTTY: a session leader with no ctty that opens a terminal
+            // without O_NOCTTY acquires it. Most programs rely on exactly
+            // this and never call TIOCSCTTY at all -- util-linux `script`
+            // does not, which is why bash under it still had no terminal
+            // and printed "cannot set terminal process group".
+            if (pending_open_.starts_with("/dev/pts/") &&
+                (pending_flags_ & static_cast<std::uint64_t>(wire::OpenFlag::noctty)) == 0) {
+                const std::int32_t me = ids().pid;
+                if (k_.procs().sid_of(me) == me && k_.procs().ctty_of(me) < 0) {
+                    const std::int32_t n = pty_slave_of_fd(static_cast<int>(fd));
+                    if (n >= 0) k_.procs().set_ctty(me, n);
+                }
+            }
             if (pending_dir_) {
                 // An overlaid host directory defers its union to the first
                 // getdents64; a virtual (procfs/sysfs) directory already has
@@ -3950,6 +4019,64 @@ public:
     // used to be discarded, so a handler that wrote through a bad pointer
     // reported success: getresuid(0x1,0x1,0x1) returned 0 where the kernel
     // returns -1. Callers that can fail must check it.
+
+    // The pty slave NUMBER behind an fd, or -1 if the fd is not a pty slave.
+    //
+    // The fd table already records the guest path every open resolved to, and
+    // the guest spelling of a slave is always /dev/pts/N (devfs maps that to
+    // whatever the host calls it), so the number is a parse away. An fd we
+    // never tracked answers -1 rather than guessing.
+    [[nodiscard]] std::int32_t pty_slave_of_fd(int fd) {
+        const std::string_view gp = k_.files().path_of_fd(fd);
+        constexpr std::string_view kPre = "/dev/pts/";
+        if (!gp.starts_with(kPre)) return -1;
+        const std::string_view n = gp.substr(kPre.size());
+        if (n.empty() || n.find_first_not_of("0123456789") != std::string_view::npos)
+            return -1;
+        return static_cast<std::int32_t>(std::atoi(std::string{n}.c_str()));
+    }
+
+    // Is `fd` this process's CONTROLLING terminal?
+    //
+    // The gate on every session ioctl. A non-tty is ENOTTY, and so is a pty
+    // the caller never claimed -- opening a slave O_NOCTTY gives you a
+    // terminal that is not yours, which is exactly the case the ioctls probe
+    // caught us faking success on.
+    //
+    // An fd with no recorded path but a live ctty is accepted: the guest's
+    // terminal is usually INHERITED (fd 0/1/2 from the launching shell), so
+    // it was never opened through us and has no tracked path. That is the
+    // common case for an interactive session, not an edge case.
+    [[nodiscard]] bool fd_is_our_ctty(int fd) {
+        const std::int32_t have = k_.procs().ctty_of(ids().pid);
+        const std::int32_t n = pty_slave_of_fd(fd);
+        if (n >= 0) return have == n;
+        // Untracked fd (bash reaches the terminal as dup(2)->9, dup3(9,255),
+        // and a dup of an INHERITED fd has no path to mirror). The fd lives
+        // in the tracee, so read what the host says it points at: our pid
+        // view is the host's, so /proc/<pid>/fd/<n> resolves it.
+        return have >= 0 && host_fd_slave_no(fd) == have;
+    }
+
+    // The pty slave number the HOST says `fd` refers to, or -1.
+    //
+    // Reads /proc/<tid>/fd/<fd> in the tracee. That is the only way to
+    // identify an fd we never saw opened -- and an inherited-then-duped
+    // terminal is the common case, not an edge case.
+    [[nodiscard]] std::int32_t host_fd_slave_no(int fd) {
+        if constexpr (!requires { mem_.host_tid(); }) {
+            return -1;   // no tracee /proc to consult
+        } else {
+            char link[64];
+            std::snprintf(link, sizeof link, "/proc/%d/fd/%d", mem_.host_tid(), fd);
+            char tgt[128];
+            const ssize_t k = ::readlink(link, tgt, sizeof tgt - 1);
+            if (k <= 0) return -1;
+            tgt[k] = '\0';
+            return lx::vfs::pty_slave_number(tgt);
+        }
+    }
+
     [[nodiscard]] bool put_u32(std::uint64_t addr, std::uint32_t v) {
         std::array<std::byte, 4> b{};
         std::memcpy(b.data(), &v, 4);
