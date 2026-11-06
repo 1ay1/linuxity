@@ -176,7 +176,7 @@ public:
     }
 
     [[nodiscard]] std::string_view cwd() const noexcept { return cwd_of(cur_pid_); }
-    void set_cwd(std::string c) { cwds_[cur_pid_] = normalize(c); }
+    void set_cwd(std::string c) { cwds_[cur_pid_] = normalize(c); last_cwd_ = cwds_[cur_pid_]; }
 
     // Per-process cwd. linuxity runs a whole guest PROCESS TREE against one
     // FileNamespace, but each process has its OWN current directory — a single
@@ -204,9 +204,25 @@ public:
         if (pid == seeded_pid_) return;
         if (cwds_.find(pid) == cwds_.end()) {
             auto it = cwds_.find(ppid);
-            cwds_[pid] = (it != cwds_.end()) ? it->second : inherited_cwd_;
+            // No record for the parent either. That happens when a task's
+            // first syscall arrives before its parent link is known -- under
+            // `make -j10` the dispatcher saw ppid=0 for roughly one task per
+            // run. inherited_cwd_ is only ever assigned by the macOS
+            // fresh-process fork path, so on Linux it stayed "/" forever and
+            // the task resolved every relative path against the ROOT. That is
+            // the "gcc: can't create s7.o: Permission denied" under a parallel
+            // build: the trace shows it opening /s7.o.
+            //
+            // Fall back to the cwd of the task that was running most recently
+            // instead. A new task is created BY a running one and inherits its
+            // cwd, so that value is the parent's by construction -- and it is
+            // never "/" unless the guest really is there.
+            cwds_[pid] = (it != cwds_.end()) ? it->second : last_cwd_;
         }
         seeded_pid_ = pid;
+        // Remember this task's cwd as the fallback for the next task whose
+        // parent we have not learned yet.
+        if (const auto& c = cwds_[pid]; !c.empty()) last_cwd_ = c;
     }
     // On fork/clone the child inherits a COPY of the parent's cwd.
     void inherit_cwd(std::int32_t child, std::int32_t parent) {
@@ -951,6 +967,10 @@ private:
     // cwd for a pid with no record and no recorded parent: "/" for the root
     // process, the parent's cwd in a forked child (import_process_state).
     std::string inherited_cwd_{"/"};
+    // The cwd of the most recently seen task, used to seed a task whose parent
+    // link is not known yet (see set_current_pid). Mutable for the same reason
+    // cwds_ is: set_current_pid is const because it only updates bookkeeping.
+    mutable std::string last_cwd_{"/"};
     std::unordered_map<int, std::string> fd_paths_;
     std::unordered_map<int, DirStream> dir_streams_;
     MetaStore meta_{};
