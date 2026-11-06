@@ -9,6 +9,7 @@
 #include "linuxity/conform/arch.hpp"
 #include "linuxity/host/posix_host.hpp"
 #include "linuxity/kernel/kernel.hpp"
+#include "linuxity/kernel/resolver.hpp"
 #include "linuxity/kernel/resources.hpp"
 #include "linuxity/loader/interp.hpp"
 #include "linuxity/runtime/linux/ptrace_trap.hpp"
@@ -25,6 +26,8 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 extern char** environ;
@@ -55,28 +58,6 @@ void reserve_low_fds() {
         }
         // fd == want: keep it open, occupying the slot.
     }
-}
-
-// A rootfs's /etc/resolv.conf carries a usable nameserver line?
-// A freshly extracted rootfs frequently ships resolv.conf as empty, absent,
-// or a dangling symlink (Debian minbase points it at systemd-resolved's
-// runtime stub), so DNS — and thus `pacman -Sy`, `apt update`, `curl` — breaks
-// out of the box. Returns true iff the file exists and contains a non-comment
-// `nameserver` directive.
-[[nodiscard]] bool rootfs_has_usable_dns(const std::string& host_resolv) {
-    std::FILE* f = std::fopen(host_resolv.c_str(), "r");
-    if (!f) return false;
-    char line[512];
-    bool ok = false;
-    while (std::fgets(line, sizeof line, f)) {
-        const char* p = line;
-        while (*p == ' ' || *p == '\t') ++p;
-        if (*p == '#' || *p == ';') continue;
-        if (std::strncmp(p, "nameserver", 10) == 0 &&
-            (p[10] == ' ' || p[10] == '\t')) { ok = true; break; }
-    }
-    std::fclose(f);
-    return ok;
 }
 
 // If a real cgroup bound was requested but linuxity's OWN cgroup has no
@@ -446,22 +427,74 @@ int main(int argc, char** argv) {
 
     // Guarantee working DNS in a real rootfs (the proot-distro lesson, done
     // the modern way). proot-distro OVERWRITES the rootfs's /etc/resolv.conf on
-    // disk with hardcoded 8.8.8.8; linuxity instead, only when the rootfs's own
-    // resolv.conf has no usable nameserver, BINDS the HOST's live
-    // /etc/resolv.conf over the guest path — so DNS tracks whatever the host
-    // actually uses (VPN, split-horizon, corporate resolver) and the pristine
-    // rootfs is never mutated. A single-FILE bind rides the same mount_host as
-    // --bind. Opt out with LINUXITY_NO_DNS=1. Skipped without --root (the guest
-    // already shares the host's real /etc).
+    // disk with hardcoded 8.8.8.8; linuxity never mutates the image.
+    //
+    // DNS. A pristine rootfs ships /etc/resolv.conf empty or absent, so the
+    // runtime supplies one: kernel/resolver.hpp picks the nameservers (env
+    // override > the image's own > the host's resolv.conf > public) and the
+    // namespace serves the result as a VIRTUAL file, like /proc and /dev.
+    //
+    // This used to BIND the host's /etc/resolv.conf, which is a glibc-ism:
+    // Android has no such file (DNS lives in netd), so the bind silently did
+    // nothing and every guest lookup failed while the host resolved fine.
+    // Serving a virtual file is one path for every host and never mutates
+    // the image. Opt out with LINUXITY_NO_DNS=1.
     if (!root.empty() && !std::getenv("LINUXITY_NO_DNS")) {
-        auto pc = k.files().classify("/etc/resolv.conf");
-        bool guest_ok = pc.realm == kernel::Realm2::host_backed &&
-                        rootfs_has_usable_dns(pc.host_path);
-        if (!guest_ok && rootfs_has_usable_dns("/etc/resolv.conf")) {
-            k.files().mount_host("/etc/resolv.conf", "/etc/resolv.conf");
-            std::fprintf(stderr,
-                "linuxity: bind /etc/resolv.conf -> host (rootfs had no DNS)\n");
+        const auto gpc = k.files().classify("/etc/resolv.conf");
+        const std::string guest_resolv =
+            gpc.realm == kernel::Realm2::host_backed ? gpc.host_path : std::string{};
+
+        const auto choice = kernel::choose_nameservers(
+            std::getenv("LINUXITY_DNS"), "/etc/resolv.conf", guest_resolv);
+
+        // The image's own resolver needs no help: leave the file alone so the
+        // guest keeps whatever it shipped (and any options with it).
+        if (choice.origin != kernel::ResolverOrigin::guest_file &&
+            !choice.empty()) {
+            const std::string body = kernel::render_resolv_conf(choice.servers);
+            k.files().mount_virtual(
+                "/etc/resolv.conf",
+                [body](std::string_view) -> Result<kernel::VirtualFile> {
+                    kernel::VirtualFile vf;
+                    vf.bytes.assign(
+                        reinterpret_cast<const std::byte*>(body.data()),
+                        reinterpret_cast<const std::byte*>(body.data() + body.size()));
+                    return vf;
+                });
+            std::fprintf(stderr, "linuxity: dns from %s (%s)\n",
+                         std::string{kernel::origin_name(choice.origin)}.c_str(),
+                         choice.servers.front().c_str());
         }
+    }
+
+    // Which AF_UNIX namespace this host actually permits. Probed, not
+    // assumed: Android's SELinux denies a filesystem bind in every directory
+    // an app can write, so a guest gpg-agent/ssh-agent/dirmngr would fail
+    // with EACCES on a path the runtime translated perfectly. Everywhere else
+    // this succeeds and nothing changes.
+    //
+    // The probe binds a socket in the overlay upper (where a guest's would
+    // go) and unlinks it. One syscall pair at startup beats a per-host #ifdef.
+    {
+        std::string probe = (persist.empty() ? std::string{"/tmp"} : persist) +
+                            "/.linuxity-sock-probe";
+        ::unlink(probe.c_str());
+        bool fs_ok = false;
+        if (int fd = ::socket(AF_UNIX, SOCK_STREAM, 0); fd >= 0) {
+            ::sockaddr_un sa{};
+            sa.sun_family = AF_UNIX;
+            std::snprintf(sa.sun_path, sizeof sa.sun_path, "%s", probe.c_str());
+            fs_ok = ::bind(fd, reinterpret_cast<::sockaddr*>(&sa), sizeof sa) == 0;
+            ::close(fd);
+            ::unlink(probe.c_str());
+        }
+        if (!fs_ok) {
+            k.files().set_socket_ns(kernel::SocketNs::abstract);
+            std::fprintf(stderr,
+                "linuxity: host forbids filesystem AF_UNIX binds; using the "
+                "abstract namespace\n");
+        }
+        k.files().set_instance_id(static_cast<std::uint64_t>(::getpid()));
     }
 
     // The rootfs makes the translation unprivileged, so we no longer need to

@@ -1878,6 +1878,28 @@ private:
                                          path_bytes));
         if (guest_path.empty() || guest_path.front() != '/') return fwd();
 
+        // Where this host lets us put a socket. On Android no directory an
+        // app can write permits an AF_UNIX bind (SELinux), so a filesystem
+        // translation would be correct and still fail with EACCES; the
+        // abstract namespace is the only one available. Both bind and connect
+        // come through here and hash the same GUEST path, so the peers still
+        // meet -- the name is derived from what they agree on, not from the
+        // host path they each translate separately.
+        if (k_.files().socket_ns() == kernel::SocketNs::abstract) {
+            const std::string name = kernel::abstract_name_for(
+                guest_path, k_.files().instance_id());
+            // An abstract address is a leading NUL then the name, and its
+            // LENGTH is what delimits it -- there is no terminator. Hand the
+            // trap the exact bytes to poke.
+            std::string addr_bytes;
+            addr_bytes.push_back('\0');
+            addr_bytes += name;
+            if (addr_bytes.size() > 108) return fwd();
+            const std::uint64_t alen = 2 + addr_bytes.size();
+            return SockRewrite{uaddr(addr + 2), std::move(addr_bytes),
+                               /*len_arg=*/2, alen};
+        }
+
         // Translate the AF_UNIX filesystem path into the SAME host path a file
         // open of guest_path would resolve to. The guest is NOT chroot'd when
         // linuxity runs unprivileged (chroot(2) needs CAP_SYS_CHROOT), so a

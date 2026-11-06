@@ -26,6 +26,7 @@
 #include "linuxity/abi/result.hpp"
 #include "linuxity/abi/types.hpp"
 #include "linuxity/kernel/meta_store.hpp"
+#include "linuxity/kernel/socket_ns.hpp"
 
 #include <sys/stat.h>
 #include <dirent.h>
@@ -177,6 +178,18 @@ public:
 
     [[nodiscard]] std::string_view cwd() const noexcept { return cwd_of(cur_pid_); }
     void set_cwd(std::string c) { cwds_[cur_pid_] = normalize(c); last_cwd_ = cwds_[cur_pid_]; }
+
+    // How AF_UNIX sockets are named on this host. Filesystem everywhere POSIX
+    // lets us create a socket node; abstract where it does not (Android's
+    // SELinux denies the bind in every directory an app can write). Probed
+    // once at startup rather than assumed, because guessing wrong means every
+    // socket-using guest daemon fails with EACCES.
+    [[nodiscard]] SocketNs socket_ns() const noexcept { return socket_ns_; }
+    void set_socket_ns(SocketNs ns) noexcept { socket_ns_ = ns; }
+
+    // Distinguishes concurrent linuxity instances in the abstract namespace.
+    [[nodiscard]] std::uint64_t instance_id() const noexcept { return instance_id_; }
+    void set_instance_id(std::uint64_t id) noexcept { instance_id_ = id; }
 
     // Per-process cwd. linuxity runs a whole guest PROCESS TREE against one
     // FileNamespace, but each process has its OWN current directory — a single
@@ -598,6 +611,9 @@ public:
     }
 
 private:
+    SocketNs      socket_ns_{SocketNs::filesystem};
+    std::uint64_t instance_id_{0};
+
     struct Mount {
         std::string prefix;      // absolute guest prefix
         std::string host_base;   // real (lower) dir; empty for virtual mounts

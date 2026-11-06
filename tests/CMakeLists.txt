@@ -4,7 +4,7 @@
 set(LX_PORTABLE_TESTS
     core authority vfs interp file_namespace sysfs_proctree
     resources address_space sysno conformance outcome wire fd_slots
-    conform_law conform_hosts conform_coverage)
+    conform_law conform_hosts conform_coverage resolver)
 
 # Tests that instantiate PosixHost. These exercise the POSIX *host backend*
 # (mmap/dirent/pread), not the portable core, so they are POSIX-only: the

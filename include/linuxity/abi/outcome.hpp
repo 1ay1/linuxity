@@ -215,9 +215,13 @@ struct ExecInterp {
 // both peers resolve to the same in-overlay node.
 struct SockRewrite {
     UAddr         path_addr;    // guest address of sockaddr_un.sun_path
-    std::string   host_path;    // translated host path to write there
+    // The bytes to write there. Usually a NUL-terminated host path; for an
+    // ABSTRACT address (hosts that forbid a filesystem bind) it is a leading
+    // NUL followed by the name, where new_len -- not a terminator -- is what
+    // delimits it. Written byte-wise, so an embedded NUL survives.
+    std::string   host_path;
     int           len_arg{2};   // register holding socklen
-    std::uint64_t new_len{0};   // family + path + NUL
+    std::uint64_t new_len{0};   // family + path (+ NUL for the filesystem form)
 
     SockRewrite(UAddr pa, std::string hp, int la, std::uint64_t nl)
         : path_addr{pa}, host_path{std::move(hp)}, len_arg{la}, new_len{nl} {}
