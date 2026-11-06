@@ -630,6 +630,38 @@ public:
         return &it->second;
     }
 
+    // The INVERSE of classify(): given a real host path, what does the guest
+    // call it? Empty when the path is not inside any of our mounts -- a host
+    // library the guest never sees, which the caller should leave alone.
+    //
+    // Needed because /proc/<pid>/maps names real files, and the guest must
+    // be told its binary is /usr/bin/sh rather than wherever the rootfs
+    // happens to be unpacked. Longest base wins, so an overlay upper inside
+    // a lower does not resolve to the outer mount.
+    [[nodiscard]] std::string guest_path_of(std::string_view host) const {
+        const Mount* best = nullptr;
+        std::size_t best_len = 0;
+        bool via_upper = false;
+        auto under = [&](std::string_view base) {
+            if (base.empty() || host.size() < base.size()) return false;
+            if (host.substr(0, base.size()) != base) return false;
+            return host.size() == base.size() || host[base.size()] == '/';
+        };
+        for (const Mount& m : mounts_) {
+            if (under(m.upper) && m.upper.size() > best_len) {
+                best = &m; best_len = m.upper.size(); via_upper = true;
+            }
+            if (under(m.host_base) && m.host_base.size() > best_len) {
+                best = &m; best_len = m.host_base.size(); via_upper = false;
+            }
+        }
+        if (!best) return {};
+        const std::string& base = via_upper ? best->upper : best->host_base;
+        std::string rel{host.substr(base.size())};
+        if (best->prefix == "/") return rel.empty() ? "/" : rel;
+        return rel.empty() ? best->prefix : best->prefix + rel;
+    }
+
     // Is this guest path one of our mount points? umount2 of something that
     // was never mounted is EINVAL, and that is how a program tests whether
     // it holds a mount -- answering 0 to everything told it yes always.

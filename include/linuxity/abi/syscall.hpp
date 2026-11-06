@@ -1148,6 +1148,18 @@ private:
             const std::string& vp = pc.virtual_path.empty() ? abs : pc.virtual_path;
             auto vf = k_.files().produce(vp);
             if (!vf) return eno(vf.error());
+            // /proc/<pid>/maps is a STUB in procfs -- it has no idea what the
+            // process mapped. The guest is a real host process, so the
+            // backend can read its actual map; fill it in here, where both
+            // the backend and the namespace are reachable. An empty maps
+            // file is not a plausible process, and pstack, a debugger
+            // attaching to a guest, and any allocator or sanitizer that
+            // walks its own mappings all read it.
+            if (vf->bytes.empty() && is_proc_maps(vp))
+                if (auto m = guest_maps(); !m.empty())
+                    vf->bytes.assign(
+                        reinterpret_cast<const std::byte*>(m.data()),
+                        reinterpret_cast<const std::byte*>(m.data() + m.size()));
             pending_open_ = vp;
             // A virtual DIRECTORY: stash its entries so getdents64 on the
             // resulting fd enumerates them (the backing temp node is a real
@@ -1157,6 +1169,50 @@ private:
             return Inject{path_arg, std::move(vf->bytes), vf->is_dir};
         }
         return eno(pc.error);
+    }
+
+    // Is this /proc/<pid>/maps (or the self/thread-self spellings)? The
+    // caller has already bound /proc/self to a real pid.
+    [[nodiscard]] static bool is_proc_maps(std::string_view p) noexcept {
+        return p.starts_with("/proc/") && p.ends_with("/maps");
+    }
+
+    // The guest's real memory map, with HOST paths rewritten back into the
+    // guest namespace. Without that rewrite the file would tell the guest
+    // its own binary lives at /tmp/linuxity-tmp-N/usr/bin/sh, which both
+    // leaks where the rootfs really is and is a path the guest cannot open.
+    [[nodiscard]] std::string guest_maps() {
+        if constexpr (!requires { mem_.host_maps(); }) {
+            return {};
+        } else {
+            auto raw = mem_.host_maps();
+            if (!raw) return {};
+            std::string out;
+            out.reserve(raw->size());
+            std::size_t pos = 0;
+            while (pos < raw->size()) {
+                const std::size_t eol = raw->find('\n', pos);
+                std::string_view line{*raw};
+                line = line.substr(pos, (eol == std::string::npos ? raw->size() : eol) - pos);
+                // The path, if any, is the last field and always absolute.
+                const std::size_t slash = line.find(" /");
+                if (slash == std::string_view::npos) {
+                    out.append(line);
+                } else {
+                    const std::string_view head = line.substr(0, slash + 1);
+                    const std::string_view hp = line.substr(slash + 1);
+                    out.append(head);
+                    if (auto g = k_.files().guest_path_of(hp); !g.empty())
+                        out.append(g);
+                    else
+                        out.append(hp);   // not ours: a host lib, leave it
+                }
+                out.push_back('\n');
+                if (eol == std::string::npos) break;
+                pos = eol + 1;
+            }
+            return out;
+        }
     }
 
     // stat/lstat/newfstatat: redirect host-backed to the real path; for
@@ -2726,9 +2782,12 @@ private:
     // caught by diffing against the live kernel.
     [[nodiscard]] Outcome do_getres(const Regs& r) {
         if (!r.arg[0] || !r.arg[1] || !r.arg[2]) return eno(Errno::efault);
-        put_u32(r.arg[0], 0);
-        put_u32(r.arg[1], 0);
-        put_u32(r.arg[2], 0);
+        // A non-null pointer can still be unwritable. put_u32 used to
+        // swallow that, so writing through 0x1 reported success where the
+        // kernel says EFAULT -- the null check caught only the easy half.
+        if (!put_u32(r.arg[0], 0) || !put_u32(r.arg[1], 0) ||
+            !put_u32(r.arg[2], 0))
+            return eno(Errno::efault);
         return val(0);
     }
 
@@ -2869,14 +2928,20 @@ public:
         // stat @28/@32, aarch64 stat @24/@28, statx @20/@24), so write them as
         // one 8-byte copy: one process_vm_writev per stat instead of two.
         // Fall back to two writes if a future layout ever splits them.
+        // The scrub overlays fields on a buffer the KERNEL already filled
+        // successfully, so the address is known good and a failed write here
+        // is not an EFAULT the guest should see -- the syscall it asked for
+        // worked. Discarding is deliberate; the casts say so, since put_u32
+        // is [[nodiscard]] precisely so the callers that CAN fail (getresuid
+        // writing through a guest pointer) cannot ignore it by accident.
         if (gid_off == uid_off + 4) {
             std::array<std::byte, 8> b{};
             std::memcpy(b.data(), &uid, 4);
             std::memcpy(b.data() + 4, &gid, 4);
             (void)mem_.copy_out(uaddr(base + uid_off), b);
         } else {
-            put_u32(base + uid_off, uid);
-            put_u32(base + gid_off, gid);
+            (void)put_u32(base + uid_off, uid);
+            (void)put_u32(base + gid_off, gid);
         }
 
         // --- mode: overlay the guest-intended permission bits when recorded ---
@@ -2888,17 +2953,22 @@ public:
                 put_u16(base + mode_off, eff);
             } else {
                 std::uint32_t host_mode = get_u32(base + mode_off);
-                put_u32(base + mode_off,
-                        kernel::MetaStore::effective_mode(host_mode, *rec));
+                (void)put_u32(base + mode_off,
+                              kernel::MetaStore::effective_mode(host_mode, *rec));
             }
         }
     }
 
     // Small typed guest-memory pokes/peeks for the scrub overlay.
-    void put_u32(std::uint64_t addr, std::uint32_t v) {
+    // Returns false if the guest buffer could not be written -- an unmapped
+    // or read-only address, which the kernel answers with EFAULT. The result
+    // used to be discarded, so a handler that wrote through a bad pointer
+    // reported success: getresuid(0x1,0x1,0x1) returned 0 where the kernel
+    // returns -1. Callers that can fail must check it.
+    [[nodiscard]] bool put_u32(std::uint64_t addr, std::uint32_t v) {
         std::array<std::byte, 4> b{};
         std::memcpy(b.data(), &v, 4);
-        (void)mem_.copy_out(uaddr(addr), b);
+        return static_cast<bool>(mem_.copy_out(uaddr(addr), b));
     }
     void put_u16(std::uint64_t addr, std::uint16_t v) {
         std::array<std::byte, 2> b{};

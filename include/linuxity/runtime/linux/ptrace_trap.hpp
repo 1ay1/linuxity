@@ -38,6 +38,8 @@
 #include <csignal>
 #include <cerrno>
 
+#include <optional>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -1031,6 +1033,33 @@ public:
     // The supervisor's own stat is safe here because the path has ALREADY been
     // translated through FileNamespace -- it is a host path we chose, not
     // guest-controlled text, so this cannot be used to escape the namespace.
+    // The TRACEE's real memory map, as /proc/<pid>/maps text.
+    //
+    // The guest is a real host process, so its mappings are real and the
+    // honest answer is to report them. procfs served an EMPTY file, which is
+    // worse than it sounds: `pstack`, a debugger attaching to a guest, and
+    // any allocator or sanitizer that walks its own mappings all read this,
+    // and an empty map is not a plausible process.
+    //
+    // Host paths in the right-hand column are the caller's problem to
+    // translate -- they are rootfs paths like /tmp/linuxity-tmp-N/usr/bin/sh
+    // and must be mapped back into the guest's namespace before the guest
+    // sees them, or the file leaks where its rootfs really lives.
+    [[nodiscard]] std::optional<std::string> host_maps() const {
+        const std::string p = "/proc/" + std::to_string(cur_) + "/maps";
+        std::FILE* f = std::fopen(p.c_str(), "re");
+        if (!f) return std::nullopt;
+        std::string out;
+        char buf[4096];
+        while (std::size_t n = std::fread(buf, 1, sizeof buf, f))
+            out.append(buf, n);
+        std::fclose(f);
+        return out;
+    }
+
+    // The supervisor's own stat is safe here because the path has ALREADY
+    // been translated through FileNamespace -- it is a host path we chose,
+    // not guest-controlled text, so this cannot be used to escape.
     [[nodiscard]] std::optional<abi::wire::StatFields>
     stat_host_path(const std::string& path) const {
         struct ::stat st{};
