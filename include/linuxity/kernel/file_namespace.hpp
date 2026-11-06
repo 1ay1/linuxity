@@ -630,6 +630,35 @@ public:
         return &it->second;
     }
 
+    // Is this absolute path one WE produced -- i.e. already a host-side path
+    // inside one of our mount roots, rather than a guest path to translate?
+    //
+    // Needed because sockaddr translation rewrites the caller's buffer IN
+    // PLACE, so a program that reuses one sockaddr for bind and then connect
+    // presents an already-translated path the second time. Translating twice
+    // doubled the prefix and the two peers never met. Checking against the
+    // mount roots makes translation idempotent.
+    //
+    // Two things this must NOT do, both of which open a confinement hole by
+    // leaving a guest path untranslated:
+    //   * match on a root mount (host_base "/"), since every absolute path
+    //     is "under" it -- that made every socket path look pre-translated.
+    //   * match a bare prefix, so "/a/bc" is not treated as inside "/a/b".
+    // A root base is therefore skipped outright: a path already translated
+    // through it is indistinguishable from a guest path, so there is nothing
+    // to detect and the double-translation it would cause is a no-op anyway.
+    [[nodiscard]] bool is_host_side_path(std::string_view abs) const {
+        auto under = [&](std::string_view base) {
+            if (base.size() < 2 || base == "/") return false;   // not a root
+            if (abs.size() <= base.size()) return false;
+            if (abs.substr(0, base.size()) != base) return false;
+            return abs[base.size()] == '/';
+        };
+        for (const Mount& m : mounts_)
+            if (under(m.host_base) || under(m.upper)) return true;
+        return false;
+    }
+
     // Normalize an absolute path: collapse "//", resolve "." and "..", drop a
     // trailing slash (except root). Pure lexical (no symlink following).
     //

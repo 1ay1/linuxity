@@ -623,6 +623,17 @@ public:
                 // a supported version; otherwise hand back a dummy ruleset fd.
                 return val((r.arg[2] & 1u) ? 1 : 3);
             case Sysno::landlock_add_rule:
+                // Accepted as a no-op, but NOT unconditionally: the kernel
+                // validates its arguments before it ever consults policy, and
+                // a null rule_attr is EFAULT. Returning 0 for anything at all
+                // means a sandbox library probing for support with a
+                // deliberately bad call concludes the opposite of the truth.
+                // An unknown rule type is EINVAL for the same reason.
+                if (r.arg[2] == 0) return eno(Errno::efault);
+                if (r.arg[1] != 1 /*LANDLOCK_RULE_PATH_BENEATH*/ &&
+                    r.arg[1] != 2 /*LANDLOCK_RULE_NET_PORT*/)
+                    return eno(Errno::einval);
+                return val(0);
             case Sysno::landlock_restrict_self:
                 return val(0);
 
@@ -1983,6 +1994,21 @@ private:
                                ::strnlen(reinterpret_cast<const char*>(pb.data()),
                                          path_bytes));
         if (guest_path.empty() || guest_path.front() != '/') return fwd();
+
+        // ALREADY TRANSLATED? The rewrite below overwrites the guest's
+        // sockaddr IN PLACE (it is the caller's own buffer, and the bytes
+        // must go in via POKEDATA to be ordered against copy_from_user), so
+        // a program that reuses one sockaddr for bind and then connect hands
+        // us back a HOST path the second time. Translating that again
+        // doubled the prefix -- /tmp is mounted on a directory under /tmp,
+        // so bind landed on /tmp/linuxity-tmp-N/sock while connect looked
+        // for /tmp/linuxity-tmp-N/linuxity-tmp-N/sock and got ENOENT. The
+        // two peers never met, which is every AF_UNIX client/server pair in
+        // one process: dbus, gpg-agent, a test harness talking to itself.
+        //
+        // Translation has to be idempotent. A path that is already inside
+        // one of our own mount roots is one we produced, so leave it be.
+        if (k_.files().is_host_side_path(guest_path)) return fwd();
 
         // Where this host lets us put a socket. On Android no directory an
         // app can write permits an AF_UNIX bind (SELinux), so a filesystem

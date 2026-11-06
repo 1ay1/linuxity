@@ -84,7 +84,8 @@ constexpr int kInterceptedHandlers =
 //
 // History, against the real denominator of 130 intercepted handlers:
 //   ioctls, legacy, xattrs, creds, cwdfs, jitwx, proclife -> 90
-constexpr std::size_t kVerifiedFloor = 90;
+//   syscalls2 (fs tail, sockets, notify, landlock, handles)  -> 108
+constexpr std::size_t kVerifiedFloor = 108;
 
 } // namespace
 

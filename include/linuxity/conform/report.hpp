@@ -44,6 +44,7 @@ namespace detail {
         case EOPNOTSUPP: return "EOPNOTSUPP";
         case EFAULT:  return "EFAULT";
         case ECHILD:  return "ECHILD";
+        case EXDEV:   return "EXDEV";
         default:      return nullptr;
     }
 }
@@ -424,6 +425,40 @@ inline std::string Scenario::key() const {
                     .exercising(abi::Sysno::prctl)
                     .exercising(abi::Sysno::getpgrp)
                     .exercising(abi::Sysno::rt_sigsuspend)
+                    .on(DirFlavour::host_backed));
+
+    // The long tail: fs calls nothing else reached, the xattr *at forms,
+    // sockets, inotify/fanotify, landlock, the file-handle API.
+    //
+    // A syscall that FAILS is still conformance. EPERM, ENOSYS and EINVAL
+    // are answers, and the guest must give the SAME one as the kernel: a
+    // guest that returns 0 where the kernel refuses is lying to the program,
+    // and one that says ENOSYS where the kernel says EPERM breaks feature
+    // detection. That is what makes most of this group testable without
+    // privilege -- the agreement is the property, not the success.
+    //
+    // bind/connect also cover the confinement boundary: a guest's AF_UNIX
+    // path must be translated into the overlay, never left on the host.
+    // landlock_restrict_self is irreversible, so it runs in a forked child.
+    v.push_back(Scenario{"syscalls2", "syscalls2"}
+                    .exercising(abi::Sysno::fchmodat2)
+                    .exercising(abi::Sysno::openat2)
+                    .exercising(abi::Sysno::utime)
+                    .exercising(abi::Sysno::futimesat)
+                    .exercising(abi::Sysno::mknod)
+                    .exercising(abi::Sysno::setxattrat)
+                    .exercising(abi::Sysno::getxattrat)
+                    .exercising(abi::Sysno::listxattrat)
+                    .exercising(abi::Sysno::removexattrat)
+                    .exercising(abi::Sysno::bind)
+                    .exercising(abi::Sysno::connect)
+                    .exercising(abi::Sysno::inotify_add_watch)
+                    .exercising(abi::Sysno::fanotify_mark)
+                    .exercising(abi::Sysno::landlock_create_ruleset)
+                    .exercising(abi::Sysno::landlock_add_rule)
+                    .exercising(abi::Sysno::landlock_restrict_self)
+                    .exercising(abi::Sysno::name_to_handle_at)
+                    .exercising(abi::Sysno::open_by_handle_at)
                     .on(DirFlavour::host_backed));
 
     return v;

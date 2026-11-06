@@ -50,6 +50,7 @@ static const char* lx_errno_name(int e) {
         case EOPNOTSUPP: return "EOPNOTSUPP";
         case EFAULT:  return "EFAULT";
         case ECHILD:  return "ECHILD";
+        case EXDEV:   return "EXDEV";
         default:      return 0;
     }
 }

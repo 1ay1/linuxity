@@ -1,0 +1,35 @@
+# linuxity conformance trace
+# scenario: syscalls2
+# arch: aarch64
+# recorded-by: live Linux kernel on this host
+# kernel: Linux 6.1.162-android14-11-g9dd05ae3a1de-ab16261587
+fchmodat2 = 1 | fchmodat2 works, or is ENOSYS on a kernel without it
+fchmodat2 = 1 | fchmodat2 on a missing file is ENOENT (or ENOSYS)
+openat2 = 1 | openat2 opens a file
+openat2 = -EINVAL | openat2 with a short struct is EINVAL
+openat2 = -EXDEV | RESOLVE_BENEATH refuses to escape
+utime = 2 | utime sets a fixed mtime
+utime = 2 | utime on a missing file is ENOENT
+futimesat = 2 | futimesat sets times
+mknod = 2 | mknod makes a FIFO
+mknod = 2 | mknod of a character device without privilege is EPERM
+setxattrat = -ENOSYS | setxattrat
+getxattrat = -ENOSYS | getxattrat
+listxattrat = -ENOSYS | listxattrat
+removexattrat = -ENOSYS | removexattrat
+socket = 1 | an AF_UNIX stream socket
+bind = -EACCES | bind it to a path in our own tree
+bind = 2 | listen on it
+connect = 2 | connect to it from a second socket
+connect = 1 | connect to a missing socket is refused
+inotify_add_watch = 1 | inotify_init1
+inotify_add_watch = 1 | watch a directory
+inotify_add_watch = -ENOENT | watching a missing path is ENOENT
+fanotify_mark = -ENOSYS | fanotify_init (EPERM without CAP_SYS_ADMIN)
+fanotify_mark = -ENOSYS | fanotify_mark
+landlock_create_ruleset = 1 | create a ruleset: works, or ENOSYS where the host has none
+landlock_add_rule = 1 | add_rule with a null attr is refused
+landlock_restrict_self = 1 | restrict_self in a child either works or is refused
+name_to_handle_at = 1 | name_to_handle_at either works or is cleanly refused
+open_by_handle_at = 1 | open_by_handle_at is refused (a success here escapes the namespace)
+unlinkat = 0 | remove the scratch dir

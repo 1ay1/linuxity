@@ -374,16 +374,26 @@ private:
 //     or EBADF from the kernel must still be matched exactly.
 //   * only in the direction native-failed / guest-succeeded. If the guest
 //     fails where the host succeeded, that is a regression and is reported.
-//   * only for ioctl, the syscall a host security policy actually filters.
+//   * only for the syscalls a host security policy actually filters: ioctl
+//     (SELinux's per-command whitelist) and bind (Android forbids a
+//     filesystem AF_UNIX bind in every directory an app can write, so
+//     linuxity falls back to the abstract namespace -- which is the whole
+//     reason the guest's sockets work there at all).
 //
 // The effect: the aarch64 golden still RECORDS the denial as the kernel's
 // truth, and the guest is still held to every other observation.
 class HostPolicyMayDeny {
 public:
+    [[nodiscard]] static constexpr bool filtered(abi::Sysno c) noexcept {
+        // connect rides along with bind: if the host refused the bind there
+        // is nothing to connect TO, so the probe marks the follow-up not
+        // applicable while the guest -- whose bind succeeded -- answers it.
+        return c == abi::Sysno::ioctl || c == abi::Sysno::bind ||
+               c == abi::Sysno::connect;
+    }
     [[nodiscard]] bool exempt(const Observation& n,
                               const Observation& g) const noexcept {
-        if (n.call != abi::Sysno::ioctl || g.call != abi::Sysno::ioctl)
-            return false;
+        if (!filtered(n.call) || n.call != g.call) return false;
         // (a) the call itself: host denied by policy, linuxity served it.
         if (g.returned.is_ok() &&
             n.returned.match([](std::int64_t) { return false; },
@@ -405,13 +415,13 @@ public:
         return na(n) != na(g);
     }
     [[nodiscard]] static constexpr std::string_view reason() noexcept {
-        return "the host denied an ioctl by policy (EACCES/EPERM) and linuxity "
-               "served it anyway -- Android's SELinux whitelist rejects "
-               "TCGETS2 on a pty slave, which is exactly what the guest kernel "
-               "is there to paper over. Covers the denied call and any "
-               "invariant the probe marked not-applicable because of it; the "
-               "reverse direction, and any two answered results, are never "
-               "exempt";
+        return "the host denied a policy-filtered syscall (EACCES/EPERM) and "
+               "linuxity served it anyway -- Android's SELinux whitelist "
+               "rejects TCGETS2 on a pty slave and forbids a filesystem "
+               "AF_UNIX bind, both of which the guest kernel is there to "
+               "paper over. Covers the denied call and any invariant the "
+               "probe marked not-applicable because of it; the reverse "
+               "direction, and any two answered results, are never exempt";
     }
 };
 
