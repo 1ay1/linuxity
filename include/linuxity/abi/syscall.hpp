@@ -964,6 +964,22 @@ private:
         return PathSyntax::ok;
     }
 
+    // An EMPTY path argument is ENOENT for every path syscall, and that is
+    // not a detail -- it is how a caller distinguishes "nothing supplied"
+    // from "the current directory". Only openat and stat checked it, so the
+    // other twelve absolutized "" to the cwd and acted on the DIRECTORY:
+    // symlinkat(x, "") reported EEXIST, mkdirat("") EEXIST, unlinkat("")
+    // EISDIR, linkat("", y) EXDEV -- four different wrong answers where the
+    // kernel says ENOENT four times. Found by the differential fuzzer, which
+    // generates "" as a path tail precisely because handlers forget it.
+    //
+    // AT_EMPTY_PATH is the documented exception (operate on the dirfd
+    // itself); callers that accept it pass their flags word so it is not
+    // rejected here.
+    [[nodiscard]] bool empty_path_arg(const Regs& r, int path_arg) {
+        return read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)])).empty();
+    }
+
     [[nodiscard]] std::string resolve_arg(const Regs& r, int path_arg, bool at,
                                           bool follow_leaf = true) {
         return resolve_raw(
@@ -1343,6 +1359,7 @@ private:
             return fwd();
         }
         bool nofollow = wire::has_at(flags, wire::AtFlag::symlink_nofollow);
+        if (empty_path_arg(r, 1)) return eno(Errno::enoent);
         std::string abs = resolve_arg(r, 1, true, /*follow_leaf=*/!nofollow);
         // Honor AT_SYMLINK_NOFOLLOW (0x100): coreutils `stat`/`ls -la` statx a
         // symlink with this flag and expect S_IFLNK; following it reported the
@@ -1459,6 +1476,7 @@ private:
                                       std::to_string(id.tid));
         }
 
+        if (empty_path_arg(r, path_arg)) return eno(Errno::enoent);
         std::string abs = resolve_arg(r, path_arg, at, /*follow_leaf=*/false);
         // The buffer + size follow the path arg: readlink(path,buf,sz) ->
         // arg1/arg2; readlinkat(dirfd,path,buf,sz) -> arg2/arg3.
@@ -1643,6 +1661,7 @@ private:
     // execve/execveat: rewrite the program-path argument to the translated
     // host path (host-backed) and forward. Virtual exec targets are refused.
     [[nodiscard]] Outcome path_exec(const Regs& r, int path_arg) {
+        if (empty_path_arg(r, path_arg)) return eno(Errno::enoent);
         std::string abs = resolve_arg(r, path_arg, path_arg == 1);
         auto pc = k_.files().classify(abs);
         // Should this exec get `--overwrite "*"` appended? Only when the
@@ -1805,6 +1824,7 @@ private:
     // A virtual procfs/sysfs path has no backing block device, so synthesize a
     // plausible tmpfs-like statfs rather than leak the host's numbers or fail.
     [[nodiscard]] Outcome path_statfs(const Regs& r) {
+        if (empty_path_arg(r, 0)) return eno(Errno::enoent);
         std::string abs = resolve_arg(r, 0, /*at=*/false);
         auto pc = k_.files().classify(abs);
         if (pc.realm == kernel::Realm2::host_backed) {
@@ -1829,6 +1849,7 @@ private:
     [[nodiscard]] Outcome path_xattr(const Regs& r, bool for_write,
                                      bool follow = true,
                                      int path_arg = 0, bool at = false) {
+        if (empty_path_arg(r, path_arg)) return eno(Errno::enoent);
         std::string abs = resolve_arg(r, path_arg, at);
         // A WRITE (set/remove) whose attribute lives in a PRIVILEGED xattr
         // namespace can never be applied by our unprivileged host process:
@@ -1924,6 +1945,7 @@ private:
     // opt out of pre-creating the chain and let the host kernel apply the rule.
     [[nodiscard]] Outcome path_mut(const Regs& r, int path_arg, bool at, Wi wi,
                                    bool strict_parent = false) {
+        if (empty_path_arg(r, path_arg)) return eno(Errno::enoent);
         std::string abs = resolve_arg(r, path_arg, at);
         auto pc = k_.files().classify(abs, /*for_write=*/true, /*follow=*/false, wi);
         if (pc.realm == kernel::Realm2::virtual_file)
@@ -1977,6 +1999,7 @@ private:
     // overlay-upper node failed. Recording-only makes the mode authoritative
     // and coherent regardless of host privilege.
     [[nodiscard]] Outcome do_chmod(const Regs& r, int path_arg, bool at, Wi /*wi*/) {
+        if (empty_path_arg(r, path_arg)) return eno(Errno::enoent);
         std::string abs = resolve_arg(r, path_arg, at);
         std::uint32_t mode = static_cast<std::uint32_t>(
             r.arg[static_cast<std::size_t>(path_arg) + 1]);
@@ -2067,6 +2090,7 @@ private:
     // which is there, instead of the target, which is not.
     [[nodiscard]] Outcome do_chown(const Regs& r, int path_arg, int uid_arg,
                                    int gid_arg, bool at, bool follow) {
+        if (empty_path_arg(r, path_arg)) return eno(Errno::enoent);
         std::string abs = resolve_arg(r, path_arg, at);
         auto pc = k_.files().classify(abs, /*for_write=*/false, follow);
         if (pc.realm == kernel::Realm2::virtual_file) return eno(Errno::erofs);
@@ -2124,6 +2148,11 @@ private:
     // (it must already exist), the destination CREATES its leaf.
     [[nodiscard]] Outcome path_mut2(const Regs& r, int a1, int a2, bool at,
                                     bool /*at2*/, bool move_meta = false) {
+        // BOTH operands. Checking only the source left symlinkat(x, "") and
+        // renameat(x, "") absolutizing the empty destination to the cwd and
+        // acting on the directory -- EEXIST where the kernel says ENOENT.
+        if (empty_path_arg(r, a1) || empty_path_arg(r, a2))
+            return eno(Errno::enoent);
         std::string src = resolve_arg(r, a1, at);
         std::string dst = resolve_second(r, a2, at);
         auto ps = k_.files().classify(src, true, false, Wi::copy_leaf);
@@ -2258,6 +2287,11 @@ private:
 
     [[nodiscard]] Outcome path_symlink(const Regs& r, int /*target_arg*/,
                                        int link_arg, bool at) {
+        // Only the LINK NAME is a path. The target is literal text that is
+        // never resolved -- a dangling or even nonsense target is legal --
+        // so an empty target is fine while an empty name is ENOENT. Checking
+        // the wrong one of the two is why this needs saying.
+        if (empty_path_arg(r, link_arg)) return eno(Errno::enoent);
         std::string link = at ? resolve_second(r, link_arg, true)
                               : k_.files().absolutize(
                                     read_cstr(uaddr(r.arg[static_cast<std::size_t>(link_arg)])),
