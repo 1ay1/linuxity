@@ -337,9 +337,20 @@ public:
                 // libalpm rewinds the package DB before loading it. See the
                 // note next to 8 in runtime/linux/seccomp_filter.hpp.
                 //
-                // Cost: a regular-file seek is one hash lookup that misses,
-                // then fwd(). Measured at ~3% on `ls -lR /usr` and in the
-                // noise on seek-heavy work, which is worth a correct rewind.
+                // COST, measured rather than estimated. Trapping a syscall
+                // is ~4.7us on this machine (a getpid that does nothing
+                // costs the same), against ~70ns untrapped -- so an lseek on
+                // a REGULAR file pays ~60x for a correctness problem only
+                // directories have. The handler itself is free: one hash
+                // lookup that misses, then fwd().
+                //
+                // It stays trapped because the alternative is wrong, not
+                // because it is cheap: `pacman -Q` reported nothing without
+                // it. The earlier note here said "~3% on ls -lR", which is
+                // true of that WORKLOAD (lseek is rare in it) and says
+                // nothing about the call. tests/bench_syscall.c measures
+                // both, so the distinction stops being guesswork.
+                //
                 // Position is a BYTE cookie matching the d_off getdents64
                 // hands out, so seek arithmetic on those values works. Map
                 // the target back to an entry by walking record lengths.

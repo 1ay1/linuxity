@@ -6,6 +6,23 @@ set(LX_PORTABLE_TESTS
     resources address_space sysno conformance outcome wire fd_slots
     conform_law conform_hosts conform_coverage resolver)
 
+# The syscall-cost benchmark. NOT a ctest: it measures, it does not assert,
+# and a timing threshold in CI is a flake generator. Build it and run it by
+# hand, natively and under linuxity, and compare the ratio -- which cancels
+# the machine out.
+#
+#   cmake --build build --target bench_syscall
+#   ./build/tests/bench_syscall 100000           # native baseline
+#   ./build/linuxity ./build/tests/bench_syscall 100000
+#
+# The conformance suite proves every answer is RIGHT and says nothing about
+# what it COSTS, so a change that made a hot path ten times slower would
+# pass all 55 tests. This is the other half.
+if(CMAKE_SYSTEM_NAME IN_LIST LX_PTRACE_HOSTS)
+    enable_language(C)
+    add_executable(bench_syscall EXCLUDE_FROM_ALL bench_syscall.c)
+endif()
+
 # The intercepted-syscall list that conform_coverage divides by is GENERATED
 # from the dispatcher (tools/intercepted.py), because the hand-written one
 # drifted -- it counted syscalls that merely forward, so coverage read 84%

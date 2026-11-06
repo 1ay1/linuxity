@@ -21,6 +21,41 @@ instruction runs bare on the CPU — no VM, no `/dev/kvm`, no interpreter. A
 backend (FEX / Rosetta-style), and that plugs in behind the same ABI at the
 ISA boundary — it is not the core.
 
+### What it costs
+
+"Native CPU speed" is about instructions, and it is exactly true — a pure
+userspace loop measures the same under linuxity as without it. Syscalls are
+the other story, and they are not free. Measured on one x86-64 host with
+`tests/bench_syscall.c`:
+
+| | native | under linuxity | |
+|---|---|---|---|
+| userspace loop | 2 ns | 2 ns | **1×** — instructions run bare |
+| `write` (untrapped) | 75 ns | 83 ns | **1.1×** — seccomp lets it through |
+| `getpid` (virtualized) | 80 ns | 4.7 µs | **59×** — one ptrace stop |
+| `openat` (path rewritten) | 557 ns | 16.8 µs | **30×** |
+| `ls -lR` on 78k syscalls | 0.10 s | 0.90 s | **9×** |
+
+The cost is the **trap**, not the work: a `getpid` that does nothing costs
+the same as an `lseek` that forwards. A seccomp filter keeps the hot
+untrapped calls (`read`/`write`/`mmap`/`futex`) at native speed, so what a
+workload pays depends entirely on how many *intercepted* syscalls it makes
+— syscall-light work is near-native, `ls -lR` is 9×.
+
+A ptrace stop is not equally cheap everywhere. The same benchmark on an
+arm64 Android device measures ~21 µs per trap against x86-64's ~4.7 µs,
+so the multipliers there are larger — but the shape is identical:
+userspace stays at 2-3 ns and untrapped `write` stays native.
+
+Run it yourself; the ratio is the honest number, since it cancels the
+machine out:
+
+```sh
+cmake --build build --target bench_syscall
+./build/tests/bench_syscall 100000             # native
+./build/linuxity ./build/tests/bench_syscall 100000
+```
+
 ```
             Linux program (AArch64 ELF)
                       │
