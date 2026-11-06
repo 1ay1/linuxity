@@ -1197,6 +1197,19 @@ private:
         return e == Errno::enoent ? fallback : e;
     }
 
+    // Is the PREFIX of this guest path caught in a symlink cycle? The leaf is
+    // deliberately excluded: rename and link act on the name, so even a
+    // self-referential link is a valid operand. Resolving with follow=true is
+    // what runs the namespace's own loop detector, and only its ELOOP is
+    // taken -- every other answer is about the leaf, which the caller decides.
+    [[nodiscard]] Errno guest_prefix_loop(const std::string& guest_abs) {
+        const auto slash = guest_abs.rfind('/');
+        if (slash == std::string::npos || slash == 0) return Errno::ok;
+        auto pc = k_.files().classify(guest_abs.substr(0, slash),
+                                      /*for_write=*/false, /*follow=*/true);
+        return pc.error == Errno::eloop ? Errno::eloop : Errno::ok;
+    }
+
     // Does this NAME exist, without following a final symlink? rename and
     // unlink act on the link itself, so a dangling one is still there as far
     // as they are concerned -- an F_OK probe would call it missing.
@@ -2742,6 +2755,21 @@ private:
             if (!host_dir_searchable(ps.host_path) ||
                 !host_dir_searchable(pd.host_path))
                 return eno(Errno::eacces);
+            // A symlink cycle the walk must pass THROUGH is ELOOP. Both
+            // classify calls above use follow=false (link and rename act on
+            // the NAME), which is exactly what skips the cycle detector, and
+            // the host cannot stand in for it: the overlay upper stores
+            // GUEST-absolute link targets, so a host ::access reads a cycle
+            // as a dangling link. Ask the namespace.
+            //
+            // The LEAF is exempt -- renaming a self-link is legal, verified
+            // against the kernel -- and a MISSING SOURCE outranks a cycle in
+            // the destination, so the source is settled first.
+            if (const Errno e = guest_prefix_loop(src); e != Errno::ok)
+                return eno(e);
+            if (host_lexists(ps.host_path))
+                if (const Errno e = guest_prefix_loop(dst); e != Errno::ok)
+                    return eno(e);
         }
         // A rename cannot name "." or ".." on either side -- they are not
         // entries you can move, and the kernel reports EBUSY. But it resolves

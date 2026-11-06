@@ -626,6 +626,42 @@ int main(void) {
     LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/nox5/d", 0x200);
     LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/nox5", 0x200);
 
+    // -- a symlink CYCLE in the prefix of a rename/link --------------------
+    // rename and link resolve with follow=false, because they act on the
+    // NAME -- which is also what skips the cycle detector, so a loop the walk
+    // must pass THROUGH answered ENOENT. The host cannot be asked instead:
+    // the overlay upper stores GUEST-absolute link targets, so a host
+    // ::access reads a cycle as a dangling link.
+    //
+    // The LEAF is deliberately exempt: renaming a self-link is legal, and so
+    // is linking onto one. Only the prefix matters.
+    LX_SYS3(SYS_symlinkat, DIR "/cyc", AT_FDCWD, DIR "/cyc");
+    // A real file to link FROM: a missing source would outrank the cycle and
+    // the step would prove nothing (it recorded ENOENT when I first wrote it
+    // with SUB/f2, which by here is gone).
+    {
+        const long src = LX_SYS4(SYS_openat, AT_FDCWD, DIR "/cycsrc",
+                                 O_WRONLY | O_CREAT, 0644);
+        if (src >= 0) LX_SYS1(SYS_close, src);
+    }
+    lx_emit("linkat",
+            LX_SYS5(SYS_linkat, AT_FDCWD, DIR "/cycsrc", AT_FDCWD, DIR "/cyc/bad", 0),
+            "a CYCLE in the link destination prefix is ELOOP");
+    lx_emit("renameat",
+            LX_SYS4(SYS_renameat, AT_FDCWD, DIR "/cyc/bad", AT_FDCWD, SUB "/x"),
+            "a CYCLE in the rename source prefix is ELOOP");
+    lx_emit("renameat",
+            LX_SYS4(SYS_renameat, AT_FDCWD, DIR "/cyc", AT_FDCWD, DIR "/cyc2"),
+            "...but the cycle itself renames fine, it is just a name");
+    lx_emit("linkat",
+            LX_SYS5(SYS_linkat, AT_FDCWD, DIR "/cycsrc", AT_FDCWD, DIR "/cyc2", 0),
+            "...and linking ONTO it is EEXIST, not ELOOP");
+    lx_emit("linkat",
+            LX_SYS5(SYS_linkat, AT_FDCWD, DIR "/nope8", AT_FDCWD, DIR "/cyc2/bad", 0),
+            "a MISSING source outranks a cycle in the destination");
+    LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/cyc2", 0);
+    LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/cycsrc", 0);
+
     // -- teardown, observing each removal ----------------------------------
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, SYM, 0), "unlink sym");
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, F2, 0), "unlink f2");
