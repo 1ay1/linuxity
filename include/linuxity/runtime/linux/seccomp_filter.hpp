@@ -24,6 +24,38 @@
 // A guest without seccomp support (old kernel, no CONFIG_SECCOMP_FILTER) is
 // handled by the caller: install_trap_filter() returns false and the backend
 // falls back to PTRACE_SYSCALL, so correctness never depends on seccomp.
+//
+// WHY NOT SECCOMP_RET_USER_NOTIF. It is the obvious next lever and it is
+// measurably faster -- 4.04us against 6.63us per answered call on this host,
+// cache-cold (a tight loop flatters it to 2.55 vs 5.24, which is not the
+// pattern a real workload has). That would take `ls -lR /usr/include` from
+// ~1.6s to ~0.8s.
+//
+// It cannot carry a REDIRECT, which is most of what linuxity does. To let a
+// notified syscall proceed the supervisor replies with
+// SECCOMP_USER_NOTIF_FLAG_CONTINUE, and linux/seccomp.h is blunt about what
+// that means:
+//
+//     "This is problematic because of an inherent TOCTOU. An attacker can
+//      exploit the time while the supervised process is waiting on a response
+//      from the supervising process to rewrite syscall arguments which are
+//      passed as pointers of the intercepted syscall. It should be absolutely
+//      clear that this means that the seccomp notifier _cannot_ be used to
+//      implement a security policy!"
+//
+// Path translation IS a security policy here -- it is what keeps a guest's
+// /etc/passwd inside its rootfs. The race is live, not theoretical: guests get
+// real threads sharing an address space (verified -- a guest pthread program
+// reports tids 1, 2, 3), so while thread A waits for its openat to be
+// answered, thread B can rewrite the path buffer A passed.
+//
+// RET_TRACE has no such window. The task is STOPPED, not merely blocked, and
+// the kernel re-reads the arguments from registers the tracer controls.
+//
+// So a notif-fd backend could only serve the calls we ANSWER outright
+// (identity, the one-stop stat), never the ones we rewrite -- which would mean
+// running both mechanisms and keeping ptrace for the security-critical half.
+// Worth revisiting if the answered set ever dominates; today it does not.
 #pragma once
 
 #include <cstddef>
