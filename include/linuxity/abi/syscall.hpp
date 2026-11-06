@@ -2370,7 +2370,12 @@ private:
         constexpr std::uint64_t kTCSETS2  = 0x402c542b;
         constexpr std::uint64_t kTCSETSW2 = 0x402c542c;
         constexpr std::uint64_t kTCSETSF2 = 0x402c542d;
-        const std::uint64_t request = r.arg[1];
+        // An ioctl request is a 32-bit number, but it rides in a 64-bit
+        // register and the direction bit makes TCGETS2 (0x802c542a) negative
+        // as a signed int -- so a guest that passes it through an int argument
+        // sign-extends it to 0xffffffff802c542a. musl does, glibc does not.
+        // Compare the low 32 bits so both spellings hit the same arm.
+        const std::uint64_t request = r.arg[1] & 0xffffffffULL;
         // Android's SELinux ioctl whitelist permits the classic termios
         // requests on a pty slave but not the termios2 ones, so the rootfs's
         // glibc gets EACCES on every tcgetattr/tcsetattr/isatty/ttyname and

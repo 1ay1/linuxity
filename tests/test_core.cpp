@@ -5,8 +5,10 @@
 #include "linuxity/abi/syscall.hpp"
 #include "linuxity/abi/types.hpp"
 
+#include <array>
 #include <cassert>
 #include <cstdio>
+#include <cstring>
 
 using namespace lx;
 
@@ -78,9 +80,29 @@ int main() {
     // Dispatch getpid through the ABI against the mock kernel. The new
     // dispatcher decodes an arch-specific number into a canonical Sysno, so
     // we feed it the x86-64 number for getpid (39) with Arch::x86_64.
-    struct NullMem {
-        Status copy_in(UAddr, std::span<std::byte>) const { return ok(); }
-        Status copy_out(UAddr, std::span<const std::byte>) const { return ok(); }
+    // A tiny scratch page, so a test can read back what the dispatcher wrote
+    // into guest memory (tcgetpgrp's answer rides in the buffer, not the
+    // return value). Addresses outside it are accepted and discarded.
+    struct ScratchMem {
+        enum : std::uint64_t { base = 0x8000 };
+        mutable std::array<std::byte, 256> page{};
+        [[nodiscard]] bool owns(UAddr a, std::size_t n) const {
+            const std::uint64_t v = value(a);
+            return v >= base && v + n <= base + page.size();
+        }
+        [[nodiscard]] std::byte* at(std::uint64_t a) {
+            return page.data() + (a - base);
+        }
+        Status copy_in(UAddr a, std::span<std::byte> d) const {
+            if (owns(a, d.size()))
+                std::memcpy(d.data(), page.data() + (value(a) - base), d.size());
+            return ok();
+        }
+        Status copy_out(UAddr a, std::span<const std::byte> s) const {
+            if (owns(a, s.size()))
+                std::memcpy(page.data() + (value(a) - base), s.data(), s.size());
+            return ok();
+        }
     } mem;
     MockKernel mk;
     abi::Syscalls sys{mk, mem, abi::Arch::x86_64};
@@ -129,6 +151,15 @@ int main() {
     downgrades_to(0x402c542b, 0x5402, false);   // TCSETS2  -> TCSETS
     downgrades_to(0x402c542c, 0x5403, false);   // TCSETSW2 -> TCSETSW
     downgrades_to(0x402c542d, 0x5404, false);   // TCSETSF2 -> TCSETSF
+
+    // The sign-extended spelling must hit the same arm. An ioctl request is a
+    // 32-bit number in a 64-bit register, and TCGETS2's direction bit makes it
+    // negative as a signed int, so musl passes 0xffffffff802c542a where glibc
+    // passes 0x802c542a. Matching only the zero-extended form let the
+    // sign-extended one fall through to the host, which denied it: `stty`
+    // under a musl binary still got EACCES after the fix "worked" for glibc.
+    downgrades_to(0xffffffff802c542aULL, 0x5401, true);
+    downgrades_to(0xffffffff402c542cULL, 0x5403, false);
 
     // The classic ones are already allowed everywhere, so they just forward.
     {
