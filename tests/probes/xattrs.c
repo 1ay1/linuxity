@@ -182,6 +182,32 @@ int main(void) {
     lx_emit("llistxattr", LX_SYS3(SYS_llistxattr, SYM, buf, (long)sizeof buf),
             "llistxattr on a symlink lists nothing");
 
+    // On a REGULAR FILE the l* forms have nothing to not-follow, so they
+    // must behave exactly like their plain counterparts. Only ever testing
+    // them on a symlink exercised the refusal and never the working path --
+    // which is most of what they do, since `cp -a` and `tar` reach for the
+    // l* spelling by default and meet regular files far more often.
+    lx_emit("lsetxattr", LX_SYS5(SYS_lsetxattr, F1, "user.lform", V2, slen(V2), 0),
+            "lsetxattr on a regular file works");
+    memset(buf, 0, sizeof buf);
+    {
+        const long g = LX_SYS4(SYS_lgetxattr, F1, "user.lform", buf, (long)sizeof buf);
+        lx_emit("lgetxattr", g, "lgetxattr reads it back");
+        lx_emit("lgetxattr", LX_CHECK(g == slen(V2), memcmp(buf, V2, (unsigned long)g) == 0),
+                "the l-form value round-trips");
+    }
+    memset(buf, 0, sizeof buf);
+    {
+        const long l = LX_SYS3(SYS_llistxattr, F1, buf, (long)sizeof buf);
+        lx_emit("llistxattr", l > 0 ? 1 : l, "llistxattr on a regular file");
+        lx_emit("llistxattr", LX_CHECK(l > 0, in_list(buf, l, "user.lform")),
+                "...and it names the attribute we set");
+    }
+    lx_emit("lremovexattr", LX_SYS2(SYS_lremovexattr, F1, "user.lform"),
+            "lremovexattr drops it");
+    lx_emit("lgetxattr", LX_SYS4(SYS_lgetxattr, F1, "user.lform", buf, (long)sizeof buf),
+            "it is ENODATA after lremovexattr");
+
     // -- removexattr -------------------------------------------------------
     lx_emit("removexattr", LX_SYS2(SYS_removexattr, F1, A2), "removexattr the second attr");
     lx_emit("removexattr", LX_SYS4(SYS_getxattr, F1, A2, buf, (long)sizeof buf),

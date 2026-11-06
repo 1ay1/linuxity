@@ -113,6 +113,22 @@ int main(void) {
         lx_emit("creat", fd < 0 ? fd : 1, "creat makes a file");
         if (fd >= 0) LX_SYS1(SYS_close, fd);
     }
+    // creat is open(O_WRONLY|O_CREAT|O_TRUNC), so it must TRUNCATE an
+    // existing file -- the half that makes it more than a synonym for open,
+    // and the half a one-call test never sees.
+    {
+        const long w = LX_SYS3(SYS_open, F2, O_WRONLY, 0);
+        if (w >= 0) { LX_SYS3(SYS_write, w, "0123456789", 10); LX_SYS1(SYS_close, w); }
+        const long fd = LX_SYS2(SYS_creat, F2, 0644);
+        if (fd >= 0) LX_SYS1(SYS_close, fd);
+        static unsigned char st[160];
+        const long s = LX_SYS2(SYS_stat, F2, st);
+        unsigned long long sz = 0;
+        if (s == 0) memcpy(&sz, st + 48, 8);      // st_size on x86-64
+        lx_emit("creat", LX_CHECK(s == 0, sz == 0), "creat truncates an existing file");
+    }
+    lx_emit("creat", LX_SYS2(SYS_creat, DIR, 0644),
+            "creat on a directory is EISDIR");
 
     // -- stat / lstat, and the equivalence with newfstatat -----------------
     const long s1 = LX_SYS2(SYS_stat, F1, a);
@@ -130,6 +146,15 @@ int main(void) {
 
     // lstat must NOT follow a symlink, which is its whole reason to exist.
     lx_emit("symlink", LX_SYS2(SYS_symlink, F1, SYM), "symlink to f1");
+    lx_emit("symlink", LX_SYS2(SYS_symlink, F1, SYM),
+            "symlink onto an existing name is EEXIST");
+    // A symlink's TARGET need not exist -- a dangling link is legal, and
+    // creating one is how install scripts stage files.
+    lx_emit("symlink", LX_SYS2(SYS_symlink, GONE, DIR "/dangling"),
+            "a dangling symlink is legal");
+    lx_emit("symlink", LX_SYS2(SYS_stat, DIR "/dangling", a),
+            "...and stat through it is ENOENT");
+    LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/dangling", 0);
     const long l1 = LX_SYS2(SYS_lstat, SYM, a);
     const long l2 = LX_SYS2(SYS_stat, SYM, b);
     lx_emit("lstat", l1, "lstat the symlink itself");
@@ -175,6 +200,17 @@ int main(void) {
     lx_emit("chown", LX_SYS3(SYS_chown, GONE, -1, -1),
             "chown a missing file is ENOENT");
     lx_emit("lchown", LX_SYS3(SYS_lchown, SYM, -1, -1), "lchown the symlink");
+    // lchown must not follow, so a DANGLING link is still chownable where
+    // chown through it would be ENOENT. That asymmetry is the whole point
+    // of the l-form and a single call on a live link never shows it.
+    LX_SYS2(SYS_symlink, GONE, DIR "/dang2");
+    lx_emit("lchown", LX_SYS3(SYS_lchown, DIR "/dang2", -1, -1),
+            "lchown works on a dangling symlink");
+    lx_emit("chown", LX_SYS3(SYS_chown, DIR "/dang2", -1, -1),
+            "chown through a dangling symlink is ENOENT");
+    LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/dang2", 0);
+    lx_emit("lchown", LX_SYS3(SYS_lchown, GONE, -1, -1),
+            "lchown a missing path is ENOENT");
 
     // -- link / unlink -----------------------------------------------------
     lx_emit("link", LX_SYS2(SYS_link, F1, DIR "/hard"), "link makes a hard link");
@@ -233,33 +269,62 @@ int main(void) {
 // not-applicable, which is the honest answer: the question cannot be asked.
 int main(void) {
     static const char* const kSteps[] = {
-        "mkdir the scratch dir", "mkdir an existing dir is EEXIST",
+        "mkdir the scratch dir",
+        "mkdir an existing dir is EEXIST",
         "mkdir with a missing parent is ENOENT",
-        "open with O_CREAT makes a file", "open a missing file is ENOENT",
+        "open with O_CREAT makes a file",
+        "open a missing file is ENOENT",
         "O_EXCL on an existing file is EEXIST",
-        "opening a directory for write is EISDIR", "creat makes a file",
-        "stat a regular file", "newfstatat the same file",
+        "opening a directory for write is EISDIR",
+        "creat makes a file",
+        "creat truncates an existing file",
+        "creat on a directory is EISDIR",
+        "stat a regular file",
+        "newfstatat the same file",
         "stat and newfstatat agree on st_ino",
         "stat and newfstatat agree on st_mode",
-        "stat a missing file is ENOENT", "stat an empty path is ENOENT",
-        "symlink to f1", "lstat the symlink itself", "lstat reports S_IFLNK",
+        "stat a missing file is ENOENT",
+        "stat an empty path is ENOENT",
+        "symlink to f1",
+        "symlink onto an existing name is EEXIST",
+        "a dangling symlink is legal",
+        "...and stat through it is ENOENT",
+        "lstat the symlink itself",
+        "lstat reports S_IFLNK",
         "lstat and stat see DIFFERENT inodes through a symlink",
-        "readlink the symlink", "readlink returns the target length",
+        "readlink the symlink",
+        "readlink returns the target length",
         "readlink a non-symlink is EINVAL",
-        "access R_OK on a readable file", "faccessat R_OK agrees",
-        "access a missing file is ENOENT", "access F_OK is existence",
-        "chmod 600", "stat sees the new mode", "chmod a missing file is ENOENT",
-        "chown -1/-1 is a no-op", "chown a missing file is ENOENT",
+        "access R_OK on a readable file",
+        "faccessat R_OK agrees",
+        "access a missing file is ENOENT",
+        "access F_OK is existence",
+        "chmod 600",
+        "stat sees the new mode",
+        "chmod a missing file is ENOENT",
+        "chown -1/-1 is a no-op",
+        "chown a missing file is ENOENT",
         "lchown the symlink",
-        "link makes a hard link", "a hard link shares the inode",
-        "link onto an existing name is EEXIST", "unlink the hard link",
-        "unlink a missing file is ENOENT", "unlink a directory is EISDIR",
-        "rename a file", "the old name is gone", "the new name is there",
+        "lchown works on a dangling symlink",
+        "chown through a dangling symlink is ENOENT",
+        "lchown a missing path is ENOENT",
+        "link makes a hard link",
+        "a hard link shares the inode",
+        "link onto an existing name is EEXIST",
+        "unlink the hard link",
+        "unlink a missing file is ENOENT",
+        "unlink a directory is EISDIR",
+        "rename a file",
+        "the old name is gone",
+        "the new name is there",
         "renaming a missing file is ENOENT",
-        "utimes sets a fixed mtime", "stat reads back the mtime we set",
+        "utimes sets a fixed mtime",
+        "stat reads back the mtime we set",
         "utimes on a missing file is ENOENT",
-        "rmdir a regular file is ENOTDIR", "rmdir a non-empty dir is ENOTEMPTY",
-        "rmdir the now-empty dir", "rmdir it again is ENOENT",
+        "rmdir a regular file is ENOTDIR",
+        "rmdir a non-empty dir is ENOTEMPTY",
+        "rmdir the now-empty dir",
+        "rmdir it again is ENOENT",
     };
     // The call name has to match the x86-64 run step for step too, and on
     // this arch none of them were issued -- "openat" is the honest stand-in

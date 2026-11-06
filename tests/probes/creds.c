@@ -103,6 +103,46 @@ int main(void) {
     lx_emit("getgid",  LX_SYS0(SYS_getgid)  == gid  ? 1 : 0, "gid unchanged");
     lx_emit("getegid", LX_SYS0(SYS_getegid) == egid ? 1 : 0, "egid unchanged");
 
+    // -- the REFUSAL paths -------------------------------------------------
+    // The calls above only ever ask for the identity we already have, which
+    // exercises decoding but not the decision.
+    //
+    // A PRIVILEGE DROP IS DELIBERATELY VACUOUS under linuxity, and that is
+    // not incoherence to be fixed. The guest world is root-owned and there
+    // is exactly one identity to be; a real setuid to pacman's 'alpm' user
+    // would EPERM on the host and abort the program, so linuxity accepts the
+    // drop and keeps reporting uid 0. Natively the same call is EPERM. So
+    // the OUTCOME cannot be compared -- what can is that the answer is
+    // self-consistent with what the getters say afterwards, which is the
+    // property a program actually depends on.
+    {
+        const long want = (uid == 0) ? 12345 : 0;   // an id we are not
+        const long rc = LX_SYS1(SYS_setuid, want);
+        const long now = LX_SYS0(SYS_geteuid);
+        // Natively: refused, and we did not move. Under linuxity: accepted,
+        // and the root world is unchanged by design. Both are coherent
+        // stories; a setter that moved us HALFWAY would not be.
+        lx_emit("setuid", (rc < 0) ? (now == euid) : (now == want || now == euid),
+                "setuid to another uid leaves a coherent identity");
+    }
+    {
+        const long want = (gid == 0) ? 12345 : 0;
+        const long rc = LX_SYS1(SYS_setgid, want);
+        const long now = LX_SYS0(SYS_getegid);
+        lx_emit("setgid", (rc < 0) ? (now == egid) : (now == want || now == egid),
+                "setgid to another gid leaves a coherent identity");
+    }
+
+    // setgroups with a bogus count: the list must survive the attempt
+    // whichever way the call goes.
+    {
+        static unsigned groups[4] = {0, 0, 0, 0};
+        (void)LX_SYS2(SYS_setgroups, -1, groups);
+        (void)LX_SYS2(SYS_setgroups, 1, 0L);
+        lx_emit("getgroups", LX_SYS2(SYS_getgroups, 0, 0L) >= 0 ? 1 : 0,
+                "getgroups still answers after bad setgroups calls");
+    }
+
     // -- setfsuid/setfsgid return the PREVIOUS value, never an error -------
     // Famously they cannot fail: the return is the old fsuid, so the way to
     // read the current one is to set it to something invalid.

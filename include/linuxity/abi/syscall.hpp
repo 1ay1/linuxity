@@ -622,9 +622,16 @@ public:
             // owner in the shadow metadata store and report success: a later
             // stat overlays the recorded uid/gid, so ownership round-trips
             // coherently (fake_id0-grade) without touching the real inode.
-            case Sysno::chown:      return do_chown(r, 0, 1, 2, false);
-            case Sysno::lchown:     return do_chown(r, 0, 1, 2, false);
-            case Sysno::fchownat:   return do_chown(r, 1, 2, 3, true);
+            case Sysno::chown:      return do_chown(r, 0, 1, 2, false, true);
+            case Sysno::lchown:     return do_chown(r, 0, 1, 2, false, false);
+            // fchownat's flags word carries AT_SYMLINK_NOFOLLOW, which is how
+            // a caller asks for lchown semantics through the *at form --
+            // `cp -a` and `tar -x` both use it. Hardcoding either answer
+            // makes one of the two spellings wrong.
+            case Sysno::fchownat:
+                return do_chown(r, 1, 2, 3, true,
+                                !wire::has_at(r.arg[4],
+                                              wire::AtFlag::symlink_nofollow));
             case Sysno::fchown:     return do_fchown(r);
             case Sysno::truncate:   return path_mut(r, 0, false, Wi::copy_leaf);
             case Sysno::utimes:     return path_mut(r, 0, false, Wi::copy_leaf);
@@ -1978,10 +1985,15 @@ private:
     // owner/group args are the two registers after the path (or dirfd+path):
     // chown(path,uid,gid)=>1,2; fchownat(dirfd,path,uid,gid,flags)=>2,3. A
     // component of (uid_t)-1 means "leave unchanged" per chown(2).
+    // `follow` distinguishes chown/fchownat (which resolve a symlink to its
+    // target) from lchown (which acts on the link itself). It was hardcoded
+    // false for all three, so chown through a DANGLING link reported success
+    // where the kernel says ENOENT: the existence check stat'ed the link,
+    // which is there, instead of the target, which is not.
     [[nodiscard]] Outcome do_chown(const Regs& r, int path_arg, int uid_arg,
-                                   int gid_arg, bool at) {
+                                   int gid_arg, bool at, bool follow) {
         std::string abs = resolve_arg(r, path_arg, at);
-        auto pc = k_.files().classify(abs, /*for_write=*/false, /*follow=*/false);
+        auto pc = k_.files().classify(abs, /*for_write=*/false, follow);
         if (pc.realm == kernel::Realm2::virtual_file) return eno(Errno::erofs);
         if (pc.realm == kernel::Realm2::absent)       return eno(pc.error);
         // classify() MAPS a path, it does not test for existence: a plain
@@ -1990,12 +2002,26 @@ private:
         // metadata rather than on the inode, so without this check chown on a
         // missing file quietly returned 0 where the kernel says ENOENT --
         // caught by the legacy probe diffing against the live kernel.
-        if constexpr (requires { mem_.stat_host_path(pc.host_path); })
+        //
+        // stat_host_path is an LSTAT, which is right for lchown but would
+        // call a dangling link "present" for chown. When following, the
+        // target is what must exist.
+        if constexpr (requires { mem_.stat_host_path(pc.host_path); }) {
             if (!mem_.stat_host_path(pc.host_path)) return eno(Errno::enoent);
+            if (follow && !host_target_exists(pc.host_path))
+                return eno(Errno::enoent);
+        }
         k_.files().meta().set_owner(
             abs, static_cast<std::uint32_t>(r.arg[static_cast<std::size_t>(uid_arg)]),
             static_cast<std::uint32_t>(r.arg[static_cast<std::size_t>(gid_arg)]));
         return val(0);
+    }
+
+    // Does this host path resolve to something real when symlinks are
+    // followed? ::access with F_OK is the cheapest way to ask, and unlike
+    // the lstat-based fast path it reports a dangling link as absent.
+    [[nodiscard]] static bool host_target_exists(const std::string& p) {
+        return !p.empty() && ::access(p.c_str(), F_OK) == 0;
     }
 
     // fchown(fd, uid, gid): same as do_chown but the target is an open fd.
