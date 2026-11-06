@@ -1,0 +1,53 @@
+# linuxity conformance trace
+# scenario: legacy
+# arch: x86_64
+# recorded-by: live Linux kernel on this host
+# kernel: Linux 7.2.14-zen1-1-zen
+mkdir = 0 | mkdir the scratch dir
+mkdir = -EEXIST | mkdir an existing dir is EEXIST
+mkdir = -ENOENT | mkdir with a missing parent is ENOENT
+open = 1 | open with O_CREAT makes a file
+open = -ENOENT | open a missing file is ENOENT
+open = -EEXIST | O_EXCL on an existing file is EEXIST
+open = -EISDIR | opening a directory for write is EISDIR
+creat = 1 | creat makes a file
+stat = 0 | stat a regular file
+newfstatat = 0 | newfstatat the same file
+stat = 1 | stat and newfstatat agree on st_ino
+stat = 1 | stat and newfstatat agree on st_mode
+stat = -ENOENT | stat a missing file is ENOENT
+stat = -ENOENT | stat an empty path is ENOENT
+symlink = 0 | symlink to f1
+lstat = 0 | lstat the symlink itself
+lstat = 1 | lstat reports S_IFLNK
+lstat = 1 | lstat and stat see DIFFERENT inodes through a symlink
+readlink = 1 | readlink the symlink
+readlink = 1 | readlink returns the target length
+readlink = -EINVAL | readlink a non-symlink is EINVAL
+access = 0 | access R_OK on a readable file
+access = 0 | faccessat R_OK agrees
+access = -ENOENT | access a missing file is ENOENT
+access = 0 | access F_OK is existence
+chmod = 0 | chmod 600
+chmod = 1 | stat sees the new mode
+chmod = -ENOENT | chmod a missing file is ENOENT
+chown = 0 | chown -1/-1 is a no-op
+chown = -ENOENT | chown a missing file is ENOENT
+lchown = 0 | lchown the symlink
+link = 0 | link makes a hard link
+link = 1 | a hard link shares the inode
+link = -EEXIST | link onto an existing name is EEXIST
+unlink = 0 | unlink the hard link
+unlink = -ENOENT | unlink a missing file is ENOENT
+unlink = -EISDIR | unlink a directory is EISDIR
+rename = 0 | rename a file
+rename = -ENOENT | the old name is gone
+rename = 0 | the new name is there
+rename = -ENOENT | renaming a missing file is ENOENT
+utimes = 0 | utimes sets a fixed mtime
+utimes = 1 | stat reads back the mtime we set
+utimes = -ENOENT | utimes on a missing file is ENOENT
+rmdir = -ENOTDIR | rmdir a regular file is ENOTDIR
+rmdir = -errno(39) | rmdir a non-empty dir is ENOTEMPTY
+rmdir = 0 | rmdir the now-empty dir
+rmdir = -ENOENT | rmdir it again is ENOENT

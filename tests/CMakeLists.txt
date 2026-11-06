@@ -38,7 +38,7 @@ set(LX_LIVE_TESTS
 if(CMAKE_SYSTEM_NAME IN_LIST LX_PTRACE_HOSTS)
     # Probes are C; the project is C++-only, so enable C just for them.
     enable_language(C)
-    set(LX_PROBES dirseek statpaths fdops rwio procid fsmutate memory signals ioctls)
+    set(LX_PROBES dirseek statpaths fdops rwio procid fsmutate memory signals ioctls legacy xattrs creds)
     foreach(p IN LISTS LX_PROBES)
         add_executable(probe_${p} probes/${p}.c)
         target_include_directories(probe_${p} PRIVATE probes)

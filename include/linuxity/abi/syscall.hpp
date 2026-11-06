@@ -226,10 +226,12 @@ public:
                 return val(flat_pgrp());
             case Sysno::getpgid:
                 if constexpr (requires { mem_.models_process_groups(); }) return fwd();
+                if (!flat_pid_exists(r.arg[0])) return eno(Errno::esrch);
                 return val(r.arg[0] ? static_cast<std::int64_t>(r.arg[0])
                                     : flat_pgrp());
             case Sysno::getsid:
                 if constexpr (requires { mem_.models_process_groups(); }) return fwd();
+                if (!flat_pid_exists(r.arg[0])) return eno(Errno::esrch);
                 return val(r.arg[0] ? static_cast<std::int64_t>(r.arg[0])
                                     : ids().pid);
             case Sysno::setpgid: {
@@ -238,6 +240,7 @@ public:
                 // caller". Only the CALLER's own group is tracked -- that is
                 // all tcgetpgrp needs, and it keeps this a pure bookkeeping
                 // note rather than a second process-group model.
+                if (!flat_pid_exists(r.arg[0])) return eno(Errno::esrch);
                 const std::int32_t who = static_cast<std::int32_t>(r.arg[0]);
                 if (who == 0 || who == ids().pid) {
                     const std::int32_t grp = static_cast<std::int32_t>(r.arg[1]);
@@ -249,8 +252,15 @@ public:
                 if constexpr (requires { mem_.models_process_groups(); }) return fwd();
                 flat_pgrp_ = ids().pid;            // a new session resets it
                 return val(ids().pid);             // new session == pid
-            case Sysno::getpriority: return val(0);       // nice 0
-            case Sysno::setpriority: return val(0);
+            // nice 0 for everything, but the KERNEL still validates `which`:
+            // only PRIO_PROCESS/PRIO_PGRP/PRIO_USER (0/1/2) exist and
+            // anything else is EINVAL. Returning 0 for any argument meant a
+            // bogus `which` succeeded where the kernel fails -- caught by the
+            // creds probe diffing against the live kernel.
+            case Sysno::getpriority:
+            case Sysno::setpriority:
+                if (r.arg[0] > 2) return eno(Errno::einval);
+                return val(0);
 
             // -- sysinfo(2): report linuxity's virtual machine (total/free RAM,
             //    process count, a plausible uptime), not the host's numbers.
@@ -677,6 +687,18 @@ private:
         return Outcome::raise_at(pid, signum);
     }
     static Outcome eno(Errno e) { return Outcome::error(e); }
+
+    // Does this guest pid name a live process? 0 means "the caller", which
+    // always does. Used by the flat getpgid/getsid/setpgid: they echoed any
+    // pid back as success, so getsid(0x3fffffff) reported a session instead
+    // of ESRCH -- caught by the creds probe diffing against the live kernel.
+    [[nodiscard]] bool flat_pid_exists(std::uint64_t pid) {
+        if (pid == 0) return true;
+        const auto p = static_cast<std::int32_t>(pid);
+        if (p < 0) return false;
+        if (p == ids().pid) return true;
+        return k_.procs().has(p);
+    }
 
     // The caller's process group under the flat model: whatever setpgid last
     // asked for, defaulting to its own pid (every task its own leader). Only
@@ -1848,6 +1870,14 @@ private:
         auto pc = k_.files().classify(abs, /*for_write=*/false, /*follow=*/false);
         if (pc.realm == kernel::Realm2::virtual_file) return eno(Errno::erofs);
         if (pc.realm == kernel::Realm2::absent)       return eno(pc.error);
+        // classify() MAPS a path, it does not test for existence: a plain
+        // host mount returns host_backed for a name that is not there, since
+        // the host path is still computable. Ownership is recorded in our own
+        // metadata rather than on the inode, so without this check chown on a
+        // missing file quietly returned 0 where the kernel says ENOENT --
+        // caught by the legacy probe diffing against the live kernel.
+        if constexpr (requires { mem_.stat_host_path(pc.host_path); })
+            if (!mem_.stat_host_path(pc.host_path)) return eno(Errno::enoent);
         k_.files().meta().set_owner(
             abs, static_cast<std::uint32_t>(r.arg[static_cast<std::size_t>(uid_arg)]),
             static_cast<std::uint32_t>(r.arg[static_cast<std::size_t>(gid_arg)]));
@@ -2478,13 +2508,19 @@ private:
     }
 
     // getresuid/getresgid: write real=eff=saved id, all 0 (our root world),
-    // into the three uid_t* the guest passed (arg0/arg1/arg2). A NULL pointer
-    // (arg==0) is skipped. Answers identically to getuid/geteuid so bash's
-    // $UID/$EUID and sudo's credential check see uid 0.
+    // into the three uid_t* the guest passed (arg0/arg1/arg2). Answers
+    // identically to getuid/geteuid so bash's $UID/$EUID and sudo's
+    // credential check see uid 0.
+    //
+    // All three pointers are REQUIRED. The kernel has no "skip NULL" rule
+    // here -- unlike, say, waitpid's status -- so a null is EFAULT. Skipping
+    // them instead returned 0 where the kernel fails, which the creds probe
+    // caught by diffing against the live kernel.
     [[nodiscard]] Outcome do_getres(const Regs& r) {
-        if (r.arg[0]) put_u32(r.arg[0], 0);
-        if (r.arg[1]) put_u32(r.arg[1], 0);
-        if (r.arg[2]) put_u32(r.arg[2], 0);
+        if (!r.arg[0] || !r.arg[1] || !r.arg[2]) return eno(Errno::efault);
+        put_u32(r.arg[0], 0);
+        put_u32(r.arg[1], 0);
+        put_u32(r.arg[2], 0);
         return val(0);
     }
 

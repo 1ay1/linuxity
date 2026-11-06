@@ -59,7 +59,13 @@ constexpr int kInterceptedHandlers = 139;
 // The verified floor. RAISE this as scenarios are added; never lower it.
 // A drop means a scenario was deleted or a syscall silently stopped being
 // exercised, which is exactly the regression this test exists to catch.
-constexpr std::size_t kVerifiedFloor = 48;
+//
+// 48 -> 52: the ioctls scenario (tty/termios, which had no probe at all).
+// 52 -> 68: the legacy scenario (the x86-64-only aliases that predate the
+//           *at family -- open/stat/access/chmod/rename/unlink/...).
+// 68 -> 80: the xattrs scenario (16 handlers that had zero coverage).
+// 80 -> 97: the creds scenario (credentials, sessions, process groups).
+constexpr std::size_t kVerifiedFloor = 97;
 
 } // namespace
 

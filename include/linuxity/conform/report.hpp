@@ -40,6 +40,9 @@ namespace detail {
         case ELOOP:   return "ELOOP";
         case ENOTTY:  return "ENOTTY";
         case ESRCH:   return "ESRCH";
+        case ENODATA: return "ENODATA";
+        case EOPNOTSUPP: return "EOPNOTSUPP";
+        case EFAULT:  return "EFAULT";
         default:      return nullptr;
     }
 }
@@ -265,6 +268,93 @@ inline std::string Scenario::key() const {
                     .exercising(abi::Sysno::ioctl)
                     .exercising(abi::Sysno::setpgid)
                     .on(DirFlavour::host_backed));
+
+    // The x86-64-only syscalls that predate the *at family, and the
+    // invariant that each answers like its modern equivalent.
+    //
+    // These are the calls an x86-64 glibc actually issues -- open, stat,
+    // access, chmod, rename, unlink -- and not one of them had differential
+    // coverage, because every other probe uses the portable *at spelling
+    // (the only one that compiles on aarch64 too). Two spellings of one
+    // operation with only one of them tested is precisely the hole the
+    // sign-extended TCGETS2 fell through.
+    //
+    // On aarch64 the probe emits the same steps marked not-applicable: the
+    // syscalls do not exist there, and the traces must stay the same length.
+    v.push_back(Scenario{"legacy", "legacy"}
+                    .exercising(abi::Sysno::open)
+                    .exercising(abi::Sysno::creat)
+                    .exercising(abi::Sysno::stat)
+                    .exercising(abi::Sysno::lstat)
+                    .exercising(abi::Sysno::access)
+                    .exercising(abi::Sysno::readlink)
+                    .exercising(abi::Sysno::chmod)
+                    .exercising(abi::Sysno::chown)
+                    .exercising(abi::Sysno::lchown)
+                    .exercising(abi::Sysno::link)
+                    .exercising(abi::Sysno::unlink)
+                    .exercising(abi::Sysno::symlink)
+                    .exercising(abi::Sysno::rename)
+                    .exercising(abi::Sysno::mkdir)
+                    .exercising(abi::Sysno::rmdir)
+                    .exercising(abi::Sysno::utimes)
+                    .on(DirFlavour::host_backed));
+
+    // Extended attributes: 16 handlers that had zero differential coverage.
+    //
+    // Not obscure -- they carry file capabilities, SELinux labels and ACLs,
+    // and tar/cp -a/setcap/rsync -X all depend on them, where a wrong answer
+    // is silent (the file copies, the attribute quietly does not). They also
+    // sit on the confinement boundary: the path forms take a GUEST path that
+    // must be translated before the host sees it, and the *at forms were
+    // once decoded on aarch64 but not x86-64, so there they reached the
+    // host's real file from a guest tree that has none.
+    v.push_back(Scenario{"xattrs", "xattrs"}
+                    .exercising(abi::Sysno::setxattr)
+                    .exercising(abi::Sysno::getxattr)
+                    .exercising(abi::Sysno::listxattr)
+                    .exercising(abi::Sysno::removexattr)
+                    .exercising(abi::Sysno::lsetxattr)
+                    .exercising(abi::Sysno::lgetxattr)
+                    .exercising(abi::Sysno::llistxattr)
+                    .exercising(abi::Sysno::lremovexattr)
+                    .exercising(abi::Sysno::fsetxattr)
+                    .exercising(abi::Sysno::fgetxattr)
+                    .exercising(abi::Sysno::flistxattr)
+                    .exercising(abi::Sysno::fremovexattr)
+                    .on(DirFlavour::host_backed));
+
+    // Credentials, sessions and process groups.
+    //
+    // 19 handlers were unverified here, including every setter. The
+    // job-control bug lived in this family: setpgid was discarded while
+    // getpgrp reported it, and nothing compared the two.
+    //
+    // Values cannot be compared -- the guest is fake-root in its own
+    // namespace, the native run is whatever user CI uses -- so the probe
+    // asserts RELATIONSHIPS that hold for any correct credential model:
+    // getresuid agrees with getuid/geteuid, a setter to the current value is
+    // a no-op, -1 means leave unchanged, getpgid(0) == getpgrp. An invariant
+    // is portable across the very difference that makes values incomparable.
+    v.push_back(Scenario{"creds", "creds"}
+                    .exercising(abi::Sysno::geteuid)
+                    .exercising(abi::Sysno::getegid)
+                    .exercising(abi::Sysno::getresuid)
+                    .exercising(abi::Sysno::getresgid)
+                    .exercising(abi::Sysno::setuid)
+                    .exercising(abi::Sysno::setgid)
+                    .exercising(abi::Sysno::setreuid)
+                    .exercising(abi::Sysno::setregid)
+                    .exercising(abi::Sysno::setresuid)
+                    .exercising(abi::Sysno::setresgid)
+                    .exercising(abi::Sysno::setfsuid)
+                    .exercising(abi::Sysno::setfsgid)
+                    .exercising(abi::Sysno::setgroups)
+                    .exercising(abi::Sysno::getsid)
+                    .exercising(abi::Sysno::getpgid)
+                    .exercising(abi::Sysno::getpriority)
+                    .exercising(abi::Sysno::setpriority)
+                    .on(DirFlavour::virtualised));
 
     return v;
 }

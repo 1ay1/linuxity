@@ -1,0 +1,54 @@
+# linuxity conformance trace
+# scenario: creds
+# arch: aarch64
+# recorded-by: live Linux kernel on this host
+# kernel: Linux 6.1.162-android14-11-g9dd05ae3a1de-ab16261587
+getuid = 1 | uid is valid
+geteuid = 1 | euid is valid
+getgid = 1 | gid is valid
+getegid = 1 | egid is valid
+geteuid = 1 | euid == uid (not a setuid binary)
+getegid = 1 | egid == gid
+getresuid = 0 | getresuid succeeds
+getresuid = 1 | getresuid's real == getuid
+getresuid = 1 | getresuid's effective == geteuid
+getresuid = 1 | getresuid's saved == effective
+getresgid = 0 | getresgid succeeds
+getresgid = 1 | getresgid's real == getgid
+getresgid = 1 | getresgid's effective == getegid
+getresuid = -EFAULT | getresuid with null pointers is EFAULT
+setuid = 0 | setuid to our own uid succeeds
+setgid = 0 | setgid to our own gid succeeds
+setreuid = 0 | setreuid to current ids
+setregid = 0 | setregid to current ids
+setresuid = 0 | setresuid to current ids
+setresgid = 0 | setresgid to current ids
+setreuid = 0 | setreuid(-1,-1) changes nothing
+setregid = 0 | setregid(-1,-1) changes nothing
+setresuid = 0 | setresuid(-1,-1,-1) changes nothing
+setresgid = 0 | setresgid(-1,-1,-1) changes nothing
+getuid = 1 | uid unchanged
+geteuid = 1 | euid unchanged
+getgid = 1 | gid unchanged
+getegid = 1 | egid unchanged
+setfsuid = 1 | setfsuid(-1) returns the current fsuid
+setfsuid = 1 | setting it back returns the same value
+setfsgid = 1 | setfsgid(-1) returns the current fsgid
+getgroups = 1 | getgroups(0,NULL) counts the groups
+getgroups = -EINVAL | a negative getgroups size is EINVAL
+setgroups = 1 | setgroups to the empty set succeeds or is EPERM
+getgroups = 1 | getgroups still works after setgroups
+getsid = 1 | getsid(0) is a valid session
+getsid = 1 | getsid(self) == getsid(0)
+getsid = -ESRCH | getsid of an absent pid is ESRCH
+getpgid = 1 | our pgrp is valid
+getpgid = 1 | getpgid(0) == getpgrp
+getpgid = 1 | getpgid(self) == getpgrp
+getpgid = -ESRCH | getpgid of an absent pid is ESRCH
+setpgid = 0 | setpgid to our own group
+setpgid = 1 | getpgid still agrees after setpgid
+setpgid = -ESRCH | setpgid of an absent pid is ESRCH
+getpriority = 1 | getpriority is a plausible nice value
+getpriority = -EINVAL | a bogus priority `which` is EINVAL
+setpriority = 0 | setpriority to nice 0
+setpriority = -EINVAL | a bogus setpriority `which` is EINVAL

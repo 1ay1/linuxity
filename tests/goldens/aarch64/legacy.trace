@@ -1,0 +1,53 @@
+# linuxity conformance trace
+# scenario: legacy
+# arch: aarch64
+# recorded-by: live Linux kernel on this host
+# kernel: Linux 6.1.162-android14-11-g9dd05ae3a1de-ab16261587
+openat = 2 | mkdir the scratch dir
+openat = 2 | mkdir an existing dir is EEXIST
+openat = 2 | mkdir with a missing parent is ENOENT
+openat = 2 | open with O_CREAT makes a file
+openat = 2 | open a missing file is ENOENT
+openat = 2 | O_EXCL on an existing file is EEXIST
+openat = 2 | opening a directory for write is EISDIR
+openat = 2 | creat makes a file
+openat = 2 | stat a regular file
+openat = 2 | newfstatat the same file
+openat = 2 | stat and newfstatat agree on st_ino
+openat = 2 | stat and newfstatat agree on st_mode
+openat = 2 | stat a missing file is ENOENT
+openat = 2 | stat an empty path is ENOENT
+openat = 2 | symlink to f1
+openat = 2 | lstat the symlink itself
+openat = 2 | lstat reports S_IFLNK
+openat = 2 | lstat and stat see DIFFERENT inodes through a symlink
+openat = 2 | readlink the symlink
+openat = 2 | readlink returns the target length
+openat = 2 | readlink a non-symlink is EINVAL
+openat = 2 | access R_OK on a readable file
+openat = 2 | faccessat R_OK agrees
+openat = 2 | access a missing file is ENOENT
+openat = 2 | access F_OK is existence
+openat = 2 | chmod 600
+openat = 2 | stat sees the new mode
+openat = 2 | chmod a missing file is ENOENT
+openat = 2 | chown -1/-1 is a no-op
+openat = 2 | chown a missing file is ENOENT
+openat = 2 | lchown the symlink
+openat = 2 | link makes a hard link
+openat = 2 | a hard link shares the inode
+openat = 2 | link onto an existing name is EEXIST
+openat = 2 | unlink the hard link
+openat = 2 | unlink a missing file is ENOENT
+openat = 2 | unlink a directory is EISDIR
+openat = 2 | rename a file
+openat = 2 | the old name is gone
+openat = 2 | the new name is there
+openat = 2 | renaming a missing file is ENOENT
+openat = 2 | utimes sets a fixed mtime
+openat = 2 | stat reads back the mtime we set
+openat = 2 | utimes on a missing file is ENOENT
+openat = 2 | rmdir a regular file is ENOTDIR
+openat = 2 | rmdir a non-empty dir is ENOTEMPTY
+openat = 2 | rmdir the now-empty dir
+openat = 2 | rmdir it again is ENOENT

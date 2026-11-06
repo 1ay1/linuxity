@@ -1,0 +1,44 @@
+# linuxity conformance trace
+# scenario: xattrs
+# arch: aarch64
+# recorded-by: live Linux kernel on this host
+# kernel: Linux 6.1.162-android14-11-g9dd05ae3a1de-ab16261587
+setxattr = -EOPNOTSUPP | setxattr user.lxtest
+setxattr = -EOPNOTSUPP | setxattr a second attribute
+setxattr = -EOPNOTSUPP | XATTR_CREATE on an existing attr is EEXIST
+setxattr = -EOPNOTSUPP | XATTR_REPLACE on a missing attr is ENODATA
+setxattr = -ENOENT | setxattr on a missing file is ENOENT
+setxattr = -EOPNOTSUPP | an unknown xattr namespace is EOPNOTSUPP
+getxattr = -EOPNOTSUPP | getxattr reads the value back
+getxattr = 2 | the value round-trips byte for byte
+getxattr = -EOPNOTSUPP | size query returns the value length
+getxattr = -EOPNOTSUPP | a too-small buffer is ERANGE
+getxattr = -EOPNOTSUPP | getxattr of a missing attr is ENODATA
+getxattr = -ENOENT | getxattr on a missing file is ENOENT
+listxattr = 1 | listxattr returns a name list
+listxattr = 2 | the list contains user.lxtest
+listxattr = 2 | the list contains user.second
+listxattr = 1 | a size query returns a positive length
+listxattr = -ERANGE | a too-small list buffer is ERANGE
+listxattr = -ENOENT | listxattr on a missing file is ENOENT
+fgetxattr = -EOPNOTSUPP | fgetxattr reads the same value
+fgetxattr = 2 | fgetxattr agrees with getxattr
+flistxattr = 1 | flistxattr lists the names
+flistxattr = 2 | flistxattr contains user.lxtest
+fsetxattr = -EOPNOTSUPP | fsetxattr writes through the fd
+fsetxattr = 2 | the path get sees what fsetxattr wrote
+fremovexattr = -EOPNOTSUPP | fremovexattr drops it again
+fgetxattr = -EBADF | fgetxattr on a closed fd is EBADF
+lgetxattr = -ENODATA | lgetxattr on a symlink does NOT follow
+getxattr = -EOPNOTSUPP | getxattr through the symlink DOES follow
+lgetxattr = 2 | the follow and no-follow forms disagree, as they must
+lsetxattr = -EPERM | lsetxattr on a symlink is EPERM
+llistxattr = 17 | llistxattr on a symlink lists nothing
+removexattr = -EOPNOTSUPP | removexattr the second attr
+removexattr = -EOPNOTSUPP | it is ENODATA after removal
+removexattr = -EOPNOTSUPP | removing it twice is ENODATA
+removexattr = -ENOENT | removexattr on a missing file is ENOENT
+lremovexattr = -EPERM | lremovexattr on a symlink
+setxattr = -EOPNOTSUPP | setxattr on a directory
+getxattr = -EOPNOTSUPP | getxattr on a directory
+removexattr = -EOPNOTSUPP | removexattr on a directory

@@ -1,0 +1,44 @@
+# linuxity conformance trace
+# scenario: xattrs
+# arch: x86_64
+# recorded-by: live Linux kernel on this host
+# kernel: Linux 7.2.14-zen1-1-zen
+setxattr = 0 | setxattr user.lxtest
+setxattr = 0 | setxattr a second attribute
+setxattr = -EEXIST | XATTR_CREATE on an existing attr is EEXIST
+setxattr = -ENODATA | XATTR_REPLACE on a missing attr is ENODATA
+setxattr = -ENOENT | setxattr on a missing file is ENOENT
+setxattr = -EOPNOTSUPP | an unknown xattr namespace is EOPNOTSUPP
+getxattr = 11 | getxattr reads the value back
+getxattr = 1 | the value round-trips byte for byte
+getxattr = 11 | size query returns the value length
+getxattr = -ERANGE | a too-small buffer is ERANGE
+getxattr = -ENODATA | getxattr of a missing attr is ENODATA
+getxattr = -ENOENT | getxattr on a missing file is ENOENT
+listxattr = 1 | listxattr returns a name list
+listxattr = 1 | the list contains user.lxtest
+listxattr = 1 | the list contains user.second
+listxattr = 1 | a size query returns a positive length
+listxattr = -ERANGE | a too-small list buffer is ERANGE
+listxattr = -ENOENT | listxattr on a missing file is ENOENT
+fgetxattr = 11 | fgetxattr reads the same value
+fgetxattr = 1 | fgetxattr agrees with getxattr
+flistxattr = 1 | flistxattr lists the names
+flistxattr = 1 | flistxattr contains user.lxtest
+fsetxattr = 0 | fsetxattr writes through the fd
+fsetxattr = 1 | the path get sees what fsetxattr wrote
+fremovexattr = 0 | fremovexattr drops it again
+fgetxattr = -EBADF | fgetxattr on a closed fd is EBADF
+lgetxattr = -ENODATA | lgetxattr on a symlink does NOT follow
+getxattr = 11 | getxattr through the symlink DOES follow
+lgetxattr = 1 | the follow and no-follow forms disagree, as they must
+lsetxattr = -EPERM | lsetxattr on a symlink is EPERM
+llistxattr = 0 | llistxattr on a symlink lists nothing
+removexattr = 0 | removexattr the second attr
+removexattr = -ENODATA | it is ENODATA after removal
+removexattr = -ENODATA | removing it twice is ENODATA
+removexattr = -ENOENT | removexattr on a missing file is ENOENT
+lremovexattr = -EPERM | lremovexattr on a symlink
+setxattr = 0 | setxattr on a directory
+getxattr = 11 | getxattr on a directory
+removexattr = 0 | removexattr on a directory
