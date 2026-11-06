@@ -2027,10 +2027,17 @@ private:
     // fchown(fd, uid, gid): same as do_chown but the target is an open fd.
     [[nodiscard]] Outcome do_fchown(const Regs& r) {
         std::string_view gp = k_.files().path_of_fd(static_cast<int>(r.arg[0]));
-        if (!gp.empty())
-            k_.files().meta().set_owner(std::string{gp},
-                                        static_cast<std::uint32_t>(r.arg[1]),
-                                        static_cast<std::uint32_t>(r.arg[2]));
+        if (gp.empty()) {
+            // No recorded path for this fd. It may still be a good host fd
+            // (inherited, or opened before we tracked it), so let the KERNEL
+            // decide and answer EBADF for a closed one. Returning 0 here
+            // meant fchown on a closed fd silently succeeded -- the same bug
+            // as its sibling fchmod, caught by the cwdfs probe.
+            return fwd();
+        }
+        k_.files().meta().set_owner(std::string{gp},
+                                    static_cast<std::uint32_t>(r.arg[1]),
+                                    static_cast<std::uint32_t>(r.arg[2]));
         return val(0);
     }
 

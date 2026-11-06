@@ -190,9 +190,22 @@ int main(void) {
                 "stat sees what fchmod set");
         lx_emit("fchown", (fd < 0) ? fd : LX_SYS3(SYS_fchown, fd, -1, -1),
                 "fchown -1/-1 is a no-op");
+        // fchown acts on the fd, so it works on a path that has been
+        // UNLINKED out from under it -- that is the difference from chown,
+        // and the reason daemons hold an fd across a rename.
+        if (fd >= 0) {
+            LX_SYS3(SYS_unlinkat, AT_FDCWD, F1, 0);
+            lx_emit("fchown", LX_SYS3(SYS_fchown, fd, -1, -1),
+                    "fchown still works on an unlinked fd");
+            // Put it back for the rest of the probe.
+            const long re = LX_SYS4(SYS_openat, AT_FDCWD, F1,
+                                    O_WRONLY | O_CREAT, 0644);
+            if (re >= 0) { LX_SYS3(SYS_write, re, "x", 1); LX_SYS1(SYS_close, re); }
+        }
         if (fd >= 0) LX_SYS1(SYS_close, fd);
     }
     lx_emit("fchmod", LX_SYS2(SYS_fchmod, 9999, 0600), "fchmod a closed fd is EBADF");
+    lx_emit("fchown", LX_SYS3(SYS_fchown, 9999, -1, -1), "fchown a closed fd is EBADF");
 
     // -- the newer *at forms. Not every kernel has them (the Android 6.1
     //    kernel predates several), so ENOSYS is a legitimate answer that

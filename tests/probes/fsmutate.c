@@ -158,6 +158,27 @@ int main(void) {
     // chown to our own ids is a no-op success; -1 means "don't change".
     lx_emit("fchownat", LX_SYS5(SYS_fchownat, AT_FDCWD, F1, -1, -1, 0),
             "chown with -1/-1 is a no-op success");
+    lx_emit("fchownat", LX_SYS5(SYS_fchownat, AT_FDCWD, DIR "/nope", -1, -1, 0),
+            "fchownat on a missing file is ENOENT");
+    // AT_SYMLINK_NOFOLLOW is how a caller asks for lchown semantics through
+    // the *at form -- cp -a and tar -x both set it. Without the flag the
+    // call must FOLLOW, so a dangling link is ENOENT; with it, the link
+    // itself is the target and the same path works. One call with flags=0
+    // never exercises the distinction.
+    LX_SYS3(SYS_symlinkat, DIR "/nope", AT_FDCWD, DIR "/dang");
+    lx_emit("fchownat", LX_SYS5(SYS_fchownat, AT_FDCWD, DIR "/dang", -1, -1, 0),
+            "fchownat follows by default, so a dangling link is ENOENT");
+    lx_emit("fchownat",
+            LX_SYS5(SYS_fchownat, AT_FDCWD, DIR "/dang", -1, -1, AT_SYMLINK_NOFOLLOW),
+            "AT_SYMLINK_NOFOLLOW acts on the link itself");
+    LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/dang", 0);
+    // An fd-relative path, which is the whole reason the *at form exists.
+    {
+        const long d = LX_SYS3(SYS_openat, AT_FDCWD, DIR, O_RDONLY | O_DIRECTORY);
+        lx_emit("fchownat", (d < 0) ? d : LX_SYS5(SYS_fchownat, d, "f1", -1, -1, 0),
+                "fchownat resolves relative to a dirfd");
+        if (d >= 0) LX_SYS1(SYS_close, d);
+    }
 
     // -- truncate ----------------------------------------------------------
     lx_emit("truncate", LX_SYS2(SYS_truncate, F1, 2), "truncate f1 to 2");
@@ -171,6 +192,28 @@ int main(void) {
     // -- utimensat ---------------------------------------------------------
     lx_emit("utimensat", LX_SYS4(SYS_utimensat, AT_FDCWD, F1, 0, 0),
             "utimensat with NULL times sets now");
+    // An EXPLICIT time must be readable back -- "sets now" is unverifiable
+    // by construction, so on its own it proves only that the call returned.
+    {
+        // struct timespec times[2] = {{sec,nsec} atime, {sec,nsec} mtime}
+        static long ts[4] = {1600000000L, 0, 1600000000L, 0};
+        lx_emit("utimensat", LX_SYS4(SYS_utimensat, AT_FDCWD, F1, ts, 0),
+                "utimensat sets an explicit time");
+        static unsigned char st[160];
+        const long s = LX_SYS4(SYS_newfstatat, AT_FDCWD, F1, st, 0);
+        unsigned long long mtime = 0;
+        if (s == 0) memcpy(&mtime, st + 88, 8);   // st_mtime on x86-64
+        lx_emit("utimensat", (s == 0 && mtime == 1600000000ULL) ? 1 : 0,
+                "stat reads back the time we set");
+    }
+    // UTIME_OMIT (0x3ffffffe) leaves one stamp alone -- how `touch -a` works.
+    {
+        static long ts[4] = {0, 0x3ffffffe, 1700000000L, 0};
+        lx_emit("utimensat", LX_SYS4(SYS_utimensat, AT_FDCWD, F1, ts, 0),
+                "UTIME_OMIT leaves atime alone");
+    }
+    lx_emit("utimensat", LX_SYS4(SYS_utimensat, AT_FDCWD, DIR "/nope", 0, 0),
+            "utimensat on a missing file is ENOENT");
 
     // -- teardown, observing each removal ----------------------------------
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, SYM, 0), "unlink sym");

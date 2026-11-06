@@ -87,6 +87,13 @@ int main(void) {
         // A negative pread offset is EINVAL.
         lx_emit("pread64", LX_SYS4(SYS_pread64, fd, buf, 4, -1),
                 "negative pread offset is EINVAL");
+        // ...and so is a negative pwrite offset. pwrite also must not
+        // extend a file backwards or move the offset, which the read-back
+        // above checks for the success case.
+        lx_emit("pwrite64", LX_SYS4(SYS_pwrite64, fd, "Q", 1, -1),
+                "negative pwrite offset is EINVAL");
+        lx_emit("pwrite64", LX_SYS4(SYS_pwrite64, 9999, "Q", 1, 0),
+                "pwrite on a closed fd is EBADF");
     }
 
     // -- readv / writev ----------------------------------------------------
@@ -106,8 +113,32 @@ int main(void) {
         // writev appends at the current offset.
         struct iovec out[2] = {{(void*)"XY", 2}, {(void*)"Z", 1}};
         lx_emit("lseek", LX_SYS3(SYS_lseek, fd, 0, SEEK_END), "seek to end");
-        lx_emit("writev", LX_SYS3(SYS_writev, fd, out, 2), "writev 2+1 bytes");
+        const long wv = LX_SYS3(SYS_writev, fd, out, 2);
+        lx_emit("writev", wv, "writev 2+1 bytes");
         lx_emit("lseek", LX_SYS3(SYS_lseek, fd, 0, SEEK_CUR), "offset advanced by 3");
+
+        // READ THEM BACK. A writev that reports 3 but scattered the bytes
+        // wrong, or coalesced the iovs in the wrong order, looks identical
+        // from the return value alone -- and ordering across iovs is the
+        // one thing writev exists to get right.
+        {
+            char back[3] = {0, 0, 0};
+            const long off = LX_SYS3(SYS_lseek, fd, -3, SEEK_CUR);
+            const long rb = (off < 0) ? off : LX_SYS3(SYS_read, fd, back, 3);
+            lx_emit_buf("writev", rb < 0 ? rb : 1, 1, back, 3,
+                        "the iovs landed in order");
+        }
+
+        // A zero-count writev writes nothing and is not an error.
+        lx_emit("writev", LX_SYS3(SYS_writev, fd, out, 0), "writev with 0 iovs is 0");
+        // A negative count is EINVAL, and a bad fd is EBADF -- the two ways
+        // a caller gets this wrong.
+        lx_emit("writev", LX_SYS3(SYS_writev, fd, out, -1),
+                "writev with a negative count is EINVAL");
+        lx_emit("writev", LX_SYS3(SYS_writev, 9999, out, 2),
+                "writev on a closed fd is EBADF");
+        lx_emit("readv", LX_SYS3(SYS_readv, 9999, iov, 2),
+                "readv on a closed fd is EBADF");
     }
 
     // -- the error boundaries ---------------------------------------------
