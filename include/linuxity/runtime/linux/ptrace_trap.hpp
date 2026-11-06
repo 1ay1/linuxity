@@ -566,6 +566,8 @@ public:
         return ok();
     }
 
+    // Write the answer back and neutralize the call.
+    //
     // Writing the general registers is only HALF of neutralizing a syscall.
     // On aarch64 the kernel latches the syscall number before the tracer
     // stop, so x8 is advisory by then and the original call still runs --
@@ -574,8 +576,18 @@ public:
     // commit silently runs the syscall we meant to answer ourselves (seen as
     // a virtualized uname returning EFAULT: the handler's reply was
     // overwritten by the real one).
+    //
+    // Returns false only on a REAL failure: a tracee that has already died is
+    // not one. A guest that signals itself fatally -- kill(getpid(), SIGKILL),
+    // which is what a crashing child or an OOM kill looks like -- is gone by
+    // the time we resume it, so ptrace answers ESRCH. Treating that as a
+    // failure aborted the whole runtime with "runtime error 5": one guest
+    // process dying took linuxity and every sibling with it. The death is
+    // observed as an ordinary reap by next() on a later iteration, exactly
+    // like any other fatal signal.
     [[nodiscard]] bool store_and_skip(const Regs& r) const {
-        return r.store(cur_) && r.commit_skip(cur_);
+        if (r.store(cur_) && r.commit_skip(cur_)) return true;
+        return errno == ESRCH;        // already gone: nothing to write to
     }
 
     // FORWARD: let the host kernel run this syscall in the task. We report the

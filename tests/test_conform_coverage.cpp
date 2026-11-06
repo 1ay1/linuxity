@@ -66,7 +66,11 @@ constexpr int kInterceptedHandlers = 139;
 // 68 -> 80: the xattrs scenario (16 handlers that had zero coverage).
 // 80 -> 97: the creds scenario (credentials, sessions, process groups).
 // 97 -> 108: the cwdfs scenario (cwd model, statfs/sysinfo, newer *at forms).
-constexpr std::size_t kVerifiedFloor = 108;
+// 108 -> 117: the proclife scenario. These looked unprobeable -- a probe has
+//            to survive to print its trace, so it can never exec or exit --
+//            until the obvious move: fork, let the CHILD exec/exit/setsid,
+//            and have the parent observe and report.
+constexpr std::size_t kVerifiedFloor = 117;
 
 } // namespace
 

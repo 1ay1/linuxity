@@ -43,6 +43,7 @@ namespace detail {
         case ENODATA: return "ENODATA";
         case EOPNOTSUPP: return "EOPNOTSUPP";
         case EFAULT:  return "EFAULT";
+        case ECHILD:  return "ECHILD";
         default:      return nullptr;
     }
 }
@@ -400,6 +401,29 @@ inline std::string Scenario::key() const {
                     .exercising(abi::Sysno::mmap)
                     .exercising(abi::Sysno::mprotect)
                     .exercising(abi::Sysno::munmap)
+                    .on(DirFlavour::host_backed));
+
+    // Process lifecycle, through a forked child.
+    //
+    // execve/exit/setsid were written off as unprobeable: a probe has to
+    // survive to print its trace, so it can never exec or exit. That is true
+    // of the probe PROCESS, not of the probe. A child execs, or exits, or
+    // changes its session, while the PARENT observes and reports -- the
+    // child's own output is discarded, and what the parent emits is the
+    // observation. That one trick reaches the whole group.
+    //
+    // No raw pid is ever emitted, only relationships: the reaped pid IS the
+    // one we forked, the status IS what the child passed to exit_group.
+    v.push_back(Scenario{"proclife", "proclife"}
+                    .exercising(abi::Sysno::execve)
+                    .exercising(abi::Sysno::execveat)
+                    .exercising(abi::Sysno::exit_group)
+                    .exercising(abi::Sysno::wait4)
+                    .exercising(abi::Sysno::setsid)
+                    .exercising(abi::Sysno::set_tid_address)
+                    .exercising(abi::Sysno::prctl)
+                    .exercising(abi::Sysno::getpgrp)
+                    .exercising(abi::Sysno::rt_sigsuspend)
                     .on(DirFlavour::host_backed));
 
     return v;

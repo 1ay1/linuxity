@@ -1,0 +1,30 @@
+# linuxity conformance trace
+# scenario: proclife
+# arch: aarch64
+# recorded-by: live Linux kernel on this host
+# kernel: Linux 6.1.162-android14-11-g9dd05ae3a1de-ab16261587
+clone = 1 | fork a child
+wait4 = 1 | wait4 reaps the child we forked
+exit_group = 1 | the child's exit status arrives intact
+exit_group = 1 | exit status 0 round-trips
+exit_group = 1 | exit status 255 round-trips
+wait4 = 1 | a SIGKILLed child reports the signal
+execve = 1 | a child can execve /bin/true
+execve = 1 | the execve actually replaced the image
+execve = 1 | execve of a missing program fails and the child continues
+execve = 1 | execve of a directory fails
+execveat = 1 | opened /bin for execveat
+execveat = 1 | execveat replaced the image
+setsid = 1 | a forked child can setsid and getsid agrees
+set_tid_address = 1 | set_tid_address returns a tid
+set_tid_address = 1 | ...and it is OUR tid
+prctl = 1 | PR_GET_DUMPABLE
+prctl = 0 | PR_SET_NAME
+prctl = 0 | PR_GET_NAME
+prctl = 1 | PR_GET_NAME reads back what PR_SET_NAME wrote
+prctl = 1 | /proc/self/comm agrees with PR_SET_NAME
+prctl = -EINVAL | a bogus prctl option is EINVAL
+getpgrp = 2 | getpgrp agrees with getpgid(0)
+rt_sigsuspend = 1 | rt_sigsuspend returns EINTR or the signal kills us
+wait4 = -ECHILD | wait4 on a pid that is not our child is ECHILD
+wait4 = -ECHILD | wait4 with no children left is ECHILD

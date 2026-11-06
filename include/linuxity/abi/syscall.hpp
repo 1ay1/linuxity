@@ -648,10 +648,30 @@ public:
             //    (return 0) without dropping dumpability. PR_GET_DUMPABLE then
             //    reports the real (still-dumpable) state, forwarded normally.
             //    Every other prctl forwards unchanged.
-            case Sysno::prctl:
-                if (static_cast<int>(r.arg[0]) == 4 /*PR_SET_DUMPABLE*/)
-                    return val(0);
+            case Sysno::prctl: {
+                const int op = static_cast<int>(r.arg[0]);
+                if (op == 4 /*PR_SET_DUMPABLE*/) return val(0);
+                // PR_SET_NAME(15) renames the thread, and /proc/<pid>/comm is
+                // the SAME FACT read back. procfs answers comm from our own
+                // process table, which never learned about the rename, so the
+                // two disagreed: a runtime that sets its thread name and then
+                // reads comm (every JVM, Go runtime and thread-pool logger
+                // does) saw the old one. Forward so the host applies it, and
+                // record it so our view matches.
+                if (op == 15 /*PR_SET_NAME*/) {
+                    std::array<std::byte, 16> raw{};
+                    if (mem_.copy_in(uaddr(r.arg[1]), raw)) {
+                        std::string nm;
+                        for (std::byte b : raw) {
+                            const char c = static_cast<char>(b);
+                            if (c == '\0') break;
+                            nm.push_back(c);
+                        }
+                        if (!nm.empty()) k_.procs().set_comm(ids().pid, nm);
+                    }
+                }
                 return fwd();
+            }
 
             // -- ioctl: MOST requests act on a real host fd (TCGETS, winsize,
             //    FIONREAD, ...) and must forward. But the JOB-CONTROL group
