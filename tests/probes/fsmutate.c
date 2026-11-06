@@ -456,6 +456,44 @@ int main(void) {
     LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/anc/kid", 0x200);
     LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/anc", 0x200);
 
+    // -- hardlink: the slash ENOENT is the LAST conclusion -----------------
+    // Every structural fact about the destination is decided before the
+    // "a hardlink is not a directory" verdict. Each of these answered ENOENT
+    // before, because the slash rule short-circuited the lot.
+    LX_SYS3(SYS_symlinkat, "nowhere", AT_FDCWD, DIR "/dang2");
+    lx_emit("linkat", LX_SYS5(SYS_linkat, AT_FDCWD, DIR "/", AT_FDCWD, DIR "/dang2/x", 0),
+            "a dangling link as the dst prefix is ENOENT");
+    LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/dang2", 0);
+    lx_emit("linkat", LX_SYS5(SYS_linkat, AT_FDCWD, DIR "/", AT_FDCWD, F1 "/x", 0),
+            "a FILE as the dst prefix is ENOTDIR");
+    lx_emit("linkat", LX_SYS5(SYS_linkat, AT_FDCWD, DIR "/", AT_FDCWD, SUB "/x", 0),
+            "linking a DIRECTORY is EPERM");
+    LX_SYS3(SYS_mkdirat, AT_FDCWD, DIR "/nox2", 0755);
+    LX_SYS4(SYS_fchmodat, AT_FDCWD, DIR "/nox2", 0644, 0);
+    lx_emit("linkat",
+            LX_SYS5(SYS_linkat, AT_FDCWD, DIR "/", AT_FDCWD, DIR "/nox2/x", 0),
+            "an unsearchable dst dir is EACCES, ahead of all of it");
+    LX_SYS4(SYS_fchmodat, AT_FDCWD, DIR "/nox2", 0755, 0);
+    LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/nox2", 0x200);
+
+    // chmod/chown in an unsearchable directory is EACCES, not ENOENT: the
+    // existence probe cannot see the file, which is not the same as it not
+    // being there.
+    LX_SYS3(SYS_mkdirat, AT_FDCWD, DIR "/nox3", 0755);
+    {
+        const long t = LX_SYS4(SYS_openat, AT_FDCWD, DIR "/nox3/t",
+                               O_WRONLY | O_CREAT, 0644);
+        if (t >= 0) LX_SYS1(SYS_close, t);
+    }
+    LX_SYS4(SYS_fchmodat, AT_FDCWD, DIR "/nox3", 0644, 0);
+    lx_emit("fchmodat", LX_SYS4(SYS_fchmodat, AT_FDCWD, DIR "/nox3/t", 0600, 0),
+            "chmod in an unsearchable dir is EACCES, not ENOENT");
+    lx_emit("fchownat", LX_SYS5(SYS_fchownat, AT_FDCWD, DIR "/nox3/t", -1, -1, 0),
+            "chown in an unsearchable dir is EACCES, not ENOENT");
+    LX_SYS4(SYS_fchmodat, AT_FDCWD, DIR "/nox3", 0755, 0);
+    LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/nox3/t", 0);
+    LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/nox3", 0x200);
+
     // -- teardown, observing each removal ----------------------------------
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, SYM, 0), "unlink sym");
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, F2, 0), "unlink f2");

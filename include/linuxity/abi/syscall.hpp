@@ -1156,6 +1156,22 @@ private:
         return ::access(parent.c_str(), X_OK) == 0;
     }
 
+    // Does the PARENT of this host path resolve at all (symlinks followed)?
+    // A dangling link used as a path component is ENOENT, which the kernel
+    // reports before anything about what is being linked. `why` separates
+    // that from the EACCES an unsearchable ancestor gives.
+    [[nodiscard]] static bool parent_resolves(const std::string& p,
+                                              Errno* why = nullptr) noexcept {
+        if (p.empty()) return true;
+        const auto slash = p.rfind('/');
+        if (slash == std::string::npos || slash == 0) return true;
+        const std::string parent = p.substr(0, slash);
+        if (::access(parent.c_str(), F_OK) == 0) return true;
+        if (why != nullptr)
+            *why = errno == EACCES ? Errno::eacces : Errno::enoent;
+        return false;
+    }
+
     // Is `anc` a prefix DIRECTORY of `p` -- i.e. would moving p into anc mean
     // absorbing a directory that contains it? The kernel answers ENOTEMPTY
     // for that, distinct from the plain "destination is a directory" case.
@@ -2387,7 +2403,8 @@ private:
         // outranks the dangling-link ENOENT below -- checking existence
         // first turned `chmod f1/bad` (f1 a file) into ENOENT.
         if (!parent_is_dir(pc.host_path)) return eno(Errno::enotdir);
-        if (!host_target_exists(pc.host_path)) return eno(Errno::enoent);
+        if (Errno why = Errno::ok; !host_target_exists(pc.host_path, &why))
+            return eno(why);
         // ALSO apply the mode to the real host inode, best-effort. The shadow
         // store makes the FULL guest-intended mode authoritative at stat time,
         // but some bits must physically land on the inode to have any effect:
@@ -2509,9 +2526,16 @@ private:
         // call a dangling link "present" for chown. When following, the
         // target is what must exist.
         if constexpr (requires { mem_.stat_host_path(pc.host_path); }) {
-            if (!mem_.stat_host_path(pc.host_path)) return eno(Errno::enoent);
-            if (follow && !host_target_exists(pc.host_path))
-                return eno(Errno::enoent);
+            if (!mem_.stat_host_path(pc.host_path)) {
+                // An lstat that fails because a directory above denies search
+                // is EACCES, not a missing name.
+                Errno why = Errno::ok;
+                (void)host_target_exists(pc.host_path, &why);
+                return eno(why == Errno::ok ? Errno::enoent : why);
+            }
+            if (Errno why = Errno::ok;
+                follow && !host_target_exists(pc.host_path, &why))
+                return eno(why);
         }
         k_.files().meta().set_owner(
             abs, static_cast<std::uint32_t>(r.arg[static_cast<std::size_t>(uid_arg)]),
@@ -2519,11 +2543,24 @@ private:
         return val(0);
     }
 
-    // Does this host path resolve to something real when symlinks are
-    // followed? ::access with F_OK is the cheapest way to ask, and unlike
-    // the lstat-based fast path it reports a dangling link as absent.
-    [[nodiscard]] static bool host_target_exists(const std::string& p) {
-        return !p.empty() && ::access(p.c_str(), F_OK) == 0;
+    // Does the TARGET of this path exist, with symlinks followed? ::access
+    // with F_OK is the cheapest way to ask, and unlike the lstat-based fast
+    // path it reports a dangling link as absent.
+    //
+    // `why` distinguishes the two reasons it can answer no: a name that
+    // is not there (ENOENT) versus one hidden behind a directory that denies
+    // search (EACCES). Collapsing them made chmod in an unsearchable
+    // directory report ENOENT.
+    [[nodiscard]] static bool host_target_exists(const std::string& p,
+                                                 Errno* why = nullptr) {
+        if (p.empty()) {
+            if (why != nullptr) *why = Errno::enoent;
+            return false;
+        }
+        if (::access(p.c_str(), F_OK) == 0) return true;
+        if (why != nullptr)
+            *why = errno == EACCES ? Errno::eacces : Errno::enoent;
+        return false;
     }
 
     // fchown(fd, uid, gid): same as do_chown but the target is an open fd.
@@ -2640,14 +2677,15 @@ private:
             }
         } else {
             // A hardlink is never a directory, so a trailing slash can never
-            // be satisfied -- but only after the checks that outrank it.
+            // be satisfied -- but it is the LAST thing the kernel concludes.
             // Against the live kernel, strictly in this order:
-            //   source missing                   -> ENOENT
-            //   source has a slash, is no dir     -> ENOTDIR
-            //   destination already exists        -> EEXIST
-            //   destination has a slash, absent   -> ENOENT
-            // The source is resolved FIRST, so link(nope, "dir/") is ENOENT
-            // for the missing source, not EEXIST for the directory.
+            //   source missing                    -> ENOENT
+            //   source has a slash, is no dir      -> ENOTDIR
+            //   destination already exists         -> EEXIST
+            //   destination's parent unsearchable  -> EACCES
+            //   destination's parent is a file     -> ENOTDIR
+            //   source is a directory              -> EPERM (no dir links)
+            //   nothing else to say                -> ENOENT
             const std::string raw1 =
                 read_cstr(uaddr(r.arg[static_cast<std::size_t>(a1)]));
             const std::string raw2 =
@@ -2655,11 +2693,22 @@ private:
             const bool slash1 = path_syntax(raw1) == PathSyntax::needs_dir;
             const bool slash2 = path_syntax(raw2) == PathSyntax::needs_dir;
             if (slash1 || slash2) {
-                if (!host_target_exists(ps.host_path))
-                    return eno(Errno::enoent);
+                if (Errno why = Errno::ok;
+                    !host_target_exists(ps.host_path, &why))
+                    return eno(why);
                 if (slash1 && !host_path_is_dir(ps.host_path))
                     return eno(Errno::enotdir);
                 if (host_target_exists(pd.host_path)) return eno(Errno::eexist);
+                // Unsearchable comes before "does not resolve": an F_OK probe
+                // fails for both reasons, and the permission is what the
+                // kernel hits first.
+                if (!host_dir_searchable(pd.host_path))
+                    return eno(Errno::eacces);
+                if (Errno why = Errno::ok;
+                    !parent_resolves(pd.host_path, &why))
+                    return eno(why);
+                if (!parent_is_dir(pd.host_path)) return eno(Errno::enotdir);
+                if (host_path_is_dir(ps.host_path)) return eno(Errno::eperm);
                 return eno(Errno::enoent);
             }
         }
