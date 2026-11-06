@@ -403,8 +403,10 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                 s += " (" + I.comm + ") ";
                 s += I.state; s += ' ';
                 s += std::to_string(I.ppid) + " ";      // ppid
-                s += std::to_string(I.pid) + " ";       // pgrp
-                s += std::to_string(I.pid) + " ";       // session
+                // From the process table, not the pid: answering pid made
+                // `ps -o pgid` show every task as its own group leader.
+                s += std::to_string(procs.pgid_of(I.pid)) + " ";  // pgrp
+                s += std::to_string(procs.sid_of(I.pid)) + " ";   // session
                 s += "0 -1 ";                           // tty_nr, tpgid
                 s += "4194304 ";                        // flags
                 s += "0 0 0 0 ";                        // minflt cminflt majflt cmajflt

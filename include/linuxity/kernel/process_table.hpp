@@ -41,6 +41,11 @@ struct ProcInfo {
     // tty_handoff assertion ("Job should not have fish's pgroup") fired
     // whenever the numbering happened to collide.
     std::int32_t pgid{0};
+    // SESSION id, same shape: 0 = inherit from the parent, so a fork stays in
+    // its parent's session until setsid. getsid(pid) used to answer pid for
+    // every pid, i.e. every task its own session leader -- wrong the same way
+    // pgid was, and a job-control shell checks both.
+    std::int32_t sid{0};
     std::string  comm{"linuxity"};   // short name (/proc/<pid>/comm, stat)
     std::string  cmdline{"linuxity"};// full argv, NUL-joined for /proc/.../cmdline
     char         state{'R'};         // R/S/D/Z/T (running by default)
@@ -55,11 +60,31 @@ struct ProcInfo {
 class ProcessTable {
 public:
     ProcessTable() {
-        // pid 1 is our init, always present.
-        procs_.emplace(1, ProcInfo{});
+        // pid 1 is our init, always present. It is spawned by linuxity like
+        // any child, so natively it inherits linuxity's group and session --
+        // it is NOT a leader. Seeding it as its own leader made its first
+        // setsid() EPERM, which any daemon or shell bootstrap trips on. The
+        // inherited id sits far above any guest pid so it never collides.
+        ProcInfo init;
+        init.pgid = kInheritedPgid;
+        init.sid  = kInheritedPgid;
+        procs_.emplace(1, init);
     }
+    // Stands in for the host group/session pid 1 was born into.
+    static constexpr std::int32_t kInheritedPgid = 0x7fff0000;
 
-    void upsert(const ProcInfo& p) { procs_[p.pid] = p; }
+    // Replace a process's identity (comm, argv, exe, ...). Group and session
+    // are KEPT unless the new record sets them: they are job-control state,
+    // not identity, and main.cpp re-upserting pid 1 at exec time used to
+    // wipe the seed above and make the first guest process its own leader.
+    void upsert(const ProcInfo& p) {
+        auto& cur = procs_[p.pid];
+        const std::int32_t pg = p.pgid ? p.pgid : cur.pgid;
+        const std::int32_t sd = p.sid ? p.sid : cur.sid;
+        cur = p;
+        cur.pgid = pg;
+        cur.sid = sd;
+    }
     void set_comm(std::int32_t pid, std::string comm) {
         auto& p = procs_[pid]; p.pid = pid; p.comm = comm;
         if (p.cmdline.empty()) p.cmdline = std::move(comm);
@@ -87,6 +112,21 @@ public:
         // because ppid is strictly closer to 1, whose record is seeded.
         if (p->ppid != 0 && p->ppid != p->pid) return pgid_of(p->ppid);
         return p->pid;
+    }
+    [[nodiscard]] std::int32_t sid_of(std::int32_t pid) const {
+        if (pid <= 0) return pid;
+        const ProcInfo* p = find(pid);
+        if (p == nullptr) return pid;
+        if (p->sid) return p->sid;
+        if (p->ppid != 0 && p->ppid != p->pid) return sid_of(p->ppid);
+        return p->pid;
+    }
+    // setsid(): a new session AND a new group, both led by the caller.
+    void set_sid(std::int32_t pid) {
+        auto& p = procs_[pid];
+        if (p.pid == 0) p.pid = pid;
+        p.sid = pid;
+        p.pgid = pid;
     }
 
     // setpgid(pid, pgid). Records the group against the TARGET, which is the
@@ -151,6 +191,20 @@ public:
         return out;
     }
     [[nodiscard]] std::size_t count() const { return pids().size(); }
+
+    // Every LIVE process in group `pgid`. kill(0)/kill(-pgid) and the
+    // backends' group signalling used the process TREE as a stand-in for a
+    // group, because groups were not tracked; now they are, so ask this.
+    // Liveness comes from the live source when there is one -- the record
+    // map keeps entries for processes that have exited.
+    [[nodiscard]] std::vector<std::int32_t> members_of(std::int32_t pgid) const {
+        std::vector<std::int32_t> out;
+        for (std::int32_t p : pids()) {
+            if (live_ && !live_->alive(p)) continue;
+            if (pgid_of(p) == pgid) out.push_back(p);
+        }
+        return out;
+    }
 
     // A cross-process view of the pid namespace, provided by the backend.
     struct LiveSource {

@@ -212,8 +212,26 @@ public:
                     // by next() on a later iteration.
                     std::int64_t ret =
                         -static_cast<std::int64_t>(Errno::eperm);
-                    if constexpr (runtime::DeliversSignals<T>)
-                        ret = trap_.deliver_signal(k.guest_pid, k.signum);
+                    if constexpr (runtime::DeliversSignals<T>) {
+                        if (k.grouped) {
+                            // A group, already resolved to its members by the
+                            // ABI layer. Success if ANY member got it, like
+                            // kill(2); the first error otherwise.
+                            int delivered = 0;
+                            std::int64_t first = 0;
+                            for (const std::int32_t m : k.members) {
+                                const std::int64_t rc =
+                                    trap_.deliver_signal(m, k.signum);
+                                if (rc == 0) ++delivered;
+                                else if (first == 0) first = rc;
+                            }
+                            ret = delivered ? 0
+                                : (first ? first
+                                         : -static_cast<std::int64_t>(Errno::esrch));
+                        } else {
+                            ret = trap_.deliver_signal(k.guest_pid, k.signum);
+                        }
+                    }
                     auto st = trap_.resume(ret);
                     if (!st) return Step::fail;
                     return Step::next;

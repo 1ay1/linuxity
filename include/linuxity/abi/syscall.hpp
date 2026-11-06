@@ -131,9 +131,26 @@ public:
             //    kill(pid,sig): arg0=pid arg1=sig. tgkill(tgid,tid,sig):
             //    arg0=tgid arg2=sig (we signal the process). tkill(tid,sig):
             //    arg0=tid arg1=sig.
-            case Sysno::kill:
-                return sig(static_cast<std::int32_t>(r.arg[0]),
-                           static_cast<std::int32_t>(r.arg[1]));
+            case Sysno::kill: {
+                const auto pid = static_cast<std::int32_t>(r.arg[0]);
+                const auto signum = static_cast<std::int32_t>(r.arg[1]);
+                // Group forms. The Linux backend does not model groups, so it
+                // used to treat "group pgid" as "the process TREE under pid
+                // pgid". That broke the moment groups became real: fish's
+                // own group is inherited (no tracee leads it), so kill(0)
+                // found nothing and the signal was lost. Resolve the members
+                // here, where the groups live, and hand the backend a list.
+                if constexpr (!requires { mem_.models_process_groups(); }) {
+                    if (pid == 0 || pid < -1) {
+                        const std::int32_t g =
+                            pid == 0 ? flat_pgrp() : -pid;
+                        auto m = k_.procs().members_of(g);
+                        if (m.empty()) return eno(Errno::esrch);
+                        return Outcome::raise_group(pid, signum, std::move(m));
+                    }
+                }
+                return sig(pid, signum);
+            }
             // tkill/tgkill address a THREAD, so unlike kill they have no
             // process-group form: a non-positive id is EINVAL, not a group.
             // Both used to accept it and report success.
@@ -244,8 +261,8 @@ public:
             case Sysno::getsid:
                 if constexpr (requires { mem_.models_process_groups(); }) return fwd();
                 if (!flat_pid_exists(r.arg[0])) return eno(Errno::esrch);
-                return val(r.arg[0] ? static_cast<std::int64_t>(r.arg[0])
-                                    : ids().pid);
+                return val(k_.procs().sid_of(
+                    r.arg[0] ? static_cast<std::int32_t>(r.arg[0]) : ids().pid));
             case Sysno::setpgid: {
                 if constexpr (requires { mem_.models_process_groups(); }) return fwd();
                 // setpgid(pid, pgid): either argument may be 0, meaning "the
@@ -259,14 +276,15 @@ public:
                 const std::int32_t target = who ? who : ids().pid;
                 const std::int32_t grp = static_cast<std::int32_t>(r.arg[1]);
                 k_.procs().set_pgid(target, grp ? grp : target);
-                if (target == ids().pid)
-                    flat_pgrp_ = grp ? grp : ids().pid;   // keep tcgetpgrp in step
                 return val(0);
             }
             case Sysno::setsid:
                 if constexpr (requires { mem_.models_process_groups(); }) return fwd();
-                flat_pgrp_ = ids().pid;            // a new session resets it
-                k_.procs().set_pgid(ids().pid, ids().pid);
+                // A group leader may not start a session (EPERM): its group
+                // would then straddle two sessions.
+                if (k_.procs().pgid_of(ids().pid) == ids().pid)
+                    return eno(Errno::eperm);
+                k_.procs().set_sid(ids().pid);
                 return val(ids().pid);             // new session == pid
             // nice 0 for everything, but the KERNEL still validates `which`:
             // only PRIO_PROCESS/PRIO_PGRP/PRIO_USER (0/1/2) exist and
@@ -837,25 +855,19 @@ private:
         return k_.procs().has(p);
     }
 
-    // The caller's process group under the flat model: whatever setpgid last
-    // asked for, defaulting to its own pid (every task its own leader). Only
-    // meaningful when the backend does NOT model real groups; those forward.
-    // The CALLER's process group. Goes through the same table as
-    // getpgid(other): two sources of truth for "my group" vs "their group"
-    // disagreed the moment one of them was updated, which is what made a
-    // freshly forked child compare unequal to its own parent's group.
+    // The CALLER's process group, straight from the per-pid table.
+    //
+    // There used to be a flat_pgrp_ scalar here too. This object serves the
+    // WHOLE traced tree, so one scalar was shared by every process: when
+    // fish's job ran setpgid(0,0) on itself, fish's own getpgrp() moved to
+    // the job's group, and tty_handoff.rs panicked ("Job should not have
+    // fish's pgroup"). Groups belong to pids, so they live only in the table.
     [[nodiscard]] std::int32_t flat_pgrp() {
-        if (flat_pgrp_) {
-            // Mirror it into the table. A child inherits through its ppid
-            // chain, so if the caller's group lives only in this scalar the
-            // child resolves to pid 1's (unset) group instead of ours -- the
-            // two models then disagree about the SAME process.
-            k_.procs().set_pgid(ids().pid, flat_pgrp_);
-            return flat_pgrp_;
-        }
         return k_.procs().pgid_of(ids().pid);
     }
-    std::int32_t flat_pgrp_{0};
+    // The terminal's foreground group. One per tree is right for now: the
+    // guest has one controlling tty. 0 = unclaimed, answer the caller's own.
+    std::int32_t fg_pgrp_{0};
 
     // The trapped task's guest identity. When the memory backend also exposes
     // the live task map (the ptrace trap does), report that task's real
@@ -3692,9 +3704,18 @@ private:
             // and the kernel still says ENOTTY. Only the kernel knows, so ask
             // it: forward, and rewrite the answer only if it succeeded.
             case kTIOCGPGRP:
+                // Whoever TIOCSPGRP last handed the terminal to; the caller's
+                // own group until someone claims it. Always answering the
+                // caller's own group is what bash needs at the prompt (it
+                // loops until tcgetpgrp == getpgrp), and it stays true there
+                // because a shell sets the foreground group to ITSELF when it
+                // takes the terminal back. But it must not be true while a
+                // JOB holds the tty, or a shell can never tell that the job
+                // is in the foreground and not itself.
                 return ArgRewrite{1, request,
                                   ArgRewrite::Convert::own_pgrp,
-                                  uaddr(r.arg[2]), flat_pgrp()};
+                                  uaddr(r.arg[2]),
+                                  fg_pgrp_ ? fg_pgrp_ : flat_pgrp()};
             case kTIOCGSID:
                 return ArgRewrite{1, request,
                                   ArgRewrite::Convert::own_sid,
@@ -3719,7 +3740,9 @@ private:
             // group is updated only if it said yes.
             case kTIOCSPGRP: {
                 const std::uint32_t want = get_u32(r.arg[2]);
-                if (want != 0) flat_pgrp_ = static_cast<std::int32_t>(want);
+                // Record the FOREGROUND group. Writing flat_pgrp_ here moved
+                // the caller itself into the group it was handing the tty to.
+                if (want != 0) fg_pgrp_ = static_cast<std::int32_t>(want);
                 // Convert::none: TIOCGPGRP writes the host's pgrp into the
                 // buffer, but this is a SETTER and that buffer is the
                 // caller's input -- leave it exactly as the guest wrote it.

@@ -283,8 +283,23 @@ public:
             // cwd, so that value is the parent's by construction -- and it is
             // never "/" unless the guest really is there.
             cwds_[pid] = (it != cwds_.end()) ? it->second : last_cwd_;
+            // A forked child also inherits COPIES of the parent's fds, so it
+            // inherits their bindings. Done here for the same reason the cwd
+            // is: this is the child's first syscall, before it can open
+            // anything of its own.
+            const std::int32_t from = (it != cwds_.end()) ? ppid : last_pid_;
+            if (have_inherited_fds_) {
+                // Fresh-process fork (darwin): the parent's fds arrived via
+                // import_process_state before we knew this pid.
+                fd_tables_[pid] = std::move(inherited_fds_);
+                inherited_fds_ = FdTable{};
+                have_inherited_fds_ = false;
+            } else if (auto fp = fd_tables_.find(from); fp != fd_tables_.end()) {
+                fd_tables_[pid] = fp->second.copy_for_fork();
+            }
         }
         seeded_pid_ = pid;
+        last_pid_ = pid;
         // Remember this task's cwd as the fallback for the next task whose
         // parent we have not learned yet.
         if (const auto& c = cwds_[pid]; !c.empty()) last_cwd_ = c;
@@ -520,8 +535,8 @@ public:
     // Records the guest path bound to a real (forwarded) fd, so readlinkat,
     // getdents, and fd-relative openat can recover the path. The fd number is
     // the REAL host fd the child holds (redirect/inject both yield real fds).
-    void bind_fd(int fd, std::string abs) { fd_paths_[fd] = std::move(abs); }
-    void unbind_fd(int fd) { fd_paths_.erase(fd); dir_streams_.erase(fd); }
+    void bind_fd(int fd, std::string abs) { fds().paths[fd] = std::move(abs); }
+    void unbind_fd(int fd) { auto& t = fds(); t.paths.erase(fd); t.dirs.erase(fd); }
     // Copy the path binding AND (if any) the virtual-directory stream from
     // `from` onto `to`. Used after a dup/dup2/dup3/fcntl(F_DUPFD): the new fd
     // aliases the same open description, so an *at call or getdents on it must
@@ -531,14 +546,16 @@ public:
     // the start). No-op if `from` has no binding.
     void mirror_fd(int from, int to) {
         if (from == to) return;
-        if (auto it = fd_paths_.find(from); it != fd_paths_.end())
-            fd_paths_[to] = it->second;
-        if (auto it = dir_streams_.find(from); it != dir_streams_.end())
-            dir_streams_[to] = DirStream{it->second.entries, 0, it->second.lazy, 0};
+        auto& t = fds();
+        if (auto it = t.paths.find(from); it != t.paths.end())
+            t.paths[to] = it->second;
+        if (auto it = t.dirs.find(from); it != t.dirs.end())
+            t.dirs[to] = DirStream{it->second.entries, 0, it->second.lazy, 0};
     }
     [[nodiscard]] std::string_view path_of_fd(int fd) const {
-        auto it = fd_paths_.find(fd);
-        return it == fd_paths_.end() ? std::string_view{} : std::string_view{it->second};
+        const auto& t = fds();
+        auto it = t.paths.find(fd);
+        return it == t.paths.end() ? std::string_view{} : std::string_view{it->second};
     }
 
     // -- Per-process state that a fork must carry to the child --------------
@@ -556,9 +573,10 @@ public:
             out.append(s);
         };
         put(cwd());
-        const auto count = static_cast<std::uint32_t>(fd_paths_.size());
+        const auto& paths = fds().paths;
+        const auto count = static_cast<std::uint32_t>(paths.size());
         out.append(reinterpret_cast<const char*>(&count), 4);
-        for (const auto& [fd, path] : fd_paths_) {
+        for (const auto& [fd, path] : paths) {
             out.append(reinterpret_cast<const char*>(&fd), sizeof fd);
             put(path);
         }
@@ -588,13 +606,17 @@ public:
         if (inherited_cwd_.empty()) inherited_cwd_ = "/";
         cwds_.clear();
         seeded_pid_ = 0;          // no record survives the clear
-        fd_paths_.clear();
+        // The child's pid is not known yet, so park the inherited fds; the
+        // child's first set_current_pid() adopts them (see inherited_fds_).
+        fd_tables_.clear();
+        inherited_fds_ = FdTable{};
         for (std::uint32_t i = 0, n = u32(); i < n && at < in.size(); ++i) {
             int fd = 0;
             std::memcpy(&fd, in.data() + at, sizeof fd);
             at += sizeof fd;
-            fd_paths_[fd] = str();
+            inherited_fds_.paths[fd] = str();
         }
+        have_inherited_fds_ = true;
     }
 
     // -- Virtual directory streams -----------------------------------------
@@ -617,19 +639,44 @@ public:
         // Kept alongside pos so a seek can map a cookie back to an index.
         std::uint64_t byte_off{0};
     };
+
+    // One process's fd bindings. A fd NUMBER means nothing without the
+    // process holding it: two processes that each open a different file
+    // routinely get the same number. These used to be keyed by fd alone and
+    // shared across the whole traced tree, so a child's open of fd 11
+    // re-pointed its PARENT's fd 11 -- /proc/self/fd/11 named the child's
+    // file in both, and the parent's *at calls and getdents resolved against
+    // the wrong path. Keyed by guest pid instead, which threads share, the
+    // way they share a real fd table.
+    struct FdTable {
+        std::unordered_map<int, std::string> paths;
+        std::unordered_map<int, DirStream> dirs;
+        // A fork copies the fd table but each copy has its OWN file offset
+        // for a virtual directory stream, so the child starts fresh streams.
+        [[nodiscard]] FdTable copy_for_fork() const {
+            FdTable t;
+            t.paths = paths;
+            for (const auto& [fd, d] : dirs)
+                t.dirs[fd] = DirStream{d.entries, d.pos, d.lazy, d.byte_off};
+            return t;
+        }
+    };
+    [[nodiscard]] FdTable& fds() const { return fd_tables_[cur_pid_]; }
+
     void bind_dir(int fd, std::vector<VirtualDirent> entries) {
-        dir_streams_[fd] = DirStream{std::move(entries), 0, {}, 0};
+        fds().dirs[fd] = DirStream{std::move(entries), 0, {}, 0};
     }
     // Bind an overlaid host directory whose union is computed on demand.
     void bind_lazy_dir(int fd, std::string abs) {
-        dir_streams_[fd] = DirStream{{}, 0, std::move(abs), 0};
+        fds().dirs[fd] = DirStream{{}, 0, std::move(abs), 0};
     }
     [[nodiscard]] bool is_virtual_dir_fd(int fd) const {
-        return dir_streams_.count(fd) != 0;
+        return fds().dirs.count(fd) != 0;
     }
     [[nodiscard]] DirStream* dir_stream(int fd) {
-        auto it = dir_streams_.find(fd);
-        if (it == dir_streams_.end()) return nullptr;
+        auto& dirs = fds().dirs;
+        auto it = dirs.find(fd);
+        if (it == dirs.end()) return nullptr;
         // First read of a lazily-bound overlay directory: build the union now.
         // If the union comes back empty the directory is not actually overlaid
         // (it vanished, or the mount changed), so drop the stream and let the
@@ -639,7 +686,7 @@ public:
             it->second.lazy.clear();
             it->second.entries = overlay_dir_union(abs);
             if (it->second.entries.empty()) {
-                dir_streams_.erase(it);
+                dirs.erase(it);
                 return nullptr;
             }
         }
@@ -1194,8 +1241,14 @@ private:
     // link is not known yet (see set_current_pid). Mutable for the same reason
     // cwds_ is: set_current_pid is const because it only updates bookkeeping.
     mutable std::string last_cwd_{"/"};
-    std::unordered_map<int, std::string> fd_paths_;
-    std::unordered_map<int, DirStream> dir_streams_;
+    // Per guest pid; see FdTable. mutable for the same reason cur_pid_ is:
+    // set_current_pid() is const and seeds a child's table on first sight.
+    mutable std::unordered_map<std::int32_t, FdTable> fd_tables_;
+    // Darwin's fork lands in a fresh process before the child's guest pid is
+    // known; import_process_state parks the fds here for the first pid seen.
+    mutable FdTable inherited_fds_;
+    mutable bool    have_inherited_fds_{false};
+    mutable std::int32_t last_pid_{0};
     MetaStore meta_{};
     bool meta_attached_{false};
     bool is_root_{true};

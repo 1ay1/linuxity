@@ -183,9 +183,18 @@ struct Inject {
 struct Raise {
     std::int32_t guest_pid;  // 0 => the current task
     std::int32_t signum;
+    // For a GROUP target (kill(0) / kill(-pgid)): the guest pids that are in
+    // that group, resolved by the ABI layer, which is the one place that
+    // knows the groups. Empty = let the backend decide (single pid, or a
+    // backend that models groups itself). `grouped` says the list is
+    // authoritative even when empty: an empty group is ESRCH.
+    std::vector<std::int32_t> members{};
+    bool grouped{false};
 
-    constexpr Raise(std::int32_t pid, std::int32_t sig) noexcept
+    Raise(std::int32_t pid, std::int32_t sig) noexcept
         : guest_pid{pid}, signum{sig} {}
+    Raise(std::int32_t pid, std::int32_t sig, std::vector<std::int32_t> m)
+        : guest_pid{pid}, signum{sig}, members{std::move(m)}, grouped{true} {}
 };
 
 // EXEC_INTERP - the guest execve'd a DYNAMIC binary. The host kernel would
@@ -304,9 +313,12 @@ public:
     [[nodiscard]] static constexpr Outcome exited(int code) {
         return Outcome{Exited{code}};
     }
-    [[nodiscard]] static constexpr Outcome raise_at(std::int32_t pid,
-                                                     std::int32_t sig) {
+    [[nodiscard]] static Outcome raise_at(std::int32_t pid, std::int32_t sig) {
         return Outcome{Raise{pid, sig}};
+    }
+    [[nodiscard]] static Outcome raise_group(std::int32_t pid, std::int32_t sig,
+                                             std::vector<std::int32_t> members) {
+        return Outcome{Raise{pid, sig, std::move(members)}};
     }
 
     // -- the ONLY way to consume one --------------------------------------

@@ -301,14 +301,12 @@ int main(void) {
     {
         const long a = do_fork();
         if (a == 0) { park(); LX_SYS1(SYS_exit_group, 0); }
-        // NOT ASSERTED YET: "a fresh child is in its parent's process group".
-        // The fix for it (ProcInfo::pgid + inheritance through ppid) is in
-        // place and correct on x86-64, but the aarch64 guest still answers
-        // the child's own pid, and I have not isolated why -- glibc's fork()
-        // is clone(SIGCHLD) there, so the spawn-event path differs, and
-        // keying on the tgid instead of the ptrace event was not enough.
-        // A step that is green on one arch only is worse than no step, so
-        // this stays out until the aarch64 side is understood.
+        // A fresh child is in its parent's group. On aarch64 this used to
+        // answer the child's own pid: pid 1 was seeded as its own leader
+        // and main re-upserted it, so the ppid walk ended on the wrong id.
+        lx_emit("getpgid",
+                LX_CHECK(a > 0, LX_SYS1(SYS_getpgid, a) == LX_SYS1(SYS_getpgid, 0)),
+                "a fresh child is in its PARENT's process group");
         const long my_pgrp = LX_SYS1(SYS_getpgid, 0);
         const long b = do_fork();
         if (b == 0) { park(); LX_SYS1(SYS_exit_group, 0); }
@@ -327,6 +325,42 @@ int main(void) {
         int st = 0;
         LX_SYS4(SYS_wait4, -1, &st, 0, 0);
         LX_SYS4(SYS_wait4, -1, &st, 0, 0);
+    }
+    {
+        // The CHILD moving itself must not move the parent. Group state was a
+        // single member shared by the whole traced tree, so a job's own
+        // setpgid(0,0) changed the SHELL's getpgrp -- exactly what fish's
+        // tty_handoff assertion caught.
+        const long before = LX_SYS1(SYS_getpgid, 0);
+        const long c = do_fork();
+        if (c == 0) {
+            LX_SYS2(SYS_setpgid, 0, 0);
+            LX_SYS1(SYS_exit_group, 0);
+        }
+        int st = 0;
+        LX_SYS4(SYS_wait4, c, &st, 0, 0);
+        lx_emit("getpgid", LX_CHECK(c > 0, LX_SYS1(SYS_getpgid, 0) == before),
+                "a child's setpgid(0,0) does not move its parent");
+    }
+    {
+        // kill(-pgid) reaches every member, and only them.
+        const long a = do_fork();
+        if (a == 0) { park(); LX_SYS1(SYS_exit_group, 0); }
+        LX_SYS2(SYS_setpgid, a, a);
+        const long b = do_fork();
+        if (b == 0) { park(); LX_SYS1(SYS_exit_group, 0); }
+        LX_SYS2(SYS_setpgid, b, a);
+        lx_emit("kill", LX_SYS2(SYS_kill, -a, 9),
+                "kill(-pgid) is accepted for a live group");
+        int st = 0;
+        const long w1 = LX_SYS4(SYS_wait4, -1, &st, 0, 0);
+        const int k1 = killed_by(st);
+        const long w2 = LX_SYS4(SYS_wait4, -1, &st, 0, 0);
+        const int k2 = killed_by(st);
+        lx_emit("kill", LX_CHECK(w1 > 0 && w2 > 0, k1 == 9 && k2 == 9),
+                "...and BOTH members die of it");
+        lx_emit("kill", LX_SYS2(SYS_kill, -a, 0),
+                "an emptied group is ESRCH");
     }
     {
         // wait4(-pgid) must reap a member of that group, not answer ECHILD.
