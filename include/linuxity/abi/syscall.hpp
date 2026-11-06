@@ -1020,35 +1020,9 @@ private:
             }
         }
         if (pc.realm == kernel::Realm2::host_backed) {
-            // FAST PATH: stat the host path ourselves and encode the answer in
-            // THIS stop. The alternative -- redirect, step the guest to its
-            // syscall exit, scrub the owner out of the buffer -- costs a
-            // second ptrace stop, and a host-backed stat is the most common
-            // trapped syscall in real workloads (63942 of 150K traps in one
-            // `ls -lR /usr/include`). Measured: 0.31us for the host stat plus
-            // 0.51us to write the buffer, against ~4.9us for a second stop.
-            //
-            // Only when the shadow store has nothing to say about this path.
-            // A chmod/chown'd file needs the overlay applied on top of the
-            // host's answer, and scrub_ids already does that correctly against
-            // a kernel-filled buffer; duplicating that policy here is how the
-            // two would drift. Rare case, so it keeps the slow path.
-            //
-            // Reached through mem_, the seam the dispatcher already uses for
-            // current_ids and models_process_groups -- NOT a new Kernel::host()
-            // accessor, which would widen the portable dispatcher's reach to
-            // the whole host interface for one optimisation.
-            if constexpr (requires { mem_.stat_host_path(pc.host_path); }) {
-                if (!k_.files().meta().lookup(abs)) {
-                    if (auto hs = mem_.stat_host_path(pc.host_path)) {
-                        const UAddr sb =
-                            uaddr(r.arg[static_cast<std::size_t>(path_arg) + 1]);
-                        return write_statbuf(sb, *hs);
-                    }
-                    // A stat that FAILED still has to report the kernel's own
-                    // errno, so fall through and let it answer.
-                }
-            }
+            if (auto fast = fast_stat(pc.host_path, abs))
+                return write_statbuf(
+                    uaddr(r.arg[static_cast<std::size_t>(path_arg) + 1]), *fast);
             // The host kernel will fill the statbuf with the host file's
             // owner; scrub it to root afterwards. statbuf is arg[1] for
             // stat/lstat, arg[2] for newfstatat.
@@ -1128,6 +1102,8 @@ private:
         // target's type ("regular file") and made git's symlink probe fail.
         auto pc = k_.files().classify(abs, /*for_write=*/false, /*follow=*/!nofollow);
         if (pc.realm == kernel::Realm2::host_backed) {
+            if (auto fast = fast_stat(pc.host_path, abs))
+                return write_statx(uaddr(r.arg[4]), *fast);
             return Redirect{PathArg{1, std::move(pc.host_path)}}
                 .with(Scrub{Scrub::Layout::statx, uaddr(r.arg[4]), abs});
         }
@@ -2026,6 +2002,43 @@ private:
         }
         if (!mem_.copy_out(uaddr(r.arg[1]), out)) return eno(Errno::efault);
         return val(static_cast<std::int64_t>(out.size()));
+    }
+
+    // Can this host-backed path be stat'd by US, and answered in the SAME
+    // trap stop? Returns the fields on yes, nullopt to take the slow path.
+    //
+    // THE one place that decides, asked by both stat and statx. The
+    // alternative -- redirect, step the guest to its syscall exit, scrub the
+    // owner out of the buffer the kernel filled -- costs a second ptrace stop,
+    // and a host-backed stat is the most common trapped syscall in real
+    // workloads (127884 of 150K traps in one `ls -lR /usr/include`, counting
+    // both forms). Measured: 0.31us for the host stat plus 0.51us to write the
+    // buffer, against ~4.9us for a second stop.
+    //
+    // Two reasons to decline, both deliberate:
+    //
+    //   * the backend cannot stat a host path. Asked with `requires` through
+    //     mem_ -- the seam already used for current_ids and
+    //     models_process_groups -- rather than a new Kernel::host() accessor,
+    //     which would widen the portable dispatcher's reach to the whole host
+    //     interface for one optimisation. A backend without it keeps the
+    //     redirect path, so the failure mode is slower, never wrong.
+    //
+    //   * the shadow store has a record for this path. A chmod/chown'd file
+    //     needs the overlay applied on top of the host's answer, and
+    //     scrub_ids already does that correctly against a kernel-filled
+    //     buffer. Duplicating that policy here is how the two would drift.
+    //
+    // A stat that FAILS also declines, so the kernel reports its own errno
+    // rather than us guessing which one.
+    [[nodiscard]] std::optional<wire::StatFields>
+    fast_stat(const std::string& host_path, const std::string& guest_path) {
+        if constexpr (requires { mem_.stat_host_path(host_path); }) {
+            if (k_.files().meta().lookup(guest_path)) return std::nullopt;
+            return mem_.stat_host_path(host_path);
+        } else {
+            return std::nullopt;
+        }
     }
 
     // Synthesize a `struct statx` (the flat, versioned stat the kernel fills
