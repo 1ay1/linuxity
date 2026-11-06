@@ -1173,10 +1173,22 @@ private:
         // If the lower is a DIRECTORY, mirror it as a directory in upper (do
         // NOT open+copy it as a regular file — that would leave a bogus file
         // where a mkdir/child-create expects a dir, yielding EEXIST/ENOTDIR).
-        if (is_dir(lo.c_str())) { ::mkdir(up.c_str(), 0755); return; }
+        // The lower file's own mode, so a copy-up does not silently
+        // re-permission it. An executable copied up as 0644 stops being
+        // runnable, which is exactly what a package manager's shipped
+        // binaries are.
+        struct ::stat lst{};
+        const bool have_mode = ::stat(lo.c_str(), &lst) == 0;
+        const ::mode_t lmode = have_mode ? (lst.st_mode & 07777) : 0;
+        if (is_dir(lo.c_str())) {
+            if (::mkdir(up.c_str(), have_mode ? lmode : 0755) == 0 && have_mode)
+                (void)::chmod(up.c_str(), lmode);   // past umask
+            return;
+        }
         int in = ::open(lo.c_str(), O_RDONLY | O_CLOEXEC);
         if (in < 0) return;                             // no lower => new file
-        int out = ::open(up.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        int out = ::open(up.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+                         have_mode ? lmode : 0644);
         if (out < 0) { ::close(in); return; }
         char buf[65536];
         for (;;) {
@@ -1196,7 +1208,15 @@ private:
     // paths of the SAME guest path, so they share a common suffix of
     // components below their respective bases; we create each upper ancestor
     // (ignoring EEXIST). Directories that exist only in lower thus gain a real
-    // upper twin, so a child create in upper resolves.
+    // upper twin, so a child create in upper resolves — each with the MODE its
+    // counterpart has in the lower layer.
+    //
+    // The mode is not cosmetic. /root is 750 and /tmp is 1777 in a real
+    // rootfs, and mirroring them as 755 both exposes a private directory and
+    // breaks the sticky bit every multi-user temp directory relies on. It
+    // also makes pacman complain -- "directory permissions differ on /etc/,
+    // filesystem: 777 package: 755" -- because it compares what it finds
+    // against what the package says.
     static void mirror_parents_from_lower(const std::string& up,
                                           const std::string& lo) {
         // Walk `up`'s ancestor prefixes; for each, mkdir it in upper. We can't
@@ -1204,14 +1224,31 @@ private:
         // ancestor of `up` bottom-up is sufficient and idempotent.
         std::size_t slash = up.find_last_of('/');
         if (slash == std::string::npos || slash == 0) return;
+        const std::size_t lo_slash = lo.find_last_of('/');
+        const std::string lo_dir =
+            lo_slash == std::string::npos ? std::string{} : lo.substr(0, lo_slash);
         std::string dir = up.substr(0, slash);
         for (std::size_t i = 1; i <= dir.size(); ++i) {
-            if (i == dir.size() || dir[i] == '/') {
-                std::string sub = dir.substr(0, i);
-                ::mkdir(sub.c_str(), 0755);   // ignore EEXIST
+            if (i != dir.size() && dir[i] != '/') continue;
+            std::string sub = dir.substr(0, i);
+            // The lower counterpart shares the TAIL of the path, so take the
+            // same number of trailing components off the lower directory.
+            ::mode_t mode = 0755;
+            if (!lo_dir.empty()) {
+                const std::size_t tail = dir.size() - i;
+                if (tail <= lo_dir.size()) {
+                    struct ::stat st{};
+                    const std::string lsub = lo_dir.substr(0, lo_dir.size() - tail);
+                    if (::stat(lsub.c_str(), &st) == 0 && S_ISDIR(st.st_mode))
+                        mode = st.st_mode & 07777;
+                }
             }
+            if (::mkdir(sub.c_str(), mode) != 0) continue;   // EEXIST: leave it
+            // mkdir masks the mode through umask, and the sticky/setgid bits
+            // never survive it, so set them explicitly on the one we created.
+            if ((mode & ~static_cast<::mode_t>(0777)) != 0 || (mode & 0077) != 0)
+                (void)::chmod(sub.c_str(), mode);
         }
-        (void)lo;
     }
 
     // mkdir -p for the directory component of a host path.
