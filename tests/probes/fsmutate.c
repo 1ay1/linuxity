@@ -298,6 +298,70 @@ int main(void) {
             LX_SYS4(SYS_renameat, AT_FDCWD, F1, AT_FDCWD, "/proc/self/comm"),
             "rename into procfs is EXDEV");
 
+    // -- the NULL path, and "."/".." as a final component ------------------
+    // A NULL path pointer is NOT an empty string. utimensat spells "set the
+    // times on this fd" that way, which is what touch(1) does on every file
+    // it stamps -- reading it as "" made touch fail with ENOENT.
+    {
+        const long dfd = LX_SYS3(SYS_openat, AT_FDCWD, DIR, O_RDONLY | O_DIRECTORY);
+        lx_emit("utimensat", LX_SYS4(SYS_utimensat, dfd, 0, 0, 0),
+                "utimensat with a NULL path sets times on the dirfd");
+        lx_emit("utimensat", LX_SYS4(SYS_utimensat, AT_FDCWD, 0, 0, 0),
+                "a NULL path with no fd to fall back on is EFAULT");
+        lx_emit("utimensat", LX_SYS4(SYS_utimensat, 999, 0, 0, 0),
+                "a NULL path on a closed fd is EBADF");
+        lx_emit("utimensat", LX_SYS4(SYS_utimensat, dfd, "", 0, 0),
+                "an EMPTY path is still ENOENT, unlike NULL");
+        lx_emit("utimensat", LX_SYS4(SYS_utimensat, dfd, "", 0, 0x1000),
+                "...unless AT_EMPTY_PATH says the fd is the target");
+        if (dfd >= 0) LX_SYS1(SYS_close, dfd);
+    }
+
+    // "." and ".." are the self and parent entries, not names you can remove.
+    // Normalizing them away first turned `rmdir d/.` into a removal of d and
+    // `rmdir d/..` into a removal of its PARENT -- the guest silently deleted
+    // directories the kernel never touches.
+    LX_SYS3(SYS_mkdirat, AT_FDCWD, DIR "/dotdir", 0755);
+    lx_emit("unlinkat",
+            LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/dotdir/.", 0x200),
+            "rmdir of a path ending in . is EINVAL");
+    lx_emit("unlinkat",
+            LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/dotdir/..", 0x200),
+            "rmdir of a path ending in .. is ENOTEMPTY");
+    lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/dotdir/.", 0),
+            "unlink of a path ending in . is EISDIR");
+    lx_emit("newfstatat",
+            LX_SYS4(SYS_newfstatat, AT_FDCWD, DIR "/dotdir", (char[512]){0}, 0),
+            "...and the directory is still there afterwards");
+    lx_emit("renameat",
+            LX_SYS4(SYS_renameat, AT_FDCWD, DIR "/dotdir/.", AT_FDCWD, DIR "/moved"),
+            "rename of a . component is EBUSY");
+    LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/dotdir", 0x200);
+
+    // An empty symlink TARGET is ENOENT, and that is checked before anything
+    // about the link name -- so it outranks the trailing-slash rule, which
+    // would otherwise report EEXIST for a name that already exists.
+    lx_emit("symlinkat", LX_SYS3(SYS_symlinkat, "", AT_FDCWD, DIR "/"),
+            "an empty symlink target is ENOENT, not EEXIST");
+
+    // A regular file used as a directory COMPONENT is ENOTDIR, and that
+    // outranks the existence check -- testing existence first answered
+    // ENOENT. Both metadata setters had the ordering wrong.
+    lx_emit("fchmodat", LX_SYS4(SYS_fchmodat, AT_FDCWD, F1 "/bad", 0511, 0),
+            "chmod through a FILE used as a directory is ENOTDIR");
+    lx_emit("fchownat", LX_SYS5(SYS_fchownat, AT_FDCWD, F1 "/bad", -1, -1, 0),
+            "chown through a FILE used as a directory is ENOTDIR");
+
+    // chmod FOLLOWS a final symlink (there is no lchmod), so a dangling one
+    // is ENOENT -- classifying the link instead of its target made this
+    // report success. Found by the differential fuzzer.
+    LX_SYS3(SYS_symlinkat, "gone-target", AT_FDCWD, DIR "/dangling");
+    lx_emit("fchmodat", LX_SYS4(SYS_fchmodat, AT_FDCWD, DIR "/dangling", 0600, 0),
+            "chmod through a dangling symlink is ENOENT");
+    lx_emit("fchownat", LX_SYS5(SYS_fchownat, AT_FDCWD, DIR "/dangling", -1, -1, 0),
+            "chown through a dangling symlink is ENOENT too");
+    LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/dangling", 0);
+
     // -- teardown, observing each removal ----------------------------------
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, SYM, 0), "unlink sym");
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, F2, 0), "unlink f2");

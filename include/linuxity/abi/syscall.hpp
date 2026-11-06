@@ -614,7 +614,7 @@ public:
             case Sysno::mkdirat:    return path_mut(r, 1, true,  Wi::parents_only, true);
             case Sysno::mknod:      return path_mut(r, 0, false, Wi::parents_only, true);
             case Sysno::mknodat:    return path_mut(r, 1, true,  Wi::parents_only, true);
-            case Sysno::rmdir:      return path_mut(r, 0, false, Wi::remove);
+            case Sysno::rmdir:      return path_mut(r, 0, false, Wi::remove, false, true);
             case Sysno::unlink:     return path_mut(r, 0, false, Wi::remove);
             case Sysno::unlinkat:   return path_mut(r, 1, true,  Wi::remove);
             case Sysno::chmod:      return do_chmod(r, 0, false, Wi::copy_leaf);
@@ -645,10 +645,12 @@ public:
                                               wire::AtFlag::symlink_nofollow));
             case Sysno::fchown:     return do_fchown(r);
             case Sysno::truncate:   return path_mut(r, 0, false, Wi::copy_leaf);
-            case Sysno::utimes:     return path_mut(r, 0, false, Wi::copy_leaf);
-            case Sysno::utime:      return path_mut(r, 0, false, Wi::copy_leaf);
-            case Sysno::utimensat:  return path_mut(r, 1, true,  Wi::copy_leaf);
-            case Sysno::futimesat:  return path_mut(r, 1, true,  Wi::copy_leaf);
+            case Sysno::utimes:     return do_utimes(r, 0, false, -1);
+            case Sysno::utime:      return do_utimes(r, 0, false, -1);
+            case Sysno::utimensat:  return do_utimes(r, 1, true,   3);
+            // futimesat takes (dirfd, path, times) -- no flags register, so
+            // there is no AT_EMPTY_PATH form to honour.
+            case Sysno::futimesat:  return do_utimes(r, 1, true,  -1);
             // fchmod acts on an already-open fd: record the guest-intended
             // mode against the fd's bound path in the shadow store, then
             // forward (the host applies what bits it can). ftruncate/fchdir
@@ -665,7 +667,7 @@ public:
             case Sysno::renameat:   return path_mut2(r, 1, 3, true,  true, true);
             case Sysno::renameat2:  return path_mut2(r, 1, 3, true,  true, true);
             case Sysno::link:       return path_mut2(r, 0, 1, false, false, false);
-            case Sysno::linkat:     return path_mut2(r, 1, 3, true,  true, false);
+            case Sysno::linkat:     return path_mut2(r, 1, 3, true,  true, false, 4);
             case Sysno::symlink:    return path_symlink(r, 0, 1, false);
             case Sysno::symlinkat:  return path_symlink(r, 0, 2, true);
 
@@ -1016,11 +1018,80 @@ private:
     // kernel says ENOENT four times. Found by the differential fuzzer, which
     // generates "" as a path tail precisely because handlers forget it.
     //
-    // AT_EMPTY_PATH is the documented exception (operate on the dirfd
-    // itself); callers that accept it pass their flags word so it is not
-    // rejected here.
-    [[nodiscard]] bool empty_path_arg(const Regs& r, int path_arg) {
-        return read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)])).empty();
+    // An EMPTY path is ENOENT for most path syscalls, but some accept it with
+    // AT_EMPTY_PATH to mean "the dirfd itself". That is per-syscall, not
+    // uniform -- newfstatat/utimensat/fchownat/linkat honour the flag,
+    // fchmodat does not (it is not in its ABI) -- so a caller opts in by
+    // passing the register index of its flags word as `flags_arg`, and -1
+    // means "this syscall has no such form".
+    [[nodiscard]] bool empty_path_arg(const Regs& r, int path_arg,
+                                      int flags_arg = -1) {
+        // A NULL pointer is NOT an empty string. read_cstr cannot tell them
+        // apart (a failed read yields ""), but the kernel does, and for
+        // utimensat/futimesat a NULL path is legal -- it means "the dirfd
+        // itself". Checking the pointer keeps the two apart.
+        if (null_path_arg(r, path_arg)) return false;
+        if (!read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)])).empty())
+            return false;
+        if (flags_arg >= 0 &&
+            wire::has_at(r.arg[static_cast<std::size_t>(flags_arg)],
+                         wire::AtFlag::empty_path))
+            return false;  // the dirfd IS the target; not an empty path
+        return true;
+    }
+
+    // Is this removal a DIRECTORY removal? unlinkat says so with
+    // AT_REMOVEDIR (its flags are the register after the path); unlink and
+    // rmdir take no flags, so they state it directly via `rmdir_syscall`.
+    [[nodiscard]] bool removedir_flag(const Regs& r, int path_arg, bool at,
+                                      bool rmdir_syscall) const noexcept {
+        if (!at) return rmdir_syscall;
+        return wire::has_at(r.arg[static_cast<std::size_t>(path_arg) + 1],
+                            wire::AtFlag::removedir);
+    }
+
+    // Is the PARENT of this host path really a directory? A rename whose
+    // path uses a regular file as a directory component is ENOTDIR, and the
+    // kernel reports that in preference to EBUSY. classify() maps a path for
+    // creation without stating the prefix, so this asks the host directly.
+    // An unknown/empty path is treated as fine -- the host call will produce
+    // the real error.
+    [[nodiscard]] static bool parent_is_dir(std::string_view host_path) noexcept {
+        if (host_path.empty()) return true;
+        const auto slash = host_path.rfind('/');
+        if (slash == std::string_view::npos || slash == 0) return true;
+        const std::string parent{host_path.substr(0, slash)};
+        struct ::stat st{};
+        if (::stat(parent.c_str(), &st) != 0) return true;
+        return S_ISDIR(st.st_mode);
+    }
+
+    // Does this path's FINAL component (ignoring trailing slashes) name the
+    // directory itself or its parent? "." and ".." are not names you can
+    // remove or rename away -- they are the self and parent entries, and the
+    // kernel refuses before it ever looks at what they point to. Normalizing
+    // them away first turns `rmdir "d/."` into `rmdir "d"` and `rmdir "d/.."`
+    // into `rmdir` of the PARENT, so the guest silently deleted directories
+    // the kernel would never have touched.
+    enum class DotTail { none, dot, dotdot };
+    [[nodiscard]] static DotTail dot_tail(std::string_view p) noexcept {
+        while (p.size() > 1 && p.back() == '/') p.remove_suffix(1);
+        if (p == "." || p.ends_with("/.")) return DotTail::dot;
+        if (p == ".." || p.ends_with("/..")) return DotTail::dotdot;
+        return DotTail::none;
+    }
+
+    // Was the path pointer itself NULL? utime/utimensat spell "operate on the
+    // fd" that way, so it has to be told apart from a "" that resolves to
+    // nothing. Every other path syscall treats NULL as EFAULT.
+    [[nodiscard]] static bool null_path_arg(const Regs& r, int path_arg) noexcept {
+        return r.arg[static_cast<std::size_t>(path_arg)] == 0;
+    }
+
+    // A non-NULL pointer to an empty string, with no flag interpretation.
+    [[nodiscard]] bool empty_cstr_arg(const Regs& r, int path_arg) {
+        return !null_path_arg(r, path_arg) &&
+               read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)])).empty();
     }
 
     [[nodiscard]] std::string resolve_arg(const Regs& r, int path_arg, bool at,
@@ -1993,6 +2064,35 @@ private:
         return fwd();
     }
 
+    // utimes/utimensat with a NULL path. That is not a missing argument -- it
+    // is the documented "set the times on the dirfd itself" form, and it is
+    // what touch(1) and anything that stamps a file actually use, so treating
+    // it as an empty path made all of them fail with ENOENT.
+    //
+    // With a real path it is an ordinary content mutation (copy_leaf). With
+    // NULL there is no path to map, so forward and let the kernel act on the
+    // host fd: timestamps are not virtualised and the fd is already the
+    // host's. That also gets the error cases right for free -- a closed fd is
+    // EBADF, and NULL with no fd to fall back on (AT_FDCWD, or the utimes
+    // forms that take no dirfd at all) is EFAULT.
+    [[nodiscard]] Outcome do_utimes(const Regs& r, int path_arg, bool at,
+                                    int flags_arg) {
+        // AT_EMPTY_PATH makes "" mean the dirfd, same as a NULL path -- both
+        // forward to the host fd. Only utimensat has a flags register.
+        const bool null_path = null_path_arg(r, path_arg);
+        const bool empty_with_flag =
+            flags_arg >= 0 && empty_cstr_arg(r, path_arg) &&
+            wire::has_at(r.arg[static_cast<std::size_t>(flags_arg)],
+                         wire::AtFlag::empty_path);
+        if (null_path || empty_with_flag) {
+            if (!at) return eno(Errno::efault);
+            if (static_cast<std::int32_t>(r.arg[0]) == wire::kAtFdCwd)
+                return eno(null_path ? Errno::efault : Errno::enoent);
+            return fwd();
+        }
+        return path_mut(r, path_arg, at, Wi::copy_leaf);
+    }
+
     // A single-path mutation (mkdir/rmdir/unlink/chmod/chown/truncate/...):
     // translate the guest path at `path_arg` to its overlay UPPER host path
     // and REDIRECT, with the WriteIntent selecting how the upper layer is
@@ -2003,8 +2103,32 @@ private:
     // strict_parent: mkdir/mknod must FAIL when the parent is missing, so they
     // opt out of pre-creating the chain and let the host kernel apply the rule.
     [[nodiscard]] Outcome path_mut(const Regs& r, int path_arg, bool at, Wi wi,
-                                   bool strict_parent = false) {
+                                   bool strict_parent = false,
+                                   bool rmdir_syscall = false) {
         if (empty_path_arg(r, path_arg)) return eno(Errno::enoent);
+        // A removal has to see the path as WRITTEN: resolve_arg normalizes
+        // "."/".." away, which would turn `rmdir d/.` into a removal of d
+        // and `rmdir d/..` into a removal of its PARENT. The kernel refuses
+        // both outright, so check before resolving.
+        if (wi == Wi::remove) {
+            const std::string raw =
+                read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)]));
+            switch (dot_tail(raw)) {
+            case DotTail::dot:
+                // rmdir says EINVAL ("." is not a removable name); plain
+                // unlink got as far as seeing a directory, so EISDIR.
+                return eno(removedir_flag(r, path_arg, at, rmdir_syscall)
+                               ? Errno::einval
+                               : Errno::eisdir);
+            case DotTail::dotdot:
+                // The parent still holds the entry we came through, so even
+                // as a directory removal it is not empty.
+                return eno(removedir_flag(r, path_arg, at, rmdir_syscall)
+                               ? Errno::enotempty
+                               : Errno::eisdir);
+            case DotTail::none: break;
+            }
+        }
         std::string abs = resolve_arg(r, path_arg, at);
         auto pc = k_.files().classify(abs, /*for_write=*/true, /*follow=*/false, wi);
         if (pc.realm == kernel::Realm2::virtual_file) {
@@ -2073,12 +2197,23 @@ private:
         std::string abs = resolve_arg(r, path_arg, at);
         std::uint32_t mode = static_cast<std::uint32_t>(
             r.arg[static_cast<std::size_t>(path_arg) + 1]);
-        auto pc = k_.files().classify(abs, /*for_write=*/false, /*follow=*/false);
+        // chmod FOLLOWS a final symlink -- there is no lchmod -- so a
+        // DANGLING link is ENOENT. classify() maps a path without proving
+        // its target exists, and the lstat-based probe sees the link itself,
+        // so chmod through a dangling link reported success where the kernel
+        // says ENOENT. Same bug its sibling do_chown already fixed, and the
+        // same ::access test fixes it.
+        auto pc = k_.files().classify(abs, /*for_write=*/false, /*follow=*/true);
         if (pc.realm == kernel::Realm2::virtual_file)
             // Even comm, which accepts writes, refuses a mode change: procfs
             // inodes have no setattr for the mode.
             return eno(virtual_mut_errno(abs, VMut::meta));
         if (pc.realm == kernel::Realm2::absent)       return eno(pc.error);
+        // A regular file used as a directory component is ENOTDIR, and that
+        // outranks the dangling-link ENOENT below -- checking existence
+        // first turned `chmod f1/bad` (f1 a file) into ENOENT.
+        if (!parent_is_dir(pc.host_path)) return eno(Errno::enotdir);
+        if (!host_target_exists(pc.host_path)) return eno(Errno::enoent);
         // ALSO apply the mode to the real host inode, best-effort. The shadow
         // store makes the FULL guest-intended mode authoritative at stat time,
         // but some bits must physically land on the inode to have any effect:
@@ -2163,6 +2298,20 @@ private:
     // which is there, instead of the target, which is not.
     [[nodiscard]] Outcome do_chown(const Regs& r, int path_arg, int uid_arg,
                                    int gid_arg, bool at, bool follow) {
+        // fchownat(fd, "", ..., AT_EMPTY_PATH) means the dirfd itself, which
+        // is fchown. Resolve through the fd's bound path so the shadow store
+        // records it against the right file.
+        if (at && empty_cstr_arg(r, path_arg) &&
+            wire::has_at(r.arg[4], wire::AtFlag::empty_path)) {
+            std::string_view gp =
+                k_.files().path_of_fd(static_cast<int>(r.arg[0]));
+            if (gp.empty()) return fwd();
+            k_.files().meta().set_owner(
+                std::string{gp},
+                static_cast<std::uint32_t>(r.arg[static_cast<std::size_t>(uid_arg)]),
+                static_cast<std::uint32_t>(r.arg[static_cast<std::size_t>(gid_arg)]));
+            return val(0);
+        }
         if (empty_path_arg(r, path_arg)) return eno(Errno::enoent);
         std::string abs = resolve_arg(r, path_arg, at);
         auto pc = k_.files().classify(abs, /*for_write=*/false, follow);
@@ -2178,6 +2327,10 @@ private:
         // missing file quietly returned 0 where the kernel says ENOENT --
         // caught by the legacy probe diffing against the live kernel.
         //
+        // A regular file used as a directory component is ENOTDIR, and the
+        // kernel reports that before any existence check -- the lstat below
+        // just fails, which would answer ENOENT.
+        if (!parent_is_dir(pc.host_path)) return eno(Errno::enotdir);
         // stat_host_path is an LSTAT, which is right for lchown but would
         // call a dangling link "present" for chown. When following, the
         // target is what must exist.
@@ -2223,16 +2376,53 @@ private:
     // (oldpath, newpath) => args 0 and 1. The source is resolved for REMOVAL
     // (it must already exist), the destination CREATES its leaf.
     [[nodiscard]] Outcome path_mut2(const Regs& r, int a1, int a2, bool at,
-                                    bool /*at2*/, bool move_meta = false) {
+                                    bool /*at2*/, bool move_meta = false,
+                                    int link_flags_arg = -1) {
+        // linkat(fd, "", newdirfd, new, AT_EMPTY_PATH) links the OPEN FD to a
+        // new name, which is how a program materialises an O_TMPFILE. The
+        // source has no path of its own, so take the fd's bound path and let
+        // the ordinary two-path flow run from there. (flags are arg 4; only
+        // linkat has them, and only linkat passes link_flags_arg >= 0.)
+        std::string src_from_fd;
+        if (link_flags_arg >= 0 && empty_cstr_arg(r, a1) &&
+            wire::has_at(r.arg[static_cast<std::size_t>(link_flags_arg)],
+                         wire::AtFlag::empty_path)) {
+            std::string_view gp =
+                k_.files().path_of_fd(static_cast<int>(r.arg[0]));
+            if (gp.empty()) return fwd();
+            src_from_fd = std::string{gp};
+        }
         // BOTH operands. Checking only the source left symlinkat(x, "") and
         // renameat(x, "") absolutizing the empty destination to the cwd and
         // acting on the directory -- EEXIST where the kernel says ENOENT.
-        if (empty_path_arg(r, a1) || empty_path_arg(r, a2))
+        // An AT_EMPTY_PATH source is exempt: its "" is legal.
+        if ((src_from_fd.empty() && empty_path_arg(r, a1)) ||
+            empty_path_arg(r, a2))
             return eno(Errno::enoent);
-        std::string src = resolve_arg(r, a1, at);
+        std::string src = src_from_fd.empty() ? resolve_arg(r, a1, at)
+                                              : src_from_fd;
         std::string dst = resolve_second(r, a2, at);
         auto ps = k_.files().classify(src, true, false, Wi::copy_leaf);
         auto pd = k_.files().classify(dst, true, false, Wi::parents_only);
+        // A rename cannot name "." or ".." on either side -- they are not
+        // entries you can move, and the kernel reports EBUSY. But it resolves
+        // BOTH paths first, so a structurally bad path wins: rename(".",
+        // "f1/bad") is ENOTDIR because f1 is a file being used as a
+        // directory, not EBUSY. classify() maps for creation and never stats
+        // the prefix, so ask the host whether each parent is really a
+        // directory before refusing on the dot.
+        if (move_meta) {
+            const std::string raw1 =
+                read_cstr(uaddr(r.arg[static_cast<std::size_t>(a1)]));
+            const std::string raw2 =
+                read_cstr(uaddr(r.arg[static_cast<std::size_t>(a2)]));
+            if (dot_tail(raw1) != DotTail::none ||
+                dot_tail(raw2) != DotTail::none) {
+                if (!parent_is_dir(ps.host_path) || !parent_is_dir(pd.host_path))
+                    return eno(Errno::enotdir);
+                return eno(Errno::ebusy);
+            }
+        }
         bool sv = k_.files().under_virtual_mount(src);
         bool dv = k_.files().under_virtual_mount(dst);
         // Crossing between a synthesized path and a real one is a genuine
@@ -2375,13 +2565,17 @@ private:
                            /*len_arg=*/2, new_len};
     }
 
-    [[nodiscard]] Outcome path_symlink(const Regs& r, int /*target_arg*/,
+    [[nodiscard]] Outcome path_symlink(const Regs& r, int target_arg,
                                        int link_arg, bool at) {
-        // Only the LINK NAME is a path. The target is literal text that is
-        // never resolved -- a dangling or even nonsense target is legal --
-        // so an empty target is fine while an empty name is ENOENT. Checking
-        // the wrong one of the two is why this needs saying.
+        // Only the LINK NAME is a path: the target is literal text that is
+        // never resolved, so a dangling or even nonsense target is legal.
+        // Both being EMPTY is still ENOENT though -- an empty name has
+        // nothing to create, and an empty target is rejected outright.
         if (empty_path_arg(r, link_arg)) return eno(Errno::enoent);
+        // The empty-target check comes BEFORE anything about the link name,
+        // so it outranks the trailing-slash rule below: symlink("",
+        // "existing-dir/") is ENOENT, not the EEXIST the name alone gives.
+        if (empty_path_arg(r, target_arg)) return eno(Errno::enoent);
         // A TRAILING SLASH means "this must be a directory", and a symlink
         // being created never is -- so the kernel refuses whatever the
         // target. WHICH refusal depends on what is already there: an

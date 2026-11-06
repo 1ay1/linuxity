@@ -56,8 +56,15 @@ static char DIR[256];
 // nothing: the interesting answers are at the boundaries, so each pool mixes
 // legal values with the ones that break naive handlers -- empty strings,
 // paths that escape, counts that overflow, fds that were never opened.
+//
+// ".." is deliberately spelled "sub/.." rather than bare "..": the latter
+// leaves the scratch tree for /tmp, which the guest presents as root-owned
+// while the native run is unprivileged, so chmod/mkdir there answer
+// differently for a reason that has nothing to do with linuxity. "sub/.."
+// still exercises parent resolution and still lands on a directory, but the
+// directory is ours.
 static const char* kPathTails[] = {
-    "f1", "sub", "sub/f2", "nope", "", ".", "..", "sub/../f1",
+    "f1", "sub", "sub/f2", "nope", "", ".", "sub/..", "sub/../f1",
     "f1/bad", "sub/", "./f1", "//f1",
 };
 static const long kFlags[] = {
@@ -152,8 +159,19 @@ static const char* note1n(int i, const char* op, const char* a, long n) {
     snprintf(g_note, sizeof g_note, "#%03d %s(%s, %ld)", i, op, a, n);
     return g_note;
 }
+// The fd's SLOT, not its number. A guest holds descriptors of its own, so the
+// same operation legitimately lands on a different fd number than the native
+// run -- printing the raw number made four seeds "diverge" over nothing. The
+// slot is what the generator chose, so it is identical in both runs; whether
+// the fd behind it is valid still shows up in the RESULT.
+static int fd_slot(long fd) {
+    for (int k = 0; k < NFD; ++k)
+        if (g_fds[k] == fd) return k;
+    return -1;  // not one of ours (a bare -1, or a number never opened)
+}
 static const char* note2n(int i, const char* op, long fd, long x, long y) {
-    snprintf(g_note, sizeof g_note, "#%03d %s(fd=%ld, %ld, %ld)", i, op, fd, x, y);
+    snprintf(g_note, sizeof g_note, "#%03d %s(fd[%d], %ld, %ld)", i, op,
+             fd_slot(fd), x, y);
     return g_note;
 }
 
@@ -300,8 +318,14 @@ int main(void) {
         }   break;
         default:
         {   const long fd = rnd_fd(); const long c = pick(6); const long a = pick(4);
-            lx_emit("fcntl", LX_SYS3(SYS_fcntl, fd, c, a),
-                    note2n(i, "fcntl", fd, c, a));
+            long rc = LX_SYS3(SYS_fcntl, fd, c, a);
+            // F_DUPFD (0) RETURNS a new descriptor, and its number depends on
+            // which fds the process already holds -- the guest holds its own,
+            // so the number differs for a reason that is not a bug. Report
+            // only whether it succeeded, and close the duplicate so the run
+            // does not leak one per op.
+            if (c == 0 && rc >= 0) { LX_SYS1(SYS_close, rc); rc = 1; }
+            lx_emit("fcntl", rc, note2n(i, "fcntl", fd, c, a));
         }   break;
         }
     }

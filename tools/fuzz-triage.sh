@@ -39,10 +39,13 @@ run() {   # run(n_ops) -> trace on stdout
     # without write permission, so force it open before removing.
     chmod -R u+rwX /tmp/lx-fuzz-probe 2>/dev/null || true
     rm -rf /tmp/lx-fuzz-probe
+    # env keeps the assignments in the environment rather than letting a
+    # ${SEED:+...} expansion land where the command name goes -- with a seed
+    # set, that made the shell try to execute "LX_FUZZ_SEED=N".
     if [ "$who" = native ]; then
-        LX_FUZZ_OPS="$n" ${SEED:+LX_FUZZ_SEED=$SEED} "$stage/fuzz" 2>&1
+        env LX_FUZZ_OPS="$n" ${SEED:+LX_FUZZ_SEED="$SEED"} "$stage/fuzz" 2>&1
     else
-        LX_FUZZ_OPS="$n" ${SEED:+LX_FUZZ_SEED=$SEED} \
+        env LX_FUZZ_OPS="$n" ${SEED:+LX_FUZZ_SEED="$SEED"} \
             "$LINUXITY" "$stage/fuzz" 2>&1 | grep -v '^linuxity:'
     fi
 }
