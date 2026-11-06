@@ -185,6 +185,40 @@ int main() {
         assert(bytes_to_string(ci->bytes).find("processor") != std::string::npos);
     }
     {
+        // On arm64, /proc/cpuinfo's "Features" must be whatever the machine
+        // spec says -- never a baked-in list. The guest runs NATIVELY, so a
+        // feature advertised here that the real CPU lacks makes libgcrypt
+        // pick an instruction path that SIGILLs: `gpg --import` died exactly
+        // that way on a Snapdragon, because the list was hardcoded from an
+        // Apple M-series chip and promised sha3/sha512.
+        kernel::ProcessTable p;
+        kernel::ProcInfo init;
+        init.pid = 1;
+        init.cmdline = "/init";
+        p.upsert(init);
+
+        // static: make_procfs keeps a reference to the spec.
+        static kernel::MachineSpec m;
+        m.machine_arch = "aarch64";
+        m.ncpu = 1;
+        m.cpu_features = "fp asimd aes pmull sha1 sha2 crc32";
+        m.cpu_implementer = "0x51";
+        m.cpu_architecture = "8";
+
+        FN g;
+        g.mount_virtual("/proc", vfs::make_procfs(p, m));
+        auto ci = g.produce("/proc/cpuinfo");
+        assert(ci.has_value());
+        const std::string s = bytes_to_string(ci->bytes);
+        assert(s.find("Features\t: fp asimd aes pmull sha1 sha2 crc32\n")
+               != std::string::npos);
+        assert(s.find("CPU implementer\t: 0x51") != std::string::npos);
+        // The feature the old hardcoded list invented must NOT appear.
+        assert(s.find("sha3") == std::string::npos &&
+               "cpuinfo must not advertise a feature the host never reported");
+        assert(s.find("sha512") == std::string::npos);
+    }
+    {
         // /proc is an ENUMERABLE directory: it lists every pid + the
         // well-known files (this backs getdents64 on /proc).
         auto d = f.produce("/proc");

@@ -120,18 +120,21 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
             if (mach.machine_arch == "aarch64") {
                 // The arm64 kernel's format (arch/arm64/kernel/cpuinfo.c):
                 // no vendor_id/model name/MHz, but Features + the MIDR
-                // fields lscpu decodes. Apple implementer 0x61. We add a
-                // "model name" line too: Asahi and several distros carry it,
-                // and fetch tools (screenfetch, fastfetch) show it.
+                // fields lscpu decodes. We add a "model name" line too: Asahi
+                // and several distros carry it, and fetch tools (screenfetch,
+                // fastfetch) show it.
+                //
+                // Features comes from the MachineSpec, which main.cpp fills
+                // from the host -- the guest executes on the real CPU, so
+                // claiming a feature it lacks makes libgcrypt choose an
+                // instruction path that SIGILLs.
                 for (long c = 0; c < ncpu; ++c) {
                     s += "processor\t: " + std::to_string(c) + "\n";
                     s += "model name\t: " + mach.cpu_model + "\n";
                     s += "BogoMIPS\t: 48.00\n"
-                         "Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics "
-                         "fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 asimddp "
-                         "sha512 asimdfhm dit uscat ilrcpc flagm ssbs sb paca pacg dcpodp "
-                         "flagm2 frint bf16 i8mm bti ecv afp\n"
-                         "CPU implementer\t: 0x61\nCPU architecture: 8\n"
+                         "Features\t: " + mach.cpu_features + "\n"
+                         "CPU implementer\t: " + mach.cpu_implementer + "\n"
+                         "CPU architecture: " + mach.cpu_architecture + "\n"
                          "CPU variant\t: 0x0\nCPU part\t: 0x" + mach.cpu_part + "\n"
                          "CPU revision\t: 0\n\n";
                 }

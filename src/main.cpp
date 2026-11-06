@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <vector>
 #include <sys/socket.h>
@@ -33,6 +34,50 @@
 extern char** environ;
 
 namespace {
+
+// Copy the HOST's arm64 CPU identity into the advertised machine.
+//
+// /proc/cpuinfo's "Features" is not decoration on arm64: libgcrypt (and other
+// hand-written crypto) reads it, picks an instruction path from it, and the
+// guest executes NATIVELY on this CPU. Advertising a feature the silicon does
+// not have is therefore a crash, not a cosmetic lie -- `gpg --import` died
+// with SIGILL on a Snapdragon because a hardcoded Apple M-series list
+// promised sha3/sha512. Anything we cannot read keeps the conservative
+// ARMv8.0 default from MachineSpec.
+#if defined(__linux__) && defined(__aarch64__)
+void read_host_arm64_cpu(lx::kernel::MachineSpec& spec) {
+    std::ifstream in{"/proc/cpuinfo"};
+    if (!in) return;
+    auto after_colon = [](const std::string& line) {
+        const auto c = line.find(':');
+        if (c == std::string::npos) return std::string{};
+        auto v = line.substr(c + 1);
+        const auto b = v.find_first_not_of(" \t");
+        if (b == std::string::npos) return std::string{};
+        auto e = v.find_last_not_of(" \t\r\n");
+        return v.substr(b, e - b + 1);
+    };
+    // First processor block only: every core advertises the same features on
+    // every arm64 system Linux will boot (big.LITTLE included -- the kernel
+    // reports the common set).
+    for (std::string line; std::getline(in, line);) {
+        if (line.rfind("Features", 0) == 0) {
+            if (auto v = after_colon(line); !v.empty()) spec.cpu_features = v;
+        } else if (line.rfind("CPU implementer", 0) == 0) {
+            if (auto v = after_colon(line); !v.empty()) spec.cpu_implementer = v;
+        } else if (line.rfind("CPU architecture", 0) == 0) {
+            if (auto v = after_colon(line); !v.empty()) spec.cpu_architecture = v;
+        } else if (line.rfind("CPU part", 0) == 0) {
+            auto v = after_colon(line);
+            if (v.rfind("0x", 0) == 0) v.erase(0, 2);   // stored without 0x
+            if (!v.empty()) spec.cpu_part = v;
+            break;   // CPU part is the last of the four in a block
+        }
+    }
+}
+#else
+void read_host_arm64_cpu(lx::kernel::MachineSpec&) {}
+#endif
 
 // Occupy the low file-descriptor slots (3..8) with harmless /dev/null handles
 // in the freshly forked child, BEFORE it execs the guest. This makes the
@@ -318,6 +363,13 @@ int main(int argc, char** argv) {
         spec.mem_total = std::uint64_t{2048} << 20;   // 2 GiB
         spec.release = "6.6.0-linuxity";
         spec.nodename = "linuxity";
+        // On arm64 the guest's /proc/cpuinfo "Features" must be the HOST's.
+        // The guest executes natively, so libgcrypt (and anything else that
+        // picks an instruction path from this line) will run what it reads: a
+        // feature we advertise but the CPU lacks is a SIGILL. gpg --import
+        // died that way under a hardcoded list. Copy the host's own values.
+        if (spec.machine_arch == "aarch64")
+            read_host_arm64_cpu(spec);
         // Fold the enforced resource policy INTO the advertised machine, so a
         // program that sizes its caches to "half of RAM" or starts "one worker
         // per CPU" shapes itself to the bound it will actually be held to —

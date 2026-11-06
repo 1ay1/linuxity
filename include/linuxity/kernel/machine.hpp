@@ -48,6 +48,16 @@ public:
     std::string   machine_arch{conform::arch_name(conform::host_arch())};
     std::string   cpu_model{"linuxity native CPU"};   // /proc/cpuinfo model name
     std::string   cpu_part{"000"};             // arm64 MIDR part number (hex)
+    // arm64 /proc/cpuinfo "Features". The guest runs NATIVELY, so this has to
+    // describe the real CPU: libgcrypt and friends read it, pick an
+    // instruction path from it, and a feature we claim but the CPU lacks is a
+    // SIGILL. (gpg --import died exactly that way on a Snapdragon, because a
+    // hardcoded Apple M-series list promised sha3/sha512.) main.cpp fills this
+    // from the host's own cpuinfo; this default is the ARMv8.0 baseline every
+    // arm64 Linux CPU has.
+    std::string   cpu_features{"fp asimd evtstrm aes pmull sha1 sha2 crc32"};
+    std::string   cpu_implementer{"0x41"};     // 0x41 = ARM Ltd
+    std::string   cpu_architecture{"8"};
 
     // -- Time --------------------------------------------------------------
     // Wall-clock at boot (for /proc/stat btime); fixed so it is stable across
