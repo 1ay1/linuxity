@@ -209,6 +209,53 @@ int main(void) {
                 "...and it is a regular file");
     }
 
+    // -- EFAULT: writing through a pointer the guest cannot write ---------
+    // Every virtualized handler that copies a struct OUT has this path, and
+    // none of them were exercised -- the probes always passed good buffers.
+    // 0x1 is unmapped on any sane process, so the kernel answers EFAULT and
+    // the guest must too. getresuid returned 0 here: it checked for NULL,
+    // which is the easy half, and the write itself discarded whether it
+    // worked.
+    {
+        void* bad = (void*)0x1;
+        lx_emit("uname",     LX_SYS1(SYS_uname, bad),     "uname to a bad pointer is EFAULT");
+        lx_emit("getcwd",    LX_SYS2(SYS_getcwd, bad, 64), "getcwd to a bad pointer is EFAULT");
+        lx_emit("sysinfo",   LX_SYS1(SYS_sysinfo, bad),   "sysinfo to a bad pointer is EFAULT");
+        lx_emit("getresuid", LX_SYS3(SYS_getresuid, bad, bad, bad),
+                "getresuid to bad pointers is EFAULT");
+        lx_emit("getresgid", LX_SYS3(SYS_getresgid, bad, bad, bad),
+                "getresgid to bad pointers is EFAULT");
+        lx_emit("statfs",    LX_SYS2(SYS_statfs, "/proc", bad),
+                "statfs to a bad pointer is EFAULT");
+    }
+
+    // -- /proc/self/maps ---------------------------------------------------
+    // Was a stub serving an empty file. The guest is a real host process
+    // with real mappings, and an empty map is not a plausible process --
+    // pstack, a debugger, and any allocator that walks its own mappings
+    // read this. The CONTENT cannot be compared (addresses are per-run), so
+    // the probe checks the shape: non-empty, and every line starts with a
+    // hex range.
+    {
+        const long fd = LX_SYS3(SYS_openat, AT_FDCWD, "/proc/self/maps", O_RDONLY);
+        lx_emit("openat", fd < 0 ? fd : 1, "open /proc/self/maps");
+        static char mb[4096];
+        const long n = (fd < 0) ? fd : LX_SYS3(SYS_read, fd, mb, (long)sizeof mb - 1);
+        if (fd >= 0) LX_SYS1(SYS_close, fd);
+        lx_emit("read", LX_CHECK(fd >= 0, n > 0), "maps is not empty");
+        // A map line is "<hex>-<hex> rwxp ...": check the first character is
+        // a hex digit and a '-' appears before the first space.
+        int shaped = 0;
+        if (n > 0) {
+            mb[n] = 0;
+            const char c = mb[0];
+            const int hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+            const char* dash = strchr(mb, '-');
+            const char* sp = strchr(mb, ' ');
+            shaped = hex && dash && sp && dash < sp;
+        }
+        lx_emit("read", LX_CHECK(n > 0, shaped), "...and the first line is an address range");
+    }
     // -- sysinfo -----------------------------------------------------------
     // struct sysinfo: uptime(8) loads(24) totalram(8) freeram(8) ...
     // Uptime and free memory differ between runs by nature; totals do not.
