@@ -2359,7 +2359,43 @@ private:
         constexpr std::uint64_t kTIOCGPGRP = 0x540F;  // get fg process group
         constexpr std::uint64_t kTIOCSPGRP = 0x5410;  // set fg process group
         constexpr std::uint64_t kTIOCGSID  = 0x5429;  // get session id
+        // The classic termios requests, and the termios2 ones glibc >= 2.42
+        // uses instead. Raw numbers: the TCGETS2 macro needs struct termios2,
+        // which isn't in every host's headers, and these are arch-independent.
+        constexpr std::uint64_t kTCGETS   = 0x5401;
+        constexpr std::uint64_t kTCSETS   = 0x5402;
+        constexpr std::uint64_t kTCSETSW  = 0x5403;   // ...after draining
+        constexpr std::uint64_t kTCSETSF  = 0x5404;   // ...after flushing
+        constexpr std::uint64_t kTCGETS2  = 0x802c542a;
+        constexpr std::uint64_t kTCSETS2  = 0x402c542b;
+        constexpr std::uint64_t kTCSETSW2 = 0x402c542c;
+        constexpr std::uint64_t kTCSETSF2 = 0x402c542d;
         const std::uint64_t request = r.arg[1];
+        // Android's SELinux ioctl whitelist permits the classic termios
+        // requests on a pty slave but not the termios2 ones, so the rootfs's
+        // glibc gets EACCES on every tcgetattr/tcsetattr/isatty/ttyname and
+        // `tty` claims "not a tty". Serve them with the classic request and fix
+        // the struct: termios2 is termios plus c_ispeed/c_ospeed, and the
+        // leading bytes are identical, so a set needs no conversion at all and
+        // a get only needs the two speeds appended.
+        {
+            const std::uint64_t classic = [&]() -> std::uint64_t {
+                switch (request) {
+                    case kTCGETS2:  return kTCGETS;
+                    case kTCSETS2:  return kTCSETS;
+                    case kTCSETSW2: return kTCSETSW;
+                    case kTCSETSF2: return kTCSETSF;
+                    default:        return 0;
+                }
+            }();
+            if (classic != 0)
+                return ArgRewrite{
+                    1, classic,
+                    request == kTCGETS2
+                        ? ArgRewrite::Convert::termios_to_termios2
+                        : ArgRewrite::Convert::none,
+                    uaddr(r.arg[2])};
+        }
         // A backend that models real process groups (HVF) also owns the
         // terminal's foreground group: forward, so tcsetpgrp actually moves
         // ^C/^Z delivery to the job and the shell survives ^Z.

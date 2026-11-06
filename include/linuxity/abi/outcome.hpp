@@ -227,6 +227,37 @@ struct SockRewrite {
         : path_addr{pa}, host_path{std::move(hp)}, len_arg{la}, new_len{nl} {}
 };
 
+// ARG_REWRITE - run the guest's syscall, but with one NON-PATH argument
+// register changed, and convert the buffer it filled on the way back.
+//
+// This exists for a host that refuses a syscall variant the guest's libc
+// insists on. Android's SELinux ioctl whitelist allows TCGETS/TCSETS on a pty
+// slave but not TCGETS2/TCSETS2, and glibc >= 2.42 implements tcgetattr/
+// tcsetattr/isatty/ttyname with the 2-variants -- so every termios call on a
+// pty fails EACCES and `tty` reports "not a tty" on a perfectly good pty.
+// struct termios2 is struct termios plus c_ispeed/c_ospeed, so the classic
+// ioctl can serve the new one if someone fixes the struct up. That someone is
+// here: swap the request register, forward, then translate the layout.
+//
+// Not a Redirect: nothing about this is a path, there is no namespace
+// translation, and the fixup rewrites a DIFFERENT buffer shape than Scrub's.
+struct ArgRewrite {
+    // How to convert the buffer once the host syscall has returned.
+    enum class Convert : std::uint8_t {
+        none,
+        termios_to_termios2,   // widen: host filled termios, guest wants termios2
+    };
+
+    int           arg;              // which argument register to replace
+    std::uint64_t to;               // what to put in it
+    Convert       convert{Convert::none};
+    UAddr         buf{};            // the guest buffer `convert` operates on
+
+    ArgRewrite(int a, std::uint64_t v) noexcept : arg{a}, to{v} {}
+    ArgRewrite(int a, std::uint64_t v, Convert c, UAddr b) noexcept
+        : arg{a}, to{v}, convert{c}, buf{b} {}
+};
+
 // EXITED - the guest asked to terminate. Carries the status, nothing else.
 struct Exited {
     int code;
@@ -238,7 +269,7 @@ struct Exited {
 
 // Exactly one fate. No flags, no combinations, no precedence to remember.
 using Fate = std::variant<Virtualize, Forward, Redirect, Inject,
-                          Raise, ExecInterp, SockRewrite, Exited>;
+                          Raise, ExecInterp, SockRewrite, ArgRewrite, Exited>;
 
 class Outcome {
 public:

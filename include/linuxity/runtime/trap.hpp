@@ -32,11 +32,13 @@
 #include "linuxity/host/win_posix.hpp"
 #include "linuxity/runtime/backend.hpp"
 
+#include <array>
 #include <concepts>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -101,7 +103,7 @@ public:
             // The dispatcher classifies the trapped syscall: service it from
             // our subsystems, forward it to the host kernel, or exit.
             abi::Outcome o = locked([&] { return sys.dispatch(f.regs); });
-            if (const char* t = trace_env) trace_fate(t, f.regs.nr, o);
+            if (const char* t = trace_env) trace_fate(t, f.regs, o);
 
             // Act on the fate. Exactly one arm runs, chosen by the type, and
             // the compiler rejects this match if a fate is left unhandled --
@@ -270,6 +272,32 @@ public:
                     return Step::next;
                 },
 
+                [&](const abi::ArgRewrite& ar) {
+                    // Swap one argument register, run the real syscall, then
+                    // convert the buffer it filled. Needs a backend that can
+                    // both write a register and step to the exit stop; without
+                    // that the guest's own request stands and we just forward
+                    // (the host may well allow it -- this is a workaround for
+                    // hosts that don't, not a correctness requirement).
+                    if constexpr (runtime::RewritesArgs<T>) {
+                        const auto conv = ar.convert;
+                        const auto buf  = ar.buf;
+                        auto fr = trap_.rewrite_arg(
+                            ar.arg, ar.to, [&](std::int64_t ret) {
+                                if (ret < 0) return;
+                                if (conv == abi::ArgRewrite::Convert::
+                                                termios_to_termios2)
+                                    widen_termios(buf);
+                            });
+                        if (!fr) return recover(fr.error());
+                        return Step::next;
+                    } else {
+                        auto fr = trap_.forward();
+                        if (!fr) return recover(fr.error());
+                        return Step::next;
+                    }
+                },
+
                 [&](abi::Virtualize v) {
                     // Hand the guest our answer; no real syscall runs.
                     auto st = trap_.resume(v.ret);
@@ -331,10 +359,66 @@ private:
         return kEmpty;
     }
 
+    // Turn the struct termios the host's TCGETS wrote into the struct
+    // termios2 the guest's TCGETS2 asked for. Same first 36 bytes, then two
+    // speed fields the classic ioctl never writes -- so fill them from the
+    // CBAUD code already in c_cflag. Verified on a pty: the kernel reports a
+    // real Bxxx code there (not BOTHER), so nothing is lost in the downgrade.
+    void widen_termios(UAddr buf) {
+        constexpr std::size_t kTermios  = 36;   // 4 flags + c_line + 19 c_cc
+        constexpr std::uint32_t kCbaud  = 0x0000100f;
+        constexpr std::uint32_t kBother = 0x00001000;
+        std::array<std::byte, kTermios> t{};
+        if (!trap_.copy_in(buf, t)) return;
+        std::uint32_t cflag = 0;
+        std::memcpy(&cflag, t.data() + 8, 4);          // c_cflag is field 3
+        const std::uint32_t speed = baud_of(cflag & kCbaud);
+        // BOTHER means the speed lives ONLY in the speed fields, which the
+        // classic ioctl didn't give us. Leave them zero rather than invent a
+        // rate -- a pty never reports BOTHER, so this is a safety net.
+        const std::uint32_t v = (cflag & kCbaud) == kBother ? 0 : speed;
+        std::array<std::byte, 8> tail{};
+        std::memcpy(tail.data(),     &v, 4);           // c_ispeed
+        std::memcpy(tail.data() + 4, &v, 4);           // c_ospeed
+        (void)trap_.copy_out(uaddr(value(buf) + kTermios), tail);
+    }
+
+    // The CBAUD code -> its baud rate. Only the codes a terminal actually
+    // reports; anything else gives 0, which is what B0 means anyway.
+    static std::uint32_t baud_of(std::uint32_t code) {
+        switch (code) {
+            case 0x1:  return 50;      case 0x2:  return 75;
+            case 0x3:  return 110;     case 0x4:  return 134;
+            case 0x5:  return 150;     case 0x6:  return 200;
+            case 0x7:  return 300;     case 0x8:  return 600;
+            case 0x9:  return 1200;    case 0xa:  return 1800;
+            case 0xb:  return 2400;    case 0xc:  return 4800;
+            case 0xd:  return 9600;    case 0xe:  return 19200;
+            case 0xf:  return 38400;
+            case 0x1001: return 57600;   case 0x1002: return 115200;
+            case 0x1003: return 230400;  case 0x1004: return 460800;
+            case 0x1005: return 500000;  case 0x1006: return 576000;
+            case 0x1007: return 921600;  case 0x1008: return 1000000;
+            case 0x1009: return 1152000; case 0x100a: return 1500000;
+            case 0x100b: return 2000000; case 0x100c: return 2500000;
+            case 0x100d: return 3000000; case 0x100e: return 3500000;
+            case 0x100f: return 4000000;
+            default: return 0;
+        }
+    }
+
     // One line per serviced syscall under LINUXITY_TRACE. The fate names
     // itself, so this is a match too rather than a row of flag tests.
-    void trace_fate(const char* t, std::uint64_t nr, const abi::Outcome& o) {
+    //
+    // The first two arguments are printed too. Without them an ioctl is just
+    // "nr=29 -> VIRT", and finding WHICH request a tty bug turned on took a
+    // round of guessing; a0/a1 is the fd and the request for ioctl, and the
+    // dirfd and path pointer for the *at calls.
+    void trace_fate(const char* t, const abi::Regs& rg, const abi::Outcome& o) {
+        const std::uint64_t nr = rg.nr;
         std::FILE* out = trace_out(t);
+        std::fprintf(out, "[lx] a0=%#llx a1=%#llx ",
+                     (unsigned long long)rg.arg[0], (unsigned long long)rg.arg[1]);
         o.match(
             [&](const abi::Virtualize& v) {
                 std::fprintf(out, "[lx] nr=%llu -> VIRT ret=%lld\n",
@@ -381,6 +465,13 @@ private:
             [&](const abi::SockRewrite& sr) {
                 std::fprintf(out, "[lx] nr=%llu -> SOCKREWRITE %s\n",
                     (unsigned long long)nr, sr.host_path.c_str());
+            },
+            [&](const abi::ArgRewrite& ar) {
+                std::fprintf(out, "[lx] nr=%llu -> ARGREWRITE a%d=%#llx%s\n",
+                    (unsigned long long)nr, ar.arg,
+                    (unsigned long long)ar.to,
+                    ar.convert == abi::ArgRewrite::Convert::termios_to_termios2
+                        ? " +widen_termios" : "");
             },
             [&](const abi::Exited& e) {
                 std::fprintf(out, "[lx] nr=%llu -> EXIT code=%d\n",

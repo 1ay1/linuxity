@@ -630,6 +630,30 @@ public:
         return ok(ret);
     }
 
+    // REWRITE_ARG: run the guest's syscall with one argument register replaced,
+    // step to its exit, and let the caller patch the result buffer before the
+    // guest can read it. Synchronous for the same reason redirect() is: the
+    // fixup has to land while the task is still stopped at the exit.
+    //
+    // No path is involved, so nothing is poked into guest memory on entry --
+    // just the one register.
+    [[nodiscard]] Result<std::int64_t> rewrite_arg(
+        int arg, std::uint64_t value_in,
+        std::function<void(std::int64_t)> post_exit = {}) {
+        Task& t = tasks_[cur_];
+        Regs r = t.regs;
+        set_arg(r, arg, value_in);
+        (void)r.store(cur_);
+        if (!step_to_exit(cur_)) return ok(std::int64_t{-1});   // task exited
+        Regs rr{};
+        (void)Regs::fetch(cur_, rr);
+        const std::int64_t ret = static_cast<std::int64_t>(rr.ret());
+        tasks_[cur_].in_call = false;
+        if (post_exit) post_exit(ret);
+        resume_task(cur_);
+        return ok(ret);
+    }
+
     // REWRITE_SOCKADDR: for an AF_UNIX bind/connect, poke the translated host
     // path into the guest's sun_path and set the socklen register, then
     // forward the call to the kernel. Like redirect(), the path bytes MUST go

@@ -145,6 +145,16 @@ concept DeliversSignals = SyscallTrap<T> && requires(T t) {
         -> std::same_as<std::int64_t>;
 };
 
+// Replace one NON-PATH argument register, run the syscall, and hand its result
+// to a callback before the guest sees it. Used to serve a syscall variant the
+// host refuses (Android's SELinux ioctl whitelist rejects TCGETS2 on a pty) by
+// downgrading it to one the host allows and fixing up the buffer.
+template <class T>
+concept RewritesArgs = SyscallTrap<T> && requires(T t) {
+    { t.rewrite_arg(0, std::uint64_t{}, std::function<void(std::int64_t)>{}) }
+        -> std::same_as<Result<std::int64_t>>;
+};
+
 // Report guest process lifecycle events (clone/exec/exit) the loop folds into
 // the pid namespace. Each backend declares its OWN event type (ptrace nests a
 // ProcEvent), so the requirement is on the SHAPE: a range of records carrying
@@ -170,6 +180,7 @@ struct Capabilities {
     static constexpr bool sockets           = TranslatesSockets<T>;
     static constexpr bool exec_interp       = ExecsThroughInterp<T>;
     static constexpr bool signals           = DeliversSignals<T>;
+    static constexpr bool arg_rewrite       = RewritesArgs<T>;
     static constexpr bool proc_events       = ReportsProcEvents<T>;
 };
 

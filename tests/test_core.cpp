@@ -104,6 +104,38 @@ int main() {
     abi::Regs g; g.nr = 102; // x86-64 getuid
     assert(virt_ret(sys.dispatch(g)) == 0 && !is_forward(sys.dispatch(g)));
 
+    // The termios2 ioctls are rewritten to their classic equivalents. Android's
+    // SELinux ioctl whitelist allows TCGETS/TCSETS on a pty slave but not
+    // these, and glibc >= 2.42 uses only these -- so without the rewrite every
+    // tcgetattr/tcsetattr on a pty fails EACCES and `tty` says "not a tty".
+    // Asserted here rather than in the live test because a host that PERMITS
+    // termios2 (x86-64 Linux) gives the same answer either way: only the
+    // dispatcher's choice of fate shows the downgrade really happens.
+    auto downgrades_to = [&](std::uint64_t req, std::uint64_t want,
+                             bool want_widen) {
+        abi::Regs io; io.nr = 16;            // x86-64 ioctl
+        io.arg[0] = 3; io.arg[1] = req; io.arg[2] = 0x7000;
+        const auto out = sys.dispatch(io);
+        const auto* ar = out.template get_if<abi::ArgRewrite>();
+        assert(ar && "a termios2 ioctl must become an ArgRewrite");
+        assert(ar->arg == 1 && "the REQUEST register is the one to replace");
+        assert(ar->to == want);
+        const bool widens = ar->convert ==
+            abi::ArgRewrite::Convert::termios_to_termios2;
+        assert(widens == want_widen &&
+               "only the getter needs c_ispeed/c_ospeed appended");
+    };
+    downgrades_to(0x802c542a, 0x5401, true);    // TCGETS2  -> TCGETS
+    downgrades_to(0x402c542b, 0x5402, false);   // TCSETS2  -> TCSETS
+    downgrades_to(0x402c542c, 0x5403, false);   // TCSETSW2 -> TCSETSW
+    downgrades_to(0x402c542d, 0x5404, false);   // TCSETSF2 -> TCSETSF
+
+    // The classic ones are already allowed everywhere, so they just forward.
+    {
+        abi::Regs io; io.nr = 16; io.arg[0] = 3; io.arg[1] = 0x5401;
+        assert(is_forward(sys.dispatch(io)));
+    }
+
     std::puts("all runtime type-algebra tests passed");
     return 0;
 }

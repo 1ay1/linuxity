@@ -11,9 +11,9 @@ using namespace lx;
 using namespace lx::abi;
 
 // -- 1. The fate is a SUM, not a product of flags -------------------------
-// Eight fates, exactly one inhabited at a time. The old struct had 2^7 = 128
-// flag combinations of which ~8 were legal; a variant has exactly 8 states.
-static_assert(std::variant_size_v<Fate> == 8);
+// Nine fates, exactly one inhabited at a time. The old struct had 2^7 = 128
+// flag combinations of which ~8 were legal; a variant has exactly 9 states.
+static_assert(std::variant_size_v<Fate> == 9);
 
 // -- 2. Mandatory payload is a constructor parameter ----------------------
 // You cannot name a fate without giving it the data that fate requires.
@@ -65,7 +65,7 @@ static_assert(Virtualize{7}.ret == 7);
 static_assert(Virtualize::fail(Errno::eacces).ret == -13);
 
 // -- 5. match() is total --------------------------------------------------
-// This compiles only because all eight alternatives are handled. Drop one arm
+// This compiles only because all nine alternatives are handled. Drop one arm
 // and the build fails naming the unhandled fate.
 [[nodiscard]] constexpr const char* name_of(const Outcome& o) {
     return o.match(
@@ -76,6 +76,7 @@ static_assert(Virtualize::fail(Errno::eacces).ret == -13);
         [](const Raise&)       { return "raise"; },
         [](const ExecInterp&)  { return "exec_interp"; },
         [](const SockRewrite&) { return "sock_rewrite"; },
+        [](const ArgRewrite&)  { return "arg_rewrite"; },
         [](const Exited&)      { return "exited"; });
 }
 
