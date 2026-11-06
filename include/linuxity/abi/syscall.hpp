@@ -1893,6 +1893,13 @@ private:
         // that "this is not a symlink" would give.
         if (const Errno e = dot_prefix_error(r, path_arg, at); e != Errno::ok)
             return eno(e);
+        // A symlink CYCLE in the prefix is ELOOP, ahead of the EINVAL that
+        // "the leaf is not a link" would give. readlink resolves the prefix
+        // but not the leaf, so the namespace has to be asked directly.
+        if (const Errno e = guest_prefix_loop(resolve_arg(r, path_arg, at,
+                                                          /*follow_leaf=*/false));
+            e != Errno::ok)
+            return eno(e);
 
         // /proc/self and /proc/thread-self ARE symlinks -- to "<pid>" and
         // "<pid>/task/<tid>". readlink must see them as such, but resolve_arg
@@ -2464,6 +2471,12 @@ private:
                 read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)])),
                 pc.host_path))
             return eno(Errno::eacces);
+        // A symlink CYCLE in the prefix is ELOOP. classify here uses
+        // follow=false (these ops act on the NAME), which is what skips the
+        // detector, so ask the namespace -- the host cannot see the cycle,
+        // because the overlay upper holds guest-absolute link targets.
+        if (const Errno e = guest_prefix_loop(abs); e != Errno::ok)
+            return eno(e);
         if (pc.realm == kernel::Realm2::virtual_file) {
             // This branch means the leaf RESOLVED, so a creating op (mkdir,
             // mknod) is refused for the name being taken, before procfs's
@@ -3166,6 +3179,9 @@ private:
                 read_cstr(uaddr(r.arg[static_cast<std::size_t>(link_arg)])),
                 pc.host_path))
             return eno(Errno::eacces);
+        // A cycle in the link name's prefix is ELOOP, same as path_mut.
+        if (const Errno e = guest_prefix_loop(link); e != Errno::ok)
+            return eno(e);
         if (pc.realm == kernel::Realm2::virtual_file)
             // Reached only when the link name RESOLVED, so the name is taken.
             return eno(virtual_mut_errno(link, VMut::exists));

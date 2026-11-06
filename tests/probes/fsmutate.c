@@ -778,6 +778,29 @@ int main(void) {
     LX_SYS4(SYS_fchmodat, AT_FDCWD, DIR "/nox7", 0755, 0);
     LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/nox7", 0x200);
 
+    // -- a prefix CYCLE is ELOOP in every handler, not just some -----------
+    // access/stat/chmod/open already reported it, because they resolve with
+    // follow=true somewhere along the way. mkdir, symlink, readlink, unlink
+    // and truncate answered ENOENT: they act on the NAME, resolve with
+    // follow=false, and that is exactly what skips the cycle detector. The
+    // host cannot substitute -- the overlay upper stores guest-absolute link
+    // targets, so a host probe sees a dangling link, never the cycle.
+    LX_SYS3(SYS_symlinkat, DIR "/cyc4", AT_FDCWD, DIR "/cyc4");
+    lx_emit("mkdirat", LX_SYS3(SYS_mkdirat, AT_FDCWD, DIR "/cyc4/x", 0755),
+            "mkdir through a cycle is ELOOP");
+    lx_emit("symlinkat", LX_SYS3(SYS_symlinkat, "t", AT_FDCWD, DIR "/cyc4/x"),
+            "symlink through a cycle is ELOOP");
+    lx_emit("readlinkat",
+            LX_SYS4(SYS_readlinkat, AT_FDCWD, DIR "/cyc4/x", (char[64]){0}, 64),
+            "readlink through a cycle is ELOOP, not EINVAL");
+    lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/cyc4/x", 0),
+            "unlink through a cycle is ELOOP");
+    lx_emit("truncate", LX_SYS2(SYS_truncate, DIR "/cyc4/x", 0),
+            "truncate through a cycle is ELOOP");
+    lx_emit("faccessat", LX_SYS3(SYS_faccessat, AT_FDCWD, DIR "/cyc4/x", 0),
+            "...and access still reports it too");
+    LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/cyc4", 0);
+
     // -- teardown, observing each removal ----------------------------------
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, SYM, 0), "unlink sym");
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, F2, 0), "unlink f2");
