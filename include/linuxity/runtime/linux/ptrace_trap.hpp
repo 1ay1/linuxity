@@ -942,13 +942,25 @@ public:
                 a.erase(0, root_.size());
             return a;
         };
-        // Drop a leading ELF interpreter token (ld-linux*.so* / ld-musl*.so*):
-        // it's how linuxity launches a dynamic binary, not the guest command.
+        // Drop a leading ELF interpreter token: it's how linuxity launches a
+        // dynamic binary, not the guest command.
+        //
+        // The name is NOT the same everywhere. glibc ships ld-linux*.so*,
+        // musl ships ld-musl*.so*, and BIONIC -- Android -- ships plain
+        // `linker64` (or `linker` on 32-bit) with no .so suffix at all,
+        // usually under /apex/com.android.runtime/bin/. Missing that last
+        // one meant every guest on Android read its own /proc/self/cmdline
+        // as "/apex/com.android.runtime/bin/linker64\0<program>" and its
+        // comm as "linker64": anything that introspects its own argv --
+        // argv[0]-based re-exec, a daemon logging its name, ps -- saw the
+        // loader instead of itself. Caught by the procid conformance probe,
+        // which was the one scenario still diverging on the device.
         auto is_interp = [](const std::string& a) {
             auto slash = a.find_last_of('/');
             std::string base = slash == std::string::npos ? a : a.substr(slash + 1);
             return base.rfind("ld-linux", 0) == 0 || base.rfind("ld-musl", 0) == 0 ||
-                   base.rfind("ld.so", 0) == 0;
+                   base.rfind("ld.so", 0) == 0 ||
+                   base == "linker64" || base == "linker";
         };
         std::size_t start = (args.size() > 1 && is_interp(args[0])) ? 1 : 0;
         // NUL-joined, which is ProcInfo::cmdline's documented contract and
