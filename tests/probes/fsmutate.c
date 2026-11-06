@@ -531,6 +531,23 @@ int main(void) {
     lx_emit("symlinkat", LX_SYS3(SYS_symlinkat, "t", AT_FDCWD, F1 "/lnk"),
             "symlink under a FILE is ENOTDIR, not EEXIST");
 
+    // rename and link had it too, and for rename that meant MOVING the file
+    // into a directory the caller never named.
+    lx_emit("renameat",
+            LX_SYS4(SYS_renameat, AT_FDCWD, F1, AT_FDCWD, DIR "/gone2/x"),
+            "rename under a MISSING parent is ENOENT");
+    lx_emit("newfstatat",
+            LX_SYS4(SYS_newfstatat, AT_FDCWD, DIR "/gone2", (char[512]){0}, 0),
+            "...no parent invented, and f1 not moved");
+    lx_emit("newfstatat", LX_SYS4(SYS_newfstatat, AT_FDCWD, F1, (char[512]){0}, 0),
+            "...f1 is still where it was");
+    lx_emit("linkat",
+            LX_SYS5(SYS_linkat, AT_FDCWD, F1, AT_FDCWD, DIR "/gone3/x", 0),
+            "hardlink under a MISSING parent is ENOENT");
+    lx_emit("newfstatat",
+            LX_SYS4(SYS_newfstatat, AT_FDCWD, DIR "/gone3", (char[512]){0}, 0),
+            "...and that parent was not invented either");
+
     // -- teardown, observing each removal ----------------------------------
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, SYM, 0), "unlink sym");
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, F2, 0), "unlink f2");

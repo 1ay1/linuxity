@@ -2773,11 +2773,15 @@ private:
         // does NOT: both names share the inode, so the original keeps its own
         // record). Do the in-store move BEFORE the redirect returns.
         if (move_meta) k_.files().meta().rename(src, dst);
-        // Both operands are guest paths, so both get translated, and the
-        // destination's parent chain must exist before the host runs it.
+        // Both operands are guest paths, so both get translated.
+        //
+        // NO .parents(): the chain is pre-created to MIRROR a lower-layer
+        // directory into the upper, never to conjure one. Asking for it here
+        // meant `rename f1 absent/x` created absent/ and MOVED THE FILE
+        // there, and link did the same -- both ENOENT on the kernel. The
+        // destination's own parent must already exist; let the host say so.
         return Redirect{PathArg{a1, std::move(ps.host_path)}}
-            .with(PathArg{a2, std::move(pd.host_path)})
-            .parents();
+            .with(PathArg{a2, std::move(pd.host_path)});
     }
 
     // symlink(target, linkpath) / symlinkat(target, newdirfd, linkpath):
