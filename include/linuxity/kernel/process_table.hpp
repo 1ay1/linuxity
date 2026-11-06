@@ -144,13 +144,23 @@ public:
     // rather than reading the caller's own field.
     [[nodiscard]] std::int32_t ctty_of(std::int32_t pid) const {
         if (pid <= 0) return -1;
+        // The session leader owns it, when there is a recorded session.
         const std::int32_t leader = sid_of(pid);
         if (const ProcInfo* l = find(leader); l != nullptr && l->ctty >= 0)
             return l->ctty;
-        // Not on the leader: a process that claimed a ctty before any setsid
-        // still has one, so fall back to its own record.
-        const ProcInfo* p = find(pid);
-        return p != nullptr ? p->ctty : -1;
+        // Otherwise walk up the tree. A ctty is INHERITED across fork and
+        // exec, exactly like pgid, and this is the common case rather than
+        // the exception: linuxity seeds pid 1 from the terminal it was
+        // launched on, and the shell the user actually typed at is pid 2.
+        // Resolving only through sid_of missed that -- sid_of(2) is 2, which
+        // has no ctty of its own, so bash saw ENOTTY on its own terminal and
+        // printed "no job control in this shell".
+        for (const ProcInfo* p = find(pid); p != nullptr; ) {
+            if (p->ctty >= 0) return p->ctty;
+            if (p->ppid == 0 || p->ppid == p->pid) break;
+            p = find(p->ppid);
+        }
+        return -1;
     }
 
     // TIOCSCTTY: make pty slave `n` the ctty of `pid`'s session.

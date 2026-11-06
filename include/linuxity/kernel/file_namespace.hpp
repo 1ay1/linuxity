@@ -399,9 +399,18 @@ public:
             if (for_write) {
                 if (wi == WriteIntent::remove) {
                     // Resolve to the layer holding the target; don't create.
-                    if (exists(up.c_str()))
-                        return PathClass{Realm2::host_backed, std::move(up),
-                                         Errno::enoent, {}};
+                    if (exists(up.c_str())) {
+                        PathClass r{Realm2::host_backed, std::move(up),
+                                    Errno::enoent, {}};
+                        // Removing the UPPER copy unshadows the lower one, so
+                        // the file would come back from the pristine rootfs.
+                        // A whiteout is still needed. pacman reinstalling the
+                        // same package twice hit this: the first install put
+                        // the file in the upper, the second unlinked it, and
+                        // the lower copy reappeared so O_EXCL said EEXIST.
+                        if (exists(lo.c_str())) r.whiteout_lower = true;
+                        return r;
+                    }
                     // Target lives ONLY in the read-only lower layer. Forwarding
                     // the unlink to `lo` would DESTROY the pristine rootfs. If
                     // the lower file doesn't exist at all (or is already whited
@@ -419,7 +428,12 @@ public:
                 else
                     copy_up(up, lo);
                 // A create/write at a whited-out path revives it: the upper
-                // now shadows the (still-pristine) lower, so drop the whiteout.
+                // now shadows the (still-pristine) lower, so drop the
+                // whiteout. Doing this HERE, before O_EXCL's own existence
+                // probe, is deliberate -- the probe then sees the name as
+                // free and the exclusive create succeeds, which is what an
+                // overlay must do for a file that only exists in the
+                // read-only lower layer.
                 if (!whiteouts_.empty()) clear_whiteout(std::string{abs});
                 return PathClass{Realm2::host_backed, std::move(up), Errno::enoent, {}};
             }
@@ -1268,6 +1282,13 @@ private:
     std::string whiteout_journal_;
 
 public:
+    // Drop a whiteout because the path really exists again (an upper-layer
+    // file now shadows the lower one). Safe to call for a path that was
+    // never deleted -- the common case, so it checks the set first.
+    void clear_whiteout_if_any(const std::string& guest_path) const {
+        if (!whiteouts_.empty()) clear_whiteout(guest_path);
+    }
+
     // Record a lower-only removal. Returns nothing; the caller reports success.
     void add_whiteout(const std::string& guest_path) const {
         if (whiteouts_.insert(guest_path).second && !whiteout_journal_.empty()) {

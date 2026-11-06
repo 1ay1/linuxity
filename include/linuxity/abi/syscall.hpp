@@ -1265,6 +1265,15 @@ private:
         return false;
     }
 
+    // Is this host path a SYMLINK (not what it points at)? A dangling link
+    // occupies its name, so an exclusive create through it is EEXIST even
+    // though the target resolves to nothing.
+    [[nodiscard]] static bool host_path_is_symlink(const std::string& p) noexcept {
+        if (p.empty()) return false;
+        struct ::stat st{};
+        return ::lstat(p.c_str(), &st) == 0 && S_ISLNK(st.st_mode);
+    }
+
     // Does the PARENT of this host path resolve at all (symlinks followed)?
     // A dangling link used as a path component is ENOENT, which the kernel
     // reports before anything about what is being linked. `why` separates
@@ -1531,10 +1540,30 @@ private:
         // caller had explicitly asked not to create.
         if (wire::has(flags, wire::OpenFlag::creat) &&
             wire::has(flags, wire::OpenFlag::excl)) {
+            // Ask about the layer the create is actually going to use. `pc`
+            // above already resolved that (the overlay UPPER, with parents
+            // mirrored), and for an overlay the lower layer's copy does not
+            // occupy the name -- an exclusive create over a pristine
+            // read-only file has to succeed, which is how a package manager
+            // overwrites a shipped file.
+            //
+            // Using a fresh follow=false classify here consulted the LOWER
+            // layer and answered EEXIST for a file the guest had just
+            // unlinked, so pacman's unlink-then-O_EXCL failed on every file
+            // in a package ("warning given when extracting ... Can't
+            // create"). The dangling-symlink case below still needs the
+            // name-not-target question, so it asks separately.
+            if (pc.realm == kernel::Realm2::host_backed &&
+                host_lexists(pc.host_path))
+                return eno(Errno::eexist);
+            // A dangling symlink occupies the NAME even though it resolves
+            // to nothing, so creating through it is EEXIST. classify above
+            // followed the link to its absent target, which would have let
+            // the overlay create that target instead.
             auto named = k_.files().classify(abs, /*for_write=*/false,
                                              /*follow=*/false);
             if (named.realm == kernel::Realm2::host_backed &&
-                host_lexists(named.host_path))
+                host_path_is_symlink(named.host_path))
                 return eno(Errno::eexist);
         }
         // O_NOFOLLOW refuses to traverse a final symlink. Without O_PATH
@@ -2537,10 +2566,15 @@ private:
         // forwarding the unlink would destroy the pristine rootfs. Record a
         // whiteout (hides the lower file in the overlay view) and report
         // success WITHOUT touching the host. Also drop any shadow meta.
+        //
+        // With an UPPER copy as well, the whiteout is still needed -- removing
+        // the upper file would unshadow the lower one and the file would come
+        // back -- but the upper copy is ours to delete, so fall through and
+        // forward the unlink too.
         if (pc.whiteout_lower) {
             k_.files().add_whiteout(abs);
             k_.files().meta().forget(abs);
-            return val(0);
+            if (pc.host_path.empty()) return val(0);
         }
         if (pc.host_path.empty()) return eno(pc.error);
         // A removal drops any shadow record so a fresh file created at the same
@@ -3768,7 +3802,18 @@ private:
                 // takes the terminal back. But it must not be true while a
                 // JOB holds the tty, or a shell can never tell that the job
                 // is in the foreground and not itself.
-                const std::int32_t fg = fg_pgrp_ ? fg_pgrp_ : flat_pgrp();
+                // The sentinel must not escape through the TTY, though it is
+                // right everywhere else. kInheritedPgid means "born into
+                // linuxity's own group, never a leader" -- pid 1's seed, so
+                // its first setsid() is not EPERM, and getpgrp/getpgid agree
+                // on it (the creds and proclife probes check exactly that).
+                // But a shell reads tcgetpgrp and feeds it straight back to
+                // tcsetpgrp, so handing out 0x7fff0000 made bash report
+                // "cannot set terminal process group (2147418112)" and drop
+                // job control. For the terminal's purposes an un-grouped
+                // process is its own leader, so report the pid.
+                std::int32_t fg = fg_pgrp_ ? fg_pgrp_ : flat_pgrp();
+                if (fg == kernel::ProcessTable::kInheritedPgid) fg = ids().pid;
                 if (!put_u32(r.arg[2], static_cast<std::uint32_t>(fg)))
                     return eno(Errno::efault);
                 return val(0);
@@ -3805,7 +3850,16 @@ private:
                 const std::uint32_t want = get_u32(r.arg[2]);
                 // Record the FOREGROUND group. Writing flat_pgrp_ here moved
                 // the caller itself into the group it was handing the tty to.
-                if (want != 0) fg_pgrp_ = static_cast<std::int32_t>(want);
+                //
+                // Reject the sentinel: a shell reads tcgetpgrp and hands the
+                // value straight back, so if 0x7fff0000 ever escaped it
+                // would be stored here and re-served forever. Treat it as
+                // the caller claiming the terminal for itself.
+                if (want == static_cast<std::uint32_t>(
+                                kernel::ProcessTable::kInheritedPgid))
+                    fg_pgrp_ = ids().pid;
+                else if (want != 0)
+                    fg_pgrp_ = static_cast<std::int32_t>(want);
                 return val(0);
             }
             default:
@@ -3895,6 +3949,14 @@ public:
         }
         if (fd >= 0 && !pending_open_.empty()) {
             k_.files().bind_fd(static_cast<int>(fd), pending_open_);
+            // The create succeeded, so an upper-layer file now shadows the
+            // lower one: the path is no longer deleted. classify() leaves the
+            // whiteout in place for a parents_only create (it must still be
+            // deleted while O_EXCL asks whether the name is taken), so this
+            // is where it gets dropped.
+            if (wire::has(static_cast<std::uint64_t>(pending_flags_),
+                          wire::OpenFlag::creat))
+                k_.files().clear_whiteout_if_any(pending_open_);
 
             // The OTHER way to get a controlling terminal, besides
             // TIOCSCTTY: a session leader with no ctty that opens a terminal

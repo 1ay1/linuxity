@@ -113,6 +113,29 @@ static const char* kSrc =
     "  close(dd); close(dd2);\n"
     "  if (access(\"/base/dupdir/victim\", F_OK) == 0) return 39;\n"
     "  if (rmdir(\"/base/dupdir\") != 0) return 40;\n"
+    // UNLINK then O_EXCL -- what libarchive (so pacman) actually does when it
+    // overwrites a file: remove the old one, then create exclusively. Both
+    // layers have to be right.
+    //
+    // Lower-only first. unlink records a whiteout, and the O_EXCL that
+    // follows must NOT see the pristine lower copy. The whiteout used to be
+    // cleared by the create's own path classification, a moment BEFORE
+    // O_EXCL asked whether the name was taken -- so it found the lower file
+    // and every pacman extract failed with "Can't create <path>".
+    "  if (unlink(\"/unlink_excl_lower\") != 0) return 41;\n"
+    "  int uf = open(\"/unlink_excl_lower\", O_WRONLY|O_CREAT|O_EXCL, 0644);\n"
+    "  if (uf < 0) return 43;\n"
+    "  if (write(uf, \"fresh\\n\", 6) != 6) return 44;\n"
+    "  close(uf);\n"
+    // Now the SAME path again. It lives in the upper this time, so unlink is
+    // a real unlink -- but the lower copy is still there and would reappear
+    // once the upper one goes, so a whiteout is needed for that case too.
+    "  if (unlink(\"/unlink_excl_lower\") != 0) return 45;\n"
+    "  if (access(\"/unlink_excl_lower\", F_OK) == 0) return 46;\n"
+    "  int uf2 = open(\"/unlink_excl_lower\", O_WRONLY|O_CREAT|O_EXCL, 0644);\n"
+    "  if (uf2 < 0) return 47;\n"
+    "  if (write(uf2, \"again\\n\", 6) != 6) return 48;\n"
+    "  close(uf2);\n"
     "  return 42;\n}\n";
 
 int main() {
@@ -126,7 +149,8 @@ int main() {
     const auto tree = lxtest::make_tree("mutate", /*overlay=*/true,
         "mkdir -p /tmp/lx_mutate_root/base"
         " && printf lower > /tmp/lx_mutate_root/lower_only"
-        " && printf old > /tmp/lx_mutate_root/excl_lower");
+        " && printf old > /tmp/lx_mutate_root/excl_lower"
+        " && printf pristine > /tmp/lx_mutate_root/unlink_excl_lower");
     if (!lxtest::compile_guest("run_mutate", tree, kSrc)) return 0;
 
     const std::string root  = tree.root;
@@ -159,6 +183,10 @@ int main() {
     };
     bool excl_upper_new = read1(upper + "/excl_lower") == "new\n";
     bool excl_lower_old = read1(root  + "/excl_lower") == "old";
+    // unlink-then-O_EXCL (what pacman does) must leave the SECOND create's
+    // contents in the upper, and the pristine lower untouched throughout.
+    bool unlink_excl_new   = read1(upper + "/unlink_excl_lower") == "again\n";
+    bool unlink_excl_lower = read1(root  + "/unlink_excl_lower") == "pristine";
 
     lxtest::remove_tree(tree);
 
@@ -197,10 +225,20 @@ int main() {
                   "(copy-up-then-O_EXCL would EEXIST: 'Can't create <path>')");
         return 1;
     }
+    if (!unlink_excl_new || !unlink_excl_lower) {
+        std::puts("run_mutate: FAIL unlink-then-O_CREAT|O_EXCL (what libarchive "
+                  "and so pacman does) did not land fresh contents in the "
+                  "upper — the whiteout was dropped before O_EXCL asked "
+                  "whether the name was taken, so the create saw the "
+                  "pristine lower file: 'warning given when extracting "
+                  "<path> (Can't create ...)' on every file in a package");
+        return 1;
+    }
     std::puts("run_mutate: mkdir/write/chmod/chown/rename/symlink/unlink all "
               "translate to the overlay upper layer, lower stays pristine, "
-              "lower-only unlink whiteouts (rootfs survives), fchdir tracks cwd, "
-              "chmod +x lands on the inode, exit=42");
+              "lower-only unlink whiteouts (rootfs survives), unlink-then-O_EXCL "
+              "re-creates, fchdir tracks cwd, chmod +x lands on the inode, "
+              "exit=42");
     return 0;
 #endif
 }

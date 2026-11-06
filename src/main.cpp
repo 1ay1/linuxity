@@ -325,6 +325,36 @@ int main(int argc, char** argv) {
         set_env("LOGNAME", "root");
         set_env("HOME", "/root");
         set_env("SHELL", "/bin/bash");
+        // PATH belongs to the ROOTFS, not the host. Inheriting it works by
+        // luck on a Linux host (/usr/bin is /usr/bin either way) and fails
+        // completely on Android, where the host PATH is /system/bin:/apex/...
+        // -- none of which exists in the guest, so an interactive shell
+        // answers "pacman: command not found" for a pacman that is sitting
+        // right there in /usr/bin.
+        //
+        // Keep any extra directories the caller added that DO exist in the
+        // guest, so `--root ... env PATH=/opt/mine:...` still means
+        // something, and drop the host-only ones.
+        {
+            std::string merged = "/usr/local/sbin:/usr/local/bin:/usr/bin:"
+                                 "/usr/sbin:/bin:/sbin";
+            if (const char* hp = std::getenv("PATH"); hp != nullptr) {
+                std::string_view rest{hp};
+                while (!rest.empty()) {
+                    const auto cut = rest.find(':');
+                    const std::string_view dir = rest.substr(0, cut);
+                    if (!dir.empty() && merged.find(std::string{dir}) ==
+                                            std::string::npos) {
+                        struct ::stat st{};
+                        if (::stat((root + std::string{dir}).c_str(), &st) == 0)
+                            merged += ":" + std::string{dir};
+                    }
+                    if (cut == std::string_view::npos) break;
+                    rest.remove_prefix(cut + 1);
+                }
+            }
+            set_env("PATH", merged);
+        }
     }
 
     // Transparent pacman --overwrite "*": expose the mode to the dispatcher
