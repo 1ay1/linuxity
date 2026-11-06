@@ -17,6 +17,7 @@
 # Usage:
 #   scripts/conform-android.sh                # build, push, diff
 #   scripts/conform-android.sh --record       # ...and re-record the goldens
+#   scripts/conform-android.sh --coverage     # line coverage ON THE DEVICE
 #   scripts/conform-android.sh --build-only   # just build for the device
 #
 # Requires: adb with a device attached, and an NDK. Point LX_ANDROID_BUILD at
@@ -37,10 +38,12 @@ DEADLINE="${LX_DEADLINE:-300}"
 
 record=0
 build_only=0
+coverage=0
 for a in "$@"; do
     case "$a" in
         --record)     record=1 ;;
         --build-only) build_only=1 ;;
+        --coverage)   coverage=1 ;;
         -h|--help)    sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 0 ;;
         *) echo "unknown option: $a" >&2; exit 2 ;;
     esac
@@ -113,6 +116,64 @@ fi
 # Ship the committed goldens so the replay path has a reference too.
 adb shell "mkdir -p $REMOTE/goldens" >/dev/null
 adb push "$REPO/tests/goldens/aarch64" "$REMOTE/goldens/" >/dev/null 2>&1 || true
+
+# -- line coverage, measured ON THE DEVICE --------------------------------
+# conform_diff proves the ANSWERS agree. This measures how much of the
+# dispatcher the probes actually execute there, which is the Android
+# equivalent of tools/coverage.sh and a different number: some syscalls do
+# not exist on aarch64 and some are denied by SELinux, so paths that run on
+# x86-64 cannot run here at all.
+if [ "$coverage" -eq 1 ]; then
+    cov_build="${LX_ANDROID_COV_BUILD:-/tmp/lx-android-coverage}"
+    llvm_bin="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+    [ -x "$llvm_bin/llvm-profdata" ] || die "no llvm-profdata in the NDK"
+
+    say "building an instrumented linuxity"
+    if [ ! -f "$cov_build/CMakeCache.txt" ]; then
+        cmake -S "$REPO" -B "$cov_build" \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI="$ABI" -DANDROID_PLATFORM="$API" \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="-fprofile-instr-generate -fcoverage-mapping" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fprofile-instr-generate" >/dev/null
+    fi
+    cmake --build "$cov_build" --target linuxity -j"$(nproc)" >/dev/null ||
+        die "instrumented build failed"
+
+    cov_remote="${REMOTE}-cov"
+    adb shell "rm -rf $cov_remote && mkdir -p $cov_remote/probes" >/dev/null
+    adb push "$cov_build/linuxity" "$cov_remote/linuxity" >/dev/null
+    for p in "$BUILD"/probes/*; do
+        [ -f "$p" ] && adb push "$p" "$cov_remote/probes/$(basename "$p")" >/dev/null
+    done
+    adb shell "chmod +x $cov_remote/linuxity $cov_remote/probes/*" >/dev/null
+
+    say "running the probes under instrumentation"
+    # ABSOLUTE paths: the guest resolves its program through its own
+    # namespace, so a relative one is ENOENT and the probe never runs -- the
+    # first attempt at this measured 30% because every probe silently failed
+    # and only linuxity's own startup was counted.
+    adb shell "cd $cov_remote && rm -f *.profraw && \
+        for p in probes/*; do \
+            LLVM_PROFILE_FILE=$cov_remote/p-\$(basename \$p).profraw \
+            timeout -s KILL 60 ./linuxity $cov_remote/\$p >/dev/null 2>&1; \
+        done; \
+        for d in /proc /sys /etc; do \
+            LLVM_PROFILE_FILE=$cov_remote/ds\$(echo \$d|tr / _).profraw \
+            timeout -s KILL 60 ./linuxity $cov_remote/probes/dirseek \$d >/dev/null 2>&1; \
+        done" >/dev/null
+
+    local_prof="$(mktemp -d)"
+    adb pull "$cov_remote" "$local_prof/" >/dev/null 2>&1
+    "$llvm_bin/llvm-profdata" merge -sparse "$local_prof"/*/*.profraw \
+        -o "$local_prof/all.profdata" || die "could not merge profiles"
+    say "dispatcher coverage on the device:"
+    "$llvm_bin/llvm-cov" report "$cov_build/linuxity" \
+        -instr-profile="$local_prof/all.profdata" 2>/dev/null |
+        grep -E 'Filename|^-|syscall\.hpp|TOTAL'
+    rm -rf "$local_prof"
+    exit 0
+fi
 
 # -- the actual check ------------------------------------------------------
 say "running conform_diff against the device kernel"

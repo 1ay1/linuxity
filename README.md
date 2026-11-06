@@ -141,12 +141,28 @@ differential suite runs on a real device, against that device's own kernel:
 ```sh
 scripts/conform-android.sh            # build, push, diff on the phone
 scripts/conform-android.sh --record   # ...and re-record tests/goldens/aarch64
+scripts/conform-android.sh --coverage # line coverage, measured on the device
 ```
 
 Needs `adb` with a device attached and an NDK (`ANDROID_NDK_HOME`). Every
-probe runs twice on the device -- natively and under linuxity -- and the two
+probe runs twice on the device — natively and under linuxity — and the two
 traces are diffed. Each device step has a hard deadline, so a guest that
 hangs fails the run instead of wedging it, and the exit status gates CI.
+
+`--coverage` measures how much of the dispatcher the probes actually execute
+**on the device**, which is not the same number as on x86-64:
+
+| | handlers verified | dispatcher lines |
+|---|---|---|
+| x86-64 | 130/130 | 80.5% |
+| Android / arm64 | 130/130 | 76.0% |
+
+The gap is real and mostly not fixable: 56 probe steps exercise syscalls
+aarch64 does not have (`open`, `stat`, `dup2`, `getpgrp`), 30 need user
+namespaces that Android compiles out, and the rest are SELinux denying
+`TCGETS2` on a pty and filesystem `AF_UNIX` binds. Those steps report
+*not-applicable* rather than passing, so the suite does not claim to have
+checked something it could not ask.
 
 ### Windows
 
