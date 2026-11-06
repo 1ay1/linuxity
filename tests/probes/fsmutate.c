@@ -362,6 +362,48 @@ int main(void) {
             "chown through a dangling symlink is ENOENT too");
     LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/dangling", 0);
 
+    // -- an unsearchable directory outranks every structural rule ----------
+    // Without +x the kernel cannot traverse into a directory at all, so it
+    // never discovers the "."/".." or the trailing slash it would otherwise
+    // complain about -- EACCES comes first. The guest normalized those
+    // components away and answered EEXIST/EINVAL/ENOTEMPTY instead.
+    LX_SYS3(SYS_mkdirat, AT_FDCWD, DIR "/nox", 0755);
+    LX_SYS3(SYS_mkdirat, AT_FDCWD, DIR "/nox/in", 0755);
+    LX_SYS4(SYS_fchmodat, AT_FDCWD, DIR "/nox", 0644, 0);   // readable, not searchable
+    lx_emit("mkdirat", LX_SYS3(SYS_mkdirat, AT_FDCWD, DIR "/nox/.", 0755),
+            "mkdir through an unsearchable dir is EACCES, not EEXIST");
+    lx_emit("mkdirat", LX_SYS3(SYS_mkdirat, AT_FDCWD, DIR "/nox/in/..", 0755),
+            "...and so is mkdir on its .. ");
+    lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/nox/.", 0x200),
+            "rmdir of . in an unsearchable dir is EACCES, not EINVAL");
+    lx_emit("openat",
+            LX_SYS4(SYS_openat, AT_FDCWD, DIR "/nox/.", O_WRONLY | O_CREAT | O_EXCL, 0644),
+            "O_CREAT through an unsearchable dir is EACCES");
+    lx_emit("symlinkat", LX_SYS3(SYS_symlinkat, "x", AT_FDCWD, DIR "/nox/in"),
+            "symlink into an unsearchable dir is EACCES");
+    lx_emit("linkat",
+            LX_SYS5(SYS_linkat, AT_FDCWD, F1, AT_FDCWD, DIR "/nox/in/", 0),
+            "hardlink into an unsearchable dir is EACCES, not ENOENT");
+    LX_SYS4(SYS_fchmodat, AT_FDCWD, DIR "/nox", 0755, 0);
+    LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/nox/in", 0x200);
+    LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/nox", 0x200);
+
+    // A TRAILING SLASH asserts the name is a directory. rename checks it
+    // against both operands (ENOTDIR when the source is not one); a hardlink
+    // is never a directory, so for link the slash can only ever fail -- but
+    // the source is resolved FIRST, so a missing source is ENOENT and an
+    // existing destination is EEXIST, both ahead of the slash.
+    lx_emit("renameat", LX_SYS4(SYS_renameat, AT_FDCWD, F1, AT_FDCWD, DIR "/newdir/"),
+            "rename of a FILE to a trailing-slash name is ENOTDIR");
+    lx_emit("renameat", LX_SYS4(SYS_renameat, AT_FDCWD, F1 "/", AT_FDCWD, DIR "/n2"),
+            "rename FROM a trailing-slash file is ENOTDIR");
+    lx_emit("linkat", LX_SYS5(SYS_linkat, AT_FDCWD, F1, AT_FDCWD, DIR "/newlnk/", 0),
+            "hardlink to a trailing-slash name is ENOENT");
+    lx_emit("linkat", LX_SYS5(SYS_linkat, AT_FDCWD, DIR "/nope", AT_FDCWD, SUB "/", 0),
+            "...but a missing SOURCE is ENOENT first, not EEXIST");
+    lx_emit("linkat", LX_SYS5(SYS_linkat, AT_FDCWD, F1, AT_FDCWD, SUB "/", 0),
+            "...and an existing destination is EEXIST, slash or not");
+
     // -- teardown, observing each removal ----------------------------------
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, SYM, 0), "unlink sym");
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, F2, 0), "unlink f2");

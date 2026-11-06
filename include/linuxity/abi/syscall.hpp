@@ -1050,6 +1050,51 @@ private:
                             wire::AtFlag::removedir);
     }
 
+    // Resolving "." or ".." still TRAVERSES the directory they sit in, so it
+    // needs search (+x) permission there -- `mkdir d/.` on a d without +x is
+    // EACCES, not the EEXIST that d's own existence would suggest.
+    // Normalizing the component away loses that requirement, so ask the host
+    // directly: for a raw path with a dot tail, the directory being traversed
+    // is the normalized path itself.
+    //
+    // Only the dot case needs this. Any other final component leaves a real
+    // parent in the host path, and the host's own call checks it.
+    [[nodiscard]] bool dot_traversal_denied(const std::string& raw,
+                                            const std::string& host_path) {
+        if (dot_tail(raw) == DotTail::none) return false;
+        if (host_path.empty()) return false;
+        return ::access(host_path.c_str(), X_OK) != 0 && errno == EACCES;
+    }
+
+    // Is the PARENT directory of this host path searchable? A name cannot be
+    // looked up or created without +x on the directory holding it, and that
+    // check precedes the structural ones (slash, dot, exists).
+    //
+    // Only a real DIRECTORY can be unsearchable: access(X_OK) on a regular
+    // file also fails with EACCES, and reporting that would mask the ENOTDIR
+    // the kernel owes for a file used as a path component. An unmapped or
+    // unknown path answers true, leaving the host call to report the rest.
+    [[nodiscard]] static bool host_dir_searchable(const std::string& p) noexcept {
+        if (p.empty()) return true;
+        const auto slash = p.rfind('/');
+        if (slash == std::string::npos || slash == 0) return true;
+        const std::string parent = p.substr(0, slash);
+        struct ::stat st{};
+        if (::stat(parent.c_str(), &st) != 0) return true;
+        if (!S_ISDIR(st.st_mode)) return true;
+        return ::access(parent.c_str(), X_OK) == 0;
+    }
+
+    // Is this host path itself a directory? Used where a trailing slash
+    // asserts the name is one. An unmapped path answers false, so the
+    // trailing-slash assertion fails and the host call reports the rest.
+    [[nodiscard]] static bool host_path_is_dir(const std::string& p) noexcept {
+        if (p.empty()) return false;
+        struct ::stat st{};
+        if (::stat(p.c_str(), &st) != 0) return false;
+        return S_ISDIR(st.st_mode);
+    }
+
     // Is the PARENT of this host path really a directory? A rename whose
     // path uses a regular file as a directory component is ENOTDIR, and the
     // kernel reports that in preference to EBUSY. classify() maps a path for
@@ -1246,6 +1291,16 @@ private:
              wire::has(flags, wire::OpenFlag::trunc)))
             open_wi = Wi::parents_only;
         auto pc = k_.files().classify(abs, for_write, /*follow=*/true, open_wi);
+        // A "."/".." component was normalized away during resolution, but
+        // traversing it needs +x on that directory. Only matters when we are
+        // CREATING: a plain open of an unsearchable dir is refused by the
+        // host call itself, while O_CREAT would otherwise see the normalized
+        // name already exist and answer EEXIST.
+        if (open_wi == Wi::parents_only &&
+            dot_traversal_denied(
+                read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)])),
+                pc.host_path))
+            return eno(Errno::eacces);
         if (pc.realm == kernel::Realm2::host_backed) {
             // Remember the guest path for this fd after the trap assigns it.
             pending_open_ = abs;
@@ -2097,8 +2152,9 @@ private:
     // translate the guest path at `path_arg` to its overlay UPPER host path
     // and REDIRECT, with the WriteIntent selecting how the upper layer is
     // prepared (create the leaf itself, copy an existing leaf up, or just
-    // resolve for removal). A virtual path (procfs/sysfs) is read-only —
-    // refuse with EROFS; an absent target yields its errno.
+    // resolve for removal). A virtual path (procfs/sysfs) gets the errno its
+    // missing inode op implies -- see virtual_mut_errno; an absent target
+    // yields its own errno.
     using Wi = kernel::FileNamespace::WriteIntent;
     // strict_parent: mkdir/mknod must FAIL when the parent is missing, so they
     // opt out of pre-creating the chain and let the host kernel apply the rule.
@@ -2113,7 +2169,18 @@ private:
         if (wi == Wi::remove) {
             const std::string raw =
                 read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)]));
-            switch (dot_tail(raw)) {
+            const DotTail dt = dot_tail(raw);
+            if (dt != DotTail::none) {
+                // ...but the kernel has to TRAVERSE the directory to discover
+                // the dot at all, so no-search is EACCES and outranks the
+                // EINVAL/ENOTEMPTY below.
+                auto dotpc = k_.files().classify(resolve_arg(r, path_arg, at),
+                                                 /*for_write=*/true,
+                                                 /*follow=*/false, wi);
+                if (dot_traversal_denied(raw, dotpc.host_path))
+                    return eno(Errno::eacces);
+            }
+            switch (dt) {
             case DotTail::dot:
                 // rmdir says EINVAL ("." is not a removable name); plain
                 // unlink got as far as seeing a directory, so EISDIR.
@@ -2131,6 +2198,12 @@ private:
         }
         std::string abs = resolve_arg(r, path_arg, at);
         auto pc = k_.files().classify(abs, /*for_write=*/true, /*follow=*/false, wi);
+        // A "."/".." component was normalized away above, but resolving it
+        // traverses its directory, which needs +x there.
+        if (dot_traversal_denied(
+                read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)])),
+                pc.host_path))
+            return eno(Errno::eacces);
         if (pc.realm == kernel::Realm2::virtual_file) {
             // This branch means the leaf RESOLVED, so a creating op (mkdir,
             // mknod) is refused for the name being taken, before procfs's
@@ -2404,6 +2477,60 @@ private:
         std::string dst = resolve_second(r, a2, at);
         auto ps = k_.files().classify(src, true, false, Wi::copy_leaf);
         auto pd = k_.files().classify(dst, true, false, Wi::parents_only);
+        // Traversal comes first: if the kernel cannot search its way to the
+        // name, EACCES is the answer and none of the slash/dot reasoning
+        // below is ever reached.
+        {
+            const std::string raw1 =
+                read_cstr(uaddr(r.arg[static_cast<std::size_t>(a1)]));
+            const std::string raw2 =
+                read_cstr(uaddr(r.arg[static_cast<std::size_t>(a2)]));
+            if (dot_traversal_denied(raw1, ps.host_path) ||
+                dot_traversal_denied(raw2, pd.host_path))
+                return eno(Errno::eacces);
+            if (!host_dir_searchable(ps.host_path) ||
+                !host_dir_searchable(pd.host_path))
+                return eno(Errno::eacces);
+        }
+        // A TRAILING SLASH asserts "this name is a directory". For rename
+        // that is checked against BOTH operands before the move: renaming a
+        // regular file to "new/" is ENOTDIR, and so is renaming "f1/" to
+        // anything. Normalizing the slash away let a file be created under a
+        // name the caller had explicitly marked as a directory.
+        if (move_meta) {
+            const std::string raw1 =
+                read_cstr(uaddr(r.arg[static_cast<std::size_t>(a1)]));
+            const std::string raw2 =
+                read_cstr(uaddr(r.arg[static_cast<std::size_t>(a2)]));
+            const bool slash1 = path_syntax(raw1) == PathSyntax::needs_dir;
+            const bool slash2 = path_syntax(raw2) == PathSyntax::needs_dir;
+            if ((slash1 || slash2) && !host_path_is_dir(ps.host_path))
+                return eno(Errno::enotdir);
+        } else {
+            // A hardlink is never a directory, so a trailing slash can never
+            // be satisfied -- but only after the checks that outrank it.
+            // Against the live kernel, strictly in this order:
+            //   source missing                   -> ENOENT
+            //   source has a slash, is no dir     -> ENOTDIR
+            //   destination already exists        -> EEXIST
+            //   destination has a slash, absent   -> ENOENT
+            // The source is resolved FIRST, so link(nope, "dir/") is ENOENT
+            // for the missing source, not EEXIST for the directory.
+            const std::string raw1 =
+                read_cstr(uaddr(r.arg[static_cast<std::size_t>(a1)]));
+            const std::string raw2 =
+                read_cstr(uaddr(r.arg[static_cast<std::size_t>(a2)]));
+            const bool slash1 = path_syntax(raw1) == PathSyntax::needs_dir;
+            const bool slash2 = path_syntax(raw2) == PathSyntax::needs_dir;
+            if (slash1 || slash2) {
+                if (!host_target_exists(ps.host_path))
+                    return eno(Errno::enoent);
+                if (slash1 && !host_path_is_dir(ps.host_path))
+                    return eno(Errno::enotdir);
+                if (host_target_exists(pd.host_path)) return eno(Errno::eexist);
+                return eno(Errno::enoent);
+            }
+        }
         // A rename cannot name "." or ".." on either side -- they are not
         // entries you can move, and the kernel reports EBUSY. But it resolves
         // BOTH paths first, so a structurally bad path wins: rename(".",
@@ -2611,6 +2738,12 @@ private:
                                     read_cstr(uaddr(r.arg[static_cast<std::size_t>(link_arg)])),
                                     k_.files().cwd());
         auto pc = k_.files().classify(link, true, false, Wi::parents_only);
+        // A "."/".." in the link name was normalized away; traversing it
+        // still needs +x on that directory.
+        if (dot_traversal_denied(
+                read_cstr(uaddr(r.arg[static_cast<std::size_t>(link_arg)])),
+                pc.host_path))
+            return eno(Errno::eacces);
         if (pc.realm == kernel::Realm2::virtual_file)
             // Reached only when the link name RESOLVED, so the name is taken.
             return eno(virtual_mut_errno(link, VMut::exists));
