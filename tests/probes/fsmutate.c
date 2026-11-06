@@ -112,6 +112,39 @@ int main(void) {
                 "readlink with a 0 buffer is EINVAL");
     }
 
+    // Can a symlink's OWN mode be changed? No -- Linux has no lchmod, a
+    // symlink's mode is fixed at 0777, and the kernel REFUSES rather than
+    // quietly redirecting the change to the target.
+    //
+    // This is how glibc implements fchmodat(p, mode, AT_SYMLINK_NOFOLLOW):
+    // open the link itself O_PATH|O_NOFOLLOW, then fchmod that descriptor.
+    // fchmod on an O_PATH fd is EBADF -- the fd has no access mode -- and
+    // libarchive relies on the refusal, treating it as "nothing to do".
+    // Reporting success made pacman warn "Can't set permissions to 0777" for
+    // every symlink in a package, and the chmod reached the link's TARGET
+    // and re-permissioned it.
+    {
+        // O_PATH is 010000000 on every Linux arch. O_NOFOLLOW is NOT:
+        // 0400000 on x86-64 but 0100000 on aarch64 (asm-generic), which the
+        // O_NOFOLLOW bug earlier in this file's history was all about. Take
+        // it from the host headers rather than hardcoding either value --
+        // fcntl.h is already included and defines it correctly per arch.
+        const long kOPath = 010000000L;
+        const long pfd = LX_SYS4(SYS_openat, AT_FDCWD, SYM,
+                                 kOPath | O_NOFOLLOW, 0);
+        lx_emit("openat", pfd >= 0 ? 1 : pfd,
+                "open a symlink O_PATH|O_NOFOLLOW");
+        if (pfd >= 0) {
+            lx_emit("fchmod", LX_SYS2(SYS_fchmod, pfd, 0777),
+                    "fchmod on an O_PATH fd is EBADF");
+            LX_SYS1(SYS_close, pfd);
+        }
+        // chmod WITHOUT the flag follows the link, so it is the TARGET's
+        // mode that moves. That must still work.
+        lx_emit("fchmodat", LX_SYS3(SYS_fchmodat, AT_FDCWD, SYM, 0644),
+                "chmod through a symlink changes its target");
+    }
+
     // A dangling symlink: stat follows (ENOENT), lstat does not (succeeds).
     {
         char st[512];

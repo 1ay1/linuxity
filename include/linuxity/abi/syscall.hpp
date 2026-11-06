@@ -2623,6 +2623,26 @@ private:
         std::string abs = resolve_arg(r, path_arg, at);
         std::uint32_t mode = static_cast<std::uint32_t>(
             r.arg[static_cast<std::size_t>(path_arg) + 1]);
+        // AT_SYMLINK_NOFOLLOW on a SYMLINK is EOPNOTSUPP. Linux has no
+        // lchmod: a symlink's own mode is fixed at 0777 and the kernel
+        // ignores it, so the request is refused outright rather than applied
+        // to the target. libarchive asks for exactly this on every symlink a
+        // package ships, and treats EOPNOTSUPP as "fine, nothing to do" --
+        // reporting success instead made it complain "Can't set permissions
+        // to 0777" for every .so link in the archive.
+        //
+        // fchmodat's own ABI has no flags argument, so only fchmodat2 (and
+        // the glibc wrapper that calls it) can get here with one.
+        if (at && path_arg + 2 < 6) {
+            const std::uint64_t flags = r.arg[static_cast<std::size_t>(path_arg) + 2];
+            if (wire::has_at(flags, wire::AtFlag::symlink_nofollow)) {
+                auto lc = k_.files().classify(abs, /*for_write=*/false,
+                                              /*follow=*/false);
+                if (lc.realm == kernel::Realm2::host_backed &&
+                    host_path_is_symlink(lc.host_path))
+                    return eno(Errno::enotsup);
+            }
+        }
         // chmod FOLLOWS a final symlink -- there is no lchmod -- so a
         // DANGLING link is ENOENT. classify() maps a path without proving
         // its target exists, and the lstat-based probe sees the link itself,
@@ -2703,6 +2723,26 @@ private:
             // for a closed fd. Returning 0 here meant fchmod on a closed fd
             // silently succeeded -- caught by the cwdfs probe.
             return fwd();
+        }
+        // An O_PATH descriptor names a file without opening it, and fchmod
+        // on one is EBADF -- the fd has no access mode to act through. That
+        // is not a corner case: glibc implements
+        // fchmodat(AT_SYMLINK_NOFOLLOW) as open(O_PATH|O_NOFOLLOW) + fchmod,
+        // so this is the path libarchive takes for every symlink a package
+        // ships. Answering 0 made it believe it had chmod'ed the link and
+        // then complain "Can't set permissions to 0777" when the mode did
+        // not stick; worse, the chmod below followed the link and
+        // re-permissioned its TARGET.
+        if (fd_is_o_path(static_cast<int>(r.arg[0])))
+            return eno(Errno::ebadf);
+        // A symlink has no mode of its own (Linux has no lchmod), so a
+        // chmod that reached one without following it is EOPNOTSUPP.
+        if (!gp.empty()) {
+            auto lc = k_.files().classify(std::string{gp}, /*for_write=*/false,
+                                          /*follow=*/false);
+            if (lc.realm == kernel::Realm2::host_backed &&
+                host_path_is_symlink(lc.host_path))
+                return eno(Errno::enotsup);
         }
         // Best-effort apply to the host inode (execute bit for execve);
         // record in the shadow store only what the inode couldn't take.
@@ -3076,6 +3116,14 @@ private:
         // meant `rename f1 absent/x` created absent/ and MOVED THE FILE
         // there, and link did the same -- both ENOENT on the kernel. The
         // destination's own parent must already exist; let the host say so.
+        //
+        // A hardlink the HOST refuses stays refused. Android denies the
+        // SELinux `link` permission on /data, so link(2) is EACCES there no
+        // matter what the guest does, and a package manager's aliases (gcc's
+        // /usr/bin/cc, g++) fail with "Can't create". Faking it with a copy
+        // was tempting and wrong: st_nlink would lie, and a package manager
+        // that later unlinks one name would leave the other behind with
+        // stale content. The guest sees the host's real answer.
         return Redirect{PathArg{a1, std::move(ps.host_path)}}
             .with(PathArg{a2, std::move(pd.host_path)});
     }
@@ -4164,6 +4212,31 @@ public:
         if (pty_slave_of_fd(fd) >= 0 || host_fd_slave_no(fd) >= 0)
             return fwd();
         return eno(Errno::enotty);
+    }
+
+    // Was this guest fd opened O_PATH?
+    //
+    // Read it from the tracee's /proc rather than tracking it ourselves: the
+    // fd may have been inherited or duped, and fdinfo is the authority the
+    // host kernel already maintains. A missing fdinfo answers "no", so the
+    // caller falls through to its normal path.
+    [[nodiscard]] bool fd_is_o_path(int fd) {
+        if constexpr (!requires { mem_.host_tid(); }) {
+            return false;
+        } else {
+            char p[64];
+            std::snprintf(p, sizeof p, "/proc/%d/fdinfo/%d", mem_.host_tid(), fd);
+            std::FILE* f = std::fopen(p, "re");
+            if (f == nullptr) return false;
+            char line[128];
+            unsigned long long fl = 0;
+            bool have = false;
+            while (std::fgets(line, sizeof line, f) != nullptr)
+                if (std::sscanf(line, "flags:\t%llo", &fl) == 1) { have = true; break; }
+            std::fclose(f);
+            // O_PATH is 010000000 on every Linux arch.
+            return have && (fl & 010000000ULL) != 0;
+        }
     }
 
     [[nodiscard]] bool put_u32(std::uint64_t addr, std::uint32_t v) {
