@@ -2493,14 +2493,34 @@ private:
                 return ArgRewrite{1, request,
                                   ArgRewrite::Convert::own_sid,
                                   uaddr(r.arg[2]), ids().pid};
-            // Accept a foreground-group change, and REMEMBER it: the next
+            // Accept a foreground-group change and REMEMBER it: the next
             // tcgetpgrp has to report what was just set or the shell decides
-            // it lost the terminal. Forwarded for the same reason -- the
-            // kernel owns whether this fd can take one at all.
+            // it lost the terminal.
+            //
+            // The VALUE must not reach the kernel. tcgetpgrp above reports
+            // the guest's pgrp (pid 1 and friends), so the shell hands that
+            // straight back here -- and pgid 1 does not exist on the host,
+            // so a forwarded TIOCSPGRP is EPERM and bash prints "cannot set
+            // terminal process group" and drops job control. The guest is
+            // already the terminal's foreground group as far as the host is
+            // concerned; what it is really asking is to move the group
+            // WITHIN its own namespace, which is ours to track.
+            //
+            // The fd still has to be vetted, or this succeeds on /dev/null
+            // where the kernel says ENOTTY. TIOCGPGRP is the read-only probe
+            // for exactly that question, so rewrite to it: the kernel decides
+            // whether this fd is our controlling terminal, and the recorded
+            // group is updated only if it said yes.
             case kTIOCSPGRP: {
                 const std::uint32_t want = get_u32(r.arg[2]);
                 if (want != 0) flat_pgrp_ = static_cast<std::int32_t>(want);
-                return fwd();
+                // Convert::none: TIOCGPGRP writes the host's pgrp into the
+                // buffer, but this is a SETTER and that buffer is the
+                // caller's input -- leave it exactly as the guest wrote it.
+                // Only the kernel's verdict on the fd is wanted.
+                return ArgRewrite{1, kTIOCGPGRP,
+                                  ArgRewrite::Convert::restore_u32,
+                                  uaddr(r.arg[2]), static_cast<std::int32_t>(want)};
             }
             default:
                 return fwd();   // real host tty/device ioctl

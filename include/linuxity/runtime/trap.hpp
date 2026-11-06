@@ -297,6 +297,11 @@ public:
                                     case C::own_pgrp:
                                     case C::own_sid:
                                         put_i32(buf, subst); break;
+                                    // The call was rewritten to a getter so
+                                    // the kernel could vet the fd; put the
+                                    // caller's own value back.
+                                    case C::restore_u32:
+                                        put_i32(buf, subst); break;
                                     case C::none: break;
                                 }
                             });

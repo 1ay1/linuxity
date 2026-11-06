@@ -209,14 +209,26 @@ int main() {
         assert(tcgetpgrp() == 4242 &&
                "tcgetpgrp must report the group setpgid just set");
 
-        // And tcsetpgrp() must stick too, for the same reason. It forwards
-        // (the kernel vets the fd) but records the group on the way through.
+        // And tcsetpgrp() must stick too, for the same reason. It is
+        // rewritten to TIOCGPGRP rather than forwarded as-is: the kernel has
+        // to vet the fd (a non-tty is ENOTTY), but the guest's pgid must NOT
+        // reach it -- pid 1 does not exist on the host, so a real TIOCSPGRP
+        // would be EPERM and the shell would drop job control. The group is
+        // recorded here, and the buffer is restored so the caller's input is
+        // not clobbered by what the probe read.
         std::uint32_t want = 777;
         std::memcpy(mem.at(0x8000), &want, sizeof want);
         abi::Regs io; io.nr = 16;
         io.arg[0] = 255; io.arg[1] = kTIOCSPGRP; io.arg[2] = 0x8000;
-        assert(is_forward(sys.dispatch(io)) &&
-               "TIOCSPGRP forwards so the kernel can reject a non-tty");
+        const auto setfate = sys.dispatch(io);
+        const auto* ar = setfate.template get_if<abi::ArgRewrite>();
+        assert(ar && "TIOCSPGRP probes the fd via an ArgRewrite");
+        assert(ar->to == kTIOCGPGRP &&
+               "rewritten to the read-only sibling, so no guest pgid reaches "
+               "the kernel");
+        assert(ar->convert == abi::ArgRewrite::Convert::restore_u32 &&
+               "the caller's buffer is put back after the probe");
+        assert(ar->subst == 777 && "restored to what the guest asked for");
         assert(tcgetpgrp() == 777 &&
                "tcgetpgrp must report the group tcsetpgrp just set");
     }

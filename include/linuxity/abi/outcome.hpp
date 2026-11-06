@@ -253,6 +253,11 @@ struct ArgRewrite {
         // only then substitute an answer in the guest's namespace.
         own_pgrp,
         own_sid,
+        // Put a value BACK after the probe call clobbered it. A setter that
+        // is rewritten to its read-only sibling (so the kernel can vet the
+        // fd) would otherwise have the caller's input overwritten by what
+        // the getter wrote.
+        restore_u32,
     };
 
     int           arg;              // which argument register to replace
