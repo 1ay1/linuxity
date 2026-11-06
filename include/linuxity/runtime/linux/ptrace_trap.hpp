@@ -228,6 +228,15 @@ public:
                 // a process monitor. Record only real processes, and map the
                 // host tid to a small guest pid so /proc is a coherent, tiny
                 // pid space (root == pid 1) rather than leaking host pids.
+                // The parent link is recorded for EVERY new task, thread or
+                // process. A PROCESS also gets a process-table entry (below);
+                // a thread must not, since it is not a separate process in
+                // the guest's view -- but it still needs gppid_, because
+                // set_current_pid() seeds a task's cwd from its parent and a
+                // missing link means seeding from pid 0, which has no record.
+                // That resolved relative paths against "/": gcc under
+                // `make -j` hit "can't create s4.o: Permission denied" because
+                // it was trying to create /s4.o.
                 if (np && event != PTRACE_EVENT_CLONE) {
                     std::int32_t gpid = gpid_of(child);
                     std::int32_t gppid = gpid_of(w);
@@ -897,13 +906,38 @@ public:
     // "pid 1". The root task is pid 1 with ppid 0 (init has no parent in
     // linuxity's world).
     [[nodiscard]] TaskIds current_ids() {
-        std::int32_t pid = gpid_of(cur_);
+        // A THREAD shares its thread-group leader's pid and keeps its own tid.
+        // gpid_of is keyed by host TID, so asking it directly gave a thread a
+        // fresh guest pid -- a pthread reported getpid()==2 where native
+        // reports the same pid as main. Two things broke on that:
+        //
+        //   * getpid() lied, which any threaded runtime notices.
+        //   * the dispatcher keys each task's CWD by guest pid, so a thread
+        //     looked up a pid with no cwd record and got "/". Relative paths
+        //     then resolved against the root: gcc under `make -j` failed with
+        //     "can't create s7.o: Permission denied" because the trace shows
+        //     it trying to create /s7.o. One root cause, two symptoms.
+        //
+        // Resolve the host tgid first and map THAT, so every thread of a
+        // process answers with the process's guest pid.
+        //
+        // CACHED: tgid_of reads /proc/<tid>/status, and doing that on every
+        // syscall cost 18.79us against 4.86us before -- a 4x regression on
+        // the hot path. A task's tgid never changes, so one lookup per task
+        // is enough.
+        ::pid_t host_tgid = cur_;
+        if (auto it = tgid_cache_.find(cur_); it != tgid_cache_.end()) {
+            host_tgid = it->second;
+        } else {
+            const ::pid_t t = tgid_of(cur_);
+            host_tgid = t > 0 ? t : cur_;
+            tgid_cache_[cur_] = host_tgid;
+        }
+        const std::int32_t pid = gpid_of(host_tgid);
+        const std::int32_t tid = gpid_of(cur_);
         std::int32_t ppid = 0;
         if (auto it = gppid_.find(pid); it != gppid_.end()) ppid = it->second;
-        // A thread (CLONE) shares its thread-group leader's pid but keeps its
-        // own tid. We map threads to their own small id space lazily via the
-        // same allocator, and the tgid is the process the monitor tracks.
-        return TaskIds{pid, pid, ppid};
+        return TaskIds{pid, tid, ppid};
     }
 
     // -- Signal delivery ---------------------------------------------------
@@ -1490,6 +1524,10 @@ private:
     std::vector<ProcEvent> proc_events_;
     std::unordered_map<::pid_t, std::int32_t> gpid_;   // host tid -> guest pid
     std::unordered_map<std::int32_t, std::int32_t> gppid_; // guest pid -> ppid
+    // host tid -> host tgid. A task's tgid is fixed for its lifetime, and
+    // tgid_of() reads /proc, so this is looked up once per task rather than
+    // once per syscall.
+    std::unordered_map<::pid_t, ::pid_t> tgid_cache_;
     std::int32_t next_gpid_{2};                        // pid 1 = root/init
     ::pid_t cur_{-1};
     ::pid_t root_pid_{-1};
