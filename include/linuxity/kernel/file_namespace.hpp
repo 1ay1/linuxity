@@ -855,7 +855,11 @@ private:
                     break;
             }
         }
-        return PathClass{Realm2::host_backed, std::move(host), Errno::enoent, {}};
+        // The hop budget ran out: this is a symlink LOOP, not a path that
+        // resolved. Returning host_backed here made the caller treat the
+        // last link in the cycle as a real file -- stat(self-link) succeeded
+        // and chmod answered ENOENT, where the kernel says ELOOP.
+        return PathClass{Realm2::absent, {}, Errno::eloop, {}};
     }
 
     static bool exists(const char* path) {

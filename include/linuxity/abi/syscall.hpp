@@ -1111,11 +1111,10 @@ private:
             if (pc.host_path.empty()) continue;
             struct ::stat st{};
             if (::stat(pc.host_path.c_str(), &st) != 0) {
-                // A prefix we cannot even stat because a directory above it
-                // denies search is EACCES, not ENOENT -- the kernel stops at
-                // the permission, before it can discover what is there.
-                if (errno == EACCES) return Errno::eacces;
-                return Errno::enoent;
+                // A prefix we cannot even stat is not necessarily absent: a
+                // directory above it may deny search (EACCES) or the walk may
+                // be caught in a symlink loop (ELOOP).
+                return access_errno();
             }
             if (!S_ISDIR(st.st_mode)) return Errno::enotdir;
             // The component exists and is a directory, but a dot AFTER it
@@ -1156,6 +1155,27 @@ private:
         return ::access(parent.c_str(), X_OK) == 0;
     }
 
+    // Why will this GUEST path not resolve? classify() collapses several
+    // distinct lookup failures into absent/ENOENT, but a caller has to report
+    // the one the kernel would: a symlink loop is ELOOP, a file used as a
+    // directory component is ENOTDIR, an unsearchable ancestor is EACCES.
+    //
+    // classify leaves host_path empty for an absent result, so map the path
+    // again purely to get a host name to ask about, then let ::access answer.
+    // Falls back to `fallback` when there is nothing to ask.
+    [[nodiscard]] Errno resolve_failure_errno(const std::string& guest_abs,
+                                              Errno fallback) {
+        // copy_leaf maps the LEAF itself (parents_only stops at the parent
+        // chain and leaves host_path empty for a prefix that cannot resolve,
+        // which is exactly the case we are here to explain).
+        auto mapped = k_.files().classify(guest_abs, /*for_write=*/false,
+                                          /*follow=*/false, Wi::copy_leaf);
+        if (mapped.host_path.empty()) return fallback;
+        if (::access(mapped.host_path.c_str(), F_OK) == 0) return fallback;
+        const Errno e = access_errno();
+        return e == Errno::enoent ? fallback : e;
+    }
+
     // Does the PARENT of this host path resolve at all (symlinks followed)?
     // A dangling link used as a path component is ENOENT, which the kernel
     // reports before anything about what is being linked. `why` separates
@@ -1167,8 +1187,7 @@ private:
         if (slash == std::string::npos || slash == 0) return true;
         const std::string parent = p.substr(0, slash);
         if (::access(parent.c_str(), F_OK) == 0) return true;
-        if (why != nullptr)
-            *why = errno == EACCES ? Errno::eacces : Errno::enoent;
+        if (why != nullptr) *why = access_errno();
         return false;
     }
 
@@ -2398,7 +2417,13 @@ private:
             // Even comm, which accepts writes, refuses a mode change: procfs
             // inodes have no setattr for the mode.
             return eno(virtual_mut_errno(abs, VMut::meta));
-        if (pc.realm == kernel::Realm2::absent)       return eno(pc.error);
+        if (pc.realm == kernel::Realm2::absent)
+            // classify collapses several lookup failures to ENOENT. When the
+            // host can still be asked (the path maps somewhere), let IT name
+            // the reason -- a symlink loop in a prefix is ELOOP, not absent.
+            return eno(pc.error == Errno::enoent
+                           ? resolve_failure_errno(abs, pc.error)
+                           : pc.error);
         // A regular file used as a directory component is ENOTDIR, and that
         // outranks the dangling-link ENOENT below -- checking existence
         // first turned `chmod f1/bad` (f1 a file) into ENOENT.
@@ -2558,9 +2583,22 @@ private:
             return false;
         }
         if (::access(p.c_str(), F_OK) == 0) return true;
-        if (why != nullptr)
-            *why = errno == EACCES ? Errno::eacces : Errno::enoent;
+        if (why != nullptr) *why = access_errno();
         return false;
+    }
+
+    // Map the errno a failed ::access/::stat left behind onto the answer the
+    // kernel would give. Three distinct reasons a lookup can fail to see a
+    // file, and collapsing them to ENOENT was wrong for all but one: a
+    // directory above denying search is EACCES, and a symlink loop is ELOOP.
+    [[nodiscard]] static Errno access_errno() noexcept {
+        switch (errno) {
+        case EACCES:  return Errno::eacces;
+        case ELOOP:   return Errno::eloop;
+        case ENOTDIR: return Errno::enotdir;
+        case ENAMETOOLONG: return Errno::enametoolong;
+        default:      return Errno::enoent;
+        }
     }
 
     // fchown(fd, uid, gid): same as do_chown but the target is an open fd.

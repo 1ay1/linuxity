@@ -494,6 +494,24 @@ int main(void) {
     LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/nox3/t", 0);
     LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/nox3", 0x200);
 
+    // -- a symlink LOOP is ELOOP, not a file and not absent ----------------
+    // The symlink chase has a hop budget, but running out of it returned the
+    // last link as a host-backed path -- so stat on a self-referential link
+    // SUCCEEDED and chmod answered ENOENT, where the kernel says ELOOP.
+    LX_SYS3(SYS_symlinkat, DIR "/loop", AT_FDCWD, DIR "/loop");
+    lx_emit("newfstatat",
+            LX_SYS4(SYS_newfstatat, AT_FDCWD, DIR "/loop", (char[512]){0}, 0),
+            "stat of a symlink loop is ELOOP, not success");
+    lx_emit("openat", LX_SYS4(SYS_openat, AT_FDCWD, DIR "/loop", O_RDONLY, 0),
+            "open of a symlink loop is ELOOP");
+    lx_emit("fchmodat", LX_SYS4(SYS_fchmodat, AT_FDCWD, DIR "/loop", 0755, 0),
+            "chmod of a symlink loop is ELOOP, not ENOENT");
+    lx_emit("newfstatat",
+            LX_SYS4(SYS_newfstatat, AT_FDCWD, DIR "/loop", (char[512]){0}, 0x100),
+            "...but lstat sees the link itself");
+    lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/loop", 0),
+            "and the loop can still be unlinked");
+
     // -- teardown, observing each removal ----------------------------------
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, SYM, 0), "unlink sym");
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, F2, 0), "unlink f2");
