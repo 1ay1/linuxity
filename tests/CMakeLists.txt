@@ -6,6 +6,18 @@ set(LX_PORTABLE_TESTS
     resources address_space sysno conformance outcome wire fd_slots
     conform_law conform_hosts conform_coverage resolver)
 
+# The intercepted-syscall list that conform_coverage divides by is GENERATED
+# from the dispatcher (tools/intercepted.py), because the hand-written one
+# drifted -- it counted syscalls that merely forward, so coverage read 84%
+# when the honest figure was 69%. This check fails if someone adds a handler
+# without regenerating, which would silently shrink the denominator.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME conform_denominator
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_SOURCE_DIR}/tools/intercepted.py --check)
+endif()
+
 # Tests that instantiate PosixHost. These exercise the POSIX *host backend*
 # (mmap/dirent/pread), not the portable core, so they are POSIX-only: the
 # Win32 CRT has no <sys/mman.h>. Keeping them out of LX_PORTABLE_TESTS is
