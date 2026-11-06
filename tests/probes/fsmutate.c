@@ -509,6 +509,11 @@ int main(void) {
     lx_emit("newfstatat",
             LX_SYS4(SYS_newfstatat, AT_FDCWD, DIR "/loop", (char[512]){0}, 0x100),
             "...but lstat sees the link itself");
+    lx_emit("fchmodat", LX_SYS4(SYS_fchmodat, AT_FDCWD, DIR "/loop/under", 0755, 0),
+            "a loop in the PREFIX is ELOOP too, not ENOENT");
+    lx_emit("newfstatat",
+            LX_SYS4(SYS_newfstatat, AT_FDCWD, DIR "/loop/under", (char[512]){0}, 0),
+            "stat through a loop prefix is ELOOP");
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/loop", 0),
             "and the loop can still be unlinked");
 

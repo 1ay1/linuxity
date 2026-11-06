@@ -796,8 +796,20 @@ private:
             } else {
                 char buf[4096];
                 ::ssize_t n = ::readlink(host.c_str(), buf, sizeof buf - 1);
-                if (n < 0)                          // not a symlink (or gone)
+                if (n < 0) {
+                    // Not a symlink -- or not THERE, which is a different
+                    // thing: a PREFIX component may be the link, and the
+                    // kernel walks a path one component at a time. Without
+                    // this, `chmod d/f1/bad` with f1 a symlink answered
+                    // ENOENT, and a cycle in the prefix never surfaced as
+                    // ELOOP.
+                    if (errno == ENOENT || errno == ELOOP) {
+                        if (auto pre_cls = chase_prefix(m, host, for_write, wi,
+                                                        depth, hops))
+                            return std::move(*pre_cls);
+                    }
                     return PathClass{Realm2::host_backed, std::move(host), Errno::enoent, {}};
+                }
                 target.assign(buf, static_cast<std::size_t>(n));
             }
             std::string guest_abs;
@@ -860,6 +872,72 @@ private:
         // last link in the cycle as a real file -- stat(self-link) succeeded
         // and chmod answered ENOENT, where the kernel says ELOOP.
         return PathClass{Realm2::absent, {}, Errno::eloop, {}};
+    }
+
+    // The leaf of `host` could not be read as a link because it is not there.
+    // Walk UP its components looking for one that IS a symlink, then resolve
+    // from that link's target with the remainder re-attached. That is what a
+    // component-by-component walk does, and it is how a cycle in the prefix
+    // becomes ELOOP rather than "the leaf is missing".
+    //
+    // nullopt when no component is a link, so the caller keeps its ENOENT.
+    [[nodiscard]] std::optional<PathClass> chase_prefix(
+        const Mount& m, const std::string& host, bool for_write, WriteIntent wi,
+        int depth, int hops) const {
+        // hops counts the chase we are already inside; only the depth and the
+        // caller's own 40-hop budget bound recursion here.
+        if (hops >= 39 || depth >= 8)
+            return PathClass{Realm2::absent, {}, Errno::eloop, {}};
+        std::string head = host;
+        std::string tail;
+        for (;;) {
+            const auto slash = head.rfind('/');
+            if (slash == std::string::npos || slash == 0) return std::nullopt;
+            tail.insert(0, head.substr(slash));
+            head.resize(slash);
+            char buf[4096];
+            const ::ssize_t n = ::readlink(head.c_str(), buf, sizeof buf - 1);
+            if (n < 0) {
+                // Still not a link. If this component does not exist either,
+                // keep walking up; anything else is the real answer.
+                if (errno == ENOENT) continue;
+                if (errno == ELOOP)
+                    return PathClass{Realm2::absent, {}, Errno::eloop, {}};
+                return std::nullopt;
+            }
+            // Found the link. Re-resolve its target (absolute targets are
+            // GUEST paths; relative ones sit beside the link) with the tail
+            // we stripped put back on.
+            std::string target(buf, static_cast<std::size_t>(n));
+            std::string next;
+            if (!target.empty() && target.front() == '/') {
+                next = std::move(target);
+            } else {
+                next = head.substr(0, head.rfind('/') + 1) + target;
+                next = host_to_guest(m, next);
+            }
+            next += tail;
+            return classify_impl(normalize(next), for_write, /*follow=*/true,
+                                 wi, depth + 1);
+        }
+    }
+
+    // Map a HOST path inside this mount back to the guest path it serves, so
+    // a resolved link target can re-enter classify_impl (which speaks guest).
+    [[nodiscard]] static std::string host_to_guest(const Mount& m,
+                                                   const std::string& host) {
+        for (const std::string* base : {&m.upper, &m.host_base}) {
+            if (base->empty()) continue;
+            if (host.size() >= base->size() &&
+                host.compare(0, base->size(), *base) == 0) {
+                std::string rel = host.substr(base->size());
+                std::string out = m.prefix == "/" ? std::string{} : m.prefix;
+                if (!rel.empty() && rel.front() != '/') out += '/';
+                out += rel;
+                return out.empty() ? std::string{"/"} : out;
+            }
+        }
+        return host;
     }
 
     static bool exists(const char* path) {
