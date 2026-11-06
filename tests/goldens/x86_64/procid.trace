@@ -46,4 +46,4 @@ sched_getaffinity = 1 | at least one cpu is in the mask
 sched_getaffinity = -EINVAL | a zero-size affinity mask is EINVAL
 kill = 0 | kill(self, 0) succeeds
 kill = -EINVAL | a bogus signal is EINVAL
-kill = -errno(3) | an absent pid is ESRCH
+kill = -ESRCH | an absent pid is ESRCH

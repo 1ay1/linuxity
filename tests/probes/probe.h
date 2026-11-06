@@ -44,6 +44,8 @@ static const char* lx_errno_name(int e) {
         case ERANGE:  return "ERANGE";
         case ESPIPE:  return "ESPIPE";
         case ELOOP:   return "ELOOP";
+        case ENOTTY:  return "ENOTTY";
+        case ESRCH:   return "ESRCH";
         default:      return 0;
     }
 }

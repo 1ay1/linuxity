@@ -1,0 +1,43 @@
+# linuxity conformance trace
+# scenario: memory
+# arch: aarch64
+# recorded-by: live Linux kernel on this host
+# kernel: Linux 6.1.162-android14-11-g9dd05ae3a1de-ab16261587
+mmap = 1 | anonymous 4 pages
+mmap = 1 | the mapping is readable and writable
+mmap = 1 | a second anonymous page
+mmap = 1 | anonymous memory is zero-filled
+munmap = 0 | unmap it
+mprotect = 0 | drop a page to read-only
+mprotect = 0 | restore read-write
+mprotect = 1 | contents survived the mprotect round-trip
+mprotect = -errno(12) | mprotect on an unmapped range is ENOMEM
+mprotect = -EINVAL | a bogus prot bit is EINVAL
+mmap = -EINVAL | a zero-length mmap is EINVAL
+mmap = -EINVAL | an unaligned MAP_FIXED is EINVAL
+mmap = -EINVAL | mmap without PRIVATE or SHARED is EINVAL
+mmap = -EBADF | a file mmap with a bad fd is EBADF
+munmap = -EINVAL | an unaligned munmap is EINVAL
+munmap = -EINVAL | a zero-length munmap is EINVAL
+munmap = -EINVAL | munmap of an unmapped range succeeds
+openat = 1 | create a file to map
+mmap = 1 | map the file
+mmap = 1 @0:4d415050454444415441 | the file's bytes through the mapping
+munmap = 0 | unmap the file
+mmap = 1 | mapping past EOF is allowed
+close = 0 | close the mapped file
+unlinkat = 0 | unlink it
+mremap = 1 | grow the mapping to 8 pages
+mremap = 1 | contents survived the mremap
+mremap = 1 | the grown tail is writable
+mremap = -errno(14) | mremap of an unmapped range is EINVAL
+madvise = 0 | MADV_NORMAL succeeds
+madvise = 0 | MADV_DONTNEED succeeds
+madvise = 1 | MADV_DONTNEED zeroed the anonymous page
+madvise = -EINVAL | a bogus advice value is EINVAL
+munmap = 0 | unmap everything
+brk = 1 | brk(0) returns a break
+brk = 1 | brk(0) is stable across calls
+brk = 1 | brk can grow
+brk = 1 | brk can shrink back
+brk = 1 | a too-low brk returns the old break, not an error

@@ -47,6 +47,43 @@ LX_PROBE_DIR=$PWD/build/probes ./build/tests/record_goldens
 `record_goldens` refuses to run on a non-Linux host rather than producing a
 golden with no kernel behind it.
 
+### Recording the aarch64 set
+
+The aarch64 goldens in this tree were recorded on a **real Android device**
+(Linux 6.1, arm64), not an emulator or a cross-build. That matters more than
+it sounds: Android is not just "Linux on arm64", it is Linux plus an SELinux
+policy that denies things a desktop kernel allows, and those denials are part
+of the behaviour a guest kernel has to cope with. The `ioctls` golden records
+one directly --
+
+```
+ioctl = -EACCES | TCGETS2 on the pty slave
+```
+
+-- because the shell domain's ioctl whitelist for devpts predates termios2.
+That is the real kernel's answer on that platform, so it is what the golden
+says. linuxity deliberately diverges there (it serves the request with the
+classic ioctl), and the `HostPolicyMayDeny` law is what permits that one
+direction: succeed where the host denied by policy, never the reverse.
+
+With only an x86-64 golden, every Android-specific path had no reference at
+all -- which is how four tty bugs shipped in a day. To re-record:
+
+```sh
+# build for the device, push the probes + recorder, run it there
+cmake --build <android-build> --target record_goldens
+adb push <android-build>/probes/* /data/local/tmp/cf/probes/
+adb push <android-build>/tests/record_goldens /data/local/tmp/cf/
+adb shell 'cd /data/local/tmp/cf && LX_PROBE_DIR=$PWD/probes ./record_goldens'
+adb pull /data/local/tmp/cf/tests/goldens/aarch64 tests/goldens/
+```
+
+A probe must emit the SAME NUMBER OF STEPS on every host, because traces are
+compared step by step: a check skipped after a failure shortens the trace and
+misaligns everything after it against an unrelated operation. Where a check
+cannot be answered -- its precondition failed -- emit `LX_NA` rather than 0,
+so "unanswerable" is distinguishable from "false".
+
 ## Who reads them
 
 | test | reference | runs on |

@@ -195,6 +195,7 @@ public:
 
             if (WIFEXITED(st) || WIFSIGNALED(st)) {
                 int code = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
+                if (WIFSIGNALED(st)) trace_killed(w, WTERMSIG(st));
                 if (w == root_pid_) exit_code_ = code;
                 if (auto it = gpid_.find(w); it != gpid_.end())
                     proc_events_.push_back({ProcEvent::reap, it->second, 0, {}, {}});
@@ -324,8 +325,32 @@ public:
             // whole runtime down mid-run (observed: gpg-agent's fast-exiting
             // double-fork intermediary killing the parent shell prematurely).
             if (sig == SIGSTOP || sig == SIGTRAP) {
-                if (tasks_.try_emplace(w).second) ++live_;
-                resume_run(w, 0);
+                // ...but only when it IS that attach stop. A SIGTRAP from a
+                // real trap instruction (a breakpoint, an assert that
+                // compiles to brk/int3) must be delivered: swallowing one is
+                // an infinite loop, because resumed with signal 0 the guest
+                // re-executes the same instruction at the same pc forever,
+                // never dying and never progressing.
+                //
+                // si_code tells them apart, but not uniformly: arm64's brk
+                // reports TRAP_BRKPT, while x86-64's int3 reports SI_KERNEL
+                // (measured, both on this kernel). The attach stop instead
+                // reports SI_USER/0, which is neither. So accept anything
+                // that is positively a trap rather than listing one arch's
+                // spelling.
+                siginfo_t si{};
+                const bool real_trap =
+                    sig == SIGTRAP &&
+                    ::ptrace(PTRACE_GETSIGINFO, w, 0, &si) == 0 &&
+                    (si.si_code == TRAP_BRKPT || si.si_code == TRAP_TRACE ||
+                     si.si_code == SI_KERNEL);
+                if (!real_trap) {
+                    if (tasks_.try_emplace(w).second) ++live_;
+                    resume_run(w, 0);
+                    continue;
+                }
+                trace_fault(w, sig);
+                resume_run(w, sig);
                 continue;
             }
             // A real syscall stop (TRACESYSGOOD => SIGTRAP|0x80). Under the
@@ -373,8 +398,71 @@ public:
             // so a SA_SIGINFO handler sees the SENDER's guest pid rather than
             // a host pid that does not exist in its namespace.
             rewrite_siginfo_pid(w);
+            trace_fault(w, sig);
             resume_run(w, sig);
         }
+    }
+
+    // A guest died on a signal. Under LINUXITY_TRACE say so, because the
+    // trace otherwise just stops mid-stream and a fatal SIGILL/SIGSEGV looks
+    // identical to a clean exit.
+    void trace_killed(::pid_t w, int sig) const {
+        const char* path = std::getenv("LINUXITY_TRACE");
+        if (!path || !*path) return;
+        std::FILE* out = std::fopen(path, "ae");
+        if (!out) return;
+        std::fprintf(out, "[lx] KILLED host_tid=%d sig=%d\n", (int)w, sig);
+        std::fclose(out);
+    }
+
+    // Under LINUXITY_TRACE, say WHERE a hardware fault happened. A guest that
+    // dies with "Illegal instruction" otherwise leaves nothing to go on: the
+    // trace just stops, because no syscall was involved. Reporting the faulting
+    // pc and the mapping it lands in turns that into a one-line answer.
+    void trace_fault(::pid_t w, int sig) const {
+        if (sig != SIGILL && sig != SIGSEGV && sig != SIGBUS && sig != SIGFPE)
+            return;
+        const char* path = std::getenv("LINUXITY_TRACE");
+        if (!path || !*path) return;
+
+        siginfo_t si{};
+        (void)::ptrace(PTRACE_GETSIGINFO, w, 0, &si);
+        Regs rr{};
+        (void)Regs::fetch(w, rr);
+        const std::uint64_t pc = rr.pc();
+
+        // Which mapping holds the pc, so the address means something without
+        // a debugger attached.
+        std::string where;
+        if (std::FILE* m = std::fopen(("/proc/" + std::to_string(w) + "/maps").c_str(), "re")) {
+            char line[512];
+            while (std::fgets(line, sizeof line, m)) {
+                unsigned long long lo = 0, hi = 0;
+                if (std::sscanf(line, "%llx-%llx", &lo, &hi) != 2) continue;
+                if (pc < lo || pc >= hi) continue;
+                std::string s{line};
+                while (!s.empty() && (s.back() == '\n' || s.back() == ' ')) s.pop_back();
+                const auto sp = s.find('/');
+                where = sp == std::string::npos ? s : s.substr(sp);
+                // Offset within the mapping is what an addr2line wants.
+                where += " +" + hex_of(pc - lo);
+                break;
+            }
+            std::fclose(m);
+        }
+
+        std::FILE* out = std::fopen(path, "ae");
+        if (!out) return;
+        std::fprintf(out, "[lx] FAULT sig=%d code=%d pc=%#llx addr=%p %s\n",
+                     sig, si.si_code, (unsigned long long)pc, si.si_addr,
+                     where.c_str());
+        std::fclose(out);
+    }
+
+    static std::string hex_of(std::uint64_t v) {
+        char b[32];
+        std::snprintf(b, sizeof b, "%#llx", (unsigned long long)v);
+        return b;
     }
 
     // Fill the arch-neutral TrapFrame from x86-64 registers at a syscall stop.
@@ -1491,6 +1579,7 @@ private:
             int sig = WSTOPSIG(st);
             if (sig != SIGTRAP && sig != (SIGTRAP | 0x80)) {
                 rewrite_siginfo_pid(w);
+                trace_fault(w, sig);
                 held_sig = sig;
             }
             ::ptrace(PTRACE_SYSCALL, w, 0, 0);

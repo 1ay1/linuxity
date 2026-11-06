@@ -280,14 +280,25 @@ public:
                     // (the host may well allow it -- this is a workaround for
                     // hosts that don't, not a correctness requirement).
                     if constexpr (runtime::RewritesArgs<T>) {
-                        const auto conv = ar.convert;
-                        const auto buf  = ar.buf;
+                        const auto conv  = ar.convert;
+                        const auto buf   = ar.buf;
+                        const auto subst = ar.subst;
                         auto fr = trap_.rewrite_arg(
                             ar.arg, ar.to, [&](std::int64_t ret) {
                                 if (ret < 0) return;
-                                if (conv == abi::ArgRewrite::Convert::
-                                                termios_to_termios2)
-                                    widen_termios(buf);
+                                using C = abi::ArgRewrite::Convert;
+                                switch (conv) {
+                                    case C::termios_to_termios2:
+                                        widen_termios(buf); break;
+                                    // The kernel let the call through, so the
+                                    // fd really is our controlling terminal.
+                                    // Replace the HOST pgrp/sid it reported
+                                    // with the guest-namespace one.
+                                    case C::own_pgrp:
+                                    case C::own_sid:
+                                        put_i32(buf, subst); break;
+                                    case C::none: break;
+                                }
                             });
                         if (!fr) return recover(fr.error());
                         return Step::next;
@@ -357,6 +368,15 @@ private:
     [[nodiscard]] static const std::string& empty_path() {
         static const std::string kEmpty;
         return kEmpty;
+    }
+
+    // Write one 32-bit value into the guest's buffer. Used to substitute the
+    // guest's own pgrp/sid for the host's after the kernel has accepted the
+    // ioctl.
+    void put_i32(UAddr buf, std::int32_t v) {
+        std::array<std::byte, 4> b{};
+        std::memcpy(b.data(), &v, 4);
+        (void)trap_.copy_out(buf, b);
     }
 
     // Turn the struct termios the host's TCGETS wrote into the struct

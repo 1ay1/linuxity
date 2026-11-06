@@ -1,9 +1,9 @@
 # linuxity conformance trace
-# scenario: dirseek-host
-# arch: x86_64
+# scenario: dirseek-proc
+# arch: aarch64
 # recorded-by: live Linux kernel on this host
-# kernel: Linux 7.2.14-zen1-1-zen
-openat = 3 | /usr/bin
+# kernel: Linux 6.1.162-android14-11-g9dd05ae3a1de-ab16261587
+openat = 3 | /proc
 getdents64 = 1 | first batch is non-empty
 lseek = 1 | cursor advanced after a read
 lseek = 1 | rewind by a byte delta (the fish case)

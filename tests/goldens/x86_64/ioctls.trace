@@ -1,0 +1,33 @@
+# linuxity conformance trace
+# scenario: ioctls
+# arch: x86_64
+# recorded-by: live Linux kernel on this host
+# kernel: Linux 7.2.14-zen1-1-zen
+openat = 1 | open /dev/ptmx
+ioctl = 0 | TIOCSPTLCK unlocks the slave
+ioctl = 0 | TIOCGPTN gets the slave number
+openat = 1 | open the pty slave /dev/pts/N
+ioctl = 0 | TCGETS on the pty slave
+ioctl = 0 | TCGETS2 on the pty slave
+ioctl = 1 | TCGETS2's first 36 bytes == TCGETS
+ioctl = 1 | TCGETS2 wrote c_ispeed
+ioctl = 1 | TCGETS2 wrote c_ospeed
+ioctl = 1 | c_ispeed == c_ospeed on a pty
+ioctl = 0 | TCGETS2 sign-extended behaves the same
+ioctl = 1 | sign-extended TCGETS2 returns the same struct
+ioctl = 0 | TCSETS2 clears ECHO
+ioctl = 1 | ECHO reads back cleared
+ioctl = 0 | TCSETSW2 restores ECHO
+ioctl = 1 | ECHO reads back set
+ioctl = 1 | TCGETS sees what TCSETSW2 set
+ioctl = 0 | TIOCGWINSZ on the pty slave
+ioctl = 0 | TIOCSWINSZ sets 40x132
+ioctl = 1 | winsize rows stuck
+ioctl = 1 | winsize cols stuck
+ioctl = -ENOTTY | TIOCGPGRP on the pty slave
+ioctl = 2 | tcgetpgrp == getpgrp (a shell loops until this holds)
+setpgid = 0 | setpgid(0,0) makes us a group leader
+ioctl = 2 | tcgetpgrp == getpgrp AFTER setpgid
+ioctl = -ENOTTY | an unknown ioctl request fails
+ioctl = -ENOTTY | TCGETS on a non-tty is ENOTTY
+ioctl = -EBADF | TCGETS on a closed fd is EBADF

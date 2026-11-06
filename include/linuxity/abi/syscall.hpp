@@ -2446,23 +2446,31 @@ private:
             // converged, it gave up with "no job control", and that turns off
             // line editing -- arrow keys echo as ^[[A. The session id is a
             // different question and stays the pid.
+            //
+            // Only when the fd really is the caller's CONTROLLING terminal,
+            // though. Answering for any fd meant TIOCGPGRP succeeded on
+            // /dev/null and on a closed fd, where the kernel says ENOTTY and
+            // EBADF -- the ioctls probe caught both by diffing against the
+            // live kernel. "Is it a tty" is not the test either: a pty slave
+            // opened O_NOCTTY IS a terminal but is not OUR controlling one,
+            // and the kernel still says ENOTTY. Only the kernel knows, so ask
+            // it: forward, and rewrite the answer only if it succeeded.
             case kTIOCGPGRP:
-            case kTIOCGSID: {
-                std::int32_t pgrp =
-                    request == kTIOCGSID ? ids().pid : flat_pgrp();
-                std::array<std::byte, sizeof pgrp> buf{};
-                std::memcpy(buf.data(), &pgrp, sizeof pgrp);
-                if (!mem_.copy_out(uaddr(r.arg[2]), buf))
-                    return eno(Errno::efault);
-                return val(0);
-            }
+                return ArgRewrite{1, request,
+                                  ArgRewrite::Convert::own_pgrp,
+                                  uaddr(r.arg[2]), flat_pgrp()};
+            case kTIOCGSID:
+                return ArgRewrite{1, request,
+                                  ArgRewrite::Convert::own_sid,
+                                  uaddr(r.arg[2]), ids().pid};
             // Accept a foreground-group change, and REMEMBER it: the next
             // tcgetpgrp has to report what was just set or the shell decides
-            // it lost the terminal.
+            // it lost the terminal. Forwarded for the same reason -- the
+            // kernel owns whether this fd can take one at all.
             case kTIOCSPGRP: {
                 const std::uint32_t want = get_u32(r.arg[2]);
                 if (want != 0) flat_pgrp_ = static_cast<std::int32_t>(want);
-                return val(0);
+                return fwd();
             }
             default:
                 return fwd();   // real host tty/device ioctl

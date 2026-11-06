@@ -53,6 +53,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cerrno>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -355,6 +356,65 @@ private:
     }
 };
 
+// linuxity may SUCCEED where the host refused by POLICY -- never the reverse.
+//
+// A guest kernel exists partly to paper over a host that forbids something
+// Linux allows. Android is the live case: the shell domain's SELinux ioctl
+// whitelist for devpts predates termios2, so TCGETS2/TCSETS2 on a pty slave
+// return EACCES, while glibc >= 2.42 uses only those requests. `tty` reported
+// "not a tty" on a working pty until linuxity served them with the classic
+// ioctl and converted the struct.
+//
+// So on Android the kernel says EACCES and linuxity says 0, and that
+// divergence is the FIX, not a bug. Exempting ioctl outright would throw away
+// the other 25 checks in the probe, so this law is deliberately narrow in
+// three ways:
+//
+//   * only EACCES/EPERM -- the errnos a policy layer produces. A real ENOTTY
+//     or EBADF from the kernel must still be matched exactly.
+//   * only in the direction native-failed / guest-succeeded. If the guest
+//     fails where the host succeeded, that is a regression and is reported.
+//   * only for ioctl, the syscall a host security policy actually filters.
+//
+// The effect: the aarch64 golden still RECORDS the denial as the kernel's
+// truth, and the guest is still held to every other observation.
+class HostPolicyMayDeny {
+public:
+    [[nodiscard]] bool exempt(const Observation& n,
+                              const Observation& g) const noexcept {
+        if (n.call != abi::Sysno::ioctl || g.call != abi::Sysno::ioctl)
+            return false;
+        // (a) the call itself: host denied by policy, linuxity served it.
+        if (g.returned.is_ok() &&
+            n.returned.match([](std::int64_t) { return false; },
+                             [](std::int32_t e) {
+                                 return e == EACCES || e == EPERM;
+                             }))
+            return true;
+        // (b) an invariant DERIVED from such a call. The probe reports 2 for
+        //     "not applicable" when the call it depends on failed, so one
+        //     side saying 2 and the other 0/1 is the same denial showing up
+        //     downstream, not a disagreement about behaviour. Two answered
+        //     results are always compared.
+        constexpr std::int64_t kNotApplicable = 2;
+        const auto na = [](const Observation& o) {
+            return o.returned.match(
+                [](std::int64_t v) { return v == kNotApplicable; },
+                [](std::int32_t) { return false; });
+        };
+        return na(n) != na(g);
+    }
+    [[nodiscard]] static constexpr std::string_view reason() noexcept {
+        return "the host denied an ioctl by policy (EACCES/EPERM) and linuxity "
+               "served it anyway -- Android's SELinux whitelist rejects "
+               "TCGETS2 on a pty slave, which is exactly what the guest kernel "
+               "is there to paper over. Covers the denied call and any "
+               "invariant the probe marked not-applicable because of it; the "
+               "reverse direction, and any two answered results, are never "
+               "exempt";
+    }
+};
+
 // The exemptions that hold on EVERY host, each with its reason. This is the
 // SSOT for "results that cannot agree between two processes" -- scenarios
 // extend it rather than restating it.
@@ -374,7 +434,7 @@ private:
 // differential test uses: fd numbers differ by design, so comparing them
 // would report a divergence on every single open.
 [[nodiscard]] constexpr auto default_law() noexcept {
-    return AnyOf{universal_exemptions(), FdNumbersDiffer{}};
+    return AnyOf{universal_exemptions(), FdNumbersDiffer{}, HostPolicyMayDeny{}};
 }
 
 // -- rendering (defined in observation.cpp) --------------------------------

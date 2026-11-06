@@ -18,6 +18,7 @@
 #include "linuxity/kernel/kernel.hpp"
 #include "linuxity/runtime/linux/ptrace_trap.hpp"
 #include "linuxity/runtime/trap.hpp"
+#include "linuxity/vfs/devfs.hpp"
 #include "linuxity/vfs/procfs.hpp"
 
 #include <cstdio>
@@ -26,22 +27,43 @@
 
 using namespace lx;
 
-// A static probe. linuxity virtualizes the job-control tty ioctls purely on
-// the REQUEST number (TIOCGPGRP/TIOCSPGRP/TIOCGSID) without touching the fd,
-// so the probe needs no real terminal: it issues TIOCGPGRP on fd 0 and checks
-// the reported foreground group equals getpgrp() (the guest's flat pid, 1) —
-// exactly the comparison a shell makes before deciding it must seize the tty.
-// A host pgid answer (the pre-fix behavior) would fail the equality and is
-// what sends real shells into their spin. TIOCSPGRP must also be accepted.
+// A static probe. The job-control ioctls are answered in the guest's own
+// namespace -- TIOCGPGRP/TIOCGSID report the caller's OWN pgrp/sid -- which is
+// what stops a session leader spinning to seize a tty it already owns.
+//
+// But they are answered only for a fd the KERNEL agrees is a terminal we may
+// ask about. That matters: on /dev/null the real kernel says ENOTTY, and
+// linuxity used to return success for ANY fd, which the ioctls conformance
+// probe caught by diffing against the live kernel.
+//
+// Both halves are checked here. The tty half uses whichever real terminal is
+// available: setsid() is virtualized (it reports a new session without
+// creating one), so TIOCSCTTY cannot be relied on to manufacture a
+// controlling terminal -- the probe takes /dev/tty when the harness gave us
+// one and otherwise just verifies the negative half, rather than asserting a
+// setup linuxity does not promise.
 static const char* kProbe =
+    "#define _GNU_SOURCE\n"
+    "#include <stdio.h>\n#include <stdlib.h>\n#include <fcntl.h>\n"
     "#include <unistd.h>\n#include <sys/ioctl.h>\n#include <termios.h>\n"
     "int main(void){\n"
     "  pid_t self=getpgrp();\n"
     "  pid_t fg=-999;\n"
-    "  if(ioctl(0,TIOCGPGRP,&fg)!=0) return 15;\n"
-    "  if(fg!=self) return 16;            /* the spin trigger: fg!=our pgrp */\n"
-    "  pid_t want=self;\n"
-    "  if(ioctl(0,TIOCSPGRP,&want)!=0) return 17;  /* set must be accepted */\n"
+    // The tty half, only if we actually have a controlling terminal.
+    "  int t=open(\"/dev/tty\",O_RDWR);\n"
+    "  if(t>=0){\n"
+    "    if(ioctl(t,TIOCGPGRP,&fg)!=0) return 15;\n"
+    "    if(fg!=self) return 16;          /* the spin trigger: fg!=our pgrp */\n"
+    "    pid_t want=self;\n"
+    "    if(ioctl(t,TIOCSPGRP,&want)!=0) return 17;\n"
+    "    if(ioctl(t,TIOCGPGRP,&fg)!=0||fg!=want) return 20;\n"
+    "  }\n"
+    // The negative half always holds: a non-tty must be ENOTTY, not a
+    // fabricated success. This is the part that was wrong before.
+    "  int n=open(\"/dev/null\",O_RDONLY);\n"
+    "  if(n<0) return 21;\n"
+    "  if(ioctl(n,TIOCGPGRP,&fg)==0) return 19;\n"
+    "  if(ioctl(n,TIOCSPGRP,&self)==0) return 22;\n"
     "  return 0;\n"
     "}\n";
 
@@ -55,6 +77,8 @@ int main() {
     if (!lxtest::compile_guest("run_tty_jobcontrol", tree, kProbe)) return 0;
 
     auto r = lxtest::run_guest(tree, [&](auto& k) {
+        // The probe needs a real pty, so it needs /dev/ptmx and /dev/pts.
+        k.files().mount_virtual("/dev", vfs::make_devfs());
         kernel::ProcInfo init;
         init.pid = 1;
         init.cmdline = tree.exec;
@@ -66,7 +90,10 @@ int main() {
     if (code == -1) { std::puts("run_tty_jobcontrol: skipped (ptrace unavailable)"); return 0; }
     if (code != 0) {
         std::printf("run_tty_jobcontrol: FAIL code=%d "
-                    "(15 TIOCGPGRP 16 fg!=getpgrp[the spin trigger] 17 TIOCSPGRP)\n",
+                    "(15 TIOCGPGRP, 16 fg!=getpgrp[the spin trigger], "
+                    "17 TIOCSPGRP, 20 tcsetpgrp did not stick, "
+                    "19/22 TIOCGPGRP/TIOCSPGRP wrongly succeeded on /dev/null, "
+                    "21 no /dev/null)\n",
                     code);
         return 1;
     }

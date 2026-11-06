@@ -38,6 +38,8 @@ namespace detail {
         case ERANGE:  return "ERANGE";
         case ESPIPE:  return "ESPIPE";
         case ELOOP:   return "ELOOP";
+        case ENOTTY:  return "ENOTTY";
+        case ESRCH:   return "ESRCH";
         default:      return nullptr;
     }
 }
@@ -116,8 +118,11 @@ inline std::string Scenario::key() const {
     // Directory seek/cookie behaviour, per flavour. The flavours are the whole
     // point: the lseek-cookie bug was invisible on host_backed (which forwards
     // to the real kernel) and appeared only on virtualised.
+    // /etc rather than /usr/bin: the scenario has to run on EVERY Linux host
+    // that might record a golden, and Android has no /usr/bin. /etc is a
+    // host-backed directory with plenty of entries on both.
     v.push_back(Scenario{"dirseek-host", "dirseek"}
-                    .with("/usr/bin")
+                    .with("/etc")
                     .exercising(abi::Sysno::getdents64)
                     .exercising(abi::Sysno::lseek)
                     .on(DirFlavour::host_backed));
@@ -241,6 +246,25 @@ inline std::string Scenario::key() const {
                     .exercising(abi::Sysno::tgkill)
                     .exercising(abi::Sysno::tkill)
                     .on(DirFlavour::virtualised));
+
+    // ioctl on a pty: termios, window size, foreground process group.
+    //
+    // ioctl is the widest syscall in Linux and had NO probe, which is how four
+    // tty bugs shipped in one day: the termios2 requests denied by Android's
+    // SELinux ioctl whitelist (`tty` reported "not a tty" on a working pty),
+    // the fix then missing musl's sign-extended spelling of the same request,
+    // and TIOCGPGRP disagreeing with getpgrp so every shell concluded it was a
+    // background job and turned off line editing.
+    //
+    // The probe makes its OWN pty rather than using stdin, which is a pipe in
+    // CI and a terminal by hand -- tty ioctls answer differently on each, and
+    // the comparison has to be deterministic. The slave is the interesting
+    // device: /dev/ptmx and a devpts slave are different SELinux classes, and
+    // the Android denial applied only to the slave.
+    v.push_back(Scenario{"ioctls", "ioctls"}
+                    .exercising(abi::Sysno::ioctl)
+                    .exercising(abi::Sysno::setpgid)
+                    .on(DirFlavour::host_backed));
 
     return v;
 }

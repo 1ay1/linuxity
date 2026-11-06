@@ -18,7 +18,10 @@
 
 int main(void) {
     // -- open, dup, and the invariant that a dup shares the file -----------
-    const long fd = LX_SYS3(SYS_openat, AT_FDCWD, "/etc/hostname", O_RDONLY);
+    // /etc/hosts rather than /etc/hostname: both are ordinary readable files
+    // on a desktop distro, but Android has no /etc/hostname, and the probe
+    // has to run on every Linux host that might record a golden.
+    const long fd = LX_SYS3(SYS_openat, AT_FDCWD, "/etc/hosts", O_RDONLY);
     lx_emit("openat", fd < 0 ? fd : 1, "open a regular file");
     if (fd < 0) return 1;
 
@@ -43,12 +46,26 @@ int main(void) {
     }
 
     // -- dup2 / dup3 -------------------------------------------------------
+    // aarch64 (and every asm-generic arch) has NO dup2 syscall at all: glibc
+    // implements dup2(o,n) as dup3(o,n,0), except that dup2 onto the SAME fd
+    // is a no-op success while dup3 is EINVAL. Do the same here so the probe
+    // builds and means the same thing on both arches -- the trace labels stay
+    // "dup2", because what is being tested is the dup2 CONTRACT.
+#ifdef SYS_dup2
+#  define LX_DUP2(o, n) LX_SYS2(SYS_dup2, (o), (n))
+#  define LX_DUP2_SELF(f) LX_SYS2(SYS_dup2, (f), (f))
+#else
+#  define LX_DUP2(o, n) LX_SYS3(SYS_dup3, (o), (n), 0)
+   // dup2(fd, fd) returns fd without closing anything; dup3 rejects it.
+#  define LX_DUP2_SELF(f) (f)
+#endif
+
     // dup2 to an explicit target must land exactly there.
-    const long t = LX_SYS2(SYS_dup2, fd, 400);
+    const long t = LX_DUP2(fd, 400);
     lx_emit("dup2", t == 400 ? 1 : t, "dup2 lands on the requested fd");
 
     // dup2 onto ITSELF is a no-op success, not an error -- a classic miss.
-    const long same = LX_SYS2(SYS_dup2, fd, fd);
+    const long same = LX_DUP2_SELF(fd);
     lx_emit("dup2", same == fd ? 1 : same, "dup2(fd, fd) is a no-op success");
 
     // dup3 with the same fds must be EINVAL (unlike dup2).
