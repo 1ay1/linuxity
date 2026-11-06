@@ -1254,6 +1254,17 @@ private:
     // Is this host path itself a directory? Used where a trailing slash
     // asserts the name is one. An unmapped path answers false, so the
     // trailing-slash assertion fails and the host call reports the rest.
+    // Is this host path a directory WITHOUT following a final symlink? A
+    // trailing slash asserts "this name is a directory", and a symlink is
+    // not one however good its target -- `rename lnk sub/` with lnk pointing
+    // at a directory is ENOTDIR, not the EISDIR that following it gives.
+    [[nodiscard]] static bool host_path_is_dir_nofollow(const std::string& p) noexcept {
+        if (p.empty()) return false;
+        struct ::stat st{};
+        if (::lstat(p.c_str(), &st) != 0) return false;
+        return S_ISDIR(st.st_mode);
+    }
+
     [[nodiscard]] static bool host_path_is_dir(const std::string& p) noexcept {
         if (p.empty()) return false;
         struct ::stat st{};
@@ -1485,6 +1496,31 @@ private:
             if (named.realm == kernel::Realm2::host_backed &&
                 host_lexists(named.host_path))
                 return eno(Errno::eexist);
+        }
+        // O_NOFOLLOW refuses to traverse a final symlink. Without O_PATH
+        // that is ELOOP for ANY link -- good, dangling or a cycle -- which is
+        // precisely the check a program makes to avoid a symlink attack, and
+        // the guest was silently following it. WITH O_PATH the pair means
+        // "open the link itself", which succeeds.
+        //
+        // has_for, not has: O_NOFOLLOW and O_PATH sit at DIFFERENT bits on
+        // aarch64, and reading the x86-64 constant made an earlier attempt at
+        // this check pass on x86-64 while doing nothing at all on the device.
+        if (wire::has_for(arch_, flags, wire::OpenFlag::nofollow)) {
+            auto named = k_.files().classify(abs, /*for_write=*/false,
+                                             /*follow=*/false);
+            if (!named.host_path.empty()) {
+                struct ::stat lst{};
+                if (::lstat(named.host_path.c_str(), &lst) == 0 &&
+                    S_ISLNK(lst.st_mode)) {
+                    if (!wire::has_for(arch_, flags, wire::OpenFlag::path))
+                        return eno(Errno::eloop);
+                    // O_PATH|O_NOFOLLOW: hand the LINK to the host.
+                    pending_open_ = abs;
+                    return Redirect{PathArg{path_arg,
+                                            std::move(named.host_path)}};
+                }
+            }
         }
         // A "."/".." component was normalized away during resolution, but
         // traversing it needs +x on that directory. Only matters when we are
@@ -2857,7 +2893,7 @@ private:
                 if (host_path_is_dir(pd.host_path) &&
                     path_is_ancestor(pd.host_path, ps.host_path))
                     return eno(Errno::enotempty);
-                if (!host_path_is_dir(ps.host_path))
+                if (!host_path_is_dir_nofollow(ps.host_path))
                     return eno(Errno::enotdir);
             }
         } else {
@@ -2883,7 +2919,7 @@ private:
                 if (Errno why = Errno::ok;
                     !host_lexists(ps.host_path, &why))
                     return eno(why);
-                if (slash1 && !host_path_is_dir(ps.host_path))
+                if (slash1 && !host_path_is_dir_nofollow(ps.host_path))
                     return eno(Errno::enotdir);
                 // LSTAT: a DANGLING symlink still occupies the name, so
                 // linking onto it is EEXIST. Following it reported ENOENT and

@@ -710,6 +710,53 @@ int main(void) {
             LX_SYS4(SYS_renameat, AT_FDCWD, DIR "/gone5", AT_FDCWD, DIR "/."),
             "...but a missing LEAF is still EBUSY");
 
+    // -- O_NOFOLLOW ---------------------------------------------------------
+    // Without O_PATH, O_NOFOLLOW is ELOOP for ANY final symlink -- good,
+    // dangling or a cycle. That is precisely the check a program makes to
+    // avoid a symlink attack, and the guest was silently FOLLOWING it. With
+    // O_PATH the pair means "open the link itself", which succeeds.
+    //
+    // This step is also why the arch-divergent open flags got found: an
+    // earlier version of the check read the x86-64 O_NOFOLLOW bit, passed
+    // here, and did nothing whatsoever on aarch64.
+    LX_SYS3(SYS_symlinkat, "f1", AT_FDCWD, DIR "/lnk2");
+    lx_emit("openat",
+            LX_SYS4(SYS_openat, AT_FDCWD, DIR "/lnk2", O_RDONLY | O_NOFOLLOW, 0),
+            "O_NOFOLLOW on a symlink is ELOOP, not a silent follow");
+    {
+        const long fd = LX_SYS4(SYS_openat, AT_FDCWD, DIR "/lnk2",
+                                // 010000000 is O_PATH spelled out: it needs
+                                // _GNU_SOURCE, which probe.h does not set.
+                                // Its value DOES agree on both ABIs, unlike
+                                // O_NOFOLLOW -- which is why this exists.
+                                O_RDONLY | O_NOFOLLOW | 010000000, 0);
+        lx_emit("openat", fd >= 0 ? 1 : fd,
+                "...but O_PATH|O_NOFOLLOW opens the link itself");
+        if (fd >= 0) LX_SYS1(SYS_close, fd);
+    }
+    {
+        // Success only: the fd NUMBER is host-specific.
+        const long fd = LX_SYS4(SYS_openat, AT_FDCWD, F1, O_RDONLY | O_NOFOLLOW, 0);
+        lx_emit("openat", fd >= 0 ? 1 : fd,
+                "O_NOFOLLOW on a plain file is fine");
+        if (fd >= 0) LX_SYS1(SYS_close, fd);
+    }
+    LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/lnk2", 0);
+
+    // A trailing slash asserts the name is a DIRECTORY, and a symlink is not
+    // one however good its target: `rename lnk sub/` with lnk -> a directory
+    // is ENOTDIR, not the EISDIR that following the link gives. The slash
+    // test has to lstat.
+    LX_SYS3(SYS_mkdirat, AT_FDCWD, DIR "/realdir", 0755);
+    LX_SYS3(SYS_symlinkat, "realdir", AT_FDCWD, DIR "/dlnk");
+    lx_emit("renameat",
+            LX_SYS4(SYS_renameat, AT_FDCWD, DIR "/dlnk", AT_FDCWD, SUB "/"),
+            "renaming a link-to-DIR onto a slashed name is ENOTDIR");
+    lx_emit("renameat",
+            LX_SYS4(SYS_renameat, AT_FDCWD, DIR "/realdir", AT_FDCWD, SUB "/"),
+            "...but a REAL directory there is not refused for that reason");
+    LX_SYS3(SYS_unlinkat, AT_FDCWD, DIR "/dlnk", 0);
+
     // -- teardown, observing each removal ----------------------------------
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, SYM, 0), "unlink sym");
     lx_emit("unlinkat", LX_SYS3(SYS_unlinkat, AT_FDCWD, F2, 0), "unlink f2");

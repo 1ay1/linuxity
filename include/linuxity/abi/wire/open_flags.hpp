@@ -23,11 +23,31 @@
 
 #include <cstdint>
 
+#include "linuxity/abi/sysno.hpp"   // Arch
+
 namespace lx::abi::wire {
 
-// Linux's open(2) flags for both targeted ABIs. x86-64 and aarch64 agree on
-// every one of these (they are asm-generic values, with x86-64 inheriting
-// them), so unlike `struct stat` there is no per-arch variant.
+// Linux's open(2) flags. The values BELOW are x86-64's.
+//
+// The comment here used to claim both targeted ABIs agree on every one of
+// these. They do not, and the claim survived because nothing at runtime read
+// the four that differ -- the first check that did (O_NOFOLLOW) silently did
+// nothing on the device. Measured with a probe compiled by each toolchain:
+//
+//                x86-64     aarch64
+//   O_DIRECTORY   65536       16384
+//   O_NOFOLLOW   131072       32768
+//   O_DIRECT      16384       65536
+//   O_TMPFILE   4259840     4210688
+//   O_PATH      2097152     2097152   (the one that really does agree)
+//
+// arm64 inherited arm's bit positions rather than asm-generic's. Note the
+// trap: x86-64's O_DIRECT is aarch64's O_DIRECTORY, so a guest using the
+// wrong table does not merely miss a flag, it reads a DIFFERENT one.
+//
+// So any flag that differs must be fetched with open_flag_for(arch, ...),
+// never read off this enum. `struct stat` has the same shape of problem and
+// solves it the same way (see wire/stat.hpp).
 enum class OpenFlag : std::uint64_t {
     rdonly    = 0,
     wronly    = 01,
@@ -53,6 +73,24 @@ enum class OpenFlag : std::uint64_t {
 
 [[nodiscard]] constexpr bool has(std::uint64_t flags, OpenFlag f) noexcept {
     return (flags & bits(f)) != 0;
+}
+
+// The ARCH-DEPENDENT flags, by value. Anything not listed here is identical
+// on both ABIs and can be read straight off the enum.
+[[nodiscard]] constexpr std::uint64_t open_flag_for(Arch a, OpenFlag f) noexcept {
+    if (a != Arch::aarch64) return bits(f);
+    switch (f) {
+    case OpenFlag::directory: return 0040000;   // 16384
+    case OpenFlag::nofollow:  return 0100000;   // 32768
+    case OpenFlag::directio:  return 0200000;   // 65536
+    case OpenFlag::tmpfile:   return 020040000; // 4210688 (incl. O_DIRECTORY)
+    default:                  return bits(f);
+    }
+}
+
+[[nodiscard]] constexpr bool has_for(Arch a, std::uint64_t flags,
+                                     OpenFlag f) noexcept {
+    return (flags & open_flag_for(a, f)) != 0;
 }
 
 // The low two bits are an access MODE, not a bitmask: O_RDONLY is 0, so
