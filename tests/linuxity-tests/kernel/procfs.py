@@ -113,6 +113,48 @@ def threads_in_task():
 
 
 @test
+def comm_renames():
+    """Writing comm renames the thread, like PR_SET_NAME, cut to 15 bytes."""
+    import ctypes
+    libc = ctypes.CDLL(None)
+
+    def get():
+        b = ctypes.create_string_buffer(16)
+        libc.prctl(16, b, 0, 0, 0)
+        return b.value
+
+    def comm(p="/proc/self/comm"):
+        with open(p) as f:
+            return f.read()
+
+    with open("/proc/self/comm", "w") as f:
+        f.write("lxt-a")
+    eq(comm(), "lxt-a\n", "comm after a write")
+    eq(get(), b"lxt-a", "PR_GET_NAME after a write")
+    with open("/proc/self/comm", "w") as f:
+        f.write("a-very-long-name-here")
+    eq(comm(), "a-very-long-nam\n", "comm is cut to 15 bytes")
+    libc.prctl(15, b"lxt-prctl", 0, 0, 0)
+    eq(comm(), "lxt-prctl\n", "comm after PR_SET_NAME")
+    seen = {}
+
+    def worker():
+        with open("/proc/thread-self/comm", "w") as f:
+            f.write("lxt-worker")
+        seen["get"] = get()
+        seen["tid"] = threading.get_native_id()
+        seen["task"] = comm(f"/proc/self/task/{seen['tid']}/comm")
+
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join()
+    eq(seen.get("get"), b"lxt-worker", "the thread's own name")
+    eq(seen.get("task"), "lxt-worker\n", "task/<tid>/comm")
+    eq(comm(), "lxt-prctl\n", "a thread's rename leaves the process name")
+    return "write, 15-byte cut, PR_SET_NAME, per thread"
+
+
+@test
 def other_processes():
     """A child's /proc entry: parent, state, cwd, and gone once reaped."""
     me = os.getpid()

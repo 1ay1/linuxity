@@ -87,7 +87,8 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                 return q == d || (q.starts_with(d) && q.size() > d.size() && q[d.size()] == '/');
             };
             if (host_dir("/proc/self/fd") || host_dir("/proc/thread-self/fd") ||
-                host_dir("/proc/self/fdinfo") || host_dir("/proc/thread-self/fdinfo")) {
+                host_dir("/proc/self/fdinfo") || host_dir("/proc/thread-self/fdinfo") ||
+                host_dir("/proc/self/ns")) {
                 kernel::VirtualFile vf; vf.redirect_host = std::move(q);
                 return ok(std::move(vf));
             }
@@ -517,7 +518,7 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                     {"exe",false},{"root",true},{"fd",true},{"maps",false},
                     {"io",false},{"oom_score",false},{"task",true},
                     {"environ",false},{"fdinfo",true},{"mountinfo",false},
-                    {"mounts",false},{"limits",false},
+                    {"mounts",false},{"limits",false},{"ns",true},
                 }));
 
             // ---- /proc/<pid>/task : the thread group -------------------

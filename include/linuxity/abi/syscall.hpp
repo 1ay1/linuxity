@@ -843,12 +843,24 @@ public:
                     std::array<std::byte, 16> raw{};
                     if (mem_.copy_in(uaddr(r.arg[1]), raw)) {
                         std::string nm;
-                        for (std::byte b : raw) {
-                            const char c = static_cast<char>(b);
+                        for (std::size_t i = 0; i < 15; ++i) {   // TASK_COMM_LEN - 1
+                            const char c = static_cast<char>(raw[i]);
                             if (c == '\0') break;
                             nm.push_back(c);
                         }
-                        if (!nm.empty()) k_.procs().set_thread_comm(ids().pid, ids().tid, nm);
+                        k_.procs().set_thread_comm(ids().pid, ids().tid, nm);
+                    }
+                }
+                // PR_GET_NAME reads our table, so a write to comm shows here too
+                if (op == 16 /*PR_GET_NAME*/) {
+                    if (!comm_files_.empty()) apply_comm_writes();
+                    const auto i = ids();
+                    if (const auto* p = k_.procs().find(i.pid)) {
+                        std::array<std::byte, 16> out{};
+                        const std::string& c = kernel::ProcessTable::comm_of(*p, i.tid);
+                        std::memcpy(out.data(), c.data(), std::min<std::size_t>(c.size(), 15));
+                        if (!mem_.copy_out(uaddr(r.arg[1]), out)) return eno(Errno::efault);
+                        return val(0);
                     }
                 }
                 return fwd();
@@ -1511,7 +1523,7 @@ private:
                 }
             }
         }
-        if (rebind("/proc/self", id.pid)) return abs;
+        if (rebind("/proc/self", id.pid)) return ns_to_host(std::move(abs));
         // thread-self is a TID, not a pid: /proc/thread-self is
         // /proc/<pid>/task/<tid> on a real kernel.
         if (abs == "/proc/thread-self" || abs.starts_with("/proc/thread-self/")) {
@@ -1519,7 +1531,28 @@ private:
             abs = "/proc/" + std::to_string(id.pid) + "/task/" +
                   std::to_string(id.tid) + rest;
         }
-        return abs;
+        return ns_to_host(std::move(abs));
+    }
+
+    // The guest shares the host's namespaces (unshare is refused), so
+    // /proc/<pid>[/task/<tid>]/ns is the tracee's own host one.
+    [[nodiscard]] std::string ns_to_host(std::string abs) const {
+        std::string_view v = abs;
+        v.remove_prefix(6);   // "/proc/"
+        auto skip_num = [&] {
+            const auto n = v.find_first_not_of("0123456789");
+            const auto digits = v.substr(0, n);
+            v.remove_prefix(digits.size());
+            return digits;
+        };
+        const auto who = skip_num();
+        if (who.empty()) return abs;
+        if (v.starts_with("/task/")) { v.remove_prefix(6); if (skip_num().empty()) return abs; }
+        if (v != "/ns" && !v.starts_with("/ns/")) return abs;
+        std::int32_t pid = 0;
+        for (const char c : who) pid = pid * 10 + (c - '0');
+        if (!k_.procs().find(pid) && !k_.procs().thread_group_of(pid)) return abs;
+        return "/proc/self" + std::string{v};
     }
     [[nodiscard]] std::string expand_proc_links(std::string abs, bool follow_leaf) {
         if (!abs.starts_with("/proc/")) return abs;
@@ -1772,6 +1805,7 @@ private:
             // Follow a cross-mount symlink to the RESOLVED virtual path (e.g.
             // /etc/mtab -> /proc/self/mounts); produce that, not the link.
             const std::string& vp = pc.virtual_path.empty() ? abs : pc.virtual_path;
+            if (!comm_files_.empty()) apply_comm_writes();
             auto vf = k_.files().produce(vp);
             if (!vf) return eno(vf.error());
             // /proc/<pid>/maps is a STUB in procfs -- it has no idea what the
@@ -1788,6 +1822,10 @@ private:
                         reinterpret_cast<const std::byte*>(m.data() + m.size()));
             pending_open_ = vp;
             pending_flags_ = 0;   // a virtual file is never a terminal
+            pending_comm_ = for_write && vp.ends_with("/comm") ? comm_target(vp)
+                                                               : std::pair<std::int32_t, std::int32_t>{0, 0};
+            // a write sets the name to just what was written, so start empty
+            if (pending_comm_.first) vf->bytes.clear();
             // A virtual DIRECTORY: stash its entries so getdents64 on the
             // resulting fd enumerates them (the backing temp node is a real
             // empty directory so O_DIRECTORY opens succeed).
@@ -2669,6 +2707,45 @@ private:
     [[nodiscard]] Outcome do_close(const Regs& r) {
         k_.files().unbind_fd(static_cast<int>(r.arg[0]));
         return fwd();   // let the child actually close its real fd
+    }
+
+    // A write to a comm file lands in its backing temp file. Pick up any that
+    // changed and rename the thread, before anything reads a name.
+    void apply_comm_writes() {
+        for (auto it = comm_files_.begin(); it != comm_files_.end();) {
+            auto& c = *it;
+            const int h = k_.procs().find(c.pid) ? ::open(c.host.c_str(), O_RDONLY | O_CLOEXEC) : -1;
+            if (h < 0) { it = comm_files_.erase(it); continue; }
+            char buf[15];   // Linux keeps 15 bytes
+            const ssize_t n = ::read(h, buf, sizeof buf);
+            ::close(h);
+            if (n > 0 && std::string_view(buf, static_cast<std::size_t>(n)) != c.seen) {
+                c.seen.assign(buf, static_cast<std::size_t>(n));
+                k_.procs().set_thread_comm(c.pid, c.tid, c.seen);
+            }
+            ++it;
+        }
+    }
+
+    // /proc/<pid>/comm, /proc/<pid>/task/<tid>/comm or /proc/<tid>/comm ->
+    // the (process, thread) it names, or {0, 0}
+    [[nodiscard]] std::pair<std::int32_t, std::int32_t> comm_target(std::string_view vp) const {
+        auto num = [&](std::string_view& s) {
+            std::int32_t v = 0;
+            std::size_t i = 0;
+            for (; i < s.size() && s[i] >= '0' && s[i] <= '9'; ++i) v = v * 10 + (s[i] - '0');
+            s.remove_prefix(i);
+            return i ? v : 0;
+        };
+        if (!vp.starts_with("/proc/")) return {0, 0};
+        vp.remove_prefix(6);
+        const std::int32_t a = num(vp);
+        std::int32_t b = 0;
+        if (vp.starts_with("/task/")) { vp.remove_prefix(6); b = num(vp); }
+        if (!a || vp != "/comm") return {0, 0};
+        if (k_.procs().find(a)) return {a, b ? b : a};
+        if (const auto tg = k_.procs().thread_group_of(a)) return {tg, a};
+        return {0, 0};
     }
 
     // dup(oldfd): forward, then mirror oldfd's bindings onto the new fd (the
@@ -4938,6 +5015,14 @@ private:
     // the ctty rule: opening a tty WITHOUT O_NOCTTY in a session that has
     // none makes it the controlling terminal.
     std::uint64_t pending_flags_{0};
+    // a comm file opened for write: the (pid, tid) it renames
+    std::pair<std::int32_t, std::int32_t> pending_comm_{0, 0};
+    struct CommFile {
+        std::string host;    // the backing temp file
+        std::int32_t pid, tid;
+        std::string seen;    // what it held last time we looked
+    };
+    std::vector<CommFile> comm_files_;
     bool pending_new_{false};    // the pending O_CREAT open makes a new name
     // guest paths of abstract-socket placeholders (see do_sockaddr_un)
     std::unordered_set<std::string> sock_placeholders_;
@@ -5416,6 +5501,14 @@ public:
         }
         if (fd >= 0 && !pending_open_.empty()) {
             k_.files().bind_fd(static_cast<int>(fd), pending_open_);
+            if (const auto [cp, ct] = std::exchange(pending_comm_, {0, 0}); cp)
+                if (auto host = tracee_fd_target(static_cast<int>(fd)); !host.empty()) {
+                    apply_comm_writes();
+                    std::erase_if(comm_files_, [&](const CommFile& c) {
+                        return c.pid == cp && c.tid == ct;
+                    });
+                    comm_files_.push_back({std::move(host), cp, ct, {}});
+                }
             // The create succeeded, so an upper-layer file now shadows the
             // lower one: the path is no longer deleted. classify() leaves the
             // whiteout in place for a parents_only create (it must still be
@@ -5670,6 +5763,18 @@ public:
             case 0x5452: case 0x5460:                            // FIOASYNC FIOQSIZE
                 return false;
             default: return true;
+        }
+    }
+
+    // The host path the tracee's fd points at, or "".
+    [[nodiscard]] std::string tracee_fd_target(int fd) {
+        if constexpr (!requires { mem_.host_tid(); }) {
+            return {};
+        } else {
+            char link[64], tgt[4096];
+            std::snprintf(link, sizeof link, "/proc/%d/fd/%d", mem_.host_tid(), fd);
+            const ssize_t k = ::readlink(link, tgt, sizeof tgt - 1);
+            return k > 0 ? std::string(tgt, static_cast<std::size_t>(k)) : std::string{};
         }
     }
 

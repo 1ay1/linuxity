@@ -65,9 +65,10 @@ def ns_links():
     if not os.path.isdir(d):
         skip("no /proc/self/ns")
     names = set(os.listdir(d))
-    for n in ("pid", "mnt", "net", "uts", "ipc", "user"):
+    # pid/user/... exist only if the kernel was built with them (Android often isn't)
+    for n in ("mnt", "net"):
         check(n in names, f"/proc/self/ns lacks {n}")
-    mine = {n: os.readlink(f"{d}/{n}") for n in ("pid", "mnt", "uts")}
+    mine = {n: os.readlink(f"{d}/{n}") for n in sorted(names) if not n.endswith("_for_children")}
     check(all(v.startswith(f"{k}:[") for k, v in mine.items()), f"ns link format {mine}")
     r, w = os.pipe()
     pid = spawn(lambda: os.write(w, repr({n: os.readlink(f"{d}/{n}") for n in mine}).encode()) and 0)
