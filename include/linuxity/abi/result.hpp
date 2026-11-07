@@ -34,7 +34,7 @@ enum class Errno : std::int32_t {
     efbig   = 27,  enospc  = 28,  espipe  = 29,  erofs   = 30,
     emlink  = 31,  epipe   = 32,  erange  = 34,  enosys  = 38,
     enotempty = 39, eloop  = 40,  enametoolong = 36,
-    enotsup = 95,
+    enotsup = 95,  eprotonosupport = 93,
     econnrefused = 111, etimedout = 110, eaddrinuse = 98,
 };
 

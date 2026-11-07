@@ -419,7 +419,8 @@ public:
             //    plausible statfs (tmpfs-like) for them instead of leaking the
             //    host's numbers.
             case Sysno::statfs:      return path_statfs(r);
-            case Sysno::fstatfs:     return fwd();
+            case Sysno::fstatfs:     return do_fstatfs(r);
+            case Sysno::socket:      return do_socket(r);
 
             // -- chroot(path): a guest chroot would chroot our HOST child to
             //    an untranslated host path — an isolation break. linuxity's
@@ -659,7 +660,7 @@ public:
             // untranslated and every symlink chmod failed ENOENT, which is
             // what made `pacman -Syu` warn "Can't set permissions to 0777"
             // for thousands of files.
-            case Sysno::fchmodat2:  return do_chmod(r, 1, true,  Wi::copy_leaf);
+            case Sysno::fchmodat2:  return do_chmod(r, 1, true,  Wi::copy_leaf, /*with_flags=*/true);
             // chown/lchown/fchown/fchownat: linuxity presents a ROOT-OWNED
             // world and the guest runs as our single UNPRIVILEGED host process,
             // so a forwarded chown (even to uid 0) EPERMs and breaks `tar -p`,
@@ -1314,6 +1315,12 @@ private:
         return S_ISDIR(st.st_mode);
     }
 
+    [[nodiscard]] static bool host_path_is_regular(const std::string& p) noexcept {
+        if (p.empty()) return false;
+        struct ::stat st{};
+        return ::stat(p.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+    }
+
     [[nodiscard]] static bool host_path_is_dir(const std::string& p) noexcept {
         if (p.empty()) return false;
         struct ::stat st{};
@@ -1606,6 +1613,7 @@ private:
             // Remember the guest path for this fd after the trap assigns it.
             pending_open_ = abs;
             pending_flags_ = flags;
+            if (for_write) grant_root_write(abs, pc.host_path);
             // If this opens a directory that is overlaid (writable upper over
             // the read-only rootfs lower), enumerate the UNION of both layers
             // and serve THAT from getdents64 on the resulting fd — otherwise a
@@ -2356,6 +2364,32 @@ private:
         return eno(pc.error);
     }
 
+    // fstatfs(fd, buf). An fd opened through a SYNTHESIZED mount (/proc,
+    // /sys, /dev) is backed by a host temp file or directory, so the host
+    // would answer tmpfs. Answer for the filesystem the guest opened. Every
+    // other fd is a real host file, and the host's answer is the truth.
+    [[nodiscard]] Outcome do_fstatfs(const Regs& r) {
+        const std::string_view gp =
+            k_.files().path_of_fd(static_cast<int>(r.arg[0]));
+        if (!gp.empty() && k_.files().under_virtual_mount(std::string{gp}))
+            return write_statfs(uaddr(r.arg[1]), gp);
+        return fwd();
+    }
+
+    // socket(domain, type, protocol). Only one combination is answered here:
+    // a NETLINK_AUDIT socket, which needs an audit subsystem linuxity does not
+    // have. A kernel built without CONFIG_AUDIT answers EPROTONOSUPPORT, and
+    // that is what systemd, auditd clients and libaudit treat as "no audit
+    // here" and stay quiet about. Forwarded, the host's answer (EACCES on
+    // Android) made systemd log an error on every run. Everything else is a
+    // real host socket.
+    [[nodiscard]] Outcome do_socket(const Regs& r) {
+        constexpr std::uint64_t kAfNetlink = 16, kNetlinkAudit = 9;
+        if (r.arg[0] == kAfNetlink && r.arg[2] == kNetlinkAudit)
+            return eno(Errno::eprotonosupport);
+        return fwd();
+    }
+
     // Extended-attribute path family: get/set/list/remove xattr and their l*
     // (no-follow) forms. All carry the guest path in arg0; translate it to the
     // overlay host path and REDIRECT so the operation lands on the ROOTFS
@@ -2626,26 +2660,56 @@ private:
     // Operation not permitted" purely because the real host chmod on the
     // overlay-upper node failed. Recording-only makes the mode authoritative
     // and coherent regardless of host privilege.
-    [[nodiscard]] Outcome do_chmod(const Regs& r, int path_arg, bool at, Wi /*wi*/) {
-        if (empty_path_arg(r, path_arg)) return eno(Errno::enoent);
-        // A "."/".." component does not excuse the components before it.
-        if (const Errno e = dot_prefix_error(r, path_arg, at); e != Errno::ok)
-            return eno(e);
-        std::string abs = resolve_arg(r, path_arg, at);
+    [[nodiscard]] Outcome do_chmod(const Regs& r, int path_arg, bool at, Wi /*wi*/,
+                                   bool with_flags = false) {
+        // Only fchmodat2 has a flags argument. fchmodat has three arguments,
+        // so reading a fourth register for it read whatever was left there.
+        const std::uint64_t flags =
+            with_flags ? r.arg[static_cast<std::size_t>(path_arg) + 2] : 0;
         std::uint32_t mode = static_cast<std::uint32_t>(
             r.arg[static_cast<std::size_t>(path_arg) + 1]);
-        // AT_SYMLINK_NOFOLLOW on a SYMLINK is EOPNOTSUPP. Linux has no
-        // lchmod: a symlink's own mode is fixed at 0777 and the kernel
-        // ignores it, so the request is refused outright rather than applied
-        // to the target. libarchive asks for exactly this on every symlink a
-        // package ships, and treats EOPNOTSUPP as "fine, nothing to do" --
-        // reporting success instead made it complain "Can't set permissions
-        // to 0777" for every .so link in the archive.
-        //
-        // fchmodat's own ABI has no flags argument, so only fchmodat2 (and
-        // the glibc wrapper that calls it) can get here with one.
-        if (at && path_arg + 2 < 6) {
-            const std::uint64_t flags = r.arg[static_cast<std::size_t>(path_arg) + 2];
+        std::string abs;
+        if (with_flags && empty_cstr_arg(r, path_arg) &&
+            wire::has_at(flags, wire::AtFlag::empty_path)) {
+            // fchmodat2(fd, "", mode, AT_EMPTY_PATH): chmod the file the fd
+            // refers to. systemd copies a file's permissions onto its
+            // replacement this way, and treating "" as a missing path made
+            // every systemd-sysusers run abort: "Failed to copy permissions
+            // from /etc/group", and no user or group was ever created.
+            const int fd = static_cast<int>(r.arg[0]);
+            std::string_view gp = k_.files().path_of_fd(fd);
+            if (gp.empty()) {
+                // No guest path to record the mode against: set it on the
+                // host inode the fd refers to, which is all we can know.
+                const int sfd = open_tracee_fd(fd);
+                if (sfd < 0) return eno(Errno::ebadf);
+                const int rc = ::fchmod(sfd, mode & wire::kPermMask);
+                const int e = errno;
+                ::close(sfd);
+                return rc == 0 ? val(0) : eno(static_cast<Errno>(e));
+            }
+            abs = std::string{gp};
+            // An O_PATH fd can name a symlink itself, and a symlink has no
+            // mode of its own: EOPNOTSUPP, as for AT_SYMLINK_NOFOLLOW below.
+            if (fd_is_o_path(fd)) {
+                auto lc = k_.files().classify(abs, false, /*follow=*/false);
+                if (lc.realm == kernel::Realm2::host_backed &&
+                    host_path_is_symlink(lc.host_path))
+                    return eno(Errno::enotsup);
+            }
+        } else {
+            if (empty_path_arg(r, path_arg)) return eno(Errno::enoent);
+            // A "."/".." component does not excuse the components before it.
+            if (const Errno e = dot_prefix_error(r, path_arg, at); e != Errno::ok)
+                return eno(e);
+            abs = resolve_arg(r, path_arg, at);
+            // AT_SYMLINK_NOFOLLOW on a SYMLINK is EOPNOTSUPP. Linux has no
+            // lchmod: a symlink's own mode is fixed at 0777 and the kernel
+            // ignores it, so the request is refused outright rather than applied
+            // to the target. libarchive asks for exactly this on every symlink a
+            // package ships, and treats EOPNOTSUPP as "fine, nothing to do" --
+            // reporting success instead made it complain "Can't set permissions
+            // to 0777" for every .so link in the archive.
             if (wire::has_at(flags, wire::AtFlag::symlink_nofollow)) {
                 auto lc = k_.files().classify(abs, /*for_write=*/false,
                                               /*follow=*/false);
@@ -2700,8 +2764,23 @@ private:
             // apply; the shadow store still presents the intended mode at stat
             // time. Only chmod a REGULAR file/dir we own in the upper.
             if (!wc.host_path.empty() && !is_symlink(wc.host_path.c_str())) {
+                // The guest runs as root, and root writes files whose mode
+                // says nobody may; linuxity, an ordinary host user, cannot.
+                // So a regular file's host inode keeps owner read/write
+                // whatever the guest asked for, and the shadow store reports
+                // the exact guest mode. Applying 0444 literally left a file
+                // linuxity itself could no longer open for writing, so guest
+                // root got EACCES writing its own read-only file.
+                //
+                // Regular files only. A directory's mode goes on literally,
+                // because its search bit is a lookup rule the guest relies
+                // on: chmod 0644 on a directory must make it unsearchable
+                // (conform_diff pins `mkdir dir/.` as EACCES there), and a
+                // floor of 0700 had quietly kept it searchable.
+                const std::uint32_t keep =
+                    host_path_is_regular(wc.host_path) ? 0600u : 0u;
                 errno = 0;
-                if (::chmod(wc.host_path.c_str(), mode & wire::kPermMask) == 0) {
+                if (::chmod(wc.host_path.c_str(), (mode & wire::kPermMask) | keep) == 0) {
                     std::uint32_t got = 0;
                     if (hostcompat::host_mode_of(wc.host_path.c_str(), got))
                         landed = got;
@@ -4227,6 +4306,57 @@ private:
     std::string pending_lazy_;   // overlaid host dir: union built on 1st getdents
     std::vector<kernel::VirtualDirent> pending_entries_;
 public:
+    // Root writes files whose mode says nobody may write them; linuxity,
+    // being an ordinary host user, cannot. So before a write open of a file
+    // linuxity owns in the upper that lacks owner write, give the host inode
+    // owner read/write and record the real mode in the shadow store -- every
+    // guest stat reads that, so the file still looks 0444.
+    //
+    // At open time rather than when the mode was set, so it also repairs
+    // files that reached the upper read-only some other way: an fchmod, an
+    // archive extraction, or an older linuxity that applied modes literally.
+    // Without it, systemd-machine-id-setup could not write the 0444 file it
+    // had just created and concluded /etc was read-only.
+    //
+    // Only our own files, so the read-only rootfs lower is never touched.
+    void grant_root_write(const std::string& abs, const std::string& host) {
+        struct ::stat st{};
+        if (::stat(host.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) return;
+        if ((st.st_mode & 0600) == 0600 || st.st_uid != ::getuid()) return;
+        const std::uint32_t real = st.st_mode & wire::kPermMask;
+        if (::chmod(host.c_str(), real | 0600) != 0) return;
+        // A mode recorded earlier is the truth already; only fill in a
+        // missing one.
+        const auto rec = k_.files().meta().lookup(abs);
+        if (!rec || (rec->have & kernel::MetaRecord::kMode) == 0)
+            k_.files().meta().set_mode(abs, real);
+    }
+
+    // A file the guest just CREATED, as guest root, with a mode that leaves
+    // no owner write (0444, as systemd creates /etc/machine-id).
+    //
+    // Root ignores permission bits; linuxity, an ordinary host user, does
+    // not. So the host inode is given owner read/write and the requested
+    // mode is recorded in the shadow store, where every stat reads it from.
+    // Left at 0444, the guest's very next write to its own new file failed
+    // with EACCES. Only when the host mode is actually missing owner access:
+    // the common 0644 create is untouched. Only when the inode is the file
+    // this open just made (st_nlink 1, owned by us) -- O_CREAT on an existing
+    // file does not change its mode, and neither does this.
+    void record_created_mode(int fd) {
+        const int sfd = open_tracee_fd(fd);
+        if (sfd < 0) return;
+        struct ::stat st{};
+        const bool ok = ::fstat(sfd, &st) == 0;
+        const std::uint32_t want = ok ? (st.st_mode & wire::kPermMask) : 0;
+        const std::uint32_t need = ok && S_ISDIR(st.st_mode) ? 0700u : 0600u;
+        if (ok && S_ISREG(st.st_mode) && (want & need) != need &&
+            st.st_uid == ::getuid() &&
+            ::fchmod(sfd, want | need) == 0)
+            k_.files().meta().set_mode(pending_open_, want);
+        ::close(sfd);
+    }
+
     // The trap calls this after a redirect/inject syscall returns a real fd,
     // so the namespace can bind the guest path to that fd (readlinkat etc.),
     // and — for a virtual directory — the entries getdents64 will enumerate.
@@ -4262,8 +4392,10 @@ public:
             // deleted while O_EXCL asks whether the name is taken), so this
             // is where it gets dropped.
             if (wire::has(static_cast<std::uint64_t>(pending_flags_),
-                          wire::OpenFlag::creat))
+                          wire::OpenFlag::creat)) {
                 k_.files().clear_whiteout_if_any(pending_open_);
+                record_created_mode(static_cast<int>(fd));
+            }
 
             // The OTHER way to get a controlling terminal, besides
             // TIOCSCTTY: a session leader with no ctty that opens a terminal

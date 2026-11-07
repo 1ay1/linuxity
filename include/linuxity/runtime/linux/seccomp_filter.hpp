@@ -175,6 +175,11 @@ inline constexpr int kTrappedX86_64[] = {
     4, 6, 262,                   // stat/lstat/newfstatat
     332,                         // statx
     137,                         // statfs        (path -> overlay redirect)
+    // fstatfs on an fd linuxity synthesized (/proc, /sys, /dev) must report
+    // THAT filesystem, not the host temp file behind it. Untrapped, fstatfs
+    // on an open /proc said tmpfs, and systemd's proc_mounted() -- which
+    // fstatfs's an O_PATH fd -- concluded /proc was not mounted.
+    138,                         // fstatfs
     21, 269, 439,                // access/faccessat/faccessat2
     80,                          // chdir
     81,                          // fchdir        (syncs tracked cwd from fd)
@@ -250,6 +255,12 @@ inline constexpr int kTrappedX86_64[] = {
     // bind lands in the chroot's lower layer and diverges from the overlay,
     // and gpg-agent's connect then fails.
     49, 42,                      // bind/connect
+    // socket: for the one family linuxity does not provide. There is no audit
+    // subsystem behind the guest, so a NETLINK_AUDIT socket answers as a
+    // kernel built without CONFIG_AUDIT does. Untrapped it reached the host,
+    // and Android's EACCES made systemd log "Failed to connect to audit log"
+    // on every run.
+    41,                          // socket
     // -- prctl: intercept PR_SET_DUMPABLE. A guest (gpg-agent, dirmngr, ssh)
     // drops dumpable for security, which makes its memory unreadable via BOTH
     // process_vm_readv AND ptrace peek for our unprivileged tracer — so we can

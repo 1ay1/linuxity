@@ -450,10 +450,20 @@ public:
                     wo.whiteout_lower = true;
                     return wo;
                 }
+                // Anything mirrored or copied up with extra owner access for
+                // linuxity's sake still has to LOOK like it shipped: record
+                // the real mode against each entry's guest path. `up` and
+                // `abs` end in the same relative path, so an entry that sits
+                // N characters before the end of `up` is N before the end of
+                // `abs` too.
+                Widened widened;
                 if (wi == WriteIntent::parents_only)
-                    mirror_parents_from_lower(up, lo);
+                    mirror_parents_from_lower(up, lo, &widened);
                 else
-                    copy_up(up, lo);
+                    copy_up(up, lo, &widened);
+                for (const auto& [tail, real] : widened)
+                    if (tail <= abs.size())
+                        meta_.set_mode(std::string{abs.substr(0, abs.size() - tail)}, real);
                 // A create/write at a whited-out path revives it: the upper
                 // now shadows the (still-pristine) lower, so drop the
                 // whiteout. Doing this HERE, before O_EXCL's own existence
@@ -1236,32 +1246,52 @@ private:
         ::rmdir(path.c_str());
     }
 
+    // What a mirror/copy-up had to widen for linuxity's own access, as
+    // (characters of `up` after that entry, the real lower mode). The caller
+    // turns each back into a guest path and records the real mode.
+    using Widened = std::vector<std::pair<std::size_t, std::uint32_t>>;
+
     // Ensure `up` exists in the upper layer, copying its bytes up from the
     // read-only lower `lo` on first write and creating parent directories.
     // Best-effort: if the lower doesn't exist this just preps the parent dirs
     // so an O_CREAT open can make the new file in upper.
-    static void copy_up(const std::string& up, const std::string& lo) {
-        mirror_parents_from_lower(up, lo);
+    //
+    // Anything the copy had to give MORE access than the lower has (see
+    // below) is reported through `widened`, so the real mode can be recorded.
+    static void copy_up(const std::string& up, const std::string& lo,
+                        Widened* widened = nullptr) {
+        mirror_parents_from_lower(up, lo, widened);
         if (exists(up.c_str())) return;                 // already copied up
-        // If the lower is a DIRECTORY, mirror it as a directory in upper (do
-        // NOT open+copy it as a regular file — that would leave a bogus file
-        // where a mkdir/child-create expects a dir, yielding EEXIST/ENOTDIR).
         // The lower file's own mode, so a copy-up does not silently
-        // re-permission it. An executable copied up as 0644 stops being
+        // re-permission it: an executable copied up as 0644 stops being
         // runnable, which is exactly what a package manager's shipped
         // binaries are.
+        //
+        // But never LESS than owner read/write (owner rwx for a directory).
+        // The guest is root and ignores permission bits; linuxity is an
+        // ordinary host user and does not. Copying /etc/machine-id up as its
+        // shipped 0444 left a file linuxity could not then open for writing,
+        // so guest root got EACCES and systemd-machine-id-setup concluded
+        // /etc was read-only. The exact mode goes in the shadow store instead.
         struct ::stat lst{};
         const bool have_mode = ::stat(lo.c_str(), &lst) == 0;
         const ::mode_t lmode = have_mode ? (lst.st_mode & 07777) : 0;
-        if (is_dir(lo.c_str())) {
-            if (::mkdir(up.c_str(), have_mode ? lmode : 0755) == 0 && have_mode)
-                (void)::chmod(up.c_str(), lmode);   // past umask
+        const bool dir = is_dir(lo.c_str());
+        const ::mode_t host_mode = !have_mode ? (dir ? 0755 : 0644)
+                                              : lmode | (dir ? 0700 : 0600);
+        if (widened != nullptr && have_mode && host_mode != lmode)
+            widened->emplace_back(0, lmode);
+        // If the lower is a DIRECTORY, mirror it as a directory in upper (do
+        // NOT open+copy it as a regular file — that would leave a bogus file
+        // where a mkdir/child-create expects a dir, yielding EEXIST/ENOTDIR).
+        if (dir) {
+            if (::mkdir(up.c_str(), host_mode) == 0) (void)::chmod(up.c_str(), host_mode);
             return;
         }
         int in = ::open(lo.c_str(), O_RDONLY | O_CLOEXEC);
         if (in < 0) return;                             // no lower => new file
         int out = ::open(up.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
-                         have_mode ? lmode : 0644);
+                         host_mode);
         if (out < 0) { ::close(in); return; }
         char buf[65536];
         for (;;) {
@@ -1274,6 +1304,8 @@ private:
             }
         }
         ::close(in); ::close(out);
+        // open() masks the mode through umask; set it exactly.
+        (void)::chmod(up.c_str(), host_mode);
     }
 
     // Reproduce every ANCESTOR directory of `up` in the upper layer, matching
@@ -1291,7 +1323,8 @@ private:
     // filesystem: 777 package: 755" -- because it compares what it finds
     // against what the package says.
     static void mirror_parents_from_lower(const std::string& up,
-                                          const std::string& lo) {
+                                          const std::string& lo,
+                                          Widened* widened = nullptr) {
         // Walk `up`'s ancestor prefixes; for each, mkdir it in upper. We can't
         // know the exact lower/upper base split here, but creating each
         // ancestor of `up` bottom-up is sufficient and idempotent.
@@ -1316,7 +1349,14 @@ private:
                         mode = st.st_mode & 07777;
                 }
             }
+            // Owner rwx at least: linuxity must be able to create inside a
+            // directory guest root writes into, and a 0555 lower directory
+            // (ca-certificates' cadir) mirrored literally refused it.
+            const ::mode_t real = mode;
+            mode |= 0700;
             if (::mkdir(sub.c_str(), mode) != 0) continue;   // EEXIST: leave it
+            if (widened != nullptr && real != mode)
+                widened->emplace_back(up.size() - sub.size(), real);
             // Always chmod the one we just created. mkdir's mode is masked by
             // the HOST's umask, which linuxity does not control -- Android's
             // adb shell runs with umask 000, a desktop with 022, so the same
@@ -1382,7 +1422,7 @@ private:
     mutable FdTable inherited_fds_;
     mutable bool    have_inherited_fds_{false};
     mutable std::int32_t last_pid_{0};
-    MetaStore meta_{};
+    mutable MetaStore meta_{};
     LinkTable links_{};
     bool meta_attached_{false};
     bool is_root_{true};

@@ -50,7 +50,7 @@ set(LX_LIVE_TESTS
     run_open_procfs run_mutate run_dev run_socket run_daemon run_shebang
     run_tty_jobcontrol run_ttyname run_termios2 run_trap_insn run_pid_namespace run_seccomp run_meta run_bind
     run_foreign_exec run_untranslated run_empty_path run_rewinddir run_fd_reuse run_proc_self run_proc_link run_path_escape
-    run_orphan_confined run_link_emulation)
+    run_orphan_confined run_link_emulation run_root_access)
 
 # ---- differential conformance -------------------------------------------
 #
