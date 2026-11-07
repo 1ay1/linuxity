@@ -178,7 +178,9 @@ int main() {
 
         auto mi = f.produce("/proc/meminfo");
         assert(mi.has_value());
-        assert(bytes_to_string(mi->bytes).find("MemTotal:") != std::string::npos);
+        // the host's live file on Linux, synthesized elsewhere
+        assert(mi->redirect_host == "/proc/meminfo" ||
+               bytes_to_string(mi->bytes).find("MemTotal:") != std::string::npos);
 
         auto ci = f.produce("/proc/cpuinfo");
         assert(ci.has_value());

@@ -465,6 +465,7 @@ inline std::string Scenario::key() const {
     // path must be translated into the overlay, never left on the host.
     // landlock_restrict_self is irreversible, so it runs in a forked child.
     v.push_back(Scenario{"syscalls2", "syscalls2"}
+                    .exercising(abi::Sysno::syslog)
                     .exercising(abi::Sysno::fchmodat2)
                     .exercising(abi::Sysno::openat2)
                     .exercising(abi::Sysno::utime)

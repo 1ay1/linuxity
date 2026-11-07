@@ -23,9 +23,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
+#if !defined(_WIN32)
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace lx::vfs {
 
@@ -76,10 +82,15 @@ inline std::string host_file(const char* path) {
 
 // A virtual node that reads the host's live file, when the host lets us.
 inline std::optional<kernel::VirtualFile> host_redirect(const char* path) {
+#if defined(_WIN32)
+    (void)path;
+    return std::nullopt;
+#else
     if (::access(path, R_OK) != 0) return std::nullopt;
     kernel::VirtualFile vf;
     vf.redirect_host = path;
     return vf;
+#endif
 }
 
 // The run state of a guest process as the host scheduler sees it ('R', 'S',
@@ -108,6 +119,68 @@ inline std::pair<int, int> run_counts(const kernel::ProcessTable& procs) {
         blocked += st == 'D';
     }
     return {running < 1 ? 1 : running, blocked};
+}
+
+// /proc/net/<rest> (rest may be empty): the host's network, which the guest
+// shares. Socket tables are rewritten so the host uid running linuxity
+// reads as the guest's root, like the rest of its identity.
+inline std::optional<Result<kernel::VirtualFile>> net_view(std::string_view rest) {
+#if defined(_WIN32)
+    (void)rest;
+    return std::nullopt;
+#else
+    const std::string host = rest.empty() ? "/proc/net" : "/proc/net/" + std::string{rest};
+    if (rest.empty()) {
+        DIR* d = ::opendir(host.c_str());
+        if (!d) return std::nullopt;
+        std::vector<kernel::VirtualDirent> e;
+        while (const dirent* de = ::readdir(d))
+            if (de->d_name[0] != '.') e.push_back({de->d_name, de->d_type == DT_DIR});
+        ::closedir(d);
+        return ok(detail::dir_file(std::move(e)));
+    }
+    static constexpr std::string_view kSockTables[] = {
+        "tcp", "tcp6", "udp", "udp6", "raw", "raw6", "icmp", "icmp6", "udplite", "udplite6"};
+    bool table = false;
+    for (const auto t : kSockTables) table |= rest == t;
+    if (!table) {
+        if (auto vf = host_redirect(host.c_str())) return ok(std::move(*vf));
+        return std::nullopt;
+    }
+    const std::string h = host_file(host.c_str());
+    if (h.empty() && ::access(host.c_str(), R_OK) != 0) return std::nullopt;
+    // the uid is the 8th field; keep its column width so the layout holds
+    const std::string me = std::to_string(::getuid());
+    std::string out;
+    std::size_t at = 0;
+    bool header = true;
+    while (at < h.size()) {
+        std::size_t nl = h.find('\n', at);
+        if (nl == std::string::npos) nl = h.size();
+        std::string line = h.substr(at, nl - at);
+        at = nl + 1;
+        if (!header) {
+            std::size_t p = 0;
+            for (int field = 0; field < 7 && p != std::string::npos; ++field) {
+                p = line.find_first_not_of(' ', p);
+                p = p == std::string::npos ? p : line.find(' ', p);
+            }
+            if (p != std::string::npos) {
+                const std::size_t b = line.find_first_not_of(' ', p);
+                const std::size_t e = b == std::string::npos ? b : line.find(' ', b);
+                if (b != std::string::npos && line.compare(b, e - b, me) == 0) {
+                    std::string repl = "0";
+                    repl.insert(0, (e - b) - 1, ' ');
+                    line.replace(b, e - b, repl);
+                }
+            }
+        }
+        header = false;
+        out += line;
+        out += '\n';
+    }
+    return ok(detail::text_file(std::move(out)));
+#endif
 }
 
 // Build a /proc producer bound to linuxity's process table + machine spec.
@@ -144,6 +217,11 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
             }
         }
 
+        // ---- /proc/net: the host's network, which the guest shares ------
+        if (abs == "/proc/net" || abs.starts_with("/proc/net/"))
+            if (auto r = net_view(abs.size() > 10 ? abs.substr(10) : std::string_view{}))
+                return std::move(*r);
+
         // ---- /proc/self -> /proc/<pid 1> canonicalization ---------------
         std::string p{abs};
         // Our "self" is always pid 1 (the traced root / init).
@@ -159,8 +237,8 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                                   "version","cmdline","filesystems","mounts",
                                   "interrupts","softirqs","swaps","partitions",
                                   "diskstats","devices","modules","misc",
-                                  "kallsyms","kmsg","self","sys"})
-                e.push_back({f, std::string_view{f} == "sys"});
+                                  "kallsyms","kmsg","self","sys","net"})
+                e.push_back({f, std::string_view{f} == "sys" || std::string_view{f} == "net"});
             return ok(dir_file(std::move(e)));
         }
 
@@ -210,6 +288,10 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
             }
             return ok(text_file(std::move(s)));
         }
+        // The guest's memory is the host's: its live accounting, every field.
+        if (abs == "/proc/meminfo" || abs == "/proc/vmstat" || abs == "/proc/zoneinfo" ||
+            abs == "/proc/buddyinfo" || abs == "/proc/pagetypeinfo")
+            if (auto vf = host_redirect(std::string{abs}.c_str())) return ok(std::move(*vf));
         if (abs == "/proc/meminfo") {
             // The kernel's own format is `"%-15s %8lu kB\n"` -- label padded
             // LEFT to 15 columns, value RIGHT-aligned in 8. This file used
@@ -386,10 +468,17 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
         // the host hides its symbols: no symbols, like kptr_restrict on a
         // locked-down kernel, but the file is there
         if (abs == "/proc/kallsyms") return ok(text_file(""));
-        // the host hides its log: open is EPERM, as for a process without
-        // CAP_SYSLOG (syscall.hpp refuses it); the file itself exists
+        // the guest's own log (syscall.hpp serves the opens); stat shows the
+        // host's node when it has one
         if (abs == "/proc/kmsg") {
-            if (auto vf = host_redirect("/proc/kmsg")) return ok(std::move(*vf));
+#if !defined(_WIN32)
+            struct ::stat kst{};
+            if (::stat("/proc/kmsg", &kst) == 0) {
+                kernel::VirtualFile vf;
+                vf.redirect_host = "/proc/kmsg";
+                return ok(std::move(vf));
+            }
+#endif
             return ok(text_file(""));
         }
         // Interrupt counters, per CPU, in the kernel's layout (show_interrupts
@@ -518,6 +607,15 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                 {"/proc/sys/kernel/msgmni", "32000", true},
                 {"/proc/sys/kernel/core_pattern", "core", false},
                 {"/proc/sys/kernel/yama/ptrace_scope", "1", true},
+                {"/proc/sys/kernel/perf_event_paranoid", "2", true},
+                {"/proc/sys/kernel/perf_event_max_sample_rate", "100000", true},
+                {"/proc/sys/kernel/kptr_restrict", "1", true},
+                // the guest's own ring buffer (/dev/kmsg) is readable by root
+                {"/proc/sys/kernel/dmesg_restrict", "0", false},
+                {"/proc/sys/kernel/printk", "4\t4\t1\t7", true},
+                {"/proc/sys/kernel/panic", "0", true},
+                {"/proc/sys/kernel/pid_max", "4194304", true},
+                {"/proc/sys/kernel/sched_autogroup_enabled", "1", true},
                 {"/proc/sys/fs/file-max", "9223372036854775807", true},
                 {"/proc/sys/fs/nr_open", "1048576", true},
                 {"/proc/sys/fs/pipe-max-size", "1048576", true},
@@ -631,8 +729,12 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                     {"exe",false},{"root",true},{"fd",true},{"maps",false},
                     {"io",false},{"oom_score",false},{"task",true},
                     {"environ",false},{"fdinfo",true},{"mountinfo",false},
-                    {"mounts",false},{"limits",false},{"ns",true},
+                    {"mounts",false},{"limits",false},{"ns",true},{"net",true},
                 }));
+            // one network namespace, shared with the host
+            if (tail == "net" || tail.starts_with("net/"))
+                if (auto r = net_view(tail.size() > 4 ? std::string_view{tail}.substr(4) : std::string_view{}))
+                    return std::move(*r);
 
             // ---- /proc/<pid>/task : the thread group -------------------
             // htop/top enumerate processes THROUGH this directory. Each

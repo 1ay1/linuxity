@@ -1833,6 +1833,7 @@ public:
             case S::rt_sigqueueinfo:
                 return 0;
             case S::ioprio_get: case S::ioprio_set:
+            case S::perf_event_open:   // (attr, pid, cpu, group_fd, flags)
                 return 1;
             default:
                 return -1;

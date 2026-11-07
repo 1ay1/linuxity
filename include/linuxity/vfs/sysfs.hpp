@@ -31,7 +31,10 @@
 #include <dirent.h>
 #include <unistd.h>
 
+#include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -66,6 +69,58 @@ inline long index_after(std::string_view s, std::string_view prefix) {
 
 } // namespace sysfs_detail
 
+namespace sysfs_detail {
+
+inline long read_long(const char* p) {
+    std::FILE* f = std::fopen(p, "re");
+    if (!f) return -1;
+    long v = -1;
+    if (std::fscanf(f, "%ld", &v) != 1) v = -1;
+    std::fclose(f);
+    return v;
+}
+
+// How busy the host's CPUs have been, smoothed over ~20 s (0..1).
+inline double smoothed_load() {
+    using clk = std::chrono::steady_clock;
+    static std::mutex mu;
+    static unsigned long long last_busy = 0, last_total = 0;
+    static clk::time_point last_at{};
+    static double ema = 0.0;
+    std::lock_guard lk{mu};
+    std::FILE* f = std::fopen("/proc/stat", "re");
+    if (!f) return ema;
+    unsigned long long v[8]{};
+    const int n = std::fscanf(f, "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
+                              &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]);
+    std::fclose(f);
+    if (n < 4) return ema;
+    unsigned long long total = 0;
+    for (const auto x : v) total += x;
+    const unsigned long long busy = total - v[3] - v[4];   // minus idle and iowait
+    const auto now = clk::now();
+    if (last_total && total > last_total) {
+        const double dt = std::chrono::duration<double>(now - last_at).count();
+        const double util = static_cast<double>(busy - last_busy) / static_cast<double>(total - last_total);
+        const double a = 1.0 - std::exp(-dt / 20.0);
+        ema += a * (util - ema);
+    }
+    if (!last_total || std::chrono::duration<double>(now - last_at).count() > 0.25) {
+        last_busy = busy; last_total = total; last_at = now;
+    }
+    return ema;
+}
+
+// CPU temperature in millidegrees C (see the producer for the sources).
+inline long cpu_temp_mc() {
+    if (const long t = read_long("/sys/class/thermal/thermal_zone0/temp"); t > 0) return t;
+    if (const long b = read_long("/sys/class/power_supply/battery/temp"); b > 0)
+        return b * 100 + static_cast<long>(smoothed_load() * 40000.0) + 3000;
+    return 42000;
+}
+
+} // namespace sysfs_detail
+
 // Build a /sys producer describing linuxity's virtual machine. It reads the
 // SAME MachineSpec (kernel/machine.hpp) as /proc and the syscalls, so the CPU
 // count, topology and reported frequency can never disagree between /sys and
@@ -95,7 +150,31 @@ make_sysfs(const kernel::MachineSpec& mach) {
         if (abs == "/sys/devices")
             return D({{"system",true},{"virtual",true},{"platform",true}});
         if (abs == "/sys/devices/system")
-            return D({{"cpu",true},{"node",true},{"memory",true}});
+            return D({{"cpu",true},{"node",true},{"memory",true},{"clocksource",true}});
+
+        // ---- clocksource: the host's if it shows it, else the arch's own
+        // names (the guest's clock IS the host's counter) -----------------
+        if (abs == "/sys/devices/system/clocksource")
+            return D({{"clocksource0",true}});
+        if (abs == "/sys/devices/system/clocksource/clocksource0")
+            return D({{"available_clocksource",false},{"current_clocksource",false},
+                      {"unbind_clocksource",false},{"uevent",false}});
+        if (abs == "/sys/devices/system/clocksource/clocksource0/current_clocksource" ||
+            abs == "/sys/devices/system/clocksource/clocksource0/available_clocksource") {
+            std::string h;
+            if (std::FILE* f = std::fopen(std::string{abs}.c_str(), "re")) {
+                char buf[256];
+                if (std::fgets(buf, sizeof buf, f)) h = buf;
+                std::fclose(f);
+            }
+            if (!h.empty()) return T(std::move(h));
+            const bool arm = mach.machine_arch == "aarch64";
+            const bool cur = abs.ends_with("current_clocksource");
+            return T(arm ? "arch_sys_counter\n" : cur ? "tsc\n" : "tsc hpet acpi_pm \n");
+        }
+        if (abs == "/sys/devices/system/clocksource/clocksource0/unbind_clocksource" ||
+            abs == "/sys/devices/system/clocksource/clocksource0/uevent")
+            return T("");
 
         // ---- CPU topology -----------------------------------------------
         if (abs == "/sys/devices/system/cpu") {
@@ -284,23 +363,12 @@ make_sysfs(const kernel::MachineSpec& mach) {
                      {"temp1_max",false},{"temp1_crit",false},
                      {"temp2_input",false},{"temp2_label",false},
                      {"uevent",false}});
-        // The host's real temperature in millidegrees, read live: its CPU
-        // thermal zone if it shows it, else its battery sensor (Android
-        // hides the zones from apps but not the battery, in tenths of a
-        // degree), else 42 C.
-        auto host_temp = [] {
-            auto num = [](const char* p) -> long {
-                std::FILE* f = std::fopen(p, "re");
-                if (!f) return -1;
-                long v = -1;
-                if (std::fscanf(f, "%ld", &v) != 1) v = -1;
-                std::fclose(f);
-                return v;
-            };
-            if (const long t = num("/sys/class/thermal/thermal_zone0/temp"); t > 0) return t;
-            if (const long t = num("/sys/class/power_supply/battery/temp"); t > 0) return t * 100;
-            return 42000L;
-        };
+        // The host's temperature in millidegrees, read live: its CPU thermal
+        // zone when it shows it. Android hides the zones from apps but not
+        // the battery sensor, which trails the CPU by minutes, so there the
+        // die is estimated from it plus how busy the cores really are,
+        // smoothed like silicon heating and cooling. 42 C with neither.
+        auto host_temp = [] { return sysfs_detail::cpu_temp_mc(); };
         auto temp_text = [&](long off) { return T(std::to_string(host_temp() + off) + "\n"); };
         {
             // Serve the leaf files under either the class-symlink flattening
@@ -334,7 +402,14 @@ make_sysfs(const kernel::MachineSpec& mach) {
         if (abs == "/sys/class/thermal")
             return D({{"thermal_zone0",true}});
         if (abs == "/sys/class/thermal/thermal_zone0")
-            return D({{"type",false},{"temp",false},{"policy",false}});
+            return D({{"type",false},{"temp",false},{"policy",false},{"mode",false},
+                      {"trip_point_0_temp",false},{"trip_point_0_type",false},
+                      {"trip_point_1_temp",false},{"trip_point_1_type",false}});
+        if (abs == "/sys/class/thermal/thermal_zone0/mode") return T("enabled\n");
+        if (abs == "/sys/class/thermal/thermal_zone0/trip_point_0_temp") return T("85000\n");
+        if (abs == "/sys/class/thermal/thermal_zone0/trip_point_0_type") return T("passive\n");
+        if (abs == "/sys/class/thermal/thermal_zone0/trip_point_1_temp") return T("105000\n");
+        if (abs == "/sys/class/thermal/thermal_zone0/trip_point_1_type") return T("critical\n");
         if (abs == "/sys/class/thermal/thermal_zone0/type") return T("cpu-thermal\n");
         if (abs == "/sys/class/thermal/thermal_zone0/temp") return temp_text(0);
         if (abs == "/sys/class/thermal/thermal_zone0/policy") return T("step_wise\n");
@@ -417,7 +492,13 @@ make_sysfs(const kernel::MachineSpec& mach) {
         if (abs == "/sys/power")    return D({{"state",false}});
         if (abs == "/sys/power/state") return T("freeze mem disk\n");
         if (abs == "/sys/kernel")
-            return D({{"mm",true},{"debug",true},{"security",true}});
+            return D({{"mm",true},{"debug",true},{"tracing",true},{"security",true}});
+        // debugfs and tracefs mount points. Nothing is mounted on them, as on
+        // a kernel booted without them mounted; their contents are kernel
+        // internals no guest can be given.
+        if (abs == "/sys/kernel/debug" || abs == "/sys/kernel/tracing" ||
+            abs == "/sys/kernel/security" || abs == "/sys/kernel/mm")
+            return D({});
 
         return err<kernel::VirtualFile>(Errno::enoent);
     };

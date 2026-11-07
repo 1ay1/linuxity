@@ -507,6 +507,13 @@ int main(int argc, char** argv) {
         kernel::MachineSpec spec;
         spec.ncpu = ncpu;
         spec.mem_total = std::uint64_t{2048} << 20;   // 2 GiB
+#if defined(__linux__)
+        // the guest's memory IS the host's, so its size and swap are too
+        if (const auto t = kernel::MachineSpec::host_meminfo_kb("MemTotal:"); t && *t)
+            spec.mem_total = *t << 10;
+        if (const auto s = kernel::MachineSpec::host_meminfo_kb("SwapTotal:"))
+            spec.swap_total = *s << 10;
+#endif
         spec.release = "6.6.0-linuxity";
         spec.nodename = "linuxity";
         // On arm64 the guest's /proc/cpuinfo "Features" must be the HOST's.

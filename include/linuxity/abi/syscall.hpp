@@ -467,6 +467,7 @@ public:
             case Sysno::fstatfs:     return do_fstatfs(r);
             case Sysno::socket:      return do_socket(r);
             case Sysno::getsockname: return do_sockname(r, false);
+            case Sysno::syslog:      return do_syslog(r);
             case Sysno::getpeername: return do_sockname(r, true);
 
             // -- chroot(path): a guest chroot would chroot our HOST child to
@@ -1095,7 +1096,7 @@ private:
     // writes -- so refusing it would break every runtime that names its
     // threads through the file rather than the prctl.
     [[nodiscard]] static bool virtual_is_writable(std::string_view p) noexcept {
-        return p.ends_with("/comm") || p == "/proc/sys/vm/drop_caches";
+        return p.ends_with("/comm") || p == "/proc/sys/vm/drop_caches" || p == "/dev/kmsg";
     }
     // Files whose mode has no read bit for anyone, root included.
     [[nodiscard]] static bool virtual_is_write_only(std::string_view p) noexcept {
@@ -1647,6 +1648,11 @@ private:
              wire::has(flags, wire::OpenFlag::trunc)))
             open_wi = Wi::parents_only;
         auto pc = k_.files().classify(abs, for_write, /*follow=*/true, open_wi);
+        // the guest's kernel log, whatever node stat shows for it
+        if ((abs == "/dev/kmsg" || abs == "/proc/kmsg") &&
+            (pc.realm == kernel::Realm2::virtual_file || pc.realm == kernel::Realm2::host_backed) &&
+            !wire::has_for(arch_, flags, wire::OpenFlag::path))
+            return kmsg_open(flags, path_arg, /*proc_style=*/abs == "/proc/kmsg");
         // A TRAILING SLASH asserts the path is a directory, and that
         // assertion is judged BEFORE O_EXCL's "the name is taken": so
         // open("d/", O_CREAT|O_EXCL) on an existing directory is EISDIR,
@@ -1808,8 +1814,6 @@ private:
             if (for_write && !virtual_is_writable(vpw)) return eno(Errno::eacces);
             if ((flags & 3) != 1 /*not O_WRONLY*/ && virtual_is_write_only(vpw))
                 return eno(Errno::eacces);
-            // only reached when the host hides its log (else it's host-backed)
-            if (vpw == "/proc/kmsg") return eno(Errno::eperm);
             // Follow a cross-mount symlink to the RESOLVED virtual path (e.g.
             // /etc/mtab -> /proc/self/mounts); produce that, not the link.
             const std::string& vp = pc.virtual_path.empty() ? abs : pc.virtual_path;
@@ -4405,11 +4409,18 @@ private:
         const auto& m = machine();
         si.uptime    = static_cast<std::int64_t>(m.uptime_seconds());
         si.loads[0]  = si.loads[1] = si.loads[2] = 0;
+        // the host's load, in the kernel's fixed point (1 << SI_LOAD_SHIFT)
+        if (std::FILE* lf = std::fopen("/proc/loadavg", "re")) {
+            double l[3]{};
+            if (std::fscanf(lf, "%lf %lf %lf", &l[0], &l[1], &l[2]) == 3)
+                for (int i = 0; i < 3; ++i) si.loads[i] = static_cast<std::uint64_t>(l[i] * 65536.0);
+            std::fclose(lf);
+        }
         si.totalram  = m.mem_total;
         si.freeram   = m.mem_free();
         si.bufferram = m.mem_buffers();
         si.totalswap = m.swap_total;
-        si.freeswap  = m.swap_total;
+        si.freeswap  = m.swap_free();
         si.procs     = static_cast<std::uint16_t>(k_.procs().count());
         si.mem_unit  = 1;                            // ram fields are bytes
         if (!mem_.copy_out(buf, {reinterpret_cast<const std::byte*>(&si), sizeof si}))
@@ -5031,6 +5042,12 @@ private:
         std::string seen;    // what it held last time we looked
     };
     std::vector<CommFile> comm_files_;
+    // The guest's kernel log: /dev/kmsg, /proc/kmsg and syslog(2) read it,
+    // writes to /dev/kmsg append to it.
+    struct KmsgRec { std::uint64_t seq; std::uint64_t ts_us; int prio; std::string text; };
+    std::vector<KmsgRec> kmsg_;
+    std::uint64_t kmsg_seq_{0}, kmsg_cleared_{0};
+    std::vector<int> kmsg_writers_;   // read ends of pipes guest writers hold
     bool pending_new_{false};    // the pending O_CREAT open makes a new name
     // guest paths of abstract-socket placeholders (see do_sockaddr_un)
     std::unordered_set<std::string> sock_placeholders_;
@@ -5355,6 +5372,128 @@ public:
 
     [[nodiscard]] static std::string self_fd(int fd) {
         return "/proc/self/fd/" + std::to_string(fd);
+    }
+
+    // -- the guest's kernel log ----------------------------------------------
+    void kmsg_add(int prio, std::string text) {
+        while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) text.pop_back();
+        const double up = machine().uptime_seconds();
+        kmsg_.push_back({kmsg_seq_++, static_cast<std::uint64_t>(up * 1e6), prio, std::move(text)});
+        if (kmsg_.size() > 4096) kmsg_.erase(kmsg_.begin(), kmsg_.begin() + 1024);
+    }
+    // The first records a kernel logs at boot, from what linuxity knows is
+    // true of this machine.
+    void kmsg_seed() {
+        if (kmsg_seq_) return;
+        const auto& m = machine();
+        auto at = [&](double t, int prio, std::string s) {
+            kmsg_.push_back({kmsg_seq_++, static_cast<std::uint64_t>(t * 1e6), prio, std::move(s)});
+        };
+        at(0, 5, "Linux version " + m.release + " (linuxity@" + m.nodename +
+                    ") (linuxity portable Linux ABI) #1");
+        at(0, 6, "Machine model: linuxity " + m.machine_arch);
+        at(0, 6, "Memory: " + std::to_string(m.mem_total >> 10) + "K available");
+        at(0.000001, 6, "smp: Brought up 1 node, " + std::to_string(m.ncpu) + " CPUs");
+        at(0.000002, 6, "clocksource: Switched to clocksource " +
+                            std::string{m.machine_arch == "aarch64" ? "arch_sys_counter" : "tsc"});
+        at(0.000003, 6, "Run /sbin/init as init process");
+    }
+    // Pick up whatever guest writers have put into their pipes. Each write
+    // is one record; "<N>" at the front sets its level, like the kernel.
+    void kmsg_drain() {
+        char buf[8192];
+        for (auto it = kmsg_writers_.begin(); it != kmsg_writers_.end();) {
+            const ::ssize_t n = ::read(*it, buf, sizeof buf);
+            if (n > 0) {
+                std::string_view s{buf, static_cast<std::size_t>(n)};
+                int prio = 12;   // LOG_USER | LOG_WARNING, the kernel's default
+                if (s.size() > 2 && s[0] == '<') {
+                    const auto close = s.find('>');
+                    if (close != std::string_view::npos && close < 5) {
+                        prio = std::atoi(std::string{s.substr(1, close - 1)}.c_str());
+                        s.remove_prefix(close + 1);
+                    }
+                }
+                kmsg_add(prio, std::string{s});
+                continue;   // more may be queued
+            }
+            if (n == 0) { ::close(*it); it = kmsg_writers_.erase(it); continue; }   // all closed
+            ++it;   // EAGAIN: nothing yet
+        }
+    }
+    // Open /dev/kmsg: a reader gets a packet pipe holding the records, one
+    // per read, then EOF; a writer gets a pipe linuxity drains into the log.
+    [[nodiscard]] Outcome kmsg_open(std::uint64_t flags, int path_arg, bool proc_style = false) {
+        kmsg_seed();
+        kmsg_drain();
+        int p[2];
+        const int pflags = O_CLOEXEC | O_NONBLOCK | (proc_style ? 0 : O_DIRECT);
+        if (::pipe2(p, pflags) != 0) return eno(wire::errno_from_host(errno));
+        const std::uint64_t acc = flags & 3u;
+        int give;
+        if (acc == 1 && !proc_style) {   // write-only
+            (void)::fcntl(p[0], F_SETPIPE_SZ, 1 << 20);
+            kmsg_writers_.push_back(p[0]);
+            give = p[1];
+        } else {
+            (void)::fcntl(p[1], F_SETPIPE_SZ, 1 << 20);
+            for (const auto& r : kmsg_) {
+                if (r.seq < kmsg_cleared_) continue;
+                char head[64];
+                if (proc_style)
+                    std::snprintf(head, sizeof head, "<%d>", r.prio & 7);
+                else
+                    std::snprintf(head, sizeof head, "%d,%llu,%llu,-;", r.prio,
+                                  static_cast<unsigned long long>(r.seq),
+                                  static_cast<unsigned long long>(r.ts_us));
+                const std::string rec = head + r.text + "\n";
+                if (::write(p[1], rec.data(), rec.size()) < 0) break;
+            }
+            ::close(p[1]);
+            give = p[0];
+        }
+        fifo_release_.push_back(give);   // our copy goes once the guest has its own
+        pending_open_ = proc_style ? "/proc/kmsg" : "/dev/kmsg";
+        pending_flags_ = 0;
+        return Redirect{PathArg{path_arg, "/proc/" + std::to_string(::getpid()) +
+                                              "/fd/" + std::to_string(give)}};
+    }
+    // syslog(2)/klogctl over the same log, in its classic text form.
+    [[nodiscard]] Outcome do_syslog(const Regs& r) {
+        kmsg_seed();
+        kmsg_drain();
+        const int type = static_cast<int>(r.arg[0]);
+        auto text = [&](bool from_clear) {
+            std::string s;
+            for (const auto& k : kmsg_) {
+                if (from_clear && k.seq < kmsg_cleared_) continue;
+                char head[48];
+                std::snprintf(head, sizeof head, "<%d>[%5llu.%06llu] ", k.prio & 7,
+                              static_cast<unsigned long long>(k.ts_us / 1000000),
+                              static_cast<unsigned long long>(k.ts_us % 1000000));
+                s += head + k.text + "\n";
+            }
+            return s;
+        };
+        switch (type) {
+            case 0: case 1: return val(0);                       // close, open
+            case 2: case 3: case 4: {                            // read, read all, read+clear
+                const std::string all = text(true);
+                const std::size_t cap = static_cast<std::size_t>(r.arg[2]);
+                if (static_cast<std::int64_t>(r.arg[2]) < 0) return eno(Errno::einval);
+                const std::string_view out = std::string_view{all}.substr(all.size() > cap ? all.size() - cap : 0);
+                if (!out.empty() && !mem_.copy_out(uaddr(r.arg[1]),
+                        {reinterpret_cast<const std::byte*>(out.data()), out.size()}))
+                    return eno(Errno::efault);
+                if (type == 4) kmsg_cleared_ = kmsg_seq_;
+                return val(static_cast<std::int64_t>(out.size()));
+            }
+            case 5: kmsg_cleared_ = kmsg_seq_; return val(0);  // clear
+            case 6: case 7: case 8: return val(0);               // console on/off/level
+            case 9: return val(0);                               // unread bytes
+            case 10: return val(1 << 17);                        // buffer size
+            default: return eno(Errno::einval);
+        }
     }
 
     // How many guest fds have the anchor's pipe open for reading and writing.

@@ -18,8 +18,12 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <ctime>
+#include <optional>
 #include <string>
+#include <string_view>
 
 #include "linuxity/conform/arch.hpp"
 #if defined(__APPLE__)
@@ -112,12 +116,50 @@ public:
     // reported 0 used on any Mac with more free RAM than the guest's size.)
     // Cached for a second: monitors poll.
     [[nodiscard]] std::uint64_t mem_available()const {
+#if defined(__linux__)
+        if (const auto v = host_meminfo_kb("MemAvailable:")) return *v << 10;
+#endif
         const double f = host_free_fraction();
         return static_cast<std::uint64_t>(static_cast<double>(mem_total) * f);
     }
-    [[nodiscard]] std::uint64_t mem_free()     const { return mem_available() * 2 / 3; }
-    [[nodiscard]] std::uint64_t mem_cached()   const { return (mem_available() - mem_free()) * 3 / 4; }
-    [[nodiscard]] std::uint64_t mem_buffers()  const { return mem_total / 128; }
+    [[nodiscard]] std::uint64_t mem_free()     const {
+#if defined(__linux__)
+        if (const auto v = host_meminfo_kb("MemFree:")) return *v << 10;
+#endif
+        return mem_available() * 2 / 3;
+    }
+    [[nodiscard]] std::uint64_t mem_cached()   const {
+#if defined(__linux__)
+        if (const auto v = host_meminfo_kb("Cached:")) return *v << 10;
+#endif
+        return (mem_available() - mem_free()) * 3 / 4;
+    }
+    [[nodiscard]] std::uint64_t mem_buffers()  const {
+#if defined(__linux__)
+        if (const auto v = host_meminfo_kb("Buffers:")) return *v << 10;
+#endif
+        return mem_total / 128;
+    }
+    [[nodiscard]] std::uint64_t swap_free()    const {
+#if defined(__linux__)
+        if (const auto v = host_meminfo_kb("SwapFree:")) return *v << 10;
+#endif
+        return swap_total;
+    }
+    // One field of the host's /proc/meminfo, in kB, read live.
+    [[nodiscard]] static std::optional<std::uint64_t> host_meminfo_kb(std::string_view key) {
+        std::FILE* f = std::fopen("/proc/meminfo", "re");
+        if (!f) return std::nullopt;
+        char line[256];
+        std::optional<std::uint64_t> out;
+        while (std::fgets(line, sizeof line, f))
+            if (std::string_view{line}.starts_with(key)) {
+                out = std::strtoull(line + key.size(), nullptr, 10);
+                break;
+            }
+        std::fclose(f);
+        return out;
+    }
     [[nodiscard]] double host_free_fraction() const {
         using clk = std::chrono::steady_clock;
         static std::atomic<double> cached{-1.0};

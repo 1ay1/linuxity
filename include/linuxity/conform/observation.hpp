@@ -404,7 +404,9 @@ public:
                c == abi::Sysno::connect || c == abi::Sysno::getsockname ||
                c == abi::Sysno::getpeername || c == abi::Sysno::link ||
                c == abi::Sysno::linkat || c == abi::Sysno::newfstatat ||
-               c == abi::Sysno::mknod || c == abi::Sysno::mknodat;
+               c == abi::Sysno::mknod || c == abi::Sysno::mknodat ||
+               // dmesg_restrict: the guest is root, the native probe isn't
+               c == abi::Sysno::syslog;
     }
     [[nodiscard]] bool exempt(const Observation& n,
                               const Observation& g) const noexcept {

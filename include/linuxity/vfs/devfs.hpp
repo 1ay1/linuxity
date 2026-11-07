@@ -56,6 +56,27 @@ namespace lx::vfs {
         static constexpr std::array<std::string_view, 7> kChar = {
             "null", "zero", "full", "random", "urandom", "tty", "ptmx",
         };
+        // Devices that exist only on some hosts: present when the host has
+        // them (whether a guest may open one is the host's call).
+        static constexpr std::array<std::string_view, 6> kHostDev = {
+            "kvm", "fuse", "vhost-net", "vhost-vsock", "rtc0", "hwrng",
+        };
+        auto host_dev_ok = [](std::string_view n) {
+            struct ::stat st{};
+            return ::stat((std::string{"/dev/"} + std::string{n}).c_str(), &st) == 0 &&
+                   (S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode));
+        };
+        auto tun_path = [] {
+            struct ::stat st{};
+            for (const char* p : {"/dev/net/tun", "/dev/tun"})
+                if (::stat(p, &st) == 0 && S_ISCHR(st.st_mode)) {
+                    // the node itself, not a host symlink to it
+                    char real[4096];
+                    if (::realpath(p, real)) return std::string{real};
+                    return std::string{p};
+                }
+            return std::string{};
+        };
         // The pseudo-symlinks a POSIX /dev provides, pointing into /proc. All
         // four are real symlinks (lstat says S_IFLNK, readlink gives the
         // /proc path); opening one follows the link to the guest's own fd,
@@ -74,10 +95,35 @@ namespace lx::vfs {
             vf.is_dir = true;
             for (auto n : kChar) vf.entries.push_back({std::string{n}, false});
             for (auto& l : kLinks) vf.entries.push_back({std::string{l.name}, false});
+            for (auto n : kHostDev)
+                if (host_dev_ok(n)) vf.entries.push_back({std::string{n}, false});
             // Common subdirs programs probe; empty is fine (getdents enumerates
             // nothing, but the dir exists so opendir/stat succeed).
             vf.entries.push_back({"shm", true});
             vf.entries.push_back({"pts", true});
+            vf.entries.push_back({"net", true});
+            vf.entries.push_back({"kmsg", false});
+            return ok(std::move(vf));
+        }
+        // /dev/net/tun: the host's tun device, under whichever name it uses
+        if (abs == "/dev/net") {
+            kernel::VirtualFile vf;
+            vf.is_dir = true;
+            if (!tun_path().empty()) vf.entries.push_back({"tun", false});
+            return ok(std::move(vf));
+        }
+        if (abs == "/dev/net/tun") {
+            if (tun_path().empty()) return err<kernel::VirtualFile>(Errno::enoent);
+            kernel::VirtualFile vf;
+            vf.redirect_host = tun_path();
+            return ok(std::move(vf));
+        }
+        // /dev/kmsg is the guest's own ring buffer (syscall.hpp serves the
+        // opens); stat shows the host's real device node when there is one
+        if (abs == "/dev/kmsg") {
+            kernel::VirtualFile vf;
+            struct ::stat st{};
+            if (::stat("/dev/kmsg", &st) == 0 && S_ISCHR(st.st_mode)) vf.redirect_host = "/dev/kmsg";
             return ok(std::move(vf));
         }
 
@@ -115,6 +161,14 @@ namespace lx::vfs {
         // guest opens the TRUE device (native sink/source/CSPRNG semantics).
         for (auto n : kChar) {
             if (leaf == n) {
+                kernel::VirtualFile vf;
+                vf.redirect_host = std::string{"/dev/"} + std::string{n};
+                return ok(std::move(vf));
+            }
+        }
+        // Host devices the guest may really use, when this host has them.
+        for (auto n : kHostDev) {
+            if (abs.substr(5) == n && host_dev_ok(n)) {
                 kernel::VirtualFile vf;
                 vf.redirect_host = std::string{"/dev/"} + std::string{n};
                 return ok(std::move(vf));

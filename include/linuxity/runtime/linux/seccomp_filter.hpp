@@ -158,6 +158,8 @@ inline constexpr int kTrappedX86_64[] = {
     314, 315,                    // sched_setattr/getattr
     302, 310, 311, 312,          // prlimit64/process_vm_readv/writev/kcmp
     251, 252,                    // ioprio_set/get
+    298,                         // perf_event_open (pid in arg1)
+    103,                         // syslog (the guest's own kernel log)
     115,                         // getgroups (the guest's own list, not the host user's)
     // -- session / process groups ------------------------------------------
     111, 121, 124, 112, 109,     // getpgrp/getpgid/getsid/setsid/setpgid

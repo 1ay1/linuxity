@@ -226,6 +226,16 @@ int main(void) {
         if (s >= 0) LX_SYS1(SYS_close, s);
         LX_SYS3(SYS_unlinkat, AT_FDCWD, SOK, 0);
     }
+    // -- syslog(2): the kernel log. Root (the guest) may read it; an
+    // unprivileged native caller gets EPERM under dmesg_restrict, which
+    // the law exempts. Sizes vary by config, so only "answered" is kept.
+    {
+        static char klog[4096];
+        const long sz = LX_SYS3(SYS_syslog, 10 /*SIZE_BUFFER*/, 0, 0);
+        lx_emit("syslog", sz > 0 ? 1 : sz, "the log has a size");
+        const long rd = LX_SYS3(SYS_syslog, 3 /*READ_ALL*/, klog, sizeof klog);
+        lx_emit("syslog", rd > 0 ? 1 : rd, "READ_ALL returns records");
+    }
     // Connecting to a socket that is not there must be refused. WHICH
     // refusal depends on the namespace: a filesystem socket gives ENOENT
     // (no such path), but where the host forbids filesystem binds --
