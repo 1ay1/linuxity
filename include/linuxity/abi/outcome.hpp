@@ -108,8 +108,16 @@ struct Virtualize {
     // like setsid whose guest answer is ours but whose host effect matters
     // (a pty's ^C goes to the HOST's foreground group).
     bool mirror_host{false};
+    // Nonzero: don't answer yet. Wait this long in the guest's kernel and run
+    // the call again (an open that has to block on another guest task).
+    std::int64_t retry_ns{0};
 
     constexpr explicit Virtualize(std::int64_t v) noexcept : ret{v} {}
+    [[nodiscard]] static constexpr Virtualize retry_after(std::int64_t ns) noexcept {
+        Virtualize x{0};
+        x.retry_ns = ns;
+        return x;
+    }
     [[nodiscard]] static constexpr Virtualize mirrored(std::int64_t v) noexcept {
         Virtualize x{v};
         x.mirror_host = true;

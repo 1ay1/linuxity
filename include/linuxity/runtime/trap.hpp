@@ -344,6 +344,13 @@ public:
                 },
 
                 [&](abi::Virtualize v) {
+                    if constexpr (requires { trap_.wait_then_retry(std::int64_t{0}); }) {
+                        if (v.retry_ns > 0) {
+                            auto st = trap_.wait_then_retry(v.retry_ns);
+                            if (!st) return recover(st.error());
+                            return Step::next;
+                        }
+                    }
                     if constexpr (requires { trap_.forward_sync_then_set(std::int64_t{0}); }) {
                         if (v.mirror_host) {
                             // run the real call for its host effect, then

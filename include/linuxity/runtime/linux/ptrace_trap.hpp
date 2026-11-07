@@ -823,6 +823,38 @@ public:
         return forward_sync([this, ret](std::int64_t) { set_ret_now(ret); });
     }
 
+    // Make the current task wait `ns` in the kernel (ppoll on no fds), then
+    // run the syscall it trapped on again from scratch, so the dispatcher
+    // sees it afresh. For an open that has to block on another guest task.
+    // A signal ends the wait early and is handled on the way out; the call
+    // then runs again, as with SA_RESTART. Ctrl-C still kills.
+    [[nodiscard]] Status wait_then_retry(std::int64_t ns) {
+        Task& t = tasks_[cur_];
+        const Regs entry = t.regs;
+        Regs r = entry;
+        const std::uint64_t ts = (entry.sp() - 256 - 32) & ~std::uint64_t{15};
+        std::string spec(16, '\0');
+        const std::int64_t sec = ns / 1'000'000'000, nsec = ns % 1'000'000'000;
+        std::memcpy(spec.data(), &sec, 8);
+        std::memcpy(spec.data() + 8, &nsec, 8);
+        if (!poke_scratch(ts, spec)) return err(Errno::efault);
+        r.set_arg(0, 0);    // no fds
+        r.set_arg(1, 0);
+        r.set_arg(2, ts);
+        r.set_arg(3, 0);    // keep the signal mask
+        r.set_arg(4, 8);
+        r.set_nr(encode(kTraceeArch, abi::Sysno::ppoll));
+        if (!r.store(cur_) || !r.commit_nr(cur_)) return err(Errno::eio);
+        t.action = Action::none;
+        t.on_exit = [w = cur_, entry](std::int64_t) {
+            Regs back = entry;
+            back.rewind_to_syscall();
+            (void)back.store(w);
+        };
+        ::ptrace(PTRACE_SYSCALL, cur_, 0, 0);
+        return ok();
+    }
+
     // Overwrite the return of the task stopped at its syscall exit. Only
     // valid inside a post_exit callback.
     void set_ret_now(std::int64_t ret) {
@@ -1351,6 +1383,15 @@ public:
         const ::pid_t t = tgid_of(tid);
         const ::pid_t out = t > 0 ? t : tid;
         tgid_cache_[tid] = out;
+        return out;
+    }
+
+    // Every traced guest process (host tgids, one per process).
+    [[nodiscard]] std::vector<::pid_t> host_tgids() {
+        std::unordered_set<::pid_t> seen;
+        std::vector<::pid_t> out;
+        for (const auto& [tid, _] : tasks_)
+            if (const ::pid_t tg = host_tgid_of(tid); seen.insert(tg).second) out.push_back(tg);
         return out;
     }
 

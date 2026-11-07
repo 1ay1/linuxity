@@ -325,6 +325,10 @@ int main(int argc, char** argv) {
         set_env("LOGNAME", "root");
         set_env("HOME", "/root");
         set_env("SHELL", "/bin/bash");
+        // The host's temp dir means nothing in the guest's namespace (adb
+        // exports TMPDIR=/data/local/tmp, so make put its jobserver FIFO
+        // there). A distro leaves it unset and programs use /tmp.
+        std::erase_if(genvp, [](const std::string& kv) { return kv.starts_with("TMPDIR="); });
         // A DISTRO umask, for the same reason as the environment above: the
         // guest is a Linux distro, not this host's shell session. Every
         // distro ships 022 (via /etc/profile or pam_umask); Android's adb
@@ -652,6 +656,27 @@ int main(int argc, char** argv) {
                 "abstract namespace\n");
         }
         k.files().set_instance_id(static_cast<std::uint64_t>(::getpid()));
+    }
+
+    // Same question for FIFOs. Android refuses mkfifo everywhere a shell can
+    // write, so emulate them there (see Syscalls::fifo_*).
+    {
+        std::string probe = (persist.empty() ? std::string{"/tmp"} : persist) +
+                            "/.linuxity-fifo-probe";
+        ::unlink(probe.c_str());
+        int rc = ::mkfifo(probe.c_str(), 0600);
+        if (rc != 0 && errno == ENOENT) {   // no host /tmp (Android): try here
+            probe = ".linuxity-fifo-probe";
+            ::unlink(probe.c_str());
+            rc = ::mkfifo(probe.c_str(), 0600);
+        }
+        if (rc == 0 && !std::getenv("LINUXITY_EMULATE_FIFOS")) {
+            ::unlink(probe.c_str());
+        } else if (rc == 0 || errno == EACCES || errno == EPERM) {
+            if (rc == 0) ::unlink(probe.c_str());
+            k.files().set_fifos_emulated(true);
+            std::fprintf(stderr, "linuxity: host forbids mkfifo; emulating FIFOs\n");
+        }
     }
 
     // The rootfs makes the translation unprivileged, so we no longer need to

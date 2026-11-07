@@ -64,7 +64,7 @@ struct MetaRecord {
     // records here how many names the guest believes share the inode. Zero
     // means "ask the host", which is the normal case.
     std::uint32_t nlink{0};
-    enum Have : std::uint8_t { kMode = 1, kUid = 2, kGid = 4, kNlink = 8 };
+    enum Have : std::uint8_t { kMode = 1, kUid = 2, kGid = 4, kNlink = 8, kFifo = 16 };
     std::uint8_t have{0};
 };
 
@@ -164,13 +164,25 @@ public:
         append(guest_path, r);
     }
 
+    // A FIFO the host wouldn't let us create (Android forbids them), kept as
+    // an empty regular file that the guest sees as S_IFIFO.
+    void set_fifo(const std::string& guest_path) {
+        auto& r = table_[guest_path];
+        r.have |= MetaRecord::kFifo;
+        append(guest_path, r);
+    }
+    [[nodiscard]] bool is_fifo(const std::string& guest_path) const {
+        auto it = table_.find(guest_path);
+        return it != table_.end() && (it->second.have & MetaRecord::kFifo) != 0;
+    }
+
     // A record that says nothing the default view doesn't already: owner
     // root (or unset) and no mode. Such records are dropped.
     [[nodiscard]] static bool is_redundant(const MetaRecord& r) noexcept {
         const bool owner_default = (!(r.have & MetaRecord::kUid) || r.uid == 0) &&
                                    (!(r.have & MetaRecord::kGid) || r.gid == 0);
         return owner_default && !(r.have & MetaRecord::kMode) &&
-               !(r.have & MetaRecord::kNlink);
+               !(r.have & MetaRecord::kNlink) && !(r.have & MetaRecord::kFifo);
     }
 
     // On rename/link the metadata should travel with the file. Move any record
@@ -211,6 +223,10 @@ public:
     // keep, unioned with the guest-intended permission bits when recorded.
     [[nodiscard]] static std::uint32_t effective_mode(std::uint32_t host_mode,
                                                       const MetaRecord& r) {
+        // the placeholder is a regular file on the host; anything else there
+        // now replaced it and says what it is
+        if ((r.have & MetaRecord::kFifo) && (host_mode & abi::wire::kFileTypeMask) == 0100000u)
+            host_mode = (host_mode & ~abi::wire::kFileTypeMask) | 0010000u;
         if (!(r.have & MetaRecord::kMode)) return host_mode;
         // Keep the host's file-type; take the guest's permission+special bits.
         return (host_mode & abi::wire::kFileTypeMask) | (r.mode & abi::wire::kPermMask);
@@ -225,16 +241,20 @@ private:
         if (journal_path_.empty()) return;
         std::FILE* fp = std::fopen(journal_path_.c_str(), "a");
         if (!fp) return;
-        // nlink goes LAST and only when set, so a journal written before this
-        // field existed still parses (the reader asks for 4 fields and takes
-        // a 5th if it is there) and the common record stays the same size.
+        write_line(fp, path, r);
+        std::fclose(fp);
+    }
+
+    // nlink goes LAST and only when set, so a journal written before this
+    // field existed still parses (the reader asks for 4 fields and takes
+    // a 5th if it is there) and the common record stays the same size.
+    static void write_line(std::FILE* fp, const std::string& path, const MetaRecord& r) {
         if ((r.have & MetaRecord::kNlink) != 0)
             std::fprintf(fp, "%o %u %u %u %u %s\n", r.mode, r.uid, r.gid,
                          static_cast<unsigned>(r.have), r.nlink, path.c_str());
         else
             std::fprintf(fp, "%o %u %u %u %s\n", r.mode, r.uid, r.gid,
                          static_cast<unsigned>(r.have), path.c_str());
-        std::fclose(fp);
     }
 
     // A TOMBSTONE line (have==0xff sentinel) records a removal: replay drops any
@@ -295,9 +315,7 @@ private:
         const std::string tmp = journal_path_ + ".tmp";
         std::FILE* fp = std::fopen(tmp.c_str(), "w");
         if (!fp) return;
-        for (const auto& [path, r] : table_)
-            std::fprintf(fp, "%o %u %u %u %s\n", r.mode, r.uid, r.gid,
-                         static_cast<unsigned>(r.have), path.c_str());
+        for (const auto& [path, r] : table_) write_line(fp, path, r);
         if (std::fclose(fp) == 0) std::rename(tmp.c_str(), journal_path_.c_str());
         else std::remove(tmp.c_str());
     }

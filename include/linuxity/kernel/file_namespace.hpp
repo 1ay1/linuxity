@@ -245,6 +245,10 @@ public:
     // socket-using guest daemon fails with EACCES.
     [[nodiscard]] SocketNs socket_ns() const noexcept { return socket_ns_; }
     void set_socket_ns(SocketNs ns) noexcept { socket_ns_ = ns; }
+    // The host refuses mkfifo (Android's SELinux, everywhere a shell can
+    // write), so the dispatcher emulates named FIFOs over real pipes.
+    [[nodiscard]] bool fifos_emulated() const noexcept { return fifos_emulated_; }
+    void set_fifos_emulated(bool on) noexcept { fifos_emulated_ = on; }
 
     // Distinguishes concurrent linuxity instances in the abstract namespace.
     [[nodiscard]] std::uint64_t instance_id() const noexcept { return instance_id_; }
@@ -923,6 +927,7 @@ public:
 
 private:
     SocketNs      socket_ns_{SocketNs::filesystem};
+    bool          fifos_emulated_{false};
     std::uint64_t instance_id_{0};
 
     struct Mount {

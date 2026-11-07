@@ -111,6 +111,16 @@ struct Regs {
     // On x86-64 skip_call() is part of the general register set, so storing
     // the registers is enough. aarch64 needs a second poke -- see below.
     [[nodiscard]] bool commit_skip(::pid_t) const noexcept { return true; }
+
+    // Run a different syscall from this entry stop. orig_rax is the number.
+    void set_nr(std::uint64_t n) noexcept { r.orig_rax = n; }
+    [[nodiscard]] bool commit_nr(::pid_t) const noexcept { return true; }
+    // At an exit stop: point back at the `syscall` instruction so it runs
+    // again with these registers.
+    void rewind_to_syscall() noexcept {
+        r.rip -= 2;
+        r.rax = r.orig_rax;
+    }
 };
 
 #elif defined(__aarch64__)
@@ -162,8 +172,24 @@ struct Regs {
         return ::ptrace(PTRACE_SETREGSET, t, NT_ARM_SYSTEM_CALL, &io) == 0;
     }
 
+    // Run a different syscall from this entry stop. As with skip, the number
+    // is latched, so it goes through NT_ARM_SYSTEM_CALL after store().
+    void set_nr(std::uint64_t n) noexcept {
+        r.regs[8] = n;
+        nr_ = static_cast<int>(n);
+    }
+    [[nodiscard]] bool commit_nr(::pid_t t) const {
+        if (nr_ < 0) return true;
+        int n = nr_;
+        ::iovec io{&n, sizeof n};
+        return ::ptrace(PTRACE_SETREGSET, t, NT_ARM_SYSTEM_CALL, &io) == 0;
+    }
+    // At an exit stop: back to the `svc`, which reads x8 afresh.
+    void rewind_to_syscall() noexcept { r.pc -= 4; }
+
 private:
     bool skip_{false};
+    int  nr_{-1};
 };
 
 #else

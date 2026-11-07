@@ -27,6 +27,7 @@
 #include "linuxity/vfs/pty_names.hpp"
 
 #include <array>
+#include "linuxity/abi/wire/errno_map.hpp"
 #include <cstdint>
 #include <cstring>
 #include <sys/stat.h>
@@ -35,8 +36,13 @@
 #include <span>
 #include <set>
 #include <string>
+#include <map>
+#include <chrono>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <dirent.h>
+#include <fcntl.h>
 
 // -- Host portability: lstat ------------------------------------------------
 // The core calls lstat(2) in exactly one place (is_symlink below), to avoid a
@@ -1616,6 +1622,14 @@ private:
                 pc.host_path))
             return eno(Errno::eacces);
         if (pc.realm == kernel::Realm2::host_backed) {
+            // An emulated FIFO opens onto its shared pipe instead.
+            if (k_.files().fifos_emulated() &&
+                !wire::has_for(arch_, flags, wire::OpenFlag::path) &&
+                k_.files().meta().is_fifo(abs)) {
+                struct ::stat st{};
+                if (::stat(pc.host_path.c_str(), &st) == 0 && S_ISREG(st.st_mode))
+                    return fifo_open(abs, st, flags, path_arg);
+            }
             // Remember the guest path for this fd after the trap assigns it.
             pending_open_ = abs;
             pending_flags_ = flags;
@@ -2688,6 +2702,14 @@ private:
             if (pc.host_path.empty()) return val(0);
         }
         if (pc.host_path.empty()) return eno(pc.error);
+        // mkfifo on a host that refuses FIFOs (Android): make the placeholder
+        // ourselves. The mode is the register after the path.
+        if (wi == Wi::parents_only && k_.files().fifos_emulated()) {
+            const Sysno sc = decode(arch_, r.nr);
+            const auto mode = static_cast<std::uint32_t>(r.arg[static_cast<std::size_t>(path_arg) + 1]);
+            if ((sc == Sysno::mknod || sc == Sysno::mknodat) && (mode & 0170000u) == 0010000u)
+                return fifo_create(abs, pc.host_path, mode);
+        }
         // A removal drops any shadow record so a fresh file created at the same
         // path later starts from the host defaults, not a stale owner/mode.
         if (wi == Wi::remove) {
@@ -4402,6 +4424,16 @@ private:
     std::uint64_t pending_flags_{0};
     // guest paths of abstract-socket placeholders (see do_sockaddr_un)
     std::unordered_set<std::string> sock_placeholders_;
+    struct EmuFifo {
+        int anchor{-1};
+        int hold_r{-1}, hold_w{-1};
+        // tasks retrying a blocking open, by guest tid, with when they last tried
+        std::map<std::int32_t, std::chrono::steady_clock::time_point> wait_r{}, wait_w{};
+    };
+    // emulated FIFOs by placeholder (dev, ino), and holds to drop once an
+    // open lands
+    std::map<std::pair<std::uint64_t, std::uint64_t>, EmuFifo> fifos_;
+    std::vector<int> fifo_release_;
     // Per-filesystem answer to "does link(2) work here", keyed by st_dev.
     std::unordered_map<std::uint64_t, bool> links_work_;
     bool pending_dir_{false};    // the pending open is a virtual directory
@@ -4530,6 +4562,164 @@ public:
         }
     }
 
+    // -- FIFOs on a host that forbids them ---------------------------------
+    // The name is an empty regular file marked as a FIFO in the meta store.
+    // Each one gets a real kernel pipe, kept by an O_PATH fd on its inode.
+    // Every guest open reopens that inode through /proc, so all openers
+    // share one pipe and read/write/EOF/SIGPIPE/poll are the kernel's own.
+    //
+    // Reopening a pipe never blocks the way opening a FIFO does, so a
+    // blocking open with nobody at the other end waits in the guest's kernel
+    // and retries. When the other end arrives it goes ahead and holds the
+    // far end until the waiter's retry lands, so the waiter can't read EOF
+    // (or the writer's data be lost) in between.
+
+    [[nodiscard]] Outcome fifo_create(const std::string& abs, const std::string& host,
+                                      std::uint32_t mode) {
+        // EEXIST against the guest's view, which may be the lower layer
+        {
+            const auto now = k_.files().classify(abs, false, /*follow=*/false);
+            struct ::stat st{};
+            if (now.realm == kernel::Realm2::host_backed && !now.host_path.empty() &&
+                ::lstat(now.host_path.c_str(), &st) == 0)
+                return eno(Errno::eexist);
+        }
+        for (std::size_t i = host.find('/', 1); i != std::string::npos; i = host.find('/', i + 1))
+            (void)::mkdir(host.substr(0, i).c_str(), 0755);
+        const int fd = ::open(host.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+        if (fd < 0) return eno(wire::errno_from_host(errno));
+        ::close(fd);
+        k_.files().clear_whiteout_if_any(abs);
+        k_.files().meta().set_mode(abs, mode & 07777u & ~guest_umask());
+        k_.files().meta().set_fifo(abs);
+        return val(0);
+    }
+
+    [[nodiscard]] Outcome fifo_open(const std::string& abs, const struct ::stat& node,
+                                    std::uint64_t flags, int path_arg) {
+        // keyed by the placeholder's inode, so a rename keeps the pipe and a
+        // new mkfifo at the same name gets a new one
+        EmuFifo& f = fifos_[{static_cast<std::uint64_t>(node.st_dev),
+                             static_cast<std::uint64_t>(node.st_ino)}];
+        if (f.anchor < 0) {
+            int p[2];
+            if (::pipe2(p, O_CLOEXEC) != 0) return eno(wire::errno_from_host(errno));
+            struct ::stat st{};
+            (void)::fstat(p[0], &st);
+            f.anchor = ::open(self_fd(p[0]).c_str(), O_PATH | O_CLOEXEC);
+            ::close(p[0]);
+            ::close(p[1]);
+            if (f.anchor < 0) return eno(Errno::enfile);
+        }
+        const std::uint64_t acc = flags & 3u;   // O_RDONLY 0, O_WRONLY 1, O_RDWR 2
+        const bool nonblock = wire::has_for(arch_, flags, wire::OpenFlag::nonblock);
+        const auto [readers, writers] = fifo_peers(f.anchor);
+        const auto now = std::chrono::steady_clock::now();
+        // a waiter that hasn't retried in a while gave up (or died)
+        auto alive = [&](std::map<std::int32_t, std::chrono::steady_clock::time_point>& m) {
+            std::erase_if(m, [&](const auto& e) { return now - e.second > std::chrono::milliseconds{500}; });
+            return !m.empty();
+        };
+        const std::int32_t me = ids().tid;
+        f.wait_r.erase(me);
+        f.wait_w.erase(me);
+        const bool reader_waiting = alive(f.wait_r), writer_waiting = alive(f.wait_w);
+        auto hold = [&](int& h, int mode) {
+            if (h < 0) h = ::open(self_fd(f.anchor).c_str(), mode | O_NONBLOCK | O_CLOEXEC);
+        };
+        constexpr std::int64_t kRetryNs = 10'000'000;   // 10 ms
+        if (acc == 0 && !nonblock) {
+            // a writer is here, came and left data (hold_r), or is waiting
+            if (writers == 0 && f.hold_r < 0 && !writer_waiting) {
+                f.wait_r[me] = now;
+                return Virtualize::retry_after(kRetryNs);
+            }
+            if (writers == 0 && f.hold_r < 0) hold(f.hold_w, O_WRONLY);   // until it lands
+        } else if (acc == 1) {
+            // the reader goes first: a blocking writer waits until one has
+            // really opened (or opened and is holding the write end for us)
+            const bool reader_open = readers > 0 || f.hold_w >= 0;
+            if (!reader_open && nonblock) {
+                // a reader blocked in open counts, as in the kernel; keep
+                // what this writer sends until that reader lands
+                if (!reader_waiting) return eno(Errno::enxio);
+                hold(f.hold_r, O_RDONLY);
+            } else if (!reader_open) {
+                f.wait_w[me] = now;
+                return Virtualize::retry_after(kRetryNs);
+            }
+        }
+        // the end held for us is replaced by ours once the open lands
+        if (acc != 1 && f.hold_r >= 0) fifo_release_.push_back(std::exchange(f.hold_r, -1));
+        if (acc != 0 && f.hold_w >= 0) fifo_release_.push_back(std::exchange(f.hold_w, -1));
+        pending_open_ = abs;
+        pending_flags_ = flags;
+        return Redirect{PathArg{path_arg, "/proc/" + std::to_string(::getpid()) +
+                                              "/fd/" + std::to_string(f.anchor)}};
+    }
+
+    [[nodiscard]] static std::string self_fd(int fd) {
+        return "/proc/self/fd/" + std::to_string(fd);
+    }
+
+    // How many guest fds have the anchor's pipe open for reading and writing.
+    // The supervisor's own holds aren't guest fds, so they don't count.
+    [[nodiscard]] std::pair<int, int> fifo_peers(int anchor) {
+        int rd = 0, wr = 0;
+        if constexpr (requires { mem_.host_tgids(); }) {
+            struct ::stat ast{};
+            if (::fstat(anchor, &ast) != 0) return {0, 0};
+            const std::string want = "pipe:[" + std::to_string(ast.st_ino) + "]";
+            for (const ::pid_t pid : mem_.host_tgids()) {
+                const std::string dir = "/proc/" + std::to_string(pid) + "/fd";
+                ::DIR* d = ::opendir(dir.c_str());
+                if (!d) continue;
+                while (const ::dirent* e = ::readdir(d)) {
+                    if (e->d_name[0] == '.') continue;
+                    char tgt[64];
+                    const std::string link = dir + "/" + e->d_name;
+                    const ::ssize_t n = ::readlink(link.c_str(), tgt, sizeof tgt);
+                    if (n != static_cast<::ssize_t>(want.size()) || want.compare(0, want.size(), tgt, static_cast<std::size_t>(n)) != 0)
+                        continue;
+                    const unsigned acc = fdinfo_flags(pid, e->d_name) & 3u;
+                    if (acc != 1) ++rd;
+                    if (acc != 0) ++wr;
+                }
+                ::closedir(d);
+            }
+        }
+        return {rd, wr};
+    }
+
+    [[nodiscard]] static unsigned fdinfo_flags(::pid_t pid, const char* fd) {
+        const std::string p = "/proc/" + std::to_string(pid) + "/fdinfo/" + fd;
+        std::FILE* f = std::fopen(p.c_str(), "re");
+        if (!f) return 0;
+        char line[128];
+        unsigned out = 0;
+        while (std::fgets(line, sizeof line, f))
+            if (std::sscanf(line, "flags: %o", &out) == 1) break;
+        std::fclose(f);
+        return out;
+    }
+
+    // The calling task's umask, from /proc ("Umask:\t0022"), or the distro's.
+    [[nodiscard]] std::uint32_t guest_umask() {
+        if constexpr (requires { mem_.host_tid(); }) {
+            const std::string p = "/proc/" + std::to_string(mem_.host_tid()) + "/status";
+            if (std::FILE* f = std::fopen(p.c_str(), "re")) {
+                char line[128];
+                unsigned m = 022;
+                bool got = false;
+                while (!got && std::fgets(line, sizeof line, f))
+                    got = std::sscanf(line, "Umask: %o", &m) == 1;
+                std::fclose(f);
+                if (got) return m;
+            }
+        }
+        return 022;
+    }
+
     // The open state note_opened_fd needs, taken out of the dispatcher so a
     // call that finishes later (a blocking FIFO open) can apply it then.
     struct PendingOpen {
@@ -4557,6 +4747,8 @@ public:
     // so the namespace can bind the guest path to that fd (readlinkat etc.),
     // and — for a virtual directory — the entries getdents64 will enumerate.
     void note_opened_fd(std::int64_t fd) {
+        // holds an emulated-FIFO open replaced; the guest's end is in place now
+        for (const int h : std::exchange(fifo_release_, {})) ::close(h);
         if (fd >= 0) {
             // A newly opened fd REPLACES whatever that number meant before.
             //
@@ -4703,7 +4895,7 @@ public:
         }
 
         // --- mode: overlay the guest-intended permission bits when recorded ---
-        if (rec && (rec->have & kernel::MetaRecord::kMode)) {
+        if (rec && (rec->have & (kernel::MetaRecord::kMode | kernel::MetaRecord::kFifo))) {
             if (is_statx) {
                 std::uint16_t host_mode = get_u16(base + mode_off);
                 std::uint16_t eff = static_cast<std::uint16_t>(
