@@ -73,6 +73,8 @@ namespace lx::abi::wire {
         case ECONNREFUSED: return Errno::econnrefused;
         case ETIMEDOUT:    return Errno::etimedout;
         case EADDRINUSE:   return Errno::eaddrinuse;
+        case ENOMSG:       return Errno::enomsg;
+        case EIDRM:        return Errno::eidrm;
         case EPROTONOSUPPORT: return Errno::eprotonosupport;
 #ifdef ENOTSUP
         case ENOTSUP:      return Errno::enotsup;

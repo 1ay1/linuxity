@@ -31,7 +31,9 @@
 // Each lives inside the fate it qualifies, so it is unrepresentable elsewhere.
 #pragma once
 
+#include <array>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <type_traits>
@@ -40,6 +42,7 @@
 #include <vector>
 
 #include "linuxity/abi/result.hpp"
+#include "linuxity/abi/sysno.hpp"
 #include "linuxity/abi/types.hpp"
 
 namespace lx::abi {
@@ -301,6 +304,25 @@ struct ArgRewrite {
         : arg{a}, to{v}, convert{c}, buf{b} {}
 };
 
+// GUEST CALLS - run a short chain of syscalls inside the trapped task in
+// place of its own call, and return the last one's result. For what only the
+// guest can make: a MAP_SHARED mapping of a SysV segment in its own memory.
+// `prev` in an arg slot means "the previous step's return"; `str0 + i`
+// means "the i-th string, poked onto the task's stack".
+struct GuestCalls {
+    static constexpr std::uint64_t prev = 0xfeedfacecafe0001ull;
+    static constexpr std::uint64_t str0 = 0xfeedfacecafe0100ull;
+    // the return value of step i (prev is the one just before)
+    static constexpr std::uint64_t prev_of(std::size_t i) { return 0xfeedfacecafe0200ull + i; }
+    struct Step { Sysno nr; std::array<std::uint64_t, 6> a; };
+    std::vector<Step> steps;
+    std::vector<std::string> strings;
+    // which step's result the guest gets (-1 = the last one)
+    int result_of{-1};
+    // called with the final result before the guest sees it
+    std::function<void(std::int64_t)> done{};
+};
+
 // EXITED - the guest asked to terminate. Carries the status, nothing else.
 struct Exited {
     int code;
@@ -312,7 +334,7 @@ struct Exited {
 
 // Exactly one fate. No flags, no combinations, no precedence to remember.
 using Fate = std::variant<Virtualize, Forward, Redirect, Inject,
-                          Raise, ExecInterp, SockRewrite, ArgRewrite, Exited>;
+                          Raise, ExecInterp, SockRewrite, ArgRewrite, GuestCalls, Exited>;
 
 class Outcome {
 public:

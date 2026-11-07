@@ -965,6 +965,77 @@ public:
     // sees it afresh. For an open that has to block on another guest task.
     // A signal ends the wait early and is handled on the way out; the call
     // then runs again, as with SA_RESTART. Ctrl-C still kills.
+    // Run a few syscalls INSIDE the current task, in place of the one it
+    // trapped on, and return the last one's result as that call's. Used
+    // where only the guest itself can make the thing (a shared mapping in
+    // its address space): each step is (sysno, 6 args); an arg of
+    // kPrevRet is replaced by the previous step's return value. A step
+    // failing stops the chain and its error is returned. `strings` are
+    // poked onto the task's stack first; kStr0 + i in an arg names the i-th.
+    static constexpr std::uint64_t kPrevRet = 0xfeedfacecafe0001ull;
+    static constexpr std::uint64_t kStr0    = 0xfeedfacecafe0100ull;
+    static constexpr std::uint64_t kStepRet = 0xfeedfacecafe0200ull;   // + step index
+    struct GuestCall { abi::Sysno nr; std::array<std::uint64_t, 6> a; };
+    [[nodiscard]] Result<std::int64_t> run_in_guest(const std::vector<GuestCall>& calls,
+                                                    const std::vector<std::string>& strings = {},
+                                                    int result_of = -1) {
+        Task& t = tasks_[cur_];
+        const Regs entry = t.regs;
+        // scratch for the strings, well below the red zone
+        std::vector<std::uint64_t> saddr;
+        std::uint64_t at = (entry.sp() - 512) & ~std::uint64_t{15};
+        for (const auto& s : strings) {
+            std::string z = s;
+            z.push_back('\0');
+            at = (at - z.size()) & ~std::uint64_t{15};
+            if (!poke_scratch(at, z)) return err<std::int64_t>(Errno::efault);
+            saddr.push_back(at);
+        }
+        std::int64_t prev = 0;
+        std::vector<std::int64_t> rets;
+        for (std::size_t i = 0; i < calls.size(); ++i) {
+            Regs r = entry;
+            for (int k = 0; k < 6; ++k) {
+                std::uint64_t v = calls[i].a[static_cast<std::size_t>(k)];
+                if (v == kPrevRet) v = static_cast<std::uint64_t>(prev);
+                else if (v >= kStr0 && v < kStr0 + saddr.size()) v = saddr[v - kStr0];
+                else if (v >= kStepRet && v < kStepRet + rets.size()) v = static_cast<std::uint64_t>(rets[v - kStepRet]);
+                r.set_arg(k, v);
+            }
+            r.set_nr(encode(kTraceeArch, calls[i].nr));
+            if (!r.store(cur_) || !r.commit_nr(cur_)) return err<std::int64_t>(Errno::eio);
+            if (!step_to_exit(cur_)) return ok(std::int64_t{-1});   // task died
+            Regs after{};
+            (void)Regs::fetch(cur_, after);
+            prev = static_cast<std::int64_t>(after.ret());
+            rets.push_back(prev);
+            if (i + 1 < calls.size()) {
+                if (prev < 0 && prev >= -4095) break;   // a step failed
+                // back to the syscall instruction to run the next step; the
+                // pc is the kernel's (past the svc), the args are set below
+                Regs again = after;
+                again.rewind_to_syscall();
+                (void)again.store(cur_);
+                if (!step_to_entry(cur_)) return ok(std::int64_t{-1});
+            }
+        }
+        // the original call's registers, with the chain's answer: the chosen
+        // step's result, or a failing step's error
+        const bool failed = prev < 0 && prev >= -4095;
+        if (!failed && result_of >= 0 && static_cast<std::size_t>(result_of) < rets.size())
+            prev = rets[static_cast<std::size_t>(result_of)];
+        Regs out{};
+        (void)Regs::fetch(cur_, out);
+        Regs keep = entry;
+        for (int k = 0; k < 6; ++k) out.set_arg(k, keep.arg(k));
+        out.set_ret(prev);
+        (void)out.store(cur_);
+        t.in_call = false;
+        t.action = Action::none;
+        resume_task(cur_);
+        return ok(prev);
+    }
+
     [[nodiscard]] Status wait_then_retry(std::int64_t ns) {
         Task& t = tasks_[cur_];
         const Regs entry = t.regs;
@@ -2188,6 +2259,23 @@ private:
                 return true;
             default:
                 return false;
+        }
+    }
+
+    // From an exit stop rewound onto the syscall instruction, run to the
+    // next syscall-ENTRY stop (that same instruction). False if it died.
+    bool step_to_entry(::pid_t w) {
+        for (;;) {
+            ::ptrace(PTRACE_SYSCALL, w, 0, 0);
+            int st = 0;
+            if (::waitpid(w, &st, __WALL) != w) return false;
+            if (WIFEXITED(st) || WIFSIGNALED(st)) return false;
+            if (!WIFSTOPPED(st)) return false;
+            if (WSTOPSIG(st) == (SIGTRAP | 0x80)) return true;   // the entry stop
+            if (WSTOPSIG(st) == SIGTRAP && (st >> 16) == PTRACE_EVENT_SECCOMP) return true;
+            // a signal arrived first: hold it for after the chain
+            if (WSTOPSIG(st) != SIGTRAP && (st >> 16) == 0)
+                if (auto it = tasks_.find(w); it != tasks_.end()) it->second.pending_sig = WSTOPSIG(st);
         }
     }
 

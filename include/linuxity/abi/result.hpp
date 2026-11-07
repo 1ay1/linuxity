@@ -36,6 +36,7 @@ enum class Errno : std::int32_t {
     enotempty = 39, eloop  = 40,  enametoolong = 36,
     enotsup = 95,  eprotonosupport = 93,
     econnrefused = 111, etimedout = 110, eaddrinuse = 98,
+    enomsg = 42, eidrm = 43,
 };
 
 [[nodiscard]] constexpr std::string_view name(Errno e) noexcept {

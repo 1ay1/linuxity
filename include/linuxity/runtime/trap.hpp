@@ -117,6 +117,24 @@ public:
 
                 [&](abi::Exited e) { exit_status = e.code; return Step::done; },
 
+                [&](const abi::GuestCalls& gc) {
+                    // Run the chain inside the task, where only it can make the
+                    // thing (a shared mapping in its own memory).
+                    if constexpr (requires { trap_.run_in_guest({}, {}, -1); }) {
+                        using GC = typename T::GuestCall;
+                        std::vector<GC> calls;
+                        for (const auto& s : gc.steps) calls.push_back(GC{s.nr, s.a});
+                        auto rr = trap_.run_in_guest(calls, gc.strings, gc.result_of);
+                        if (!rr) return recover(rr.error());
+                        if (gc.done) locked([&] { gc.done(*rr); });
+                        return Step::next;
+                    } else {
+                        auto st = trap_.resume(-static_cast<std::int64_t>(Errno::enosys));
+                        if (!st) return recover(st.error());
+                        return Step::next;
+                    }
+                },
+
                 [&](const abi::Inject& in) {
                     // A purely virtual node: back it with a real host temp -- a
                     // temp FILE (with the synthesized bytes) for a file, or an
@@ -585,6 +603,10 @@ private:
                     ar.convert == abi::ArgRewrite::Convert::termios_to_termios2
                         ? " +widen_termios" : "");
             },
+            [&](const abi::GuestCalls& gc) {
+                std::fprintf(out, "[lx] nr=%llu -> GUESTCALLS steps=%zu\n",
+                    (unsigned long long)nr, gc.steps.size());
+            },
             [&](const abi::Exited& e) {
                 std::fprintf(out, "[lx] nr=%llu -> EXIT code=%d\n",
                     (unsigned long long)nr, e.code);
@@ -666,6 +688,8 @@ private:
                         }
                         kernel_.procs().upsert(pi);
                         kernel_.procs().assign_ns_pid(pi.pid);
+                        // a forked child shares its parent's SysV attaches
+                        kernel_.procs().ipc().inherit(pi.pid, pi.ppid);
                         // A freshly forked child inherits a COPY of its
                         // parent's cwd AT FORK TIME. Seeding it here (rather
                         // than lazily on the child's first syscall) means the
@@ -695,6 +719,8 @@ private:
                             np.exec_setuid = np.exec_setgid = abi::creds::kKeep;
                             np.creds_given = true;
                             kernel_.procs().upsert(np);
+                            // exec unmaps every SysV segment it had attached
+                            kernel_.procs().ipc().process_gone_maps(np.pid);
                         }
                         break;
                     case EV::thread:
@@ -712,6 +738,8 @@ private:
                         break;
                     case EV::reap:
                         kernel_.procs().drop_thread(static_cast<std::int32_t>(e.pid));
+                        // its SysV attaches go and its SEM_UNDO adjustments apply
+                        kernel_.procs().ipc().process_gone(static_cast<std::int32_t>(e.pid));
                         // pid 1 (our init) is never removed: /proc must always
                         // have a root even as the last guest thread winds down.
                         if (e.pid != 1) {

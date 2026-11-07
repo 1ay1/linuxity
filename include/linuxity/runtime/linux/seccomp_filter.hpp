@@ -162,6 +162,10 @@ inline constexpr int kTrappedX86_64[] = {
     103,                         // syslog (the guest's own kernel log)
     272, 308,                    // unshare/setns (the guest's own namespaces)
     170, 171,                    // sethostname/setdomainname (per UTS namespace)
+    // SysV IPC: served by linuxity where the host has none (Android)
+    29, 30, 31, 67,              // shmget/shmat/shmctl/shmdt
+    64, 65, 66, 220,             // semget/semop/semctl/semtimedop
+    68, 69, 70, 71,              // msgget/msgsnd/msgrcv/msgctl
     115,                         // getgroups (the guest's own list, not the host user's)
     // -- session / process groups ------------------------------------------
     111, 121, 124, 112, 109,     // getpgrp/getpgid/getsid/setsid/setpgid

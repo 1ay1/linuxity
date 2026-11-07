@@ -17,6 +17,7 @@
 
 #include "linuxity/abi/types.hpp"
 #include "linuxity/kernel/namespaces.hpp"
+#include "linuxity/kernel/sysv_ipc.hpp"
 
 #include <algorithm>
 #include <array>
@@ -478,6 +479,9 @@ public:
 
     [[nodiscard]] Namespaces& ns() { return ns_; }
     [[nodiscard]] const Namespaces& ns() const { return ns_; }
+    // System V IPC objects, one set per IPC namespace (kernel/sysv_ipc.hpp)
+    [[nodiscard]] SysvIpc& ipc() { return ipc_; }
+    [[nodiscard]] const SysvIpc& ipc() const { return ipc_; }
     // A pid's namespaces (the initial ones for an unknown pid).
     [[nodiscard]] NsSet ns_of(std::int32_t pid) const {
         auto it = procs_.find(pid);
@@ -538,6 +542,7 @@ private:
     std::map<std::int32_t, ProcInfo> procs_;
     std::int32_t last_pid_{1};
     Namespaces ns_;
+    SysvIpc ipc_;
     std::map<std::uint64_t, PidNs> pidns_;
     std::int32_t reader_{0};
     std::map<std::int32_t, std::uint64_t> clone_ns_;

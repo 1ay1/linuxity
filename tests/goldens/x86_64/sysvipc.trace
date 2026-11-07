@@ -1,0 +1,40 @@
+# linuxity conformance trace
+# scenario: sysvipc
+# arch: x86_64
+# recorded-by: live Linux kernel on this host
+# kernel: Linux 7.2.14-zen1-1-zen
+msgget = 1 | msgget IPC_PRIVATE
+msgsnd = 0 | msgsnd type 2
+msgsnd = 0 | msgsnd type 1
+msgrcv = 1 | msgrcv picks by type
+msgrcv = -errno(7) | a short buffer is E2BIG
+msgrcv = 1 | MSG_NOERROR truncates
+msgrcv = -errno(42) | an empty queue with IPC_NOWAIT is ENOMSG
+msgctl = 1 | IPC_STAT: empty, mode 0600
+msgrcv = 1 | a blocked child gets the parent's message
+msgctl = 0 | IPC_RMID
+msgsnd = -EINVAL | a removed queue is EINVAL
+msgget = 1 | the same key finds the same queue
+msgget = -EEXIST | IPC_EXCL on a taken key is EEXIST
+msgget = -ENOENT | a missing key is ENOENT
+semget = 1 | semget 2 semaphores
+semctl = 0 | SETVAL 1
+semctl = 1 | GETVAL
+semop = 0 | semop down
+semop = -errno(11) | would block with IPC_NOWAIT is EAGAIN
+semtimedop = -errno(11) | semtimedop times out with EAGAIN
+semop = 1 | a blocked child wakes when the parent ups
+semctl = 0 | SETALL 5, 0
+semop = 1 | semop is all or nothing
+semctl = 1 | SEM_UNDO reverts on exit
+semctl = 1 | IPC_STAT nsems 2
+semctl = 0 | IPC_RMID
+shmget = 1 | shmget 8 KiB
+shmat = 1 | shmat
+shmctl = 1 | IPC_STAT size and nattch
+shmat = 1 | a child shares the parent's pages
+shmat = 1 | the parent sees the child's write
+shmctl = 0 | IPC_RMID while attached
+shmctl = 1 | the memory lives until the last detach
+shmdt = 0 | shmdt
+shmdt = -EINVAL | shmdt twice is EINVAL

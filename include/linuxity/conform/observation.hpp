@@ -421,7 +421,15 @@ public:
                c == abi::Sysno::statmount || c == abi::Sysno::listmount ||
                c == abi::Sysno::pivot_root || c == abi::Sysno::chroot ||
                c == abi::Sysno::swapon || c == abi::Sysno::swapoff ||
-               c == abi::Sysno::quotactl || c == abi::Sysno::acct;
+               c == abi::Sysno::quotactl || c == abi::Sysno::acct ||
+               // SysV IPC: the get calls can be ENOSYS on the host; every
+               // later step then reads "not applicable" there
+               c == abi::Sysno::msgget || c == abi::Sysno::msgsnd ||
+               c == abi::Sysno::msgrcv || c == abi::Sysno::msgctl ||
+               c == abi::Sysno::semget || c == abi::Sysno::semop ||
+               c == abi::Sysno::semtimedop || c == abi::Sysno::semctl ||
+               c == abi::Sysno::shmget || c == abi::Sysno::shmat ||
+               c == abi::Sysno::shmdt || c == abi::Sysno::shmctl;
     }
     [[nodiscard]] bool exempt(const Observation& n,
                               const Observation& g) const noexcept {
@@ -430,10 +438,14 @@ public:
         //     For unshare a kernel built without that namespace type says
         //     EINVAL (Android has no user namespaces): also the host's limit.
         const bool ns_call = n.call == abi::Sysno::unshare;
+        // a kernel built without SysV IPC answers ENOSYS (Android)
+        const bool sysv = n.call == abi::Sysno::msgget || n.call == abi::Sysno::semget ||
+                          n.call == abi::Sysno::shmget;
         if (g.returned.is_ok() &&
             n.returned.match([](std::int64_t) { return false; },
                              [&](std::int32_t e) {
-                                 return e == EACCES || e == EPERM || (ns_call && e == EINVAL);
+                                 return e == EACCES || e == EPERM || (ns_call && e == EINVAL) ||
+                                        (sysv && e == ENOSYS);
                              }))
             return true;
         // (b) an invariant DERIVED from such a call. The probe reports 2 for

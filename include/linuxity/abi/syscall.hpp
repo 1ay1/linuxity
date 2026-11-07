@@ -47,7 +47,10 @@
 #if !defined(_WIN32)
 #include <sys/resource.h>
 #include <sys/ioctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
+#include <ctime>
 
 // -- Host portability: lstat ------------------------------------------------
 // The core calls lstat(2) in exactly one place (is_symlink below), to avoid a
@@ -477,6 +480,18 @@ public:
             case Sysno::getsockname: return do_sockname(r, false);
             case Sysno::syslog:      return do_syslog(r);
             case Sysno::unshare:     return do_unshare(r);
+            case Sysno::msgget:      return do_msgget(r);
+            case Sysno::msgsnd:      return do_msgsnd(r);
+            case Sysno::msgrcv:      return do_msgrcv(r);
+            case Sysno::msgctl:      return do_msgctl(r);
+            case Sysno::semget:      return do_semget(r);
+            case Sysno::semop:       return do_semop(r, false);
+            case Sysno::semtimedop:  return do_semop(r, true);
+            case Sysno::semctl:      return do_semctl(r);
+            case Sysno::shmget:      return do_shmget(r);
+            case Sysno::shmat:       return do_shmat(r);
+            case Sysno::shmdt:       return do_shmdt(r);
+            case Sysno::shmctl:      return do_shmctl(r);
             case Sysno::setns:       return do_setns(r);
             case Sysno::sethostname: return do_set_uts(r, false);
             case Sysno::setdomainname: return do_set_uts(r, true);
@@ -5032,6 +5047,8 @@ private:
         return *k_.procs().find_mut(id.pid);
     }
 
+#include "linuxity/abi/sysv_handlers.inc"
+
     // -- namespaces (kernel/namespaces.hpp) ----------------------------------
     // An id of the guest's initial user namespace, as the caller's own user
     // namespace names it (the overflow id 65534 when it isn't mapped).
@@ -5265,6 +5282,9 @@ private:
     std::pair<std::int32_t, std::string> pending_map_;
     struct MapFile { std::string host; std::int32_t pid; std::string which; };
     std::vector<MapFile> map_files_;
+    // SysV IPC: segment file serial, and when each blocked semop started
+    std::uint64_t shm_serial_{0};
+    std::unordered_map<std::int32_t, std::chrono::steady_clock::time_point> sem_waits_;
     // The guest's kernel log: /dev/kmsg, /proc/kmsg and syslog(2) read it,
     // writes to /dev/kmsg append to it.
     struct KmsgRec { std::uint64_t seq; std::uint64_t ts_us; int prio; std::string text; };

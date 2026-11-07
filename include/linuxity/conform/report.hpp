@@ -501,6 +501,15 @@ inline std::string Scenario::key() const {
     // mount(2) really runs and can be compared. It happens in a forked
     // child because joining a mount namespace is irreversible.
     //
+    // sysvipc: message queues, semaphores and shared memory. Android has no
+    // SysV IPC (ENOSYS natively); linuxity serves it there.
+    v.push_back(Scenario{"sysvipc", "sysvipc"}
+                    .exercising(abi::Sysno::msgget).exercising(abi::Sysno::msgsnd)
+                    .exercising(abi::Sysno::msgrcv).exercising(abi::Sysno::msgctl)
+                    .exercising(abi::Sysno::semget).exercising(abi::Sysno::semop)
+                    .exercising(abi::Sysno::semtimedop).exercising(abi::Sysno::semctl)
+                    .exercising(abi::Sysno::shmget).exercising(abi::Sysno::shmat)
+                    .exercising(abi::Sysno::shmdt).exercising(abi::Sysno::shmctl));
     // namespaces: unshare, setns and the per-UTS-namespace names. Natively
     // an unprivileged probe is refused (EPERM) where the guest, root, is
     // served; the law exempts that direction only.
