@@ -15,8 +15,11 @@ def interrupt_keys():
     """^C, ^\\ and ^Z reach the foreground job as SIGINT, SIGQUIT and SIGTSTP."""
     def waiter():
         # dumpable resets on exec, so turn core dumps off from inside
+        # SIG_DFL: python's own SIGINT handler can miss a ^C that lands just
+        # before time.sleep starts sleeping, on native Linux too
         os.execv(sys.executable, [sys.executable, "-S", "-c",
-                  "import ctypes, time; ctypes.CDLL(None).prctl(4, 0, 0, 0, 0); "
+                  "import ctypes, signal, time; ctypes.CDLL(None).prctl(4, 0, 0, 0, 0); "
+                  "signal.signal(signal.SIGINT, signal.SIG_DFL); "
                   "print('READY', flush=True); time.sleep(30)"])
 
     for key, sig in ((b"\x03", signal.SIGINT), (b"\x1c", signal.SIGQUIT)):
