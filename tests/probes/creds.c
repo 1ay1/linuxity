@@ -107,14 +107,12 @@ int main(void) {
     // The calls above only ever ask for the identity we already have, which
     // exercises decoding but not the decision.
     //
-    // A PRIVILEGE DROP IS DELIBERATELY VACUOUS under linuxity, and that is
-    // not incoherence to be fixed. The guest world is root-owned and there
-    // is exactly one identity to be; a real setuid to pacman's 'alpm' user
-    // would EPERM on the host and abort the program, so linuxity accepts the
-    // drop and keeps reporting uid 0. Natively the same call is EPERM. So
-    // the OUTCOME cannot be compared -- what can is that the answer is
-    // self-consistent with what the getters say afterwards, which is the
-    // property a program actually depends on.
+    // A PRIVILEGE DROP IS REAL under linuxity: the guest is root, root may
+    // setuid to anyone, and afterwards it IS that user (credentials are
+    // tracked per process, abi/creds.hpp). Natively the probe runs
+    // unprivileged and the same call is EPERM. So the OUTCOME cannot be
+    // compared -- what can is that the answer is self-consistent with what
+    // the getters say afterwards, which is the property a program depends on.
     {
         const long want = (uid == 0) ? 12345 : 0;   // an id we are not
         const long rc = LX_SYS1(SYS_setuid, want);
@@ -145,18 +143,43 @@ int main(void) {
 
     // -- setfsuid/setfsgid return the PREVIOUS value, never an error -------
     // Famously they cannot fail: the return is the old fsuid, so the way to
-    // read the current one is to set it to something invalid.
+    // read the current one is to set it to something invalid. Compared with
+    // the euid NOW: a privileged caller's setuid above really moved it.
     {
+        const long now_euid = LX_SYS0(SYS_geteuid);
         const long prev = LX_SYS1(SYS_setfsuid, -1);
-        lx_emit("setfsuid", prev == euid ? 1 : 0,
+        lx_emit("setfsuid", prev == now_euid ? 1 : 0,
                 "setfsuid(-1) returns the current fsuid");
         lx_emit("setfsuid", LX_SYS1(SYS_setfsuid, prev) == prev ? 1 : 0,
                 "setting it back returns the same value");
     }
     {
+        const long now_egid = LX_SYS0(SYS_getegid);
         const long prev = LX_SYS1(SYS_setfsgid, -1);
-        lx_emit("setfsgid", prev == egid ? 1 : 0,
+        lx_emit("setfsgid", prev == now_egid ? 1 : 0,
                 "setfsgid(-1) returns the current fsgid");
+    }
+
+    // -- capabilities ------------------------------------------------------
+    // The answer differs (root vs a user), the contract doesn't: a bad
+    // version is EINVAL and is answered with the one the kernel prefers,
+    // and setting back exactly what capget said always works.
+    {
+        static unsigned int hdr[2];
+        static unsigned int data[6];
+        hdr[0] = 0x12345678; hdr[1] = 0;
+        lx_emit("capget", LX_SYS2(SYS_capget, hdr, data), "capget with a bad version is EINVAL");
+        lx_emit("capget", hdr[0] == 0x20080522 ? 1 : 0, "...and writes back the preferred version");
+        hdr[0] = 0x20080522; hdr[1] = 0;
+        const long g = LX_SYS2(SYS_capget, hdr, data);
+        lx_emit("capget", g, "capget v3 of ourselves");
+        lx_emit("capget", (data[0] & ~data[1]) == 0 && (data[3] & ~data[4]) == 0 ? 1 : 0,
+                "effective is within permitted");
+        hdr[0] = 0x20080522; hdr[1] = 0;
+        lx_emit("capset", g == 0 ? LX_SYS2(SYS_capset, hdr, data) : g,
+                "setting back what capget said works");
+        hdr[0] = 0x12345678; hdr[1] = 0;
+        lx_emit("capset", LX_SYS2(SYS_capset, hdr, data), "capset with a bad version is EINVAL");
     }
 
     // -- groups ------------------------------------------------------------

@@ -18,7 +18,9 @@
 #include "linuxity/abi/types.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
@@ -59,9 +61,29 @@ struct ProcInfo {
     std::uint32_t gid{0};
     std::string  exe{};              // guest path of the image (/proc/<pid>/exe)
     std::vector<std::int32_t> threads{}; // guest tids besides the main thread
+    // names of non-main threads that set one; comm is the main thread's
+    std::vector<std::pair<std::int32_t, std::string>> thread_comms{};
     // setgroups(2) list; inherited across fork, root's [0] until set
     std::vector<std::uint32_t> groups{};
     bool groups_set{false};
+    // Credentials: real, effective, saved, filesystem. Copied at fork.
+    std::array<std::uint32_t, 4> uids{0, 0, 0, 0};
+    std::array<std::uint32_t, 4> gids{0, 0, 0, 0};
+    // Capability sets (bit n = capability n), moved by the kernel's rules
+    // on setuid and exec. kAllCaps until something drops them.
+    std::uint64_t cap_eff{kAllCaps}, cap_prm{kAllCaps}, cap_inh{0},
+                  cap_bnd{kAllCaps}, cap_amb{0};
+    bool keepcaps{false};
+    bool no_new_privs{false};
+    std::int32_t nice{0};
+    // set on a spawn record that carries the parent's credentials
+    bool creds_given{false};
+    // created by the task's own first syscall, before its spawn event
+    bool live_seen{false};
+    // owner ids of a set-user/group-ID file the pending execve runs
+    std::uint32_t exec_setuid{0xffffffffu}, exec_setgid{0xffffffffu};
+
+    static constexpr std::uint64_t kAllCaps = (std::uint64_t{1} << 41) - 1;   // 0..40
 };
 
 // The virtual process table. Ordered by pid so /proc enumerates numerically.
@@ -92,11 +114,21 @@ public:
         auto threads = std::move(cur.threads);   // reaped one by one, not by exec
         auto groups = std::move(cur.groups);     // exec keeps credentials
         const bool groups_set = cur.groups_set;
+        const auto uids = cur.uids, gids = cur.gids;
+        const ProcInfo old = cur;
+        const bool had_creds = cur.pid != 0;
         cur = p;
         cur.pgid = pg;
         cur.sid = sd;
         if (cur.threads.empty()) cur.threads = std::move(threads);
         if (!cur.groups_set) { cur.groups = std::move(groups); cur.groups_set = groups_set; }
+        if (had_creds && !p.creds_given) {
+            cur.uids = uids; cur.gids = gids;
+            cur.cap_eff = old.cap_eff; cur.cap_prm = old.cap_prm; cur.cap_inh = old.cap_inh;
+            cur.cap_bnd = old.cap_bnd; cur.cap_amb = old.cap_amb;
+            cur.keepcaps = old.keepcaps; cur.no_new_privs = old.no_new_privs; cur.nice = old.nice;
+        }
+        cur.creds_given = false;
     }
     void add_thread(std::int32_t pid, std::int32_t tid) {
         auto it = procs_.find(pid);
@@ -105,12 +137,35 @@ public:
         if (std::find(t.begin(), t.end(), tid) == t.end()) t.push_back(tid);
     }
     void drop_thread(std::int32_t tid) {
-        for (auto& [_, p] : procs_)
+        for (auto& [_, p] : procs_) {
             std::erase(p.threads, tid);
+            std::erase_if(p.thread_comms, [&](const auto& e) { return e.first == tid; });
+        }
+    }
+    // the process a non-main thread belongs to, or 0
+    [[nodiscard]] std::int32_t thread_group_of(std::int32_t tid) const {
+        for (const auto& [pid, p] : procs_)
+            if (std::find(p.threads.begin(), p.threads.end(), tid) != p.threads.end())
+                return pid;
+        return 0;
     }
     void set_comm(std::int32_t pid, std::string comm) {
         auto& p = procs_[pid]; p.pid = pid; p.comm = comm;
         if (p.cmdline.empty()) p.cmdline = std::move(comm);
+    }
+    // PR_SET_NAME / a comm write: names one thread, not the process
+    void set_thread_comm(std::int32_t pid, std::int32_t tid, std::string comm) {
+        if (tid == pid || tid <= 0) return set_comm(pid, std::move(comm));
+        auto& tc = procs_[pid].thread_comms;
+        for (auto& [t, c] : tc)
+            if (t == tid) { c = std::move(comm); return; }
+        tc.emplace_back(tid, std::move(comm));
+    }
+    // a thread's name: its own if it set one, else the process's
+    [[nodiscard]] static const std::string& comm_of(const ProcInfo& p, std::int32_t tid) {
+        for (const auto& [t, c] : p.thread_comms)
+            if (t == tid) return c;
+        return p.comm;
     }
     void add(std::int32_t pid, std::int32_t ppid) {
         ProcInfo p; p.pid = pid; p.ppid = ppid;
@@ -128,21 +183,28 @@ public:
         if (pid <= 0) return pid;
         const ProcInfo* p = find(pid);
         if (p == nullptr) return pid;
-        if (p->pgid) return p->pgid;
-        // No group recorded for this pid. It does NOT lead its own group --
-        // it inherits its parent's, which is the whole bug this field fixes.
-        // Walk up until a pid with a recorded group, or pid 1. Terminates
-        // because ppid is strictly closer to 1, whose record is seeded.
-        if (p->ppid != 0 && p->ppid != p->pid) return pgid_of(p->ppid);
-        return p->pid;
+        // Walk up until a pid with a recorded group. A link that's gone (an
+        // ancestor already reaped) or unknown can't have been ours to make
+        // a group from, so the chain ends at init's. Answering the missing
+        // pid's own number made a dead parent's pid look like our group --
+        // and our session, so setpgid said EPERM to a non-leader.
+        for (int hops = 0; p != nullptr && hops < 4096; ++hops) {
+            if (p->pgid) return p->pgid;
+            if (p->ppid == 0 || p->ppid == p->pid) break;
+            p = find(p->ppid);
+        }
+        return pid == 1 ? pid : (find(1) && find(1)->pgid ? find(1)->pgid : 1);
     }
     [[nodiscard]] std::int32_t sid_of(std::int32_t pid) const {
         if (pid <= 0) return pid;
         const ProcInfo* p = find(pid);
         if (p == nullptr) return pid;
-        if (p->sid) return p->sid;
-        if (p->ppid != 0 && p->ppid != p->pid) return sid_of(p->ppid);
-        return p->pid;
+        for (int hops = 0; p != nullptr && hops < 4096; ++hops) {
+            if (p->sid) return p->sid;
+            if (p->ppid == 0 || p->ppid == p->pid) break;
+            p = find(p->ppid);
+        }
+        return pid == 1 ? pid : (find(1) && find(1)->sid ? find(1)->sid : 1);
     }
     // setsid(): a new session AND a new group, both led by the caller.
     void set_sid(std::int32_t pid) {
@@ -312,7 +374,15 @@ public:
     };
     void set_live_source(const LiveSource* s) noexcept { live_ = s; }
 
+    // Guest pid/tid -> host task, for the live facts only the host kernel
+    // keeps (signal masks, cpu times, memory, environ). Set by the trap
+    // backend; absent, procfs falls back to modeled values.
+    using HostOf = std::function<int(std::int32_t)>;
+    void set_host_resolver(HostOf f) { host_of_ = std::move(f); }
+    [[nodiscard]] int host_of(std::int32_t gpid) const { return host_of_ ? host_of_(gpid) : -1; }
+
 private:
+    HostOf host_of_;
     std::map<std::int32_t, ProcInfo> procs_;
     const LiveSource* live_{nullptr};
     mutable std::map<std::int32_t, ProcInfo> scratch_;

@@ -192,6 +192,8 @@ public:
                             // and only a Redirect can even carry a scrub.
                             if (rc == 0 && rd.scrub)
                                 locked([&] { sys.scrub_ids(*rd.scrub); });
+                            if (rc == 0 && rd.created)
+                                locked([&] { sys.note_created(*rd.created, rd.created_dir); });
                             if constexpr (requires { trap_.set_ret_now(std::int64_t{0}); })
                                 if (rd.force_ret) trap_.set_ret_now(*rd.force_ret);
                         },
@@ -212,8 +214,20 @@ public:
                     // completes the syscall and yields its value.
                     make_host_parents(sr.host_path);
                     if constexpr (runtime::TranslatesSockets<T>) {
-                        auto rr = trap_.rewrite_sockaddr(
-                            sr.path_addr, sr.host_path, sr.len_arg, sr.new_len);
+                        const int sock_fd = static_cast<int>(f.regs.arg[0]);
+                        int sock_tid = -1;
+                        if constexpr (requires { trap_.host_tid(); }) sock_tid = trap_.host_tid();
+                        auto rr = [&] {
+                            if constexpr (requires { trap_.rewrite_sockaddr(sr.path_addr, sr.host_path, 0, 0, nullptr); })
+                                return trap_.rewrite_sockaddr(
+                                    sr.path_addr, sr.host_path, sr.len_arg, sr.new_len,
+                                    [&locked, &sys, sock_tid, sock_fd, name = sr.guest_path, binds = sr.binds](std::int64_t ret) {
+                                        if (ret == 0)
+                                            locked([&] { sys.note_socket_name(sock_tid, sock_fd, name, binds); });
+                                    });
+                            else
+                                return trap_.rewrite_sockaddr(sr.path_addr, sr.host_path, sr.len_arg, sr.new_len);
+                        }();
                         if (!rr) return recover(rr.error());
                         return Step::next;
                     } else {
@@ -324,6 +338,8 @@ public:
                     if constexpr (runtime::RewritesArgs<T>) {
                         const auto conv  = ar.convert;
                         const auto buf   = ar.buf;
+                        const auto len   = ar.len;
+                        const std::string name = ar.name;
                         auto fr = trap_.rewrite_arg(
                             ar.arg, ar.to, [&](std::int64_t ret) {
                                 if (ret < 0) return;
@@ -331,6 +347,8 @@ public:
                                 switch (conv) {
                                     case C::termios_to_termios2:
                                         widen_termios(buf); break;
+                                    case C::unix_name:
+                                        put_unix_name(buf, len, name); break;
                                     case C::none: break;
                                 }
                             });
@@ -344,6 +362,17 @@ public:
                 },
 
                 [&](abi::Virtualize v) {
+                    if constexpr (requires { trap_.mirror_setpgid(0, 0, std::int64_t{0}); }) {
+                        using Mir = abi::Virtualize::Mirror;
+                        if (v.host_mirror != Mir::none) {
+                            auto fr = v.host_mirror == Mir::setpgid
+                                          ? trap_.mirror_setpgid(v.m_a, v.m_b, v.ret)
+                                          : trap_.mirror_tcsetpgrp(v.m_ptr, v.m_a, v.ret);
+                            if (v.host_mirror == Mir::tcsetpgrp) locked([&] { sys.note_foreground(); });
+                            if (!fr) return recover(fr.error());
+                            return Step::next;
+                        }
+                    }
                     if constexpr (requires { trap_.wait_then_retry(std::int64_t{0}); }) {
                         if (v.retry_ns > 0) {
                             auto st = trap_.wait_then_retry(v.retry_ns);
@@ -361,6 +390,7 @@ public:
                         }
                     }
                     // Hand the guest our answer; no real syscall runs.
+                    locked([&] { sys.note_foreground(); });
                     auto st = trap_.resume(v.ret);
                     if (!st) return Step::fail;
                     return Step::next;
@@ -418,6 +448,27 @@ private:
     [[nodiscard]] static const std::string& empty_path() {
         static const std::string kEmpty;
         return kEmpty;
+    }
+
+    // getsockname/getpeername/accept filled a sockaddr_un with the host path
+    // the kernel holds; put back the name the guest bound, within the
+    // caller's buffer, and report the full length as the kernel does.
+    void put_unix_name(UAddr buf, UAddr len, const std::string& name) {
+        std::array<std::byte, 4> lb{};
+        if (!trap_.copy_in(len, lb)) return;
+        std::uint32_t cap = 0;
+        std::memcpy(&cap, lb.data(), 4);
+        std::array<std::byte, 110> sa{};
+        const std::uint16_t fam = 1;   // AF_UNIX (the guest's ABI, not the host's headers)
+        std::memcpy(sa.data(), &fam, 2);
+        const bool abstract = !name.empty() && name.front() == '\0';
+        const std::size_t n = std::min<std::size_t>(name.size(), 107);
+        std::memcpy(sa.data() + 2, name.data(), n);
+        const std::uint32_t full = static_cast<std::uint32_t>(2 + n + (abstract ? 0 : 1));
+        const std::size_t wrote = std::min<std::size_t>(cap, full);
+        if (wrote) (void)trap_.copy_out(buf, std::span<const std::byte>{sa.data(), wrote});
+        std::memcpy(lb.data(), &full, 4);
+        (void)trap_.copy_out(len, lb);
     }
 
     // Turn the struct termios the host's TCGETS wrote into the struct
@@ -578,8 +629,33 @@ private:
                             pi.rss_pages = pp->rss_pages;
                             pi.groups = pp->groups;
                             pi.groups_set = pp->groups_set;
+                            pi.uids = pp->uids;
+                            pi.gids = pp->gids;
+                            pi.cap_eff = pp->cap_eff;
+                            pi.cap_prm = pp->cap_prm;
+                            pi.cap_inh = pp->cap_inh;
+                            pi.cap_bnd = pp->cap_bnd;
+                            pi.cap_amb = pp->cap_amb;
+                            pi.keepcaps = pp->keepcaps;
+                            pi.no_new_privs = pp->no_new_privs;
+                            pi.nice = pp->nice;
+                            pi.creds_given = true;
                         }
                         pi.state = 'R';
+                        // The child may have run (and setsid/setpgid/setuid'd)
+                        // before this event is applied; then it already has a
+                        // record and only the gaps get filled from here.
+                        if (auto* existing = kernel_.procs().find_mut(pi.pid); existing && existing->live_seen) {
+                            if (existing->ppid == 0) existing->ppid = pi.ppid;
+                            if (existing->comm == "linuxity" || existing->comm.empty()) {
+                                existing->comm = pi.comm;
+                                existing->cmdline = pi.cmdline;
+                            }
+                            kernel_.files().inherit_cwd(
+                                static_cast<std::int32_t>(e.pid),
+                                static_cast<std::int32_t>(e.ppid));
+                            break;
+                        }
                         kernel_.procs().upsert(pi);
                         // A freshly forked child inherits a COPY of its
                         // parent's cwd AT FORK TIME. Seeding it here (rather
@@ -604,6 +680,11 @@ private:
                                                                : e.cmdline;
                             }
                             np.state = 'R';
+                            // execve's credential transform, with the set-ID
+                            // bits of the file path_exec resolved
+                            abi::creds::on_exec(np, np.exec_setuid, np.exec_setgid);
+                            np.exec_setuid = np.exec_setgid = abi::creds::kKeep;
+                            np.creds_given = true;
                             kernel_.procs().upsert(np);
                         }
                         break;

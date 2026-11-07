@@ -27,6 +27,7 @@
 #include "linuxity/vfs/pty_names.hpp"
 
 #include <array>
+#include "linuxity/abi/creds.hpp"
 #include "linuxity/abi/wire/errno_map.hpp"
 #include <cstdint>
 #include <cstring>
@@ -43,6 +44,10 @@
 #include <vector>
 #include <dirent.h>
 #include <fcntl.h>
+#if !defined(_WIN32)
+#include <sys/resource.h>
+#include <sys/ioctl.h>
+#endif
 
 // -- Host portability: lstat ------------------------------------------------
 // The core calls lstat(2) in exactly one place (is_symlink below), to avoid a
@@ -123,6 +128,10 @@ public:
         {
             auto id = ids();
             k_.files().set_current_pid(id.pid, id.ppid);
+            // A task can trap before its spawn event is folded in; build its
+            // fork-time record now so no handler sees a half-made one.
+            if constexpr (requires { mem_.host_tid(); })
+                if (!k_.procs().find_mut(id.pid)) (void)me();
         }
         switch (sc) {
             // -- process lifecycle: let the task ACTUALLY exit in the kernel
@@ -184,14 +193,17 @@ public:
             //    already own, so three implementations was three chances to
             //    be wrong -- and Windows took one, hardcoding pid 1 for every
             //    process.
-            case Sysno::getpid:  case Sysno::gettid:  case Sysno::getppid:
-            case Sysno::getuid:  case Sysno::geteuid:
-            case Sysno::getgid:  case Sysno::getegid: {
+            case Sysno::getpid:  case Sysno::gettid:  case Sysno::getppid: {
                 const auto i = ids();
                 if (auto a = identity_answer(sc, {i.pid, i.tid, i.ppid}))
                     return val(*a);
                 return fwd();
             }
+            // The guest's own credentials, tracked per process (abi/creds.hpp).
+            case Sysno::getuid:  return val(me().uids[0]);
+            case Sysno::geteuid: return val(me().uids[1]);
+            case Sysno::getgid:  return val(me().gids[0]);
+            case Sysno::getegid: return val(me().gids[1]);
 
             // -- getresuid(ruid*,euid*,suid*) / getresgid(rgid*,egid*,sgid*):
             //    bash and sudo read these at startup to populate $UID/$EUID.
@@ -201,7 +213,7 @@ public:
             //    Write all three id-out pointers (arg0/1/2) to 0.
             case Sysno::getresuid:
             case Sysno::getresgid:
-                return do_getres(r);
+                return do_getres(r, sc == Sysno::getresuid ? me().uids : me().gids);
 
             // -- benign process-init syscalls libc issues early ----------
             // set_tid_address carries no host resource; serve it trivially so
@@ -283,8 +295,33 @@ public:
                 const std::int32_t who = static_cast<std::int32_t>(r.arg[0]);
                 const std::int32_t target = who ? who : ids().pid;
                 const std::int32_t grp = static_cast<std::int32_t>(r.arg[1]);
-                k_.procs().set_pgid(target, grp ? grp : target);
-                return val(0);
+                if (grp < 0) return eno(Errno::einval);
+                const std::int32_t want = grp ? grp : target;
+                // The kernel's rules: the target is the caller or its child,
+                // in the caller's session, not a session leader; the group
+                // is the target itself or one already in that session.
+                const std::int32_t me_pid = ids().pid;
+                if (auto* mp = k_.procs().find_mut(me_pid); mp && mp->ppid == 0 && ids().ppid > 0)
+                    mp->ppid = ids().ppid;
+                if (target != me_pid) {
+                    const auto* tp = k_.procs().find(target);
+                    if (!tp || tp->ppid != me_pid) return eno(Errno::esrch);
+                    if (k_.procs().sid_of(target) != k_.procs().sid_of(me_pid)) return eno(Errno::eperm);
+                }
+                if (k_.procs().sid_of(target) == target) return eno(Errno::eperm);
+                if (want != target) {
+                    bool exists = false;
+                    for (std::int32_t p : k_.procs().pids())
+                        if (k_.procs().pgid_of(p) == want &&
+                            k_.procs().sid_of(p) == k_.procs().sid_of(target)) { exists = true; break; }
+                    if (!exists) return eno(Errno::eperm);
+                }
+                k_.procs().set_pgid(target, want);
+                Virtualize v{0};
+                v.host_mirror = Virtualize::Mirror::setpgid;
+                v.m_a = who;
+                v.m_b = grp;
+                return v;
             }
             case Sysno::setsid:
                 if constexpr (requires { mem_.models_process_groups(); }) return fwd();
@@ -303,8 +340,7 @@ public:
             // creds probe diffing against the live kernel.
             case Sysno::getpriority:
             case Sysno::setpriority:
-                if (r.arg[0] > 2) return eno(Errno::einval);
-                return val(0);
+                return do_priority(r, sc == Sysno::setpriority);
 
             // -- sysinfo(2): report linuxity's virtual machine (total/free RAM,
             //    process count, a plausible uptime), not the host's numbers.
@@ -430,6 +466,8 @@ public:
             case Sysno::statfs:      return path_statfs(r);
             case Sysno::fstatfs:     return do_fstatfs(r);
             case Sysno::socket:      return do_socket(r);
+            case Sysno::getsockname: return do_sockname(r, false);
+            case Sysno::getpeername: return do_sockname(r, true);
 
             // -- chroot(path): a guest chroot would chroot our HOST child to
             //    an untranslated host path — an isolation break. linuxity's
@@ -724,12 +762,22 @@ public:
             //    the guest believes it dropped to the sandbox user; the host
             //    process is untouched. Subsequent geteuid/getuid still report
             //    0 (the guest's coherent root world).
-            case Sysno::setuid:     case Sysno::setgid:
-            case Sysno::setreuid:   case Sysno::setregid:
-            case Sysno::setresuid:  case Sysno::setresgid:
-            case Sysno::setfsuid:   case Sysno::setfsgid:   return val(0);
-            case Sysno::setgroups:  return do_setgroups(r);
-            case Sysno::getgroups:  return do_getgroups(r);
+            // -- CREDENTIALS. Tracked per process with the kernel's rules, so
+            //    a drop to an unprivileged user sticks and later checks see
+            //    it. The host process is never changed: one host user runs
+            //    the whole tree, and ownership is ours to present anyway.
+            case Sysno::setuid:    return creds_result(creds::set_one(me(), me().uids, creds::kCapSetuid, u32(r, 0)));
+            case Sysno::setgid:    return creds_result(creds::set_one(me(), me().gids, creds::kCapSetgid, u32(r, 0)));
+            case Sysno::setreuid:  return creds_result(creds::setre(me(), me().uids, creds::kCapSetuid, u32(r, 0), u32(r, 1)));
+            case Sysno::setregid:  return creds_result(creds::setre(me(), me().gids, creds::kCapSetgid, u32(r, 0), u32(r, 1)));
+            case Sysno::setresuid: return creds_result(creds::setres(me(), me().uids, creds::kCapSetuid, u32(r, 0), u32(r, 1), u32(r, 2)));
+            case Sysno::setresgid: return creds_result(creds::setres(me(), me().gids, creds::kCapSetgid, u32(r, 0), u32(r, 1), u32(r, 2)));
+            case Sysno::setfsuid:  return val(creds::set_fs(me(), me().uids, creds::kCapSetuid, u32(r, 0)));
+            case Sysno::setfsgid:  return val(creds::set_fs(me(), me().gids, creds::kCapSetgid, u32(r, 0)));
+            case Sysno::setgroups: return do_setgroups(r);
+            case Sysno::getgroups: return do_getgroups(r);
+            case Sysno::capget:    return do_capget(r);
+            case Sysno::capset:    return do_capset(r);
 
             // -- LANDLOCK (pacman 7's download sandbox). We cannot apply an
             //    LSM ruleset to a ptraced tree, but linuxity's own namespace
@@ -782,6 +830,7 @@ public:
             //    Every other prctl forwards unchanged.
             case Sysno::prctl: {
                 const int op = static_cast<int>(r.arg[0]);
+                if (auto a = prctl_creds(op, r)) return *a;
                 if (op == 4 /*PR_SET_DUMPABLE*/) return val(0);
                 // PR_SET_NAME(15) renames the thread, and /proc/<pid>/comm is
                 // the SAME FACT read back. procfs answers comm from our own
@@ -799,7 +848,7 @@ public:
                             if (c == '\0') break;
                             nm.push_back(c);
                         }
-                        if (!nm.empty()) k_.procs().set_comm(ids().pid, nm);
+                        if (!nm.empty()) k_.procs().set_thread_comm(ids().pid, ids().tid, nm);
                     }
                 }
                 return fwd();
@@ -881,6 +930,15 @@ private:
     // unclaimed: answer the caller's own group. Per terminal, because a
     // pty.fork() child's new session must not see the outer shell's job.
     std::unordered_map<std::int32_t, std::int32_t> fg_pgrp_;
+    std::pair<std::int32_t, std::int32_t> pending_fg_{-2, 0};
+public:
+    // The trap finished handing the host terminal over: the guest's
+    // tcgetpgrp may now report the new foreground group.
+    void note_foreground() {
+        if (pending_fg_.first != -2) fg_pgrp_[pending_fg_.first] = pending_fg_.second;
+        pending_fg_ = {-2, 0};
+    }
+private:
 
     // The trapped task's guest identity. When the memory backend also exposes
     // the live task map (the ptrace trap does), report that task's real
@@ -1394,6 +1452,16 @@ private:
         std::string_view dir = at ? dir_of(static_cast<std::int64_t>(r.arg[0]))
                                   : std::string_view{};
         std::string abs = k_.files().absolutize(raw, dir);
+        // A synthesized symlink at the leaf (/dev/stdin -> /proc/self/fd/0)
+        // is followed like any link when the call follows: opening
+        // /dev/stdout opens the guest's fd 1.
+        if (follow_leaf && abs.starts_with("/dev/")) {
+            for (int hops = 0; hops < 8; ++hops) {
+                auto vf = k_.files().produce(abs);
+                if (!vf || vf->symlink_target.empty() || vf->symlink_target == "(proc-link)") break;
+                abs = k_.files().absolutize(vf->symlink_target, "/dev");
+            }
+        }
         return expand_proc_links(bind_proc_self(std::move(abs)), follow_leaf);
     }
 
@@ -1624,6 +1692,21 @@ private:
                 pc.host_path))
             return eno(Errno::eacces);
         if (pc.realm == kernel::Realm2::host_backed) {
+            // /dev/tty with no controlling terminal: the node is there, the
+            // open is ENXIO. (The host task may still have linuxity's own
+            // terminal, which is not the guest's.)
+            if (abs == "/dev/tty" && pc.host_path == "/dev/tty" && k_.procs().ctty_of(ids().pid) < 0)
+                return eno(Errno::enxio);
+            pending_new_ = wire::has(flags, wire::OpenFlag::creat) && !guest_exists(abs);
+            // An unprivileged guest user gets the kernel's answer for the
+            // mode and owner it sees; the host only ever sees its own user.
+            if (!pending_new_ && !wire::has_for(arch_, flags, wire::OpenFlag::path)) {
+                const std::uint64_t acc = flags & 3u;
+                int want = acc == 0 ? 4 : acc == 1 ? 2 : 6;
+                if (wire::has(flags, wire::OpenFlag::trunc)) want |= 2;
+                if (!guest_may(abs, want)) return eno(Errno::eacces);
+                if (privileged()) grant_root_dir_access(abs, pc.host_path);
+            }
             // An emulated FIFO opens onto its shared pipe instead.
             if (k_.files().fifos_emulated() &&
                 !wire::has_for(arch_, flags, wire::OpenFlag::path) &&
@@ -1950,6 +2033,16 @@ private:
         std::string abs = resolve_arg(r, path_arg, at);
         auto pc = k_.files().classify(abs);
         if (pc.realm == kernel::Realm2::host_backed) {
+            // access/faccessat answer for the guest's own ids. Root reads
+            // and writes anything but still needs an x bit to execute.
+            const auto sc = decode(arch_, r.nr);
+            if (sc == Sysno::access || sc == Sysno::faccessat || sc == Sysno::faccessat2) {
+                const int want = static_cast<int>(r.arg[static_cast<std::size_t>(path_arg) + 1] & 7u);
+                if (want != 0 && guest_exists(abs)) {
+                    if (!guest_may(abs, want)) return eno(Errno::eacces);
+                    if (!(want & 1)) return val(0);
+                }
+            }
             return Redirect{PathArg{path_arg, std::move(pc.host_path)}};
         }
         if (pc.realm == kernel::Realm2::virtual_file) return val(0);
@@ -2035,6 +2128,16 @@ private:
                                   static_cast<std::size_t>(r.arg[bi0 + 1]),
                                   std::to_string(id.pid) + "/task/" +
                                       std::to_string(id.tid));
+            // A synthesized symlink outside /proc (/dev/stdin -> /proc/self/fd/0,
+            // /dev/fd): its own target, before resolve_arg expands the leaf
+            // through it.
+            if (!pre.starts_with("/proc/")) {
+                if (auto vf = k_.files().produce(pre);
+                    vf && !vf->symlink_target.empty() && vf->symlink_target != "(proc-link)")
+                    return write_link(uaddr(r.arg[bi0]),
+                                      static_cast<std::size_t>(r.arg[bi0 + 1]),
+                                      vf->symlink_target);
+            }
         }
 
         if (empty_path_arg(r, path_arg)) return eno(Errno::enoent);
@@ -2319,8 +2422,19 @@ private:
                     interp_host = std::move(si_host);   // static interpreter
                 }
                 if (!sh.arg.empty()) prefix.push_back(std::move(sh.arg));
+                // The kernel hands the interpreter the script path exactly as
+                // given to execve, so $0 / sys.argv[0] read "./s2". A
+                // relative path only resolves if the host cwd is the guest's,
+                // so fall back to the absolute one when it isn't.
+                std::string script = abs;
+                const std::string given = read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)]));
+                if (!given.empty() && given.front() != '/') {
+                    const auto cc = k_.files().classify(std::string{k_.files().cwd()});
+                    if (cc.realm == kernel::Realm2::host_backed && host_cwd_is(cc.host_path))
+                        script = given;
+                }
                 // prog_guest is the script, as a guest path.
-                ExecInterp ei{path_arg, std::move(interp_host), abs};
+                ExecInterp ei{path_arg, std::move(interp_host), std::move(script)};
                 ei.prefix = std::move(prefix);
                 return ei;
             }
@@ -2704,6 +2818,11 @@ private:
             if (pc.host_path.empty()) return val(0);
         }
         if (pc.host_path.empty()) return eno(pc.error);
+        // Creating or removing a name writes the parent directory, and in a
+        // sticky one only the file's or the directory's owner may remove it.
+        if ((wi == Wi::remove || wi == Wi::parents_only) && !privileged()) {
+            if (Errno e = dir_entry_allowed(abs, wi == Wi::remove); e != Errno::ok) return eno(e);
+        }
         // mkfifo on a host that refuses FIFOs (Android): make the placeholder
         // ourselves. The mode is the register after the path.
         if (wi == Wi::parents_only && k_.files().fifos_emulated()) {
@@ -2738,8 +2857,34 @@ private:
         // whole chain where Linux returns ENOENT, so mkdir/mknod opt out and
         // let the host kernel apply the rule against the translated path.
         // Found by the differential harness.
-        if (wi == Wi::parents_only) o.make_parents = !strict_parent;
+        if (wi == Wi::parents_only) {
+            o.make_parents = !strict_parent;
+            const Sysno sc = decode(arch_, r.nr);
+            o.created = abs;
+            o.created_dir = sc == Sysno::mkdir || sc == Sysno::mkdirat;
+        }
         return o;
+    }
+
+    // May the caller add or remove the name `guest` in its parent directory?
+    [[nodiscard]] Errno dir_entry_allowed(const std::string& guest, bool removing) {
+        const std::size_t cut = guest.rfind('/');
+        const std::string parent = cut == 0 ? std::string{"/"} : guest.substr(0, cut);
+        if (!guest_may(parent, 3)) return Errno::eacces;
+        if (!removing) return Errno::ok;
+        // the sticky bit: only the file's owner or the dir's owner (or
+        // CAP_FOWNER) may remove or rename a name in it
+        const auto pc = k_.files().classify(parent);
+        struct ::stat st{};
+        std::uint32_t mode = 0;
+        if (auto rec = k_.files().meta().lookup(parent); rec && (rec->have & kernel::MetaRecord::kMode))
+            mode = rec->mode;
+        else if (pc.realm == kernel::Realm2::host_backed && ::stat(pc.host_path.c_str(), &st) == 0)
+            mode = st.st_mode;
+        if (!(mode & 01000u) || creds::capable(me(), creds::kCapFowner)) return Errno::ok;
+        const std::uint32_t fsuid = me().uids[3];
+        if (owner_of(guest).first == fsuid || owner_of(parent).first == fsuid) return Errno::ok;
+        return Errno::eperm;
     }
 
     // chmod/fchmodat: RECORD the guest-intended permission bits in the shadow
@@ -2853,9 +2998,14 @@ private:
         // overlay upper; a copy-up first ensures a lower-only file gains a
         // writable upper twin to mark. When the inode then carries the bits
         // exactly, the shadow store keeps NO record (it would add nothing).
+        // chmod follows the final link, so the mode belongs to the target.
+        // Recording it under the link's name meant stat of the target never
+        // saw it.
+        const std::string target = k_.files().resolve_links(abs);
+        if (!creds_may_chown_or_chmod(target)) return eno(Errno::eperm);
         std::uint32_t landed = 0xffffffffu;
         {
-            auto wc = k_.files().classify(abs, /*for_write=*/true,
+            auto wc = k_.files().classify(target, /*for_write=*/true,
                                           /*follow=*/false, Wi::copy_leaf);
             // Skip a symlink: chmod on a symlink either follows it (wrong
             // target) or, with AT_SYMLINK_NOFOLLOW as libarchive passes,
@@ -2896,7 +3046,12 @@ private:
                 }
             }
         }
-        k_.files().meta().set_mode(abs, mode, landed);
+        // A setgid bit only survives when the caller is in the file's group
+        // (or has CAP_FSETID), as in the kernel's chmod.
+        if ((mode & 02000u) && !creds::capable(me(), creds::kCapFsetid) &&
+            !in_group(owner_of(target).second))
+            mode &= ~02000u;
+        k_.files().meta().set_mode(target, mode, landed);
         return val(0);
     }
 
@@ -3010,10 +3165,35 @@ private:
                 follow && !host_target_exists(pc.host_path, &why))
                 return eno(why);
         }
-        k_.files().meta().set_owner(
-            abs, static_cast<std::uint32_t>(r.arg[static_cast<std::size_t>(uid_arg)]),
-            static_cast<std::uint32_t>(r.arg[static_cast<std::size_t>(gid_arg)]));
+        const std::string target = follow ? k_.files().resolve_links(abs) : abs;
+        const std::uint32_t nu = static_cast<std::uint32_t>(r.arg[static_cast<std::size_t>(uid_arg)]);
+        const std::uint32_t ng = static_cast<std::uint32_t>(r.arg[static_cast<std::size_t>(gid_arg)]);
+        if (Errno e = chown_allowed(target, nu, ng); e != Errno::ok) return eno(e);
+        k_.files().meta().set_owner(target, nu, ng);
+        // A chown by someone without CAP_FSETID drops set-user-ID, and
+        // set-group-ID when group exec is set. Root keeps them, which is how
+        // a package install leaves sudo setuid.
+        if (auto rec = k_.files().meta().lookup(target);
+            !creds::capable(me(), creds::kCapFsetid) && (nu != creds::kKeep || ng != creds::kKeep) &&
+            rec && (rec->have & kernel::MetaRecord::kMode)) {
+            std::uint32_t m = rec->mode;
+            m &= ~04000u;
+            if (m & 010u) m &= ~02000u;
+            if (m != rec->mode) k_.files().meta().set_mode(target, m);
+        }
         return val(0);
+    }
+
+    // chown(2)'s rules: changing the owner needs CAP_CHOWN; changing only
+    // the group needs ownership and membership of the new group.
+    [[nodiscard]] Errno chown_allowed(const std::string& guest, std::uint32_t uid, std::uint32_t gid) {
+        if (creds::capable(me(), creds::kCapChown)) return Errno::ok;
+        const auto [ou, og] = owner_of(guest);
+        if (uid != creds::kKeep && uid != ou) return Errno::eperm;
+        if (gid != creds::kKeep && gid != og) {
+            if (ou != me().uids[3] || !in_group(gid)) return Errno::eperm;
+        }
+        return Errno::ok;
     }
 
     // Does the TARGET of this path exist, with symlinks followed? ::access
@@ -3548,6 +3728,11 @@ private:
     // translate the sun_path into the overlay (below) for BOTH bind and
     // connect, keeping the socket inside the guest's world and letting the two
     // peers meet at the same node.
+    [[nodiscard]] static std::string inode_key(const struct ::stat& st) {
+        return "ino:" + std::to_string(static_cast<std::uint64_t>(st.st_dev)) + ":" +
+               std::to_string(static_cast<std::uint64_t>(st.st_ino));
+    }
+
     [[nodiscard]] Outcome do_sockaddr_un(const Regs& r, bool for_bind) {
         constexpr std::uint16_t kAfUnix = 1;
         const std::uint64_t addr = r.arg[1];
@@ -3563,6 +3748,7 @@ private:
                                ::strnlen(reinterpret_cast<const char*>(pb.data()),
                                          path_bytes));
         if (guest_path.empty()) return fwd();
+        const std::string raw_guest_path = guest_path;   // getsockname reports this spelling
         // A relative sun_path resolves against the caller's cwd. Ours is
         // virtual, so the host's cwd is somewhere else entirely: forwarding
         // it raw put the socket in whatever dir linuxity was started from.
@@ -3584,16 +3770,20 @@ private:
         // one of our own mount roots is one we produced, so leave it be.
         if (k_.files().is_host_side_path(guest_path)) return fwd();
 
+        // A name that already exists is the kernel's EADDRINUSE, socket or
+        // not. (This used to unlink it first, so a second bind silently
+        // stole the first one's name.)
+        if (for_bind && guest_exists(guest_path)) return eno(Errno::eaddrinuse);
+
         // Where this host lets us put a socket. On Android no directory an
         // app can write permits an AF_UNIX bind (SELinux), so a filesystem
         // translation would be correct and still fail with EACCES; the
-        // abstract namespace is the only one available. Both bind and connect
-        // come through here and hash the same GUEST path, so the peers still
-        // meet -- the name is derived from what they agree on, not from the
-        // host path they each translate separately.
+        // abstract namespace is the only one available. Bind and connect both
+        // derive the name from the placeholder's inode, so the peers meet.
         if (k_.files().socket_ns() == kernel::SocketNs::abstract) {
-            const std::string name = kernel::abstract_name_for(
-                guest_path, k_.files().instance_id());
+            // The name follows the placeholder file's inode, like a real
+            // socket node: unlink frees it, rename and link keep it.
+            std::string key = guest_path;
             // A BIND also has to leave the NAME behind. The socket itself
             // lives in the abstract namespace, where nothing is on disk --
             // but a guest that binds a path expects to find it there
@@ -3603,25 +3793,36 @@ private:
             // with ENOENT on a socket that had bound successfully.
             //
             // So drop a real, empty file at the translated path. It is not
-            // the socket -- connect still goes through the abstract name,
-            // which both peers derive from the same GUEST path -- it is the
-            // name, which is the part the guest can observe.
+            // the socket, it is the name, and its inode picks the abstract
+            // address connect looks up.
             if (for_bind) {
                 auto pc = k_.files().classify(guest_path, /*for_write=*/true,
                                               /*follow=*/false,
                                               Wi::parents_only);
                 if (pc.realm == kernel::Realm2::host_backed &&
                     !pc.host_path.empty()) {
-                    (void)::unlink(pc.host_path.c_str());
                     const int fd = ::open(pc.host_path.c_str(),
-                                          O_WRONLY | O_CREAT | O_EXCL, 0600);
-                    if (fd >= 0) {
-                        ::close(fd);
-                        // stat should see a socket, as on Linux
-                        sock_placeholders_.insert(guest_path);
-                    }
+                                          O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+                    if (fd < 0)
+                        return eno(errno == EEXIST ? Errno::eaddrinuse
+                                                   : wire::errno_from_host(errno));
+                    struct ::stat st{};
+                    if (::fstat(fd, &st) == 0) key = inode_key(st);
+                    ::close(fd);
+                    // stat should see a socket, as on Linux
+                    sock_placeholders_.insert(guest_path);
+                }
+            } else {
+                auto pc = k_.files().classify(guest_path, /*for_write=*/false,
+                                              /*follow=*/true, Wi::copy_leaf);
+                if (pc.realm == kernel::Realm2::host_backed && !pc.host_path.empty()) {
+                    struct ::stat st{};
+                    if (::stat(pc.host_path.c_str(), &st) != 0)
+                        return eno(errno == ENOTDIR ? Errno::enotdir : Errno::enoent);
+                    key = inode_key(st);
                 }
             }
+            const std::string name = kernel::abstract_name_for(key, k_.files().instance_id());
             // An abstract address is a leading NUL then the name, and its
             // LENGTH is what delimits it -- there is no terminator. Hand the
             // trap the exact bytes to poke.
@@ -3630,8 +3831,10 @@ private:
             addr_bytes += name;
             if (addr_bytes.size() > 108) return fwd();
             const std::uint64_t alen = 2 + addr_bytes.size();
-            return SockRewrite{uaddr(addr + 2), std::move(addr_bytes),
-                               /*len_arg=*/2, alen};
+            SockRewrite sr{uaddr(addr + 2), std::move(addr_bytes), /*len_arg=*/2, alen};
+            sr.guest_path = raw_guest_path;
+            sr.binds = for_bind;
+            return sr;
         }
 
         // Translate the AF_UNIX filesystem path into the SAME host path a file
@@ -3660,23 +3863,15 @@ private:
         // forward rather than truncating (truncation is worse).
         if (host_path.size() + 1 > 108) return fwd();
 
-        if (for_bind) {
-            // Pre-unlink any stale socket at the translated path so the
-            // forwarded bind never hits EADDRINUSE. Cover both layers.
-            auto rd = k_.files().classify(guest_path, /*for_write=*/false,
-                                          /*follow=*/false);
-            (void)::unlink(host_path.c_str());
-            if (!rd.host_path.empty() && rd.host_path != host_path)
-                (void)::unlink(rd.host_path.c_str());
-        }
-
         // Emit a socket-path rewrite: the trap pokes host_path into the
         // guest's sun_path and sets the socklen register, then forwards the
         // (now overlay-targeted) bind/connect to the kernel.
         // sizeof(sa_family_t) == 2, then the path bytes and its NUL.
         const std::uint64_t new_len = 2 + host_path.size() + 1;
-        return SockRewrite{uaddr(addr + 2), std::move(host_path),
-                           /*len_arg=*/2, new_len};
+        SockRewrite sr{uaddr(addr + 2), std::move(host_path), /*len_arg=*/2, new_len};
+        sr.guest_path = raw_guest_path;
+        sr.binds = for_bind;
+        return sr;
     }
 
     [[nodiscard]] Outcome path_symlink(const Regs& r, int target_arg,
@@ -4236,6 +4431,16 @@ private:
         // sign-extends it to 0xffffffff802c542a. musl does, glibc does not.
         // Compare the low 32 bits so both spellings hit the same arm.
         const std::uint64_t request = r.arg[1] & 0xffffffffULL;
+        // A terminal request on something that isn't a char device is ENOTTY
+        // on every kernel. Answer it here: Android's SELinux says EACCES first.
+        if (is_tty_request(request) && host_fd_is_file(static_cast<int>(r.arg[0])))
+            return eno(Errno::enotty);
+        // tcdrain/tcsendbreak: on a pty this is a no-op (writes reach the
+        // other end at once, no break op). Android's SELinux refuses it, so
+        // answer it there.
+        if ((request == 0x5409 /*TCSBRK*/ || request == 0x5425 /*TCSBRKP*/) &&
+            host_refuses_tcsbrk() && host_fd_is_pty(static_cast<int>(r.arg[0])))
+            return val(0);
         // Android's SELinux ioctl whitelist permits the classic termios
         // requests on a pty slave but not the termios2 ones, so the rootfs's
         // glibc gets EACCES on every tcgetattr/tcsetattr/isatty/ttyname and
@@ -4346,6 +4551,24 @@ private:
             // pty where a desktop kernel returns ENOTTY. Answering ENOTTY
             // ourselves hid that, and the on-device golden caught it.
             case kTIOCGPGRP: {
+                // On a pty MASTER this asks about the slave's session, which
+                // need not be ours.
+                if (const std::int32_t m = pty_master_slave(static_cast<int>(r.arg[0])); m >= 0) {
+                    const auto it = fg_pgrp_.find(m);
+                    std::int32_t fg = 0;
+                    if (it != fg_pgrp_.end()) {
+                        fg = it->second;
+                    } else {
+                        for (std::int32_t p : k_.procs().pids())
+                            if (const auto* pi = k_.procs().find(p); pi && pi->ctty == m && k_.procs().sid_of(p) == p) {
+                                fg = k_.procs().pgid_of(p);
+                                break;
+                            }
+                    }
+                    if (fg <= 0) return fwd();
+                    if (!put_u32(r.arg[2], static_cast<std::uint32_t>(fg))) return eno(Errno::efault);
+                    return val(0);
+                }
                 if (!fd_is_our_ctty(static_cast<int>(r.arg[0])))
                     return ctty_refusal(r);
                 // Whoever TIOCSPGRP last handed the terminal to; the caller's
@@ -4364,7 +4587,15 @@ private:
                 // itself a leader and hands the terminal to that group.
                 const std::int32_t tty = k_.procs().ctty_of(ids().pid);
                 const auto it = fg_pgrp_.find(tty);
-                const std::int32_t fg = it != fg_pgrp_.end() ? it->second : flat_pgrp();
+                // No tcsetpgrp yet: the terminal's foreground is the group
+                // of the session that claimed it (its leader's), not the
+                // caller's. Answering the caller's own group made a job
+                // think it owned the tty before its shell handed it over.
+                std::int32_t fg;
+                if (it != fg_pgrp_.end()) fg = it->second;
+                else if (tty >= 0)        fg = k_.procs().pgid_of(k_.procs().sid_of(ids().pid));
+                else                      fg = flat_pgrp();
+                if (fg == kernel::ProcessTable::kInheritedPgid) fg = flat_pgrp();
                 if (!put_u32(r.arg[2], static_cast<std::uint32_t>(fg)))
                     return eno(Errno::efault);
                 return val(0);
@@ -4410,11 +4641,29 @@ private:
                 // unclaimed tty) means "my own group", i.e. unclaimed again.
                 const std::int32_t tty = k_.procs().ctty_of(ids().pid);
                 if (want == static_cast<std::uint32_t>(
-                                kernel::ProcessTable::kInheritedPgid))
+                                kernel::ProcessTable::kInheritedPgid)) {
                     fg_pgrp_.erase(tty);
-                else if (want != 0)
-                    fg_pgrp_[tty] = static_cast<std::int32_t>(want);
-                return val(0);
+                    return val(0);
+                }
+                if (static_cast<std::int32_t>(want) <= 0) return eno(Errno::einval);
+                // the group has to exist in the caller's session
+                bool found = false;
+                const std::int32_t sess = k_.procs().sid_of(ids().pid);
+                for (std::int32_t p : k_.procs().pids())
+                    if (k_.procs().pgid_of(p) == static_cast<std::int32_t>(want) &&
+                        k_.procs().sid_of(p) == sess) { found = true; break; }
+                if (!found) return eno(Errno::eperm);
+                // Hand the real terminal to the same group, so the line
+                // discipline's ^C/^Z/SIGTTIN reach the job the guest chose.
+                // The guest-visible foreground group is updated after that
+                // (note_foreground), so a job that polls tcgetpgrp can't see
+                // the terminal as its own before the host agrees.
+                pending_fg_ = {tty, static_cast<std::int32_t>(want)};
+                Virtualize v{0};
+                v.host_mirror = Virtualize::Mirror::tcsetpgrp;
+                v.m_a = static_cast<std::int32_t>(want);
+                v.m_ptr = r.arg[2];
+                return v;
             }
             default:
                 return fwd();   // real host tty/device ioctl
@@ -4430,15 +4679,234 @@ private:
     // here -- unlike, say, waitpid's status -- so a null is EFAULT. Skipping
     // them instead returned 0 where the kernel fails, which the creds probe
     // caught by diffing against the live kernel.
-    [[nodiscard]] Outcome do_getres(const Regs& r) {
+    [[nodiscard]] Outcome do_getres(const Regs& r, const std::array<std::uint32_t, 4>& ids) {
         if (!r.arg[0] || !r.arg[1] || !r.arg[2]) return eno(Errno::efault);
         // A non-null pointer can still be unwritable. put_u32 used to
         // swallow that, so writing through 0x1 reported success where the
         // kernel says EFAULT -- the null check caught only the easy half.
-        if (!put_u32(r.arg[0], 0) || !put_u32(r.arg[1], 0) ||
-            !put_u32(r.arg[2], 0))
+        if (!put_u32(r.arg[0], ids[0]) || !put_u32(r.arg[1], ids[1]) ||
+            !put_u32(r.arg[2], ids[2]))
             return eno(Errno::efault);
         return val(0);
+    }
+
+    // getpriority/setpriority on PRIO_PROCESS, PRIO_PGRP and PRIO_USER,
+    // over each process's nice. The host process is also renice'd, best
+    // effort, so the scheduler sees it. getpriority returns 20 - nice.
+    [[nodiscard]] Outcome do_priority(const Regs& r, bool set) {
+        const std::uint64_t which = r.arg[0];
+        if (which > 2) return eno(Errno::einval);
+        const auto who = static_cast<std::int32_t>(r.arg[1]);
+        std::vector<std::int32_t> targets;
+        const std::int32_t self = ids().pid;
+        if (which == 0) {                       // PRIO_PROCESS
+            const std::int32_t p = who ? who : self;
+            if (p != self && !k_.procs().has(p)) return eno(Errno::esrch);
+            targets.push_back(p);
+        } else {
+            const std::int32_t g = which == 1 ? (who ? who : k_.procs().pgid_of(self)) : -1;
+            const std::uint32_t u = which == 2 ? (who ? static_cast<std::uint32_t>(who) : me().uids[1]) : 0;
+            for (std::int32_t p : k_.procs().pids()) {
+                const auto* pi = k_.procs().find(p);
+                if (!pi) continue;
+                if (which == 1 ? k_.procs().pgid_of(p) == g : pi->uids[0] == u) targets.push_back(p);
+            }
+            if (targets.empty()) return eno(Errno::esrch);
+        }
+        if (!set) {
+            int best = 19;
+            for (std::int32_t p : targets)
+                if (const auto* pi = k_.procs().find(p)) best = std::min(best, static_cast<int>(pi->nice));
+            if (targets.size() == 1 && targets[0] == self) best = me().nice;
+            return val(20 - best);
+        }
+        int nv = static_cast<int>(static_cast<std::int32_t>(r.arg[2]));
+        nv = std::clamp(nv, -20, 19);
+        for (std::int32_t p : targets) {
+            auto* pi = p == self ? &me() : k_.procs().find_mut(p);
+            if (!pi) continue;
+            if (!creds::capable(me(), creds::kCapSysNice)) {
+                if (pi->uids[0] != me().uids[1] && pi->uids[1] != me().uids[1]) return eno(Errno::eperm);
+                if (nv < pi->nice) return eno(Errno::eacces);
+            }
+            pi->nice = nv;
+            if constexpr (requires { mem_.host_tid_of(0); }) {
+#if !defined(_WIN32)
+                if (const auto h = mem_.host_tid_of(p); h > 0) (void)::setpriority(PRIO_PROCESS, static_cast<id_t>(h), nv);
+#endif
+            }
+        }
+        return val(0);
+    }
+
+    // The prctls whose state is the process's credentials. no_new_privs is
+    // forwarded as well: the host's own copy is what blocks a set-ID exec
+    // outside our view, and the kernel won't let anyone clear it.
+    [[nodiscard]] std::optional<Outcome> prctl_creds(int op, const Regs& r) {
+        auto& p = me();
+        const std::uint64_t a = r.arg[1];
+        switch (op) {
+            case 7:   // PR_GET_KEEPCAPS
+                return val(p.keepcaps ? 1 : 0);
+            case 8:   // PR_SET_KEEPCAPS
+                if (a > 1) return eno(Errno::einval);
+                p.keepcaps = a == 1;
+                return val(0);
+            case 23:  // PR_CAPBSET_READ
+                if (a > static_cast<std::uint64_t>(creds::kCapLast)) return eno(Errno::einval);
+                return val((p.cap_bnd >> a) & 1);
+            case 24:  // PR_CAPBSET_DROP
+                if (a > static_cast<std::uint64_t>(creds::kCapLast)) return eno(Errno::einval);
+                if (!creds::capable(p, creds::kCapSetpcap)) return eno(Errno::eperm);
+                p.cap_bnd &= ~creds::bit(static_cast<int>(a));
+                return val(0);
+            case 38:  // PR_SET_NO_NEW_PRIVS
+                if (a != 1 || r.arg[2] || r.arg[3] || r.arg[4]) return eno(Errno::einval);
+                p.no_new_privs = true;
+                return std::nullopt;   // forward too
+            case 39:  // PR_GET_NO_NEW_PRIVS
+                if (a || r.arg[2] || r.arg[3] || r.arg[4]) return eno(Errno::einval);
+                return val(p.no_new_privs ? 1 : 0);
+            case 47: {   // PR_CAP_AMBIENT
+                const int c = static_cast<int>(r.arg[2]);
+                if (a == 4) {    // CLEAR_ALL
+                    p.cap_amb = 0;
+                    return val(0);
+                }
+                if (c < 0 || c > creds::kCapLast) return eno(Errno::einval);
+                const std::uint64_t b = creds::bit(c);
+                if (a == 1) return val((p.cap_amb & b) ? 1 : 0);            // IS_SET
+                if (a == 2) {                                                // RAISE
+                    if (!(p.cap_prm & b) || !(p.cap_inh & b)) return eno(Errno::eperm);
+                    p.cap_amb |= b;
+                    return val(0);
+                }
+                if (a == 3) { p.cap_amb &= ~b; return val(0); }              // LOWER
+                return eno(Errno::einval);
+            }
+            default:
+                return std::nullopt;
+        }
+    }
+
+    // The calling process's record, created on first use. A task can run
+    // before its spawn event is folded in, so a missing record is built the
+    // way fork would: the parent's credentials, groups and nice.
+    [[nodiscard]] kernel::ProcInfo& me() {
+        const auto id = ids();
+        if (auto* p = k_.procs().find_mut(id.pid)) return *p;
+        kernel::ProcInfo pi;
+        pi.pid = id.pid;
+        pi.ppid = id.ppid;
+        if (const auto* pp = id.ppid > 0 ? k_.procs().find(id.ppid) : nullptr) {
+            pi.comm = pp->comm;
+            pi.cmdline = pp->cmdline;
+            pi.groups = pp->groups;
+            pi.groups_set = pp->groups_set;
+            pi.uids = pp->uids;
+            pi.gids = pp->gids;
+            pi.cap_eff = pp->cap_eff;
+            pi.cap_prm = pp->cap_prm;
+            pi.cap_inh = pp->cap_inh;
+            pi.cap_bnd = pp->cap_bnd;
+            pi.cap_amb = pp->cap_amb;
+            pi.keepcaps = pp->keepcaps;
+            pi.no_new_privs = pp->no_new_privs;
+            pi.nice = pp->nice;
+        }
+        pi.creds_given = true;
+        pi.live_seen = true;
+        k_.procs().upsert(pi);
+        return *k_.procs().find_mut(id.pid);
+    }
+    [[nodiscard]] static std::uint32_t u32(const Regs& r, int i) {
+        return static_cast<std::uint32_t>(r.arg[static_cast<std::size_t>(i)]);
+    }
+
+    // The owner the guest sees for a file: what it chown'd, else root.
+    [[nodiscard]] std::pair<std::uint32_t, std::uint32_t> owner_of(const std::string& guest) {
+        std::uint32_t uid = 0, gid = 0;
+        if (auto rec = k_.files().meta().lookup(guest)) {
+            if (rec->have & kernel::MetaRecord::kUid) uid = rec->uid;
+            if (rec->have & kernel::MetaRecord::kGid) gid = rec->gid;
+        }
+        return {uid, gid};
+    }
+    [[nodiscard]] bool in_group(std::uint32_t gid) {
+        const auto& p = me();
+        if (p.gids[3] == gid) return true;
+        for (std::uint32_t g : k_.procs().groups_of(p.pid))
+            if (g == gid) return true;
+        return false;
+    }
+    // chmod and setting a file's group need ownership or CAP_FOWNER.
+    [[nodiscard]] bool creds_may_chown_or_chmod(const std::string& guest) {
+        return creds::capable(me(), creds::kCapFowner) || owner_of(guest).first == me().uids[3];
+    }
+    [[nodiscard]] static Outcome creds_result(Errno e) {
+        return e == Errno::ok ? val(0) : eno(e);
+    }
+
+    // capget(hdr, data): versions 1 (32-bit sets) and 2/3 (two u32 halves).
+    // A bad version writes the preferred one back and is EINVAL.
+    [[nodiscard]] Outcome do_capget(const Regs& r) {
+        std::uint32_t ver = 0;
+        if (!get_u32_checked(r.arg[0], ver)) return eno(Errno::efault);
+        constexpr std::uint32_t kV1 = 0x19980330, kV2 = 0x20071026, kV3 = 0x20080522;
+        if (ver != kV1 && ver != kV2 && ver != kV3) {
+            (void)put_u32(r.arg[0], kV3);
+            // probing for the version: a null data pointer makes it success
+            return r.arg[1] ? eno(Errno::einval) : val(0);
+        }
+        std::int32_t pid = 0;
+        std::uint32_t raw = 0;
+        if (!get_u32_checked(r.arg[0] + 4, raw)) return eno(Errno::efault);
+        pid = static_cast<std::int32_t>(raw);
+        if (pid < 0) return eno(Errno::einval);
+        const kernel::ProcInfo* p = pid == 0 || pid == ids().pid ? &me() : k_.procs().find(pid);
+        if (p == nullptr) return eno(Errno::esrch);
+        if (r.arg[1] == 0) return val(0);
+        const int halves = ver == kV1 ? 1 : 2;
+        for (int i = 0; i < halves; ++i) {
+            const std::uint64_t at = r.arg[1] + static_cast<std::uint64_t>(i) * 12;
+            const int sh = 32 * i;
+            if (!put_u32(at, static_cast<std::uint32_t>(p->cap_eff >> sh)) ||
+                !put_u32(at + 4, static_cast<std::uint32_t>(p->cap_prm >> sh)) ||
+                !put_u32(at + 8, static_cast<std::uint32_t>(p->cap_inh >> sh)))
+                return eno(Errno::efault);
+        }
+        return val(0);
+    }
+
+    [[nodiscard]] Outcome do_capset(const Regs& r) {
+        std::uint32_t ver = 0, raw = 0;
+        if (!get_u32_checked(r.arg[0], ver) || !get_u32_checked(r.arg[0] + 4, raw))
+            return eno(Errno::efault);
+        constexpr std::uint32_t kV1 = 0x19980330, kV2 = 0x20071026, kV3 = 0x20080522;
+        if (ver != kV1 && ver != kV2 && ver != kV3) {
+            (void)put_u32(r.arg[0], kV3);
+            return eno(Errno::einval);
+        }
+        const auto pid = static_cast<std::int32_t>(raw);
+        if (pid != 0 && pid != ids().pid) return eno(Errno::eperm);
+        std::uint64_t set[3] = {0, 0, 0};
+        for (int i = 0; i < (ver == kV1 ? 1 : 2); ++i) {
+            for (int k = 0; k < 3; ++k) {
+                std::uint32_t v = 0;
+                if (!get_u32_checked(r.arg[1] + static_cast<std::uint64_t>(i * 12 + k * 4), v))
+                    return eno(Errno::efault);
+                set[k] |= static_cast<std::uint64_t>(v) << (32 * i);
+            }
+        }
+        const std::uint64_t mask = kernel::ProcInfo::kAllCaps;
+        return creds_result(creds::capset(me(), set[0] & mask, set[1] & mask, set[2] & mask));
+    }
+
+    [[nodiscard]] bool get_u32_checked(std::uint64_t addr, std::uint32_t& out) {
+        std::array<std::byte, 4> b{};
+        if (!mem_.copy_in(uaddr(addr), b)) return false;
+        std::memcpy(&out, b.data(), 4);
+        return true;
     }
 
     // struct utsname: 6 fixed-size NUL-terminated char[65] fields. We
@@ -4470,8 +4938,10 @@ private:
     // the ctty rule: opening a tty WITHOUT O_NOCTTY in a session that has
     // none makes it the controlling terminal.
     std::uint64_t pending_flags_{0};
+    bool pending_new_{false};    // the pending O_CREAT open makes a new name
     // guest paths of abstract-socket placeholders (see do_sockaddr_un)
     std::unordered_set<std::string> sock_placeholders_;
+    std::unordered_map<std::uint64_t, std::string> sock_names_, sock_peers_;
     struct EmuFifo {
         int anchor{-1};
         int hold_r{-1}, hold_w{-1};
@@ -4526,18 +4996,102 @@ public:
     // this open just made (st_nlink 1, owned by us) -- O_CREAT on an existing
     // file does not change its mode, and neither does this.
     void record_created_mode(int fd) {
-        const int sfd = open_tracee_fd(fd);
-        if (sfd < 0) return;
-        struct ::stat st{};
-        const bool ok = ::fstat(sfd, &st) == 0;
-        const std::uint32_t want = ok ? (st.st_mode & wire::kPermMask) : 0;
-        const std::uint32_t need = ok && S_ISDIR(st.st_mode) ? 0700u : 0600u;
-        if (ok && S_ISREG(st.st_mode) && (want & need) != need &&
-            st.st_uid == ::getuid() &&
-            ::fchmod(sfd, want | need) == 0)
-            k_.files().meta().set_mode(pending_open_, want);
-        ::close(sfd);
+        // stat through the magic link, not open: an open here is an extra
+        // IN_OPEN/IN_CLOSE that inotify watchers see
+        if constexpr (!requires { mem_.host_tid(); }) {
+            (void)fd;
+            return;
+        } else {
+            char link[64];
+            std::snprintf(link, sizeof link, "/proc/%d/fd/%d", mem_.host_tid(), fd);
+            struct ::stat st{};
+            if (::stat(link, &st) != 0 || !S_ISREG(st.st_mode)) return;
+            const std::uint32_t want = st.st_mode & wire::kPermMask;
+            if ((want & 0600u) == 0600u || st.st_uid != ::getuid()) return;
+            // only now does the host inode need owner rw (root writes 0444)
+            const int sfd = open_tracee_fd(fd);
+            if (sfd < 0) return;
+            if (::fchmod(sfd, want | 0600u) == 0) k_.files().meta().set_mode(pending_open_, want);
+            ::close(sfd);
+        }
     }
+
+    // Root reads and searches any directory. The host user owns the tree
+    // but not always the bits (a guest chmod 0000 lands on the host inode),
+    // so give the host owner rwx and keep the guest-visible mode recorded.
+    void grant_root_dir_access(const std::string& abs, const std::string& host) {
+        struct ::stat st{};
+        if (::stat(host.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) return;
+        if ((st.st_mode & 0700u) == 0700u || st.st_uid != ::geteuid()) return;
+        const auto rec = k_.files().meta().lookup(abs);
+        if (!rec || (rec->have & kernel::MetaRecord::kMode) == 0)
+            k_.files().meta().set_mode(abs, st.st_mode & 07777u);
+        (void)::chmod(host.c_str(), (st.st_mode & 07777u) | 0700u);
+    }
+
+    // AF_UNIX names the guest gave, by the socket's host inode. bind names
+    // the socket itself; connect names its peer. getsockname/getpeername
+    // report these instead of the translated host path the kernel holds.
+    // `host_tid` is the task the fd belongs to: this runs from a deferred
+    // exit hook, after the trap may have moved on to another task.
+    void note_socket_name(int host_tid, int fd, const std::string& name, bool binds) {
+        const std::uint64_t ino = socket_inode_of(host_tid, fd);
+        if (ino == 0) return;
+        (binds ? sock_names_ : sock_peers_)[ino] = name;
+    }
+    [[nodiscard]] static std::uint64_t socket_inode_of(int host_tid, int fd) {
+        char link[64], tgt[64];
+        std::snprintf(link, sizeof link, "/proc/%d/fd/%d", host_tid, fd);
+        const ::ssize_t n = ::readlink(link, tgt, sizeof tgt - 1);
+        if (n <= 8) return 0;
+        tgt[n] = '\0';
+        unsigned long long ino = 0;
+        return std::sscanf(tgt, "socket:[%llu]", &ino) == 1 ? ino : 0;
+    }
+    [[nodiscard]] std::uint64_t socket_inode(int fd) {
+        if constexpr (!requires { mem_.host_tid(); }) {
+            return 0;
+        } else {
+            return socket_inode_of(mem_.host_tid(), fd);
+        }
+    }
+
+    // getsockname(fd, addr, len) / getpeername: an AF_UNIX socket the guest
+    // named gets its own spelling back, not the translated host path.
+    [[nodiscard]] Outcome do_sockname(const Regs& r, bool peer) {
+        if (!r.arg[1] || !r.arg[2]) return fwd();
+        const std::uint64_t ino = socket_inode(static_cast<int>(r.arg[0]));
+        if (ino == 0) return fwd();
+        const auto& m = peer ? sock_peers_ : sock_names_;
+        auto it = m.find(ino);
+        if (it == m.end()) {
+            // A peer that accepted us: its name is the listener's, which the
+            // host shows as our translated path. Translate it back.
+            return fwd();
+        }
+        ArgRewrite ar{0, r.arg[0], ArgRewrite::Convert::unix_name, uaddr(r.arg[1])};
+        ar.len = uaddr(r.arg[2]);
+        ar.name = it->second;
+        return ar;
+    }
+
+    // May the calling guest process access `guest` for `want` (4 r, 2 w,
+    // 1 x), judged on the mode and owner the guest sees? Absent files pass;
+    // the host call that follows reports ENOENT itself.
+    [[nodiscard]] bool guest_may(const std::string& guest, int want) {
+        const auto pc = k_.files().classify(guest);
+        if (pc.realm != kernel::Realm2::host_backed || pc.host_path.empty()) return true;
+        struct ::stat st{};
+        if (::stat(pc.host_path.c_str(), &st) != 0) return true;
+        std::uint32_t mode = st.st_mode & 07777u;
+        if (auto rec = k_.files().meta().lookup(guest); rec && (rec->have & kernel::MetaRecord::kMode))
+            mode = rec->mode & 07777u;
+        const auto [uid, gid] = owner_of(guest);
+        auto p = me();
+        p.groups = k_.procs().groups_of(p.pid);
+        return creds::permitted(p, mode, uid, gid, want, S_ISDIR(st.st_mode));
+    }
+    [[nodiscard]] bool privileged() { return creds::capable(me(), creds::kCapDacOverride); }
 
     // A translated host path at or over PATH_MAX fails on the host even when
     // the guest named it relative to a dirfd or its cwd, which have no length
@@ -4791,6 +5345,46 @@ public:
         note_opened_fd(fd);
     }
 
+    // A file this guest process just created: its owner is the creator's
+    // fsuid, its group the fsgid or, under a setgid directory, the
+    // directory's group (and a new subdirectory inherits the setgid bit).
+    // Root creating as root is the default view, so that records nothing.
+    void note_created(const std::string& guest, bool is_dir) {
+        const auto& p = me();
+        const std::string parent = guest.substr(0, std::max<std::size_t>(guest.rfind('/'), 1));
+        std::uint32_t gid = p.gids[3];
+        bool sgid_parent = false;
+        if (auto rec = k_.files().meta().lookup(parent); rec && (rec->have & kernel::MetaRecord::kMode))
+            sgid_parent = (rec->mode & 02000u) != 0;
+        else {
+            const auto pc = k_.files().classify(parent);
+            struct ::stat st{};
+            sgid_parent = pc.realm == kernel::Realm2::host_backed &&
+                          ::stat(pc.host_path.c_str(), &st) == 0 && (st.st_mode & S_ISGID);
+        }
+        if (sgid_parent) gid = owner_of(parent).second;
+        if (p.uids[3] != 0 || gid != 0) k_.files().meta().set_owner(guest, p.uids[3], gid);
+        if (is_dir && sgid_parent) {
+            const auto pc = k_.files().classify(guest);
+            struct ::stat st{};
+            std::uint32_t m = 0755;
+            if (auto rec = k_.files().meta().lookup(guest); rec && (rec->have & kernel::MetaRecord::kMode))
+                m = rec->mode;
+            else if (pc.realm == kernel::Realm2::host_backed && ::stat(pc.host_path.c_str(), &st) == 0)
+                m = st.st_mode & 07777u;
+            k_.files().meta().set_mode(guest, m | 02000u);
+        }
+    }
+
+    // Does the guest see anything at `abs` (without following a final link)?
+    [[nodiscard]] bool guest_exists(const std::string& abs) {
+        const auto pc = k_.files().classify(abs, false, /*follow=*/false);
+        if (pc.realm == kernel::Realm2::virtual_file) return true;
+        if (pc.realm != kernel::Realm2::host_backed || pc.host_path.empty()) return false;
+        struct ::stat st{};
+        return ::lstat(pc.host_path.c_str(), &st) == 0;
+    }
+
     // The trap calls this after a redirect/inject syscall returns a real fd,
     // so the namespace can bind the guest path to that fd (readlinkat etc.),
     // and — for a virtual directory — the entries getdents64 will enumerate.
@@ -4831,6 +5425,7 @@ public:
                           wire::OpenFlag::creat)) {
                 k_.files().clear_whiteout_if_any(pending_open_);
                 record_created_mode(static_cast<int>(fd));
+                if (std::exchange(pending_new_, false)) note_created(pending_open_, false);
             }
 
             // The OTHER way to get a controlling terminal, besides
@@ -4991,6 +5586,25 @@ public:
     // reported success: getresuid(0x1,0x1,0x1) returned 0 where the kernel
     // returns -1. Callers that can fail must check it.
 
+    // If `fd` is a pty master, the number of its slave, else -1.
+    [[nodiscard]] std::int32_t pty_master_slave(int fd) {
+        if constexpr (!requires { mem_.host_tid(); }) {
+            return -1;
+        } else {
+            const int sfd = open_tracee_fd(fd);
+            if (sfd < 0) return -1;
+            unsigned n = 0;
+            constexpr unsigned long kTIOCGPTN = 0x80045430;   // same on x86-64 and aarch64
+#if !defined(_WIN32)
+            const bool is_master = ::ioctl(sfd, kTIOCGPTN, &n) == 0;
+#else
+            const bool is_master = false;
+#endif
+            ::close(sfd);
+            return is_master ? static_cast<std::int32_t>(n) : -1;
+        }
+    }
+
     // The pty slave NUMBER behind an fd, or -1 if the fd is not a pty slave.
     //
     // The fd table already records the guest path every open resolved to, and
@@ -5046,6 +5660,69 @@ public:
             tgt[k] = '\0';
             return lx::vfs::pty_slave_number(tgt);
         }
+    }
+
+    // A terminal ioctl ('T' type), minus the generic FIO* ones files accept.
+    [[nodiscard]] static bool is_tty_request(std::uint64_t req) noexcept {
+        if (((req >> 8) & 0xff) != 'T') return false;
+        switch (req & 0xffff) {
+            case 0x541B: case 0x5421: case 0x5450: case 0x5451:   // FIONREAD FIONBIO FIONCLEX FIOCLEX
+            case 0x5452: case 0x5460:                            // FIOASYNC FIOQSIZE
+                return false;
+            default: return true;
+        }
+    }
+
+    // Is the tracee's fd a regular file or directory on the host?
+    [[nodiscard]] bool host_fd_is_file(int fd) {
+        if constexpr (!requires { mem_.host_tid(); }) {
+            return false;
+        } else {
+            char link[64];
+            std::snprintf(link, sizeof link, "/proc/%d/fd/%d", mem_.host_tid(), fd);
+            struct ::stat st{};
+            return ::stat(link, &st) == 0 && (S_ISREG(st.st_mode) || S_ISDIR(st.st_mode));
+        }
+    }
+
+    // Is the tracee's fd either end of a pty?
+    [[nodiscard]] bool host_fd_is_pty(int fd) {
+        if (pty_slave_of_fd(fd) >= 0 || host_fd_slave_no(fd) >= 0) return true;
+        if constexpr (!requires { mem_.host_tid(); }) {
+            return false;
+        } else {
+            char link[64];
+            std::snprintf(link, sizeof link, "/proc/%d/fd/%d", mem_.host_tid(), fd);
+            char tgt[64];
+            const ssize_t k = ::readlink(link, tgt, sizeof tgt - 1);
+            if (k <= 0) return false;
+            tgt[k] = '\0';
+            return std::string_view{tgt}.ends_with("ptmx");
+        }
+    }
+
+    // Does the host's policy refuse TCSBRK on a pty? Asked once.
+    [[nodiscard]] static bool host_refuses_tcsbrk() {
+#if defined(_WIN32)
+        return false;
+#else
+        static const bool refuses = [] {
+            const int m = ::posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC);
+            if (m < 0) return false;
+            bool r = false;
+            if (::grantpt(m) == 0 && ::unlockpt(m) == 0)
+                if (const char* n = ::ptsname(m)) {
+                    const int s = ::open(n, O_RDWR | O_NOCTTY | O_CLOEXEC);
+                    if (s >= 0) {
+                        r = ::ioctl(s, 0x5409, 1) != 0 && errno == EACCES;
+                        ::close(s);
+                    }
+                }
+            ::close(m);
+            return r;
+        }();
+        return refuses;
+#endif
     }
 
     // How to refuse a session ioctl on an fd we do not own.

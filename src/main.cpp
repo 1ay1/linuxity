@@ -817,6 +817,12 @@ int main(int argc, char** argv) {
     // then loaded host libraries, or failed to load any. conform::host_arch()
     // is the one place that answers this.
     runtime::Cpu cpu{trap, k, trap, conform::host_arch()};
+    // procfs reads live per-task facts from the guest's real host task
+    k.procs().set_host_resolver([&trap](std::int32_t g) { return static_cast<int>(trap.host_tid_of(g)); });
+    trap.set_guest_ids([&k](std::int32_t g) {
+        const auto* p = k.procs().find(g);
+        return p ? std::pair{p->uids[1], p->gids[1]} : std::pair<std::uint32_t, std::uint32_t>{0, 0};
+    });
 
     auto rc = cpu.run(uaddr(0), uaddr(0));
 

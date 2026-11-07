@@ -14,8 +14,19 @@ from multiprocessing import shared_memory
 
 warnings.simplefilter("ignore")
 
-ROOT = os.environ.get("CRAZY_ROOT") or (
-    "/root/crazy-test" if os.access("/root", os.W_OK) else "/tmp/crazy-test")
+def _scratch_root():
+    if os.environ.get("CRAZY_ROOT"):
+        return os.environ["CRAZY_ROOT"]
+    for cand in ("/root/crazy-test", "/tmp/crazy-test"):
+        try:
+            os.makedirs(cand, exist_ok=True)
+            return cand
+        except OSError:
+            continue
+    return "/tmp/crazy-test"
+
+
+ROOT = _scratch_root()
 TIMEOUT = 60
 TESTS = []
 
@@ -1458,7 +1469,15 @@ def run_one(fn, wake):
         signal.set_wakeup_fd(-1)
         for x in wake:
             os.close(x)
-        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+        # a backgrounded sh starts us with SIGINT/SIGQUIT ignored, and that
+        # survives exec, so reset everything but python's own SIGPIPE/SIGXFSZ
+        keep = (signal.SIGKILL, signal.SIGSTOP, signal.SIGPIPE, signal.SIGXFSZ)
+        for s in signal.valid_signals():
+            if s not in keep:
+                try:
+                    signal.signal(s, signal.SIG_DFL)
+                except (OSError, ValueError):
+                    pass
         res = {"ok": False, "info": "?"}
         try:
             os.setpgid(0, 0)

@@ -5,7 +5,7 @@ import os
 import resource
 import time
 
-from lxt import SYS, check, eq, expect_errno, libc, skip, spawn, reap, syscall, test
+from lxt import ENV, SYS, check, eq, expect_errno, libc, skip, spawn, reap, syscall, test
 
 
 @test
@@ -66,7 +66,14 @@ def randomness():
         check(len(f.read(16)) == 16, "/dev/random")
     with open("/dev/zero", "rb") as f:
         eq(f.read(8192), bytes(8192), "/dev/zero")
-    with open("/dev/full", "wb", buffering=0) as f:
+    try:
+        f = open("/dev/full", "wb", buffering=0)
+    except PermissionError:
+        # Android's SELinux won't let an app open it; only on someone else's kernel
+        if not ENV["host_kernel"]:
+            raise
+        return "getrandom, urandom, random, zero; full refused by the host [host]"
+    with f:
         expect_errno(errno.ENOSPC, "write to /dev/full", f.write, b"x")
     return "getrandom, urandom, random, zero, full"
 

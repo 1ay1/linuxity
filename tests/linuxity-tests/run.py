@@ -89,9 +89,16 @@ def start(case, root):
         res = {"verdict": "FAIL", "info": "?"}
         try:
             os.setpgid(0, 0)
-            signal.signal(signal.SIGCHLD, signal.SIG_DFL)
-            for s in (signal.SIGINT, signal.SIGTERM):
-                signal.signal(s, signal.SIG_DFL)
+            # a backgrounded sh starts us with SIGINT/SIGQUIT ignored, and
+            # ignored signals survive exec, so reset them all. SIGPIPE and
+            # SIGXFSZ stay as python set them.
+            keep = (signal.SIGKILL, signal.SIGSTOP, signal.SIGPIPE, signal.SIGXFSZ)
+            for s in signal.valid_signals():
+                if s not in keep:
+                    try:
+                        signal.signal(s, signal.SIG_DFL)
+                    except (OSError, ValueError):
+                        pass
             os.dup2(out.fileno(), 1)
             os.dup2(out.fileno(), 2)
             d = os.path.join(root, case.id.replace("/", "_").replace(":", "_"))
@@ -244,8 +251,15 @@ def main():
     for c in cases:
         c.timeout = c.timeout * a.timeout_scale
 
-    root = os.environ.get("LXT_ROOT") or (
-        "/root/lxt-scratch" if os.access("/root", os.W_OK) else os.path.join(tempfile.gettempdir(), "lxt-scratch"))
+    root = os.environ.get("LXT_ROOT")
+    if not root:
+        for cand in ("/root/lxt-scratch", os.path.join(tempfile.gettempdir(), "lxt-scratch")):
+            try:
+                os.makedirs(cand, exist_ok=True)
+                root = cand
+                break
+            except OSError:
+                continue
     os.makedirs(root, exist_ok=True)
     e = lxt.ENV
     print(f"LINUXITY TESTS  {e['kernel']} {e['machine']}  python {e['python']}  "

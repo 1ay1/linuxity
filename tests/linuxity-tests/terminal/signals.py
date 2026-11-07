@@ -123,9 +123,10 @@ def interactive_shell_job_control():
     def fg():
         return struct.unpack("i", fcntl.ioctl(fd, termios.TIOCGPGRP, b"\0" * 4))[0]
 
+    shell_group = wait_until(fg, 10, "bash to take the terminal")
     os.write(fd, b"sleep 30\n")
     # ^Z only stops the job once bash has handed it the terminal
-    wait_until(lambda: fg() not in (0, pid), 10, "bash to give the terminal to the job")
+    wait_until(lambda: fg() not in (0, shell_group), 10, "bash to give the terminal to the job")
     for line, want in ((b"\x1a", b"Stopped"), (b"jobs", b"sleep 30"),
                        (b"bg", b"sleep 30 &"), (b"kill %1; wait", b"Terminated"),
                        (b"set -o | grep monitor", b"on"), (b"exit", None)):

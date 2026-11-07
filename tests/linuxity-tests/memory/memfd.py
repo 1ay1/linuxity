@@ -5,7 +5,7 @@ import mmap
 import os
 import socket
 
-from lxt import check, eq, expect_errno, must, reap, spawn, test
+from lxt import ENV, check, eq, expect_errno, must, reap, spawn, test
 
 
 @test
@@ -17,8 +17,14 @@ def create_and_name():
     link = os.readlink(f"/proc/self/fd/{fd}")
     check(link.startswith("/memfd:lxt-mem") and link.endswith("(deleted)"), f"link {link!r}")
     eq(os.fstat(fd).st_nlink, 0, "nlink")
-    with open(f"/proc/self/fd/{fd}", "rb") as f:
-        eq(f.read(), b"x" * 10000, "reopen through /proc")
+    try:
+        with open(f"/proc/self/fd/{fd}", "rb") as f:
+            eq(f.read(), b"x" * 10000, "reopen through /proc")
+    except PermissionError:
+        # Android's SELinux refuses reopening a memfd; only on someone else's kernel
+        if not ENV["host_kernel"]:
+            raise
+        link += ", reopen refused by the host [host]"
     expect_errno(errno.EINVAL, "a name over 249 bytes", os.memfd_create, "n" * 250)
     c = os.memfd_create("cloexec", os.MFD_CLOEXEC)
     check(fcntl.fcntl(c, fcntl.F_GETFD) & fcntl.FD_CLOEXEC, "MFD_CLOEXEC")

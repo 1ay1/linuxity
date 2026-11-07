@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <set>
 #include <string>
 #include <string_view>
 
@@ -391,9 +392,79 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                 "devtmpfs /dev devtmpfs rw,nosuid 0 0\n"
                 "tmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n"));
         }
-        if (abs == "/proc/sys" || abs == "/proc/sys/kernel")
-            return ok(dir_file({{"kernel",true},{"osrelease",false},{"hostname",false},
-                                {"pid_max",false},{"random",true}}));
+        // /proc/sys: the knobs programs read. Machine facts are ours; the
+        // limits come from the host, since its kernel enforces them, and
+        // fall back to the kernel's defaults when the host hides them.
+        {
+            struct Knob { const char* path; const char* fallback; bool from_host; };
+            static constexpr Knob kKnobs[] = {
+                {"/proc/sys/kernel/ostype", "Linux", false},
+                {"/proc/sys/kernel/threads-max", "126000", true},
+                {"/proc/sys/kernel/ngroups_max", "65536", false},
+                {"/proc/sys/kernel/cap_last_cap", "40", true},
+                {"/proc/sys/kernel/randomize_va_space", "2", true},
+                {"/proc/sys/kernel/shmmax", "18446744073692774399", true},
+                {"/proc/sys/kernel/shmall", "18446744073692774399", true},
+                {"/proc/sys/kernel/shmmni", "4096", true},
+                {"/proc/sys/kernel/sem", "32000\t1024000000\t500\t32000", true},
+                {"/proc/sys/kernel/msgmax", "8192", true},
+                {"/proc/sys/kernel/msgmnb", "16384", true},
+                {"/proc/sys/kernel/msgmni", "32000", true},
+                {"/proc/sys/kernel/core_pattern", "core", false},
+                {"/proc/sys/kernel/yama/ptrace_scope", "1", true},
+                {"/proc/sys/fs/file-max", "9223372036854775807", true},
+                {"/proc/sys/fs/nr_open", "1048576", true},
+                {"/proc/sys/fs/pipe-max-size", "1048576", true},
+                {"/proc/sys/fs/inotify/max_user_watches", "65536", true},
+                {"/proc/sys/fs/inotify/max_user_instances", "128", true},
+                {"/proc/sys/fs/inotify/max_queued_events", "16384", true},
+                {"/proc/sys/vm/overcommit_memory", "0", true},
+                {"/proc/sys/vm/max_map_count", "65530", true},
+                {"/proc/sys/vm/swappiness", "60", true},
+                {"/proc/sys/net/core/somaxconn", "4096", true},
+                {"/proc/sys/net/ipv4/ip_local_port_range", "32768\t60999", true},
+                {"/proc/sys/net/ipv4/tcp_fin_timeout", "60", true},
+            };
+            for (const Knob& k : kKnobs) {
+                if (abs != k.path) continue;
+                std::string v;
+                if (k.from_host) {
+                    if (std::FILE* f = std::fopen(k.path, "re")) {
+                        char buf[256];
+                        const std::size_t n = std::fread(buf, 1, sizeof buf, f);
+                        std::fclose(f);
+                        v.assign(buf, n);
+                    }
+                }
+                if (v.empty()) v = std::string{k.fallback} + "\n";
+                return ok(text_file(std::move(v)));
+            }
+            auto dir_of = [&](std::string_view d) {
+                std::vector<kernel::VirtualDirent> e;
+                std::set<std::string> seen;
+                const std::string pre = std::string{d} + "/";
+                for (const Knob& k : kKnobs) {
+                    std::string_view p{k.path};
+                    if (!p.starts_with(pre)) continue;
+                    p.remove_prefix(pre.size());
+                    const std::size_t s = p.find('/');
+                    std::string name{p.substr(0, s)};
+                    if (seen.insert(name).second) e.push_back({name, s != std::string_view::npos});
+                }
+                return e;
+            };
+            for (const char* d : {"/proc/sys", "/proc/sys/kernel", "/proc/sys/fs", "/proc/sys/vm",
+                                  "/proc/sys/net", "/proc/sys/net/core", "/proc/sys/net/ipv4",
+                                  "/proc/sys/fs/inotify", "/proc/sys/kernel/yama"}) {
+                if (abs != d) continue;
+                auto e = dir_of(d);
+                if (abs == "/proc/sys/kernel")
+                    for (const char* n : {"osrelease", "hostname", "pid_max"})
+                        e.push_back({n, false});
+                if (abs == "/proc/sys/kernel") e.push_back({"random", true});
+                return ok(dir_file(std::move(e)));
+            }
+        }
         if (abs == "/proc/sys/kernel/osrelease") return ok(text_file(release + "\n"));
         if (abs == "/proc/sys/kernel/hostname")  return ok(text_file(nodename + "\n"));
         if (abs == "/proc/sys/kernel/pid_max")   return ok(text_file("32768\n"));
@@ -432,6 +503,10 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
         auto [pid, tail] = detail::split_pid(p);
         if (pid >= 0) {
             const kernel::ProcInfo* pi = procs.find(static_cast<std::int32_t>(pid));
+            std::int32_t self_tid = static_cast<std::int32_t>(pid);   // names the thread
+            // /proc/<tid> of a non-main thread is unlisted but resolves, like Linux
+            if (!pi)
+                if (const auto tg = procs.thread_group_of(self_tid)) pi = procs.find(tg);
             if (!pi) return err<kernel::VirtualFile>(Errno::enoent);
             const auto& I = *pi;
 
@@ -441,6 +516,8 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                     {"cmdline",false},{"comm",false},{"cwd",true},
                     {"exe",false},{"root",true},{"fd",true},{"maps",false},
                     {"io",false},{"oom_score",false},{"task",true},
+                    {"environ",false},{"fdinfo",true},{"mountinfo",false},
+                    {"mounts",false},{"limits",false},
                 }));
 
             // ---- /proc/<pid>/task : the thread group -------------------
@@ -467,20 +544,70 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                         {"io",false},{"children",false},
                     }));
                 // Re-target the file lookup at the thread's own file, which
-                // mirrors the process's.
+                // mirrors the process's but names the thread. Parse tid
+                // first: it views into tail.
+                self_tid = static_cast<std::int32_t>(std::atol(std::string{tid}.c_str()));
                 tail = std::string{rest.substr(slash + 1)};
             }
 
-            if (tail == "comm")   return ok(text_file(I.comm + "\n"));
+            // The host task's own /proc, for facts only the host kernel keeps.
+            const int host = procs.host_of(self_tid);
+            auto host_file = [&](const char* leaf) {
+                std::string out;
+                if (host <= 0) return out;
+                const std::string p = "/proc/" + std::to_string(host) + "/" + leaf;
+                if (std::FILE* f = std::fopen(p.c_str(), "re")) {
+                    char buf[8192];
+                    while (std::size_t n = std::fread(buf, 1, sizeof buf, f)) out.append(buf, n);
+                    std::fclose(f);
+                }
+                return out;
+            };
+            // One "Key:\tvalue" line of the host task's status, or "".
+            auto host_status = [&, cache = std::string{}](std::string_view key) mutable {
+                if (cache.empty()) cache = host_file("status");
+                std::size_t at = 0;
+                while (at < cache.size()) {
+                    const std::size_t nl = std::min(cache.find('\n', at), cache.size());
+                    std::string_view line{cache.data() + at, nl - at};
+                    if (line.starts_with(key) && line.size() > key.size() && line[key.size()] == ':')
+                        return std::string{line.substr(key.size() + 1)};
+                    at = nl + 1;
+                }
+                return std::string{};
+            };
+            // The host task's stat fields after "(comm)", 0-based from state.
+            auto host_stat = [&]() {
+                std::vector<std::string> f;
+                const std::string s = host_file("stat");
+                const std::size_t rp = s.rfind(')');
+                if (rp == std::string::npos) return f;
+                std::size_t at = rp + 2;
+                while (at < s.size()) {
+                    const std::size_t sp = std::min(s.find(' ', at), s.size());
+                    f.emplace_back(s.substr(at, sp - at));
+                    at = sp + 1;
+                }
+                return f;
+            };
+
+            const std::string& comm = kernel::ProcessTable::comm_of(I, self_tid);
+            if (tail == "comm")   return ok(text_file(comm + "\n"));
             if (tail == "cmdline") {
                 std::string cl = I.cmdline; cl.push_back('\0');  // NUL-terminated
                 return ok(text_file(std::move(cl)));
             }
             if (tail == "stat") {
-                // The single-line /proc/<pid>/stat (fields per proc(5)).
+                // The single-line /proc/<pid>/stat (fields per proc(5)). Ids
+                // and names are ours; times and memory are the task's own.
+                const auto hs = host_stat();
+                auto hf = [&](std::size_t i, const char* dflt) {
+                    // proc(5) numbers from 1 (pid); hs[0] is field 3 (state)
+                    return i - 3 < hs.size() ? hs[i - 3] : std::string{dflt};
+                };
                 std::string s;
-                s += std::to_string(I.pid);
-                s += " (" + I.comm + ") ";
+                s += std::to_string(self_tid);
+                s += " (" + comm + ") ";
                 s += I.state; s += ' ';
                 s += std::to_string(I.ppid) + " ";      // ppid
                 // From the process table, not the pid: answering pid made
@@ -488,24 +615,30 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                 s += std::to_string(procs.pgid_of(I.pid)) + " ";  // pgrp
                 s += std::to_string(procs.sid_of(I.pid)) + " ";   // session
                 s += "0 -1 ";                           // tty_nr, tpgid
-                s += "4194304 ";                        // flags
-                s += "0 0 0 0 ";                        // minflt cminflt majflt cmajflt
-                // utime/stime advance with virtual uptime so a monitor shows a
-                // live per-process CPU% and a growing TIME+ column. A small
-                // fraction of elapsed jiffies is attributed to this task.
-                {
-                    long up_j = static_cast<long>(mach.uptime_seconds() * 100);
-                    long ut = up_j / 20, st = up_j / 40;   // ~5% user, ~2.5% sys
-                    s += std::to_string(ut) + " " + std::to_string(st) + " 0 0 ";
-                }
-                s += "20 0 ";                           // priority nice
+                s += hf(9, "4194304") + " ";            // flags
+                for (std::size_t i = 10; i <= 17; ++i)   // faults, utime stime cutime cstime
+                    s += hf(i, "0") + " ";
+                s += std::to_string(20 + I.nice) + " " + std::to_string(I.nice) + " ";  // priority nice
                 s += std::to_string(1 + I.threads.size()) + " 0 ";  // num_threads itrealvalue
-                s += "100 ";                            // starttime (jiffies)
-                s += std::to_string(I.vsize_bytes) + " ";           // vsize
-                s += std::to_string(I.rss_pages) + " ";             // rss (pages)
-                s += "18446744073709551615 ";           // rsslim
-                s += "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n";  // rest, zeroed
+                s += hf(22, "100") + " ";               // starttime
+                s += hf(23, std::to_string(I.vsize_bytes).c_str()) + " ";
+                s += hf(24, std::to_string(I.rss_pages).c_str()) + " ";
+                s += hf(25, "18446744073709551615");
+                for (std::size_t i = 26; i <= 52; ++i)  // the rest, as the task has them
+                    s += " " + hf(i, "0");
+                s += "\n";
                 return ok(text_file(std::move(s)));
+            }
+            if (tail == "environ") {
+                // The task's real initial environment, as the kernel keeps it.
+                std::string env = host_file("environ");
+                return ok(text_file(std::move(env)));
+            }
+            if (tail == "limits") {
+                // the task's real rlimits; the host enforces them
+                std::string l = host_file("limits");
+                if (l.empty()) return err<kernel::VirtualFile>(Errno::enoent);
+                return ok(text_file(std::move(l)));
             }
             if (tail == "statm") {
                 std::uint64_t sz = I.vsize_bytes / 4096;
@@ -517,7 +650,7 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
             }
             if (tail == "status") {
                 std::string s;
-                s += "Name:\t" + I.comm + "\n";
+                s += "Name:\t" + comm + "\n";
                 s += "State:\t"; s += I.state;
                 switch (I.state) {
                     case 'R': s += " (running)\n"; break;
@@ -527,12 +660,63 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                     default:  s += " (sleeping)\n"; break;
                 }
                 s += "Tgid:\t" + std::to_string(I.pid) + "\n";
-                s += "Pid:\t" + std::to_string(I.pid) + "\n";
+                s += "Pid:\t" + std::to_string(self_tid) + "\n";
                 s += "PPid:\t" + std::to_string(I.ppid) + "\n";
-                s += "Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\n";
+                s += "TracerPid:\t0\n";
+                auto ids = [](const std::array<std::uint32_t, 4>& v) {
+                    return std::to_string(v[0]) + "\t" + std::to_string(v[1]) + "\t" +
+                           std::to_string(v[2]) + "\t" + std::to_string(v[3]) + "\n";
+                };
+                s += "Uid:\t" + ids(I.uids);
+                s += "Gid:\t" + ids(I.gids);
+                s += "FDSize:\t" + (host_status("FDSize").empty() ? std::string{"\t64"} : host_status("FDSize")) + "\n";
+                s += "Groups:\t";
+                {
+                    const auto g = procs.groups_of(I.pid);
+                    for (std::size_t i = 0; i < g.size(); ++i)
+                        s += std::to_string(g[i]) + " ";
+                }
+                s += "\n";
+                s += "NStgid:\t" + std::to_string(I.pid) + "\n";
+                s += "NSpid:\t" + std::to_string(self_tid) + "\n";
+                s += "NSpgid:\t" + std::to_string(procs.pgid_of(I.pid)) + "\n";
+                s += "NSsid:\t" + std::to_string(procs.sid_of(I.pid)) + "\n";
+                // memory, as the task really uses it
+                for (const char* k : {"VmPeak", "VmSize", "VmLck", "VmPin", "VmHWM", "VmRSS",
+                                      "RssAnon", "RssFile", "RssShmem", "VmData", "VmStk",
+                                      "VmExe", "VmLib", "VmPTE", "VmSwap"}) {
+                    std::string v = host_status(k);
+                    if (v.empty()) {
+                        if (std::string_view{k} == "VmSize") v = "\t" + std::to_string(I.vsize_bytes / 1024) + " kB";
+                        else if (std::string_view{k} == "VmRSS") v = "\t" + std::to_string(I.rss_pages * 4) + " kB";
+                        else continue;
+                    }
+                    s += std::string{k} + ":" + v + "\n";
+                }
                 s += "Threads:\t" + std::to_string(1 + I.threads.size()) + "\n";
-                s += "VmSize:\t" + std::to_string(I.vsize_bytes/1024) + " kB\n";
-                s += "VmRSS:\t"  + std::to_string(I.rss_pages*4) + " kB\n";
+                // signal state, which only the kernel holds
+                for (const char* k : {"SigQ", "SigPnd", "ShdPnd", "SigBlk", "SigIgn", "SigCgt"}) {
+                    std::string v = host_status(k);
+                    s += std::string{k} + ":" + (v.empty() ? std::string{"\t0000000000000000"} : v) + "\n";
+                }
+                char caps[160];
+                std::snprintf(caps, sizeof caps,
+                              "CapInh:\t%016llx\nCapPrm:\t%016llx\nCapEff:\t%016llx\n"
+                              "CapBnd:\t%016llx\nCapAmb:\t%016llx\n",
+                              static_cast<unsigned long long>(I.cap_inh),
+                              static_cast<unsigned long long>(I.cap_prm),
+                              static_cast<unsigned long long>(I.cap_eff),
+                              static_cast<unsigned long long>(I.cap_bnd),
+                              static_cast<unsigned long long>(I.cap_amb));
+                s += caps;
+                s += std::string{"NoNewPrivs:\t"} + (I.no_new_privs ? "1" : "0") + "\n";
+                s += "Seccomp:\t0\nSeccomp_filters:\t0\n";
+                for (const char* k : {"Cpus_allowed", "Cpus_allowed_list", "Mems_allowed",
+                                      "Mems_allowed_list", "voluntary_ctxt_switches",
+                                      "nonvoluntary_ctxt_switches"}) {
+                    std::string v = host_status(k);
+                    if (!v.empty()) s += std::string{k} + ":" + v + "\n";
+                }
                 return ok(text_file(std::move(s)));
             }
             if (tail == "io")

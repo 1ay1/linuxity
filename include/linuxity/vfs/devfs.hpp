@@ -56,16 +56,15 @@ namespace lx::vfs {
         static constexpr std::array<std::string_view, 7> kChar = {
             "null", "zero", "full", "random", "urandom", "tty", "ptmx",
         };
-        // The pseudo-symlinks a POSIX /dev provides, pointing into /proc.
-        // stdin/stdout/stderr must work when OPENED (a shell's `> /dev/stdout`
-        // does open(2), not readlink), so they REDIRECT straight to the real
-        // host fd path rather than presenting as symlinks. /dev/fd is a
-        // directory link, kept as a symlink.
+        // The pseudo-symlinks a POSIX /dev provides, pointing into /proc. All
+        // four are real symlinks (lstat says S_IFLNK, readlink gives the
+        // /proc path); opening one follows the link to the guest's own fd,
+        // which /proc/self/fd/N resolves to the task's real descriptor.
         struct Node { std::string_view name, target; bool is_link; };
         static constexpr std::array<Node, 4> kLinks = {{
-            {"stdin",  "/proc/self/fd/0", false},
-            {"stdout", "/proc/self/fd/1", false},
-            {"stderr", "/proc/self/fd/2", false},
+            {"stdin",  "/proc/self/fd/0", true},
+            {"stdout", "/proc/self/fd/1", true},
+            {"stderr", "/proc/self/fd/2", true},
             {"fd",     "/proc/self/fd",   true},
         }};
 
@@ -102,13 +101,13 @@ namespace lx::vfs {
         //
         // Resolve it to the slave the guest actually claimed, because the
         // host's /dev/tty is a DIFFERENT terminal (linuxity's) or none at
-        // all. With no ctty the kernel's answer is ENXIO, and that is what a
-        // daemon after setsid expects to see.
+        // all. With no ctty the node still exists (char 5,0) and only an
+        // open fails, with ENXIO. The host's own /dev/tty gives exactly that:
+        // stat works, and opening it fails for a task with no terminal.
         if (leaf == "tty" && ctty) {
             const int n = ctty();
-            if (n < 0) return err<kernel::VirtualFile>(Errno::enxio);
             kernel::VirtualFile vf;
-            vf.redirect_host = pty_slave_path(n);
+            vf.redirect_host = n < 0 ? std::string{"/dev/tty"} : pty_slave_path(n);
             return ok(std::move(vf));
         }
 

@@ -186,6 +186,20 @@ int main(void) {
         const long slen = (long)sizeof sa;
         const long b = (s < 0) ? s : LX_SYS3(SYS_bind, s, sa, slen);
         lx_emit("bind", b, "bind it to a path in our own tree");
+        // the kernel reads the sockaddr, never writes it
+        lx_emit("bind", memcmp(sa + 2, SOK, sizeof SOK) == 0 ? 1 : 0,
+                "bind leaves the caller's sockaddr as it was");
+        {
+            static unsigned char got[110];
+            static unsigned int glen;
+            memset(got, 0, sizeof got);
+            glen = sizeof got;
+            const long g = (b == 0) ? LX_SYS3(SYS_getsockname, s, got, &glen) : -1;
+            lx_emit("getsockname",
+                    LX_CHECK(b == 0, g == 0 && glen == 2 + sizeof SOK &&
+                                     memcmp(got + 2, SOK, sizeof SOK) == 0),
+                    "getsockname gives back the path that was bound");
+        }
         const long l = (b == 0) ? LX_SYS2(SYS_listen, s, 1) : -1;
         lx_emit("bind", LX_CHECK(b == 0, l == 0), "listen on it");
 
@@ -198,6 +212,16 @@ int main(void) {
                       : LX_SYS3(SYS_connect, c, sa, slen);
         lx_emit("connect", LX_CHECK(b == 0 && c >= 0, cc == 0),
                 "connect to it from a second socket");
+        {
+            static unsigned char got[110];
+            static unsigned int glen;
+            memset(got, 0, sizeof got);
+            glen = sizeof got;
+            const long g = (cc == 0) ? LX_SYS3(SYS_getpeername, c, got, &glen) : -1;
+            lx_emit("getpeername",
+                    LX_CHECK(cc == 0, g == 0 && memcmp(got + 2, SOK, sizeof SOK) == 0),
+                    "the client's peer is the bound path");
+        }
         if (c >= 0) LX_SYS1(SYS_close, c);
         if (s >= 0) LX_SYS1(SYS_close, s);
         LX_SYS3(SYS_unlinkat, AT_FDCWD, SOK, 0);

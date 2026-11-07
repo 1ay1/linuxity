@@ -257,14 +257,19 @@ private:
                                            const Trace& t) const {
         if (t.steps.empty()) return "golden has no steps";
 
-        // NOT CHECKED: whether every step names a syscall this ABI has.
-        // A step LABEL names the contract under test, not the syscall the
-        // probe issued -- fdops labels a step "dup2" on aarch64, which has
-        // no dup2, because dup2-onto-the-same-fd must succeed where dup3
-        // gives EINVAL. Judging labels by arch_has rejected 7 of 19
-        // freshly-recorded aarch64 goldens. The arch in the PATH is the real
-        // guard against a cross-arch recording.
-        //
+        // A recording from the other ABI. A step's label names the contract
+        // under test, and a scenario may test a contract this ABI reaches by
+        // another syscall: fdops labels a step "dup2" on aarch64 on purpose,
+        // and lists dup2 in its expects. So a label this ABI lacks is fine
+        // when the scenario declares it -- and is an x86-64 recording when
+        // it doesn't ("open" in a dirseek golden on aarch64).
+        for (const Observation& o : t.steps) {
+            if (arch_has(paths_.arch, o.call)) continue;
+            bool declared = false;
+            for (const abi::Sysno want : s.expects) declared = declared || want == o.call;
+            if (!declared) return "golden names a syscall this ABI does not have";
+        }
+
         // `expects`, below, IS a list of syscalls the probe must issue, so
         // arch_has is the right question there -- but only for the ones this
         // ABI has. legacy exists to pin the x86-64-only path (open, stat,

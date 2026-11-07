@@ -394,13 +394,15 @@ private:
 class HostPolicyMayDeny {
 public:
     [[nodiscard]] static constexpr bool filtered(abi::Sysno c) noexcept {
-        // connect rides along with bind, and newfstatat with link: if the
-        // host refused the bind there is nothing to connect TO, and if it
+        // connect, getsockname and getpeername ride along with bind, and
+        // newfstatat with link: if the host refused the bind there is nothing
+        // to connect TO or name, and if it
         // refused the link there is nothing to stat -- so the probe marks
         // the follow-up not applicable while the guest, whose call
         // succeeded, answers it. Clause (b) below pairs the two up.
         return c == abi::Sysno::ioctl || c == abi::Sysno::bind ||
-               c == abi::Sysno::connect || c == abi::Sysno::link ||
+               c == abi::Sysno::connect || c == abi::Sysno::getsockname ||
+               c == abi::Sysno::getpeername || c == abi::Sysno::link ||
                c == abi::Sysno::linkat || c == abi::Sysno::newfstatat ||
                c == abi::Sysno::mknod || c == abi::Sysno::mknodat;
     }

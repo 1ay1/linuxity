@@ -146,7 +146,10 @@ inline constexpr int kTrappedX86_64[] = {
     200,                         // tkill                 (guest tid in)
     234,                         // tgkill                (guest tid in)
     434,                         // pidfd_open            (guest pid in)
+    129,                         // rt_sigqueueinfo       (guest pid in, siginfo ids)
     55,                          // getsockopt            (SO_PEERCRED pid out)
+    51, 52,                      // getsockname/getpeername (AF_UNIX names in guest spelling)
+    46, 47,                      // sendmsg/recvmsg       (SCM_CREDENTIALS ids, both ways)
     63,                          // uname
     99,                          // sysinfo
     204,                         // sched_getaffinity
@@ -277,9 +280,10 @@ inline constexpr int kTrappedX86_64[] = {
     // must stay inspectable. We no-op PR_SET_DUMPABLE and forward every other
     // prctl unchanged.
     157,                         // prctl
-    // -- privilege drops (vacuous in a root-owned world) -------------------
+    // -- credentials (tracked per process, see abi/creds.hpp) --------------
     105, 106, 114, 113, 117, 119, 122, 123, 116,
     // setuid/setgid/setregid/setreuid/setresuid/setresgid/setfsuid/setfsgid/setgroups
+    125, 126,                    // capget/capset
     // -- landlock (accepted no-op; the namespace already confines) ---------
     444, 445, 446,               // landlock_create_ruleset/add_rule/restrict_self
     // -- mount ops we own --------------------------------------------------

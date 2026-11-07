@@ -377,6 +377,14 @@ public:
         return cur.empty() ? std::string{"/"} : cur;
     }
 
+    // The guest path `abs` names once a final symlink chain is followed
+    // (itself if it isn't a link). For keying per-file state on the file,
+    // not on one of the names that point at it.
+    [[nodiscard]] std::string resolve_links(const std::string& abs) const {
+        std::string t = physical_if_symlink(abs);
+        return t.empty() ? abs : t;
+    }
+
     // If guest path `abs` is a symlink, the guest path it finally resolves
     // to; otherwise "". Targets are guest paths (an absolute rootfs link
     // means the guest's root), so this is walked here, not by the host.
@@ -455,7 +463,29 @@ public:
         if (!m) return PathClass{Realm2::absent, {}, Errno::enoent, {}};
         if (m->producer) {
             auto vf = m->producer(abs);
-            if (!vf) return PathClass{Realm2::absent, {}, vf.error(), {}};
+            if (!vf) {
+                // As the kernel's walk: if an existing ancestor is not a
+                // directory, the answer is ENOTDIR, not ENOENT.
+                Errno e = vf.error();
+                if (e == Errno::enoent && depth == 0) {
+                    std::string_view up = abs;
+                    while (up.size() > m->prefix.size()) {
+                        const std::size_t cut = up.rfind('/');
+                        if (cut == std::string_view::npos || cut == 0) break;
+                        up = up.substr(0, cut);
+                        const PathClass pc = classify_impl(up, false, true, wi, depth + 1);
+                        if (pc.realm == Realm2::absent) continue;
+                        bool dir = false;
+                        if (pc.realm == Realm2::host_backed)
+                            dir = is_dir(pc.host_path.c_str());
+                        else if (auto pv = m->producer(up))
+                            dir = pv->is_dir;
+                        if (!dir) e = Errno::enotdir;
+                        break;
+                    }
+                }
+                return PathClass{Realm2::absent, {}, e, {}};
+            }
             // A device node backed by a real host device (/dev/null, ...):
             // resolve to the host path so open/read/write/mmap ride the true
             // character device with native semantics.

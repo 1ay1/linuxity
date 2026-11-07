@@ -84,6 +84,9 @@ public:
         Regs regs{};
         // run at the exit stop of a redirect that didn't wait for it
         std::function<void(std::int64_t)> on_exit{};
+        // the call is being forwarded as the guest issued it (so the normal
+        // exit translations apply even with an on_exit hook)
+        bool forwarded{false};
     };
 
     [[nodiscard]] Status start(UAddr, UAddr) {
@@ -309,10 +312,16 @@ public:
                 // That resolved relative paths against "/": gcc under
                 // `make -j` hit "can't create s4.o: Permission denied" because
                 // it was trying to create /s4.o.
-                if (np && event != PTRACE_EVENT_CLONE) {
+                // A CLONE event is a thread only if the child shares the
+                // creator's thread group; clone3() for a plain fork (what
+                // glibc's posix_spawn and subprocess use) reports CLONE too.
+                const bool is_thread = np && event == PTRACE_EVENT_CLONE &&
+                                       tgid_of(child) == host_tgid_of(w);
+                if (np && !is_thread) {
                     std::int32_t gpid = gpid_of(child);
                     std::int32_t gppid = gpid_of(host_tgid_of(w));   // a thread's child belongs to its process
                     gppid_[gpid] = gppid;
+                    tgid_cache_[child] = child;
                     proc_events_.push_back({ProcEvent::spawn, gpid, gppid, {}, {}});
                 } else if (np) {
                     note_thread(w, child);
@@ -583,6 +592,12 @@ public:
             }
             return;
         }
+        // sendmsg with SCM_CREDENTIALS names the sender in guest terms; the
+        // host kernel checks it against host ids, so restate it in those.
+        if (sc == abi::Sysno::sendmsg) {
+            rewrite_scm_creds(w, rr.arg(1), t);
+            return;
+        }
         // Calls whose pid (0 = self) names a task: map a guest pid to its host
         // task, so sched_setaffinity(pid) pins OUR child, not a host stranger.
         if (const int at = pid_arg_of(sc); at >= 0) {
@@ -599,6 +614,8 @@ public:
                     const ::pid_t h2 = g2 > 0 ? host_tid_of(g2) : -1;
                     if (g2 > 0) wr.set_arg(1, static_cast<std::uint64_t>(h2 > 0 ? h2 : 0x7fffffff));
                 }
+                // the siginfo the guest built names the sender by guest ids
+                if (sc == abi::Sysno::rt_sigqueueinfo) fix_queued_siginfo(w, rr.arg(2), t);
                 (void)wr.store(w);
                 t.regs = wr;
                 rr = wr;
@@ -617,19 +634,17 @@ public:
                     rr = wr;
                 }
             } else if (gpid < -1) {
-                // wait4(-pgid): "any member of process group pgid". This used
-                // to pass through, handing the host a GUEST pgid -- the host
-                // found no such group and answered ECHILD, so a shell waiting
-                // on a job never reaped it (fish's `help` left its pager
-                // stuck). Groups are not modelled here (see the kill note
-                // below), and kill approximates a group with the guest
-                // process TREE; do the same and wait on the leader's host
-                // tid, which is the member a shell is waiting for. pid 0 and
-                // -1 are genuinely group-free and still pass through.
+                // wait4(-pgid): any member of that group. When setpgid was
+                // mirrored onto the host, the group's host id is its
+                // leader's host pid and this is a real group wait. Where the
+                // host refused the mirror, waiting on the leader is the best
+                // a shell gets (fish's `help` pager hung on ECHILD before).
                 const ::pid_t host = host_tid_of(-gpid);
                 if (host > 0) {
+                    const bool real = host_groups_.count(-gpid) != 0;
                     Regs wr = rr;
-                    wr.set_arg(0, static_cast<std::uint64_t>(host));
+                    wr.set_arg(0, real ? static_cast<std::uint64_t>(-static_cast<std::int64_t>(host))
+                                       : static_cast<std::uint64_t>(host));
                     (void)wr.store(w);
                     t.regs = wr;
                     rr = wr;
@@ -764,8 +779,59 @@ public:
                r.arg(1) == 1 /*SOL_SOCKET*/ && r.arg(2) == 17 /*SO_PEERCRED*/ &&
                r.arg(3) != 0;
     }
-    [[nodiscard]] static bool needs_out_fixup(const Regs& r) {
-        return is_getlk(r) || is_peercred(r);
+    [[nodiscard]] bool needs_out_fixup(const Regs& r, ::pid_t w = -1) const {
+        return is_getlk(r) || is_peercred(r) || is_recv_creds(r, w);
+    }
+    // `w` is the task the registers belong to; at an exit stop that is not
+    // necessarily cur_ any more.
+    [[nodiscard]] bool is_recv_creds(const Regs& r, ::pid_t w = -1) const {
+        if (abi::decode(kTraceeArch, r.nr()) != abi::Sysno::recvmsg || r.arg(1) == 0) return false;
+        errno = 0;
+        const long ctllen = ::ptrace(PTRACE_PEEKDATA, w > 0 ? w : cur_,
+                                     reinterpret_cast<void*>(r.arg(1) + 40), 0);
+        return errno == 0 && ctllen >= 28;
+    }
+
+    // recvmsg: SCM_CREDENTIALS from a peer in the tree comes back as the
+    // host's {pid, uid, gid}; restate it as the guest sees that process.
+    void translate_recv_creds(::pid_t w, const Regs& r) {
+        if (static_cast<long long>(r.ret()) < 0) return;
+        auto peek = [&](std::uint64_t a, std::uint64_t& out) {
+            errno = 0;
+            const long v = ::ptrace(PTRACE_PEEKDATA, w, reinterpret_cast<void*>(a), 0);
+            if (errno) return false;
+            out = static_cast<std::uint64_t>(v);
+            return true;
+        };
+        const std::uint64_t msg = r.arg(1);
+        std::uint64_t ctl = 0, ctllen = 0;
+        if (!peek(msg + 32, ctl) || !peek(msg + 40, ctllen) || !ctl) return;
+        std::uint64_t off = 0;
+        while (off + 16 <= ctllen) {
+            std::uint64_t len = 0, lt = 0;
+            if (!peek(ctl + off, len) || !peek(ctl + off + 8, lt) || len < 16) return;
+            const auto level = static_cast<std::uint32_t>(lt), type = static_cast<std::uint32_t>(lt >> 32);
+            if (level == 1 && type == 2 && len >= 28) {
+                const std::uint64_t at = ctl + off + 16;
+                std::uint64_t w0 = 0, w1 = 0;
+                if (!peek(at, w0) || !peek(at + 8, w1)) return;
+                const auto hp = static_cast<::pid_t>(static_cast<std::uint32_t>(w0));
+                const std::int32_t g = known_gpid_of(hp);
+                if (g <= 0) return;
+                const auto ids = guest_ids_of_ ? guest_ids_of_(g) : std::pair<std::uint32_t, std::uint32_t>{0, 0};
+                const std::uint64_t n0 = static_cast<std::uint32_t>(g) | (static_cast<std::uint64_t>(ids.first) << 32);
+                const std::uint64_t n1 = (w1 & ~0xffffffffull) | ids.second;
+                ::ptrace(PTRACE_POKEDATA, w, reinterpret_cast<void*>(at), reinterpret_cast<void*>(n0));
+                ::ptrace(PTRACE_POKEDATA, w, reinterpret_cast<void*>(at + 8), reinterpret_cast<void*>(n1));
+            }
+            off += (len + 7) & ~std::uint64_t{7};
+        }
+    }
+
+    // The guest {uid, gid} of a guest pid, for restating credentials the
+    // host passes along (SCM_CREDENTIALS, SO_PEERCRED).
+    void set_guest_ids(std::function<std::pair<std::uint32_t, std::uint32_t>(std::int32_t)> f) {
+        guest_ids_of_ = std::move(f);
     }
 
     // struct ucred {pid, uid, gid}. A peer in the guest tree is a guest
@@ -780,9 +846,10 @@ public:
         const auto host = static_cast<std::int32_t>(static_cast<std::uint32_t>(w0));
         const std::int32_t g = host > 0 ? known_gpid_of(host) : 0;
         if (g <= 0) return;   // not ours: leave the host's answer alone
-        // pid in the low half, uid=0 in the high half; gid=0 low half of w1
-        const auto n0 = static_cast<std::uint64_t>(static_cast<std::uint32_t>(g));
-        const auto n1 = static_cast<std::uint64_t>(w1) & ~0xffffffffull;
+        const auto ids = guest_ids_of_ ? guest_ids_of_(g) : std::pair<std::uint32_t, std::uint32_t>{0, 0};
+        const auto n0 = static_cast<std::uint64_t>(static_cast<std::uint32_t>(g)) |
+                        (static_cast<std::uint64_t>(ids.first) << 32);
+        const auto n1 = (static_cast<std::uint64_t>(w1) & ~0xffffffffull) | ids.second;
         ::ptrace(PTRACE_POKEDATA, w, reinterpret_cast<void*>(at), reinterpret_cast<void*>(n0));
         ::ptrace(PTRACE_POKEDATA, w, reinterpret_cast<void*>(at + 8), reinterpret_cast<void*>(n1));
     }
@@ -813,11 +880,12 @@ public:
         // it as fork-ret != child-getpid) and the two drive modes diverged
         // (run_seccomp, 15 vs 0). The exit stop is where that translation
         // happens, so skipping it is only safe per-syscall.
-        if (seccomp_ && !owes_exit_stop(t.regs.nr()) && !needs_out_fixup(t.regs)) {
+        if (seccomp_ && !owes_exit_stop(t.regs.nr()) && !needs_out_fixup(t.regs) && !t.on_exit) {
             t.in_call = false;
             resume_run(cur_, 0);
             return ok(std::int64_t{0});
         }
+        t.forwarded = true;
         ::ptrace(PTRACE_SYSCALL, cur_, 0, 0);   // run the real syscall to exit
         return ok(std::int64_t{0});
     }
@@ -1040,14 +1108,38 @@ public:
     [[nodiscard]] Status rewrite_sockaddr(UAddr path_addr,
                                           const std::string& host_path,
                                           int len_arg,
-                                          std::uint64_t new_len) {
+                                          std::uint64_t new_len,
+                                          std::function<void(std::int64_t)> on_done = {}) {
         Task& t = tasks_[cur_];
         Regs r = t.regs;
+        // Save the guest's own sockaddr bytes: the kernel reads ours but
+        // never writes the buffer back, so without a restore the guest's
+        // struct would hold the translated host path afterwards.
+        const std::size_t span = std::max<std::size_t>(host_path.size() + 1, 108);
+        std::vector<std::byte> saved(span);
+        const bool have_saved = static_cast<bool>(copy_in(path_addr, saved));
+        const std::uint64_t old_len = reg_arg(r, len_arg);
         if (!poke_path(value(path_addr), host_path))
             return err(Errno::efault);
         set_arg(r, len_arg, new_len);
         (void)r.store(cur_);
         t.action = Action::none;
+        t.on_exit = [this, w = cur_, path_addr, saved = std::move(saved), have_saved, len_arg,
+                     old_len, fn = std::move(on_done)](std::int64_t ret) {
+            if (have_saved) {
+                const pid_t keep = cur_;
+                cur_ = w;
+                (void)poke_bytes(value(path_addr),
+                                 std::string(reinterpret_cast<const char*>(saved.data()), saved.size() - 1));
+                cur_ = keep;
+            }
+            // a restarted call has to see the guest's socklen again
+            if (ret <= -512 && ret >= -516) {
+                Regs now{};
+                if (Regs::fetch(w, now)) { now.set_arg(len_arg, old_len); (void)now.store(w); }
+            }
+            if (fn) fn(ret);
+        };
         ::ptrace(PTRACE_SYSCALL, cur_, 0, 0);   // run the real bind/connect
         return ok();
     }
@@ -1400,7 +1492,18 @@ public:
         const std::int32_t pid = gpid_of(host_tgid);
         const std::int32_t tid = gpid_of(cur_);
         std::int32_t ppid = 0;
-        if (auto it = gppid_.find(pid); it != gppid_.end()) ppid = it->second;
+        if (auto it = gppid_.find(pid); it != gppid_.end()) {
+            ppid = it->second;
+        } else if (pid != 1) {
+            // The child's attach stop can win the race with the parent's
+            // fork event, so its first syscall arrives with no parent link.
+            // The host knows the parent; take it from there.
+            const ::pid_t hp = status_field(host_tgid, "PPid:");
+            if (const std::int32_t gp = hp > 0 ? known_gpid_of(hp) : 0; gp > 0) {
+                gppid_[pid] = gp;
+                ppid = gp;
+            }
+        }
         return TaskIds{pid, tid, ppid};
     }
 
@@ -1586,6 +1689,137 @@ public:
         proc_events_.push_back({ProcEvent::cont, gpid_of(tg), 0, {}, {}});
     }
 
+    // Run the trapped setpgid(pid, pgid) on the host with both ids made
+    // host ids, then give the guest `ret`. Records whether the group now
+    // exists for real, which decides how wait4(-pgid) is served.
+    [[nodiscard]] Result<std::int64_t> mirror_setpgid(std::int32_t gpid, std::int32_t gpgid,
+                                                      std::int64_t ret) {
+        const ::pid_t hp = gpid == 0 ? 0 : host_tid_of(gpid);
+        const ::pid_t hg = gpgid == 0 ? 0 : host_tid_of(gpgid);
+        if (hp < 0 || hg < 0) return forward_sync_then_set(ret);
+        Task& t = tasks_[cur_];
+        Regs r = t.regs;
+        r.set_arg(0, static_cast<std::uint64_t>(hp));
+        r.set_arg(1, static_cast<std::uint64_t>(hg));
+        (void)r.store(cur_);
+        t.regs = r;
+        const std::int32_t group = gpgid ? gpgid : (gpid ? gpid : gpid_of(host_tgid_of(cur_)));
+        return forward_sync([this, ret, group](std::int64_t host) {
+            if (host == 0) host_groups_.insert(group);
+            set_ret_now(ret);
+        });
+    }
+
+    // Run the trapped TIOCSPGRP on the host with the group as a host id, so
+    // the real tty sends ^C/^Z/SIGTTIN to the right job. The guest's pid_t
+    // is put back afterwards.
+    [[nodiscard]] Result<std::int64_t> mirror_tcsetpgrp(std::uint64_t argp, std::int32_t gpgid,
+                                                        std::int64_t ret) {
+        const ::pid_t hg = host_tid_of(gpgid);
+        if (hg <= 0 || !argp) return forward_sync_then_set(ret);
+        std::array<std::byte, 4> saved{};
+        if (!copy_in(uaddr(argp), saved)) return forward_sync_then_set(ret);
+        std::array<std::byte, 4> hb{};
+        std::memcpy(hb.data(), &hg, 4);
+        if (!copy_out(uaddr(argp), hb)) return forward_sync_then_set(ret);
+        return forward_sync([this, ret, argp, saved](std::int64_t) {
+            (void)copy_out(uaddr(argp), saved);
+            set_ret_now(ret);
+        });
+    }
+
+    // Walk sendmsg's control buffer for SCM_CREDENTIALS and replace the
+    // guest's {pid, uid, gid} with the host task's, remembering the guest
+    // bytes so they can be put back after the call. Root in the guest may
+    // name any of its own processes; anything else is left for the kernel
+    // to refuse.
+    void rewrite_scm_creds(::pid_t w, std::uint64_t msg, Task& t) {
+        auto peek = [&](std::uint64_t a, std::uint64_t& out) {
+            errno = 0;
+            const long v = ::ptrace(PTRACE_PEEKDATA, w, reinterpret_cast<void*>(a), 0);
+            if (errno) return false;
+            out = static_cast<std::uint64_t>(v);
+            return true;
+        };
+        std::uint64_t ctl = 0, ctllen = 0;
+        if (!msg || !peek(msg + 32, ctl) || !peek(msg + 40, ctllen) || !ctl) return;
+        std::uint64_t off = 0;
+        while (off + 16 <= ctllen) {
+            std::uint64_t len = 0, lt = 0;
+            if (!peek(ctl + off, len) || !peek(ctl + off + 8, lt) || len < 16) return;
+            const auto level = static_cast<std::uint32_t>(lt), type = static_cast<std::uint32_t>(lt >> 32);
+            if (level == 1 /*SOL_SOCKET*/ && type == 2 /*SCM_CREDENTIALS*/ && len >= 28) {
+                std::uint64_t w0 = 0, w1 = 0;
+                const std::uint64_t at = ctl + off + 16;
+                if (!peek(at, w0) || !peek(at + 8, w1)) return;
+                const auto gp = static_cast<std::int32_t>(static_cast<std::uint32_t>(w0));
+                const ::pid_t hp = host_tgid_of(host_tid_of(gp) > 0 ? host_tid_of(gp) : w);
+                const auto hu = static_cast<std::uint64_t>(::getuid());
+                const auto hg = static_cast<std::uint64_t>(::getgid());
+                const std::uint64_t n0 = static_cast<std::uint32_t>(hp) | (hu << 32);
+                const std::uint64_t n1 = (w1 & ~0xffffffffull) | hg;
+                ::ptrace(PTRACE_POKEDATA, w, reinterpret_cast<void*>(at), reinterpret_cast<void*>(n0));
+                ::ptrace(PTRACE_POKEDATA, w, reinterpret_cast<void*>(at + 8), reinterpret_cast<void*>(n1));
+                t.on_exit = [w, at, w0, w1](std::int64_t) {
+                    ::ptrace(PTRACE_POKEDATA, w, reinterpret_cast<void*>(at), reinterpret_cast<void*>(w0));
+                    ::ptrace(PTRACE_POKEDATA, w, reinterpret_cast<void*>(at + 8), reinterpret_cast<void*>(w1));
+                };
+                return;
+            }
+            off += (len + 7) & ~std::uint64_t{7};
+        }
+    }
+
+    // sigqueue fills siginfo with SI_QUEUE and si_pid/si_uid = the guest's
+    // getpid/getuid. The host refuses a queued signal whose si_pid isn't the
+    // caller's own (EPERM), so restate them as the host's for the call and
+    // put the guest's back after; the receiver's copy is translated on
+    // delivery like any other sender.
+    void fix_queued_siginfo(::pid_t w, std::uint64_t info, Task& t) {
+        if (!info) return;
+        errno = 0;
+        const long word = ::ptrace(PTRACE_PEEKDATA, w, reinterpret_cast<void*>(info + 16), 0);
+        if (errno) return;
+        const auto hp = static_cast<std::uint32_t>(host_tgid_of(w));
+        const auto hu = static_cast<std::uint32_t>(::getuid());
+        const auto nw = static_cast<std::uint64_t>(hp) | (static_cast<std::uint64_t>(hu) << 32);
+        ::ptrace(PTRACE_POKEDATA, w, reinterpret_cast<void*>(info + 16), reinterpret_cast<void*>(nw));
+        t.on_exit = [w, info, word](std::int64_t) {
+            ::ptrace(PTRACE_POKEDATA, w, reinterpret_cast<void*>(info + 16), reinterpret_cast<void*>(word));
+        };
+    }
+
+    // clone/clone3 with CLONE_PARENT_SETTID store the child's tid in the
+    // parent's memory, and that's what glibc keeps as the thread's tid
+    // (pthread_kill, pthread_getattr_np use it). It is the host tid; make it
+    // the guest's. CLONE_CHILD_SETTID's copy lives in the child, which reads
+    // gettid() (already translated) for the same field, so it's left.
+    void translate_clone_tids(::pid_t w, const Regs& r, ::pid_t host, std::int32_t g) {
+        constexpr std::uint64_t kParentSettid = 0x00100000;
+        std::uint64_t flags = 0, ptid = 0;
+        const abi::Sysno sc = abi::decode(kTraceeArch, r.nr());
+        if (sc == abi::Sysno::clone3) {
+            // struct clone_args { u64 flags, pidfd, child_tid, parent_tid, ... }
+            errno = 0;
+            const long f = ::ptrace(PTRACE_PEEKDATA, w, reinterpret_cast<void*>(r.arg(0)), 0);
+            const long p = ::ptrace(PTRACE_PEEKDATA, w, reinterpret_cast<void*>(r.arg(0) + 24), 0);
+            if (errno) return;
+            flags = static_cast<std::uint64_t>(f);
+            ptid = static_cast<std::uint64_t>(p);
+        } else if (sc == abi::Sysno::clone) {
+            flags = r.arg(0);
+            ptid = r.arg(2);   // same slot on x86-64 and aarch64
+        } else {
+            return;
+        }
+        if (!(flags & kParentSettid) || ptid == 0) return;
+        errno = 0;
+        const long word = ::ptrace(PTRACE_PEEKDATA, w, reinterpret_cast<void*>(ptid), 0);
+        if (errno || static_cast<::pid_t>(static_cast<std::uint32_t>(word)) != host) return;
+        const auto uw = (static_cast<std::uint64_t>(word) & ~0xffffffffull) | static_cast<std::uint32_t>(g);
+        ::ptrace(PTRACE_POKEDATA, w, reinterpret_cast<void*>(ptid), reinterpret_cast<void*>(uw));
+    }
+
     // Which argument of `sc` is a pid/tid the host would resolve, or -1.
     [[nodiscard]] static int pid_arg_of(abi::Sysno sc) noexcept {
         using S = abi::Sysno;
@@ -1596,6 +1830,7 @@ public:
             case S::sched_setattr: case S::sched_getattr:
             case S::prlimit64: case S::process_vm_readv:
             case S::process_vm_writev: case S::kcmp:
+            case S::rt_sigqueueinfo:
                 return 0;
             case S::ioprio_get: case S::ioprio_set:
                 return 1;
@@ -1810,8 +2045,11 @@ private:
             (void)Regs::fetch(w, r);
             auto fn = std::exchange(t.on_exit, {});
             fn(static_cast<std::int64_t>(r.ret()));
-            return;
+            // a deferred redirect owns its result; a forwarded call that only
+            // borrowed a buffer still gets the usual translations below
+            if (t.action != Action::none || !t.forwarded) { t.forwarded = false; return; }
         }
+        t.forwarded = false;
         if (t.action == Action::set_ret) {
             Regs r{};
             (void)Regs::fetch(w, r);
@@ -1862,11 +2100,16 @@ private:
                 translate_getlk(w, r);
             } else if (is_peercred(r)) {
                 translate_peercred(w, r);
+            } else if (is_recv_creds(r, w)) {
+                translate_recv_creds(w, r);
             } else if (returns_pid(r.nr())) {
                 auto host = static_cast<::pid_t>(static_cast<long long>(r.ret()));
                 if (host > 0) {
-                    r.set_ret(static_cast<std::int64_t>(gpid_of(host)));
+                    const std::int32_t g = gpid_of(host);
+                    r.set_ret(static_cast<std::int64_t>(g));
                     (void)r.store(w);
+                    // entry regs: on aarch64 x0 is already the return value
+                    translate_clone_tids(w, t.regs, host, g);
                 }
             }
         }
@@ -1931,9 +2174,12 @@ private:
                 auto child = static_cast<::pid_t>(np);
                 if (np && tasks_.emplace(child, Task{}).second)
                     ++live_;
-                if (np && event != PTRACE_EVENT_CLONE) {
+                const bool is_thread = np && event == PTRACE_EVENT_CLONE &&
+                                       tgid_of(child) == host_tgid_of(w);
+                if (np && !is_thread) {
                     const std::int32_t gppid = gpid_of(host_tgid_of(w));
                     gppid_[gpid_of(child)] = gppid;
+                    tgid_cache_[child] = child;
                     proc_events_.push_back({ProcEvent::spawn, gpid_of(child),
                                             gppid, {}, {}});
                 } else if (np) {
@@ -2069,6 +2315,9 @@ private:
     std::string root_;
     std::function<void()> pre_exec_;   // child hook (post-fork, pre-execve)
     std::vector<ProcEvent> proc_events_;
+    std::function<std::pair<std::uint32_t, std::uint32_t>(std::int32_t)> guest_ids_of_;
+    // guest process groups that also exist on the host (setpgid mirrored)
+    std::unordered_set<std::int32_t> host_groups_;
     // tasks parked in a group-stop (kill -STOP, ^Z) until a SIGCONT
     std::unordered_set<::pid_t> stopped_;
     // SIGSTOPs we sent that the task hasn't taken yet (see the attach stop)

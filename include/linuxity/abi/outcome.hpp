@@ -108,6 +108,10 @@ struct Virtualize {
     // like setsid whose guest answer is ours but whose host effect matters
     // (a pty's ^C goes to the HOST's foreground group).
     bool mirror_host{false};
+    // A host mirror that needs guest ids made host ids first.
+    enum class Mirror : std::uint8_t { none, setpgid, tcsetpgrp } host_mirror{Mirror::none};
+    std::int32_t m_a{0}, m_b{0};      // setpgid: pid, pgid. tcsetpgrp: pgid
+    std::uint64_t m_ptr{0};           // tcsetpgrp: the pid_t* argument
     // Nonzero: don't answer yet. Wait this long in the guest's kernel and run
     // the call again (an open that has to block on another guest task).
     std::int64_t retry_ns{0};
@@ -152,6 +156,9 @@ struct Redirect {
     bool                   may_block{false};
     // run for the host effect only; the guest gets this instead
     std::optional<std::int64_t> force_ret{};
+    // on success this call created `created` (a dir if created_dir)
+    std::optional<std::string> created{};
+    bool                   created_dir{false};
     std::optional<Scrub>   scrub{};
 
     explicit Redirect(PathArg p) : first{std::move(p)} {}
@@ -177,7 +184,7 @@ struct Redirect {
     // Asked by the trap loop (the single Redirect consumer), so the 14 sites
     // that BUILD a Redirect do not each need to know about the optimisation.
     [[nodiscard]] bool is_noop() const noexcept {
-        return !second && !make_parents && !scrub && !force_ret && first.arg >= 0 &&
+        return !second && !make_parents && !scrub && !force_ret && !created && first.arg >= 0 &&
                !first.rewrites;
     }
 };
@@ -253,6 +260,8 @@ struct SockRewrite {
     std::string   host_path;
     int           len_arg{2};   // register holding socklen
     std::uint64_t new_len{0};   // family + path (+ NUL for the filesystem form)
+    std::string   guest_path{}; // what the guest named, for getsockname later
+    bool          binds{false}; // bind (names this socket) vs connect (names the peer)
 
     SockRewrite(UAddr pa, std::string hp, int la, std::uint64_t nl)
         : path_addr{pa}, host_path{std::move(hp)}, len_arg{la}, new_len{nl} {}
@@ -277,12 +286,15 @@ struct ArgRewrite {
     enum class Convert : std::uint8_t {
         none,
         termios_to_termios2,   // widen: host filled termios, guest wants termios2
+        unix_name,             // an AF_UNIX address came back: report the guest's spelling
     };
 
     int           arg;              // which argument register to replace
     std::uint64_t to;               // what to put in it
     Convert       convert{Convert::none};
     UAddr         buf{};            // the guest buffer `convert` operates on
+    UAddr         len{};            // unix_name: the socklen_t* beside it
+    std::string   name{};           // unix_name: the guest's spelling
 
     ArgRewrite(int a, std::uint64_t v) noexcept : arg{a}, to{v} {}
     ArgRewrite(int a, std::uint64_t v, Convert c, UAddr b) noexcept

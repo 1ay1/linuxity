@@ -207,15 +207,21 @@ int main() {
                "TIOCNOTTY with nothing to release is ENOTTY");
 
         // getpgrp still tracks setpgid, which is the other half of the loop
-        // bash spins on and is independent of owning a terminal.
+        // bash spins on and is independent of owning a terminal. Joining a
+        // group that doesn't exist is EPERM, as on Linux; making one's own
+        // works.
         auto getpgrp = [&] {
             abi::Regs p; p.nr = 111;             // x86-64 getpgrp
             return virt_ret(sys.dispatch(p));
         };
         abi::Regs sp; sp.nr = 109;               // x86-64 setpgid
         sp.arg[0] = 0; sp.arg[1] = 4242;
+        assert(virt_ret(sys.dispatch(sp)) == -static_cast<std::int64_t>(Errno::eperm) &&
+               "joining a group that doesn't exist is EPERM");
+        sp.arg[1] = 0;
         (void)sys.dispatch(sp);
-        assert(getpgrp() == 4242 && "setpgid must be visible to getpgrp");
+        abi::Regs gp; gp.nr = 39;                // x86-64 getpid
+        assert(getpgrp() == virt_ret(sys.dispatch(gp)) && "setpgid must be visible to getpgrp");
     }
 
     std::puts("all runtime type-algebra tests passed");
