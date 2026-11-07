@@ -104,8 +104,17 @@ struct DupMirror {
 // real syscall runs.
 struct Virtualize {
     std::int64_t ret;
+    // Also run the real call on the host and ignore its result. For calls
+    // like setsid whose guest answer is ours but whose host effect matters
+    // (a pty's ^C goes to the HOST's foreground group).
+    bool mirror_host{false};
 
     constexpr explicit Virtualize(std::int64_t v) noexcept : ret{v} {}
+    [[nodiscard]] static constexpr Virtualize mirrored(std::int64_t v) noexcept {
+        Virtualize x{v};
+        x.mirror_host = true;
+        return x;
+    }
 
     // An errno return, negated into the kernel's -errno convention exactly
     // once, here, so no call site open-codes the sign.
@@ -130,6 +139,11 @@ struct Redirect {
     PathArg                first;
     std::optional<PathArg> second{};      // rename/link: both operands are paths
     bool                   make_parents{false};
+    // may wait on another guest task (a FIFO open), so the backend must not
+    // block the whole tree waiting for it
+    bool                   may_block{false};
+    // run for the host effect only; the guest gets this instead
+    std::optional<std::int64_t> force_ret{};
     std::optional<Scrub>   scrub{};
 
     explicit Redirect(PathArg p) : first{std::move(p)} {}
@@ -155,7 +169,7 @@ struct Redirect {
     // Asked by the trap loop (the single Redirect consumer), so the 14 sites
     // that BUILD a Redirect do not each need to know about the optimisation.
     [[nodiscard]] bool is_noop() const noexcept {
-        return !second && !make_parents && !scrub && first.arg >= 0 &&
+        return !second && !make_parents && !scrub && !force_ret && first.arg >= 0 &&
                !first.rewrites;
     }
 };

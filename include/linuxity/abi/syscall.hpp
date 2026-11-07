@@ -35,6 +35,7 @@
 #include <span>
 #include <set>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 // -- Host portability: lstat ------------------------------------------------
@@ -286,7 +287,9 @@ public:
                 if (k_.procs().pgid_of(ids().pid) == ids().pid)
                     return eno(Errno::eperm);
                 k_.procs().set_sid(ids().pid);
-                return val(ids().pid);             // new session == pid
+                // new session == pid; the host's session has to follow, or
+                // the pty this session takes never signals it
+                return Virtualize::mirrored(ids().pid);
             // nice 0 for everything, but the KERNEL still validates `which`:
             // only PRIO_PROCESS/PRIO_PGRP/PRIO_USER (0/1/2) exist and
             // anything else is EINVAL. Returning 0 for any argument meant a
@@ -1424,9 +1427,12 @@ private:
             const std::string own = "/proc/" + std::to_string(id.pid);
             for (const std::string_view who : {std::string_view{"/proc/self"},
                                                std::string_view{own}}) {
-                const std::string fd_prefix = std::string{who} + "/fd";
-                if (abs == fd_prefix || abs.starts_with(fd_prefix + "/"))
-                    return "/proc/self/fd" + abs.substr(fd_prefix.size());
+                for (const std::string_view leaf : {std::string_view{"/fd"},
+                                                    std::string_view{"/fdinfo"}}) {
+                    const std::string pre = std::string{who} + std::string{leaf};
+                    if (abs == pre || abs.starts_with(pre + "/"))
+                        return "/proc/self" + std::string{leaf} + abs.substr(pre.size());
+                }
             }
         }
         if (rebind("/proc/self", id.pid)) return abs;
@@ -1635,7 +1641,17 @@ private:
                 pending_dir_   = true;
                 pending_lazy_  = abs;
             }
-            return Redirect{PathArg{path_arg, std::move(pc.host_path)}};
+            // A FIFO open without O_NONBLOCK waits for the other end, which
+            // is another guest task the tracer must keep serving.
+            const bool may_block =
+                !wire::has_for(arch_, flags, wire::OpenFlag::nonblock) &&
+                !wire::has_for(arch_, flags, wire::OpenFlag::path) && [&] {
+                    struct ::stat st{};
+                    return ::stat(pc.host_path.c_str(), &st) == 0 && S_ISFIFO(st.st_mode);
+                }();
+            Redirect rd{PathArg{path_arg, std::move(pc.host_path)}};
+            rd.may_block = may_block;
+            return rd;
         }
         if (pc.realm == kernel::Realm2::virtual_file) {
             // A virtual file is SYNTHESIZED -- for most of procfs there is
@@ -2130,7 +2146,8 @@ private:
                         if (fd >= 0) {
                             std::string_view gp =
                                 k_.files().path_of_fd(fd);
-                            if (!gp.empty()) return std::string{gp};
+                            if (!gp.empty())
+                                return std::string{gp} + (host_fd_deleted(fd) ? " (deleted)" : "");
                         }
                     }
                 }
@@ -2143,6 +2160,20 @@ private:
         std::int32_t v = 0;
         for (char c : s) { if (c < '0' || c > '9') return -1; v = v * 10 + (c - '0'); }
         return s.empty() ? -1 : v;
+    }
+
+    // Does the host say the file behind the tracee's fd was unlinked?
+    [[nodiscard]] bool host_fd_deleted(int fd) {
+        if constexpr (!requires { mem_.host_tid(); }) {
+            return false;
+        } else {
+            char link[64], tgt[4096];
+            std::snprintf(link, sizeof link, "/proc/%d/fd/%d", mem_.host_tid(), fd);
+            const ::ssize_t n = ::readlink(link, tgt, sizeof tgt);
+            constexpr std::string_view kDel = " (deleted)";
+            return n >= static_cast<::ssize_t>(kDel.size()) &&
+                   std::string_view{tgt, static_cast<std::size_t>(n)}.ends_with(kDel);
+        }
     }
 
     // Write a readlink target (NOT NUL-terminated, per readlink(2)) into the
@@ -2284,8 +2315,9 @@ private:
     }
 
     [[nodiscard]] Outcome do_chdir(const Regs& r) {
+        const std::string old_cwd{k_.files().cwd()};
         std::string abs = k_.files().absolutize(read_cstr(uaddr(r.arg[0])),
-                                                k_.files().cwd());
+                                                old_cwd);
         auto pc = k_.files().classify(abs);
         if (pc.realm == kernel::Realm2::absent) return eno(pc.error);
         // chdir is fully virtualized (we track cwd and never forward), so we
@@ -2298,12 +2330,57 @@ private:
         // mkdir(dir) then retry -- our false-success made git skip the mkdir,
         // never create the work tree, and die "Cannot access work tree".
         if (pc.realm == kernel::Realm2::host_backed) {
+            // a deep dir's host path can pass PATH_MAX; walk it instead
             struct ::stat st{};
-            if (::stat(pc.host_path.c_str(), &st) != 0) return eno(Errno::enoent);
-            if (!S_ISDIR(st.st_mode))                   return eno(Errno::enotdir);
+            const int dfd = open_long(pc.host_path, O_PATH | O_CLOEXEC);
+            if (dfd < 0) return eno(Errno::enoent);
+            const int rc = ::fstat(dfd, &st);
+            ::close(dfd);
+            if (rc != 0)            return eno(Errno::enoent);
+            if (!S_ISDIR(st.st_mode)) return eno(Errno::enotdir);
         }
         k_.files().set_cwd(abs);
+        // Move the host cwd too, best effort and answer ignored, so an
+        // over-long cwd-relative path can be rebased on it (see
+        // rebase_on_dirfd). The guest's answer is the check above.
+        if constexpr (requires { mem_.host_tid(); }) {
+            if (pc.realm == kernel::Realm2::host_backed) {
+                std::string hp = std::move(pc.host_path);
+                if (hp.size() >= 4096) {
+                    // too long for the host: step from the old cwd instead
+                    const auto oc = k_.files().classify(old_cwd);
+                    const std::string base = oc.host_path + "/";
+                    if (oc.realm != kernel::Realm2::host_backed || !hp.starts_with(base) ||
+                        hp.size() - base.size() >= 4096 || !host_cwd_is(oc.host_path))
+                        return val(0);   // host cwd can't follow; guest view is fine
+                    hp = hp.substr(base.size());
+                }
+                Redirect rd{PathArg{0, std::move(hp)}};
+                rd.force_ret = 0;
+                return rd;
+            }
+        }
         return val(0);
+    }
+
+    // open() for a host path that may be longer than PATH_MAX: walk it one
+    // component at a time. Returns an fd or -1.
+    [[nodiscard]] static int open_long(const std::string& p, int flags) {
+        if (p.size() < 4096) return ::open(p.c_str(), flags);
+        int fd = ::open("/", O_PATH | O_DIRECTORY | O_CLOEXEC);
+        std::size_t i = 0;
+        while (fd >= 0 && i < p.size()) {
+            while (i < p.size() && p[i] == '/') ++i;
+            if (i >= p.size()) break;
+            const std::size_t j = std::min(p.find('/', i), p.size());
+            const std::string part = p.substr(i, j - i);
+            i = j;
+            const bool last = p.find_first_not_of('/', j) == std::string::npos;
+            const int nfd = ::openat(fd, part.c_str(), last ? flags : (O_PATH | O_DIRECTORY | O_CLOEXEC));
+            ::close(fd);
+            fd = nfd;
+        }
+        return fd;
     }
 
     // fchdir(fd): the guest changes cwd to an already-open directory fd. The
@@ -3461,7 +3538,12 @@ private:
         std::string guest_path(reinterpret_cast<const char*>(pb.data()),
                                ::strnlen(reinterpret_cast<const char*>(pb.data()),
                                          path_bytes));
-        if (guest_path.empty() || guest_path.front() != '/') return fwd();
+        if (guest_path.empty()) return fwd();
+        // A relative sun_path resolves against the caller's cwd. Ours is
+        // virtual, so the host's cwd is somewhere else entirely: forwarding
+        // it raw put the socket in whatever dir linuxity was started from.
+        if (guest_path.front() != '/')
+            guest_path = k_.files().absolutize(guest_path, k_.files().cwd());
 
         // ALREADY TRANSLATED? The rewrite below overwrites the guest's
         // sockaddr IN PLACE (it is the caller's own buffer, and the bytes
@@ -3509,7 +3591,11 @@ private:
                     (void)::unlink(pc.host_path.c_str());
                     const int fd = ::open(pc.host_path.c_str(),
                                           O_WRONLY | O_CREAT | O_EXCL, 0600);
-                    if (fd >= 0) ::close(fd);
+                    if (fd >= 0) {
+                        ::close(fd);
+                        // stat should see a socket, as on Linux
+                        sock_placeholders_.insert(guest_path);
+                    }
                 }
             }
             // An abstract address is a leading NUL then the name, and its
@@ -3765,6 +3851,13 @@ private:
             if (fields && !k_.files().links().empty() &&
                 k_.files().links().has_aliases(host_path))
                 fields->nlink = k_.files().links().count(host_path);
+            // the empty file an abstract-namespace bind left is a socket
+            if (fields && sock_placeholders_.count(guest_path)) {
+                if ((fields->mode & 0170000u) == 0100000u)
+                    fields->mode = (fields->mode & ~0170000u) | 0140000u;
+                else
+                    sock_placeholders_.erase(guest_path);
+            }
             return fields;
         } else {
             return std::nullopt;
@@ -4121,7 +4214,10 @@ private:
             //
             // The session bookkeeping is already ours, so answer from it.
             case kTIOCSCTTY: {
-                const std::int32_t n = pty_slave_of_fd(static_cast<int>(r.arg[0]));
+                // A slave from TIOCGPTPEER (glibc's openpty) or an inherited
+                // fd has no path binding, so ask the host which pts it is.
+                std::int32_t n = pty_slave_of_fd(static_cast<int>(r.arg[0]));
+                if (n < 0) n = host_fd_slave_no(static_cast<int>(r.arg[0]));
                 if (n < 0) return eno(Errno::enotty);   // not a pty at all
                 const std::int32_t me = ids().pid;
                 // Only a session leader may claim one. getsid == pid is the
@@ -4133,13 +4229,17 @@ private:
                 if (have >= 0 && have != n && r.arg[2] != 1)
                     return eno(Errno::eperm);
                 k_.procs().set_ctty(me, n);
-                return val(0);
+                // Best effort on the host too, so the pty's own ^C and
+                // hangup reach this session. Android refuses it; that's fine.
+                return Virtualize::mirrored(0);
             }
             case kTIOCNOTTY: {
                 const std::int32_t me = ids().pid;
                 if (k_.procs().ctty_of(me) < 0) return ctty_refusal(r);
                 k_.procs().clear_ctty(me);
-                return val(0);
+                // TIOCSCTTY was mirrored on the host, so give it up there too,
+                // or a forwarded TIOCGPGRP still sees the old claim
+                return Virtualize::mirrored(0);
             }
 
             // Report the caller's OWN pgrp as the terminal's foreground group
@@ -4300,6 +4400,8 @@ private:
     // the ctty rule: opening a tty WITHOUT O_NOCTTY in a session that has
     // none makes it the controlling terminal.
     std::uint64_t pending_flags_{0};
+    // guest paths of abstract-socket placeholders (see do_sockaddr_un)
+    std::unordered_set<std::string> sock_placeholders_;
     // Per-filesystem answer to "does link(2) work here", keyed by st_dev.
     std::unordered_map<std::uint64_t, bool> links_work_;
     bool pending_dir_{false};    // the pending open is a virtual directory
@@ -4355,6 +4457,100 @@ public:
             ::fchmod(sfd, want | need) == 0)
             k_.files().meta().set_mode(pending_open_, want);
         ::close(sfd);
+    }
+
+    // A translated host path at or over PATH_MAX fails on the host even when
+    // the guest named it relative to a dirfd or its cwd, which have no length
+    // limit on Linux. If the call's base dir sits at a prefix of `host`,
+    // return the rest so the host walks from there too. In *at calls the
+    // dirfd is always the register right before the path.
+    [[nodiscard]] std::optional<std::string> rebase_on_dirfd(const Regs& r, int path_arg,
+                                                             const std::string& host) {
+        constexpr std::size_t kPathMax = 4096;
+        constexpr int kAtFdcwd = -100;
+        if (host.size() < kPathMax || path_arg < 0) return std::nullopt;
+        bool at = false;
+        switch (decode(arch_, r.nr)) {
+            case Sysno::openat: case Sysno::openat2: case Sysno::mkdirat:
+            case Sysno::mknodat: case Sysno::unlinkat: case Sysno::newfstatat:
+            case Sysno::statx: case Sysno::fchmodat: case Sysno::fchmodat2:
+            case Sysno::fchownat: case Sysno::faccessat: case Sysno::faccessat2:
+            case Sysno::utimensat: case Sysno::readlinkat: case Sysno::symlinkat:
+            case Sysno::linkat: case Sysno::renameat: case Sysno::renameat2:
+                at = path_arg >= 1;
+                break;
+            default:
+                break;
+        }
+        const int dirfd = at ? static_cast<int>(r.arg[static_cast<std::size_t>(path_arg - 1)])
+                             : kAtFdcwd;
+        std::string gdir;
+        if (dirfd == kAtFdcwd) {
+            gdir = k_.files().cwd();
+        } else if (dirfd >= 0) {
+            gdir = std::string{k_.files().path_of_fd(dirfd)};
+        }
+        if (gdir.empty()) return std::nullopt;
+        const auto pc = k_.files().classify(gdir);
+        if (pc.realm != kernel::Realm2::host_backed || pc.host_path.empty()) return std::nullopt;
+        const std::string base = pc.host_path.back() == '/' ? pc.host_path : pc.host_path + "/";
+        if (host.size() == base.size() - 1 && base.starts_with(host)) return std::string{"."};
+        // the shared leading directories, then ".." for each one of the
+        // base's that's left, then the rest of the target
+        std::size_t common = 0;
+        for (std::size_t k = 0; k < base.size() && k < host.size() && base[k] == host[k]; ++k)
+            if (base[k] == '/') common = k + 1;
+        std::string rest;
+        for (std::size_t k = common; k < base.size(); ++k)
+            if (base[k] == '/') rest += "../";
+        rest += host.substr(std::min(common, host.size()));
+        if (rest.empty()) rest = ".";
+        if (rest.size() >= kPathMax) return std::nullopt;
+        // The host cwd only follows chdir best effort; make sure it's there.
+        if (dirfd == kAtFdcwd && !host_cwd_is(pc.host_path)) return std::nullopt;
+        return rest;
+    }
+
+    // Is the tracee's real host cwd the directory at `host_dir`? Compared by
+    // inode, walking the path a component at a time since it may be longer
+    // than PATH_MAX.
+    [[nodiscard]] bool host_cwd_is(const std::string& host_dir) {
+        if constexpr (!requires { mem_.host_tid(); }) {
+            return false;
+        } else {
+            char link[64];
+            std::snprintf(link, sizeof link, "/proc/%d/cwd", mem_.host_tid());
+            struct ::stat a{}, b{};
+            if (::stat(link, &a) != 0) return false;
+            const int fd = open_long(host_dir, O_PATH | O_DIRECTORY | O_CLOEXEC);
+            if (fd < 0) return false;
+            const bool same = ::fstat(fd, &b) == 0 && a.st_dev == b.st_dev && a.st_ino == b.st_ino;
+            ::close(fd);
+            return same;
+        }
+    }
+
+    // The open state note_opened_fd needs, taken out of the dispatcher so a
+    // call that finishes later (a blocking FIFO open) can apply it then.
+    struct PendingOpen {
+        std::int32_t pid{0}, ppid{0};
+        std::string path;
+        std::uint64_t flags{0};
+    };
+    [[nodiscard]] PendingOpen take_pending_open() {
+        auto id = ids();
+        PendingOpen p{id.pid, id.ppid, std::exchange(pending_open_, {}), pending_flags_};
+        pending_dir_ = false;
+        pending_lazy_.clear();
+        pending_entries_.clear();
+        return p;
+    }
+    void finish_pending_open(PendingOpen p, std::int64_t fd) {
+        k_.files().set_current_pid(p.pid, p.ppid);
+        pending_open_ = std::move(p.path);
+        // only an existing FIFO is deferred, so O_CREAT made nothing
+        pending_flags_ = p.flags & ~static_cast<std::uint64_t>(wire::OpenFlag::creat);
+        note_opened_fd(fd);
     }
 
     // The trap calls this after a redirect/inject syscall returns a real fd,
@@ -4517,6 +4713,19 @@ public:
                 std::uint32_t host_mode = get_u32(base + mode_off);
                 (void)put_u32(base + mode_off,
                               kernel::MetaStore::effective_mode(host_mode, *rec));
+            }
+        }
+        // The placeholder an abstract-namespace bind left (see do_sockaddr_un)
+        // is a socket to the guest. Only while it's still the empty file we
+        // made; anything else at that name now is what it says it is.
+        if (!s.guest_path.empty() && sock_placeholders_.count(s.guest_path)) {
+            const std::uint32_t m = is_statx ? get_u16(base + mode_off) : get_u32(base + mode_off);
+            if ((m & 0170000u) == 0100000u) {
+                const std::uint32_t sm = (m & ~0170000u) | 0140000u;
+                if (is_statx) put_u16(base + mode_off, static_cast<std::uint16_t>(sm));
+                else          (void)put_u32(base + mode_off, sm);
+            } else {
+                sock_placeholders_.erase(s.guest_path);
             }
         }
         // st_nlink, for an inode whose extra names are EMULATED (see

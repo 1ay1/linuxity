@@ -82,6 +82,8 @@ public:
         std::int64_t ret{0};
         int pending_sig{0};    // a signal held during a redirect, to re-inject
         Regs regs{};
+        // run at the exit stop of a redirect that didn't wait for it
+        std::function<void(std::int64_t)> on_exit{};
     };
 
     [[nodiscard]] Status start(UAddr, UAddr) {
@@ -245,8 +247,10 @@ public:
                 int code = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
                 if (WIFSIGNALED(st)) trace_killed(w, WTERMSIG(st));
                 if (w == root_pid_) exit_code_ = code;
-                if (auto it = gpid_.find(w); it != gpid_.end())
+                if (auto it = gpid_.find(w); it != gpid_.end()) {
                     proc_events_.push_back({ProcEvent::reap, it->second, 0, {}, {}});
+                    reparent_orphans_of(it->second);
+                }
                 // NB: do NOT erase gpid_[w] here. The parent's wait4() has not
                 // run its exit stop yet; when it does, finalize_exit translates
                 // the reaped HOST pid to its GUEST pid via this very map. If we
@@ -255,6 +259,8 @@ public:
                 // fork. A dead child's identity must outlive it until reaped;
                 // guest pids are tiny ints, so retaining them is cheap.
                 tasks_.erase(w);
+                stopped_.erase(w);
+                stop_owed_.erase(w);
                 --live_;
                 // The ROOT task is the guest's init/session leader. When it
                 // exits the foreground session is over and control returns to
@@ -303,9 +309,11 @@ public:
                 // it was trying to create /s4.o.
                 if (np && event != PTRACE_EVENT_CLONE) {
                     std::int32_t gpid = gpid_of(child);
-                    std::int32_t gppid = gpid_of(w);
+                    std::int32_t gppid = gpid_of(host_tgid_of(w));   // a thread's child belongs to its process
                     gppid_[gpid] = gppid;
                     proc_events_.push_back({ProcEvent::spawn, gpid, gppid, {}, {}});
+                } else if (np) {
+                    note_thread(w, child);
                 }
                 // If we're mid-servicing this task's clone/fork (in_call), it
                 // still owes us its EXIT stop so finalize_exit can translate
@@ -374,7 +382,33 @@ public:
             // and can drive live_ to 0 while real tasks remain, tearing the
             // whole runtime down mid-run (observed: gpg-agent's fast-exiting
             // double-fork intermediary killing the parent shell prematurely).
-            if (sig == SIGSTOP || sig == SIGTRAP) {
+            if (sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU) {
+                siginfo_t si{};
+                const bool have_si = ::ptrace(PTRACE_GETSIGINFO, w, 0, &si) == 0;
+                // GETSIGINFO fails with EINVAL only at a group-stop: the
+                // signal was delivered and the task is now job-stopped.
+                // Leave it stopped until a SIGCONT; resuming here undid
+                // every kill -STOP and ^Z.
+                if (!have_si && errno == EINVAL && tasks_.count(w)) {
+                    if (stopped_.insert(w).second)
+                        proc_events_.push_back({ProcEvent::stop, gpid_of(host_tgid_of(w)), 0, {}, {}});
+                    continue;
+                }
+                // A fresh tracee's attach stop: a SIGSTOP the kernel added
+                // with no siginfo (SI_USER from pid 0). A real one has a
+                // sender and has to be delivered.
+                const bool attach = sig == SIGSTOP && (!have_si ||
+                    (si.si_code == SI_USER && si.si_pid == 0));
+                if (attach) {
+                    if (tasks_.try_emplace(w).second) ++live_;
+                    // A guest SIGSTOP sent before the attach stop was taken
+                    // merged into it (one pending SIGSTOP max). Deliver it.
+                    resume_run(w, stop_owed_.erase(w) ? SIGSTOP : 0);
+                    continue;
+                }
+                if (sig == SIGSTOP) stop_owed_.erase(w);
+            }
+            if (sig == SIGTRAP) {
                 // ...but only when it IS that attach stop. A SIGTRAP from a
                 // real trap instruction (a breakpoint, an assert that
                 // compiles to brk/int3) must be delivered: swallowing one is
@@ -533,6 +567,20 @@ public:
     // (returns_pid). pid<=0 (any child / process group) passes through.
     void translate_entry_args(::pid_t w, Regs& rr, Task& t) {
         const abi::Sysno sc = abi::decode(kTraceeArch, rr.nr());
+        if (sc == abi::Sysno::pidfd_open) {
+            // A guest pid; one outside the tree must be ESRCH, not some
+            // unrelated host process. No host pid is ever INT_MAX.
+            auto gpid = static_cast<std::int32_t>(static_cast<long long>(rr.arg(0)));
+            if (gpid > 0) {
+                const ::pid_t host = host_tid_of(gpid);
+                Regs wr = rr;
+                wr.set_arg(0, static_cast<std::uint64_t>(host > 0 ? host : 0x7fffffff));
+                (void)wr.store(w);
+                t.regs = wr;
+                rr = wr;
+            }
+            return;
+        }
         if (sc == abi::Sysno::wait4) {
             auto gpid = static_cast<std::int32_t>(static_cast<long long>(rr.arg(0)));
             if (gpid > 0) {
@@ -679,6 +727,57 @@ public:
                                       abi::Sysno::waitid;
     }
 
+    // fcntl(F_GETLK) fills struct flock's l_pid with the HOST pid of the
+    // lock holder, and SO_PEERCRED's ucred holds a host pid/uid/gid. Both
+    // need their exit stop to be put in the guest's terms.
+    static constexpr std::uint64_t kFGetLk = 5;
+    [[nodiscard]] static bool is_getlk(const Regs& r) {
+        return abi::decode(kTraceeArch, r.nr()) == abi::Sysno::fcntl &&
+               r.arg(1) == kFGetLk && r.arg(2) != 0;
+    }
+    [[nodiscard]] static bool is_peercred(const Regs& r) {
+        return abi::decode(kTraceeArch, r.nr()) == abi::Sysno::getsockopt &&
+               r.arg(1) == 1 /*SOL_SOCKET*/ && r.arg(2) == 17 /*SO_PEERCRED*/ &&
+               r.arg(3) != 0;
+    }
+    [[nodiscard]] static bool needs_out_fixup(const Regs& r) {
+        return is_getlk(r) || is_peercred(r);
+    }
+
+    // struct ucred {pid, uid, gid}. A peer in the guest tree is a guest
+    // process, so it's root like every guest; one outside shows pid 0.
+    void translate_peercred(::pid_t w, const Regs& r) {
+        if (static_cast<long long>(r.ret()) != 0) return;
+        const std::uint64_t at = r.arg(3);
+        errno = 0;
+        const long w0 = ::ptrace(PTRACE_PEEKDATA, w, reinterpret_cast<void*>(at), 0);
+        const long w1 = ::ptrace(PTRACE_PEEKDATA, w, reinterpret_cast<void*>(at + 8), 0);
+        if (errno != 0) return;
+        const auto host = static_cast<std::int32_t>(static_cast<std::uint32_t>(w0));
+        const std::int32_t g = host > 0 ? known_gpid_of(host) : 0;
+        if (g <= 0) return;   // not ours: leave the host's answer alone
+        // pid in the low half, uid=0 in the high half; gid=0 low half of w1
+        const auto n0 = static_cast<std::uint64_t>(static_cast<std::uint32_t>(g));
+        const auto n1 = static_cast<std::uint64_t>(w1) & ~0xffffffffull;
+        ::ptrace(PTRACE_POKEDATA, w, reinterpret_cast<void*>(at), reinterpret_cast<void*>(n0));
+        ::ptrace(PTRACE_POKEDATA, w, reinterpret_cast<void*>(at + 8), reinterpret_cast<void*>(n1));
+    }
+
+    // l_pid sits at offset 24 of struct flock on x86-64 and aarch64. A
+    // holder outside the guest tree shows as 0, like a pid namespace.
+    void translate_getlk(::pid_t w, const Regs& r) {
+        if (static_cast<long long>(r.ret()) != 0) return;
+        const std::uint64_t at = r.arg(2) + 24;
+        errno = 0;
+        const long word = ::ptrace(PTRACE_PEEKDATA, w, reinterpret_cast<void*>(at), 0);
+        if (errno != 0) return;
+        const auto host = static_cast<std::int32_t>(static_cast<std::uint32_t>(word));
+        if (host <= 0) return;
+        auto uw = static_cast<std::uint64_t>(word);
+        uw = (uw & ~0xffffffffull) | static_cast<std::uint32_t>(known_gpid_of(host));
+        ::ptrace(PTRACE_POKEDATA, w, reinterpret_cast<void*>(at), reinterpret_cast<void*>(uw));
+    }
+
     [[nodiscard]] Result<std::int64_t> forward() {
         Task& t = tasks_[cur_];
         t.action = Action::none;
@@ -690,7 +789,7 @@ public:
         // it as fork-ret != child-getpid) and the two drive modes diverged
         // (run_seccomp, 15 vs 0). The exit stop is where that translation
         // happens, so skipping it is only safe per-syscall.
-        if (seccomp_ && !owes_exit_stop(t.regs.nr())) {
+        if (seccomp_ && !owes_exit_stop(t.regs.nr()) && !needs_out_fixup(t.regs)) {
             t.in_call = false;
             resume_run(cur_, 0);
             return ok(std::int64_t{0});
@@ -716,6 +815,21 @@ public:
         if (post_exit) post_exit(ret);
         resume_task(cur_);
         return ok(ret);
+    }
+
+    // Run the real call for its host side effect (setsid, TIOCSCTTY), then
+    // overwrite its result with `ret`, the guest's answer. These never block.
+    [[nodiscard]] Result<std::int64_t> forward_sync_then_set(std::int64_t ret) {
+        return forward_sync([this, ret](std::int64_t) { set_ret_now(ret); });
+    }
+
+    // Overwrite the return of the task stopped at its syscall exit. Only
+    // valid inside a post_exit callback.
+    void set_ret_now(std::int64_t ret) {
+        Regs rr{};
+        if (!Regs::fetch(cur_, rr)) return;
+        rr.set_ret(ret);
+        (void)rr.store(cur_);
     }
 
     // REDIRECT: rewrite the char* path arg to the translated host path (in the
@@ -798,6 +912,42 @@ public:
         return ok(ret);
     }
 
+    // REDIRECT for a call that may block on ANOTHER guest task (opening a
+    // FIFO waits for its other end). Rewrite the path and let it run;
+    // `on_exit` gets the result at its exit stop, so the tracer keeps
+    // serving the rest of the tree meanwhile.
+    [[nodiscard]] Status redirect_deferred(int path_arg, const std::string& host_path,
+                                           std::function<void(std::int64_t)> on_exit) {
+        Task& t = tasks_[cur_];
+        Regs r = t.regs;
+        const std::size_t need = host_path.size() + 1;
+        const std::uint64_t scratch = (t.regs.sp() - 256 - need) & ~std::uint64_t{15};
+        if (poke_path(scratch, host_path, /*dead_scratch=*/true)) {
+            set_arg(r, path_arg, scratch);
+            (void)r.store(cur_);
+        } else {
+            (void)t.regs.store(cur_);   // same fallback as redirect()
+        }
+        t.action = Action::none;
+        const std::uint64_t guest_ptr = t.regs.arg(path_arg);
+        t.on_exit = [w = cur_, path_arg, guest_ptr,
+                     fn = std::move(on_exit)](std::int64_t ret) {
+            // -ERESTART*: the kernel re-runs the call with these registers,
+            // and a signal handler may overwrite the scratch path on the
+            // stack, so point the arg back at the guest's own string.
+            if (ret <= -512 && ret >= -516) {
+                Regs now{};
+                if (Regs::fetch(w, now)) {
+                    set_arg(now, path_arg, guest_ptr);
+                    (void)now.store(w);
+                }
+            }
+            fn(ret);
+        };
+        ::ptrace(PTRACE_SYSCALL, cur_, 0, 0);
+        return ok();
+    }
+
     // REWRITE_ARG: run the guest's syscall with one argument register replaced,
     // step to its exit, and let the caller patch the result buffer before the
     // guest can read it. Synchronous for the same reason redirect() is: the
@@ -867,15 +1017,21 @@ public:
         int argv_reg = path_arg + 1;
         std::uint64_t argv_ptr = reg_arg(r, argv_reg);
 
-        // Read the original argv pointer array (stop at NULL, bounded).
+        // Read the original argv pointer array up to its NULL, in chunks.
+        // The kernel's own limit is the stack rlimit, not an entry count.
         std::vector<std::uint64_t> orig;
-        for (std::size_t i = 0; i < 1024; ++i) {
-            std::uint64_t p = 0;
-            std::array<std::byte, 8> b{};
-            if (!copy_in(uaddr(argv_ptr + i * 8), b)) break;
-            std::memcpy(&p, b.data(), 8);
-            if (p == 0) break;
-            orig.push_back(p);
+        constexpr std::size_t kChunk = 512, kMaxArgs = std::size_t{1} << 21;
+        for (bool done = false; !done && orig.size() < kMaxArgs;) {
+            std::array<std::uint64_t, kChunk> buf{};
+            const std::uint64_t at = argv_ptr + orig.size() * 8;
+            // don't run a chunk across a page we may not own
+            const std::size_t to_page = (4096 - (at & 4095)) / 8;
+            const std::size_t n = std::min(kChunk, to_page == 0 ? kChunk : to_page);
+            if (!copy_in(uaddr(at), std::as_writable_bytes(std::span{buf.data(), n}))) break;
+            for (std::size_t i = 0; i < n; ++i) {
+                if (buf[i] == 0) { done = true; break; }
+                orig.push_back(buf[i]);
+            }
         }
 
         // Lay strings then the pointer array into a scratch block below rsp.
@@ -1077,9 +1233,9 @@ public:
     // linuxity's real, live process list. The trap stays decoupled from the
     // kernel: it only emits events, it never touches ProcessTable itself.
     struct ProcEvent {
-        enum Kind { spawn, exec, reap } kind;
+        enum Kind { spawn, exec, reap, thread, stop, cont, reparent } kind;
         ::pid_t pid;          // the affected task's tid (== pid for a process)
-        ::pid_t ppid;         // parent (spawn only)
+        ::pid_t ppid;         // parent (spawn), owning process (thread)
         std::string comm;     // program name (exec only)
         std::string cmdline;  // full argv, space-joined (exec only)
     };
@@ -1181,19 +1337,31 @@ public:
         // syscall cost 18.79us against 4.86us before -- a 4x regression on
         // the hot path. A task's tgid never changes, so one lookup per task
         // is enough.
-        ::pid_t host_tgid = cur_;
-        if (auto it = tgid_cache_.find(cur_); it != tgid_cache_.end()) {
-            host_tgid = it->second;
-        } else {
-            const ::pid_t t = tgid_of(cur_);
-            host_tgid = t > 0 ? t : cur_;
-            tgid_cache_[cur_] = host_tgid;
-        }
+        ::pid_t host_tgid = host_tgid_of(cur_);
         const std::int32_t pid = gpid_of(host_tgid);
         const std::int32_t tid = gpid_of(cur_);
         std::int32_t ppid = 0;
         if (auto it = gppid_.find(pid); it != gppid_.end()) ppid = it->second;
         return TaskIds{pid, tid, ppid};
+    }
+
+    // Cached host tgid of a host tid.
+    ::pid_t host_tgid_of(::pid_t tid) {
+        if (auto it = tgid_cache_.find(tid); it != tgid_cache_.end()) return it->second;
+        const ::pid_t t = tgid_of(tid);
+        const ::pid_t out = t > 0 ? t : tid;
+        tgid_cache_[tid] = out;
+        return out;
+    }
+
+    // A new thread `child` in the same process as `creator`. A clone that
+    // made a separate process (no CLONE_THREAD) isn't one.
+    void note_thread(::pid_t creator, ::pid_t child) {
+        const ::pid_t tg = host_tgid_of(creator);
+        const ::pid_t ctg = tgid_of(child);
+        if (ctg > 0 && ctg != tg) return;
+        tgid_cache_[child] = tg;
+        proc_events_.push_back({ProcEvent::thread, gpid_of(child), gpid_of(tg), {}, {}});
     }
 
     // -- Signal delivery ---------------------------------------------------
@@ -1326,8 +1494,28 @@ public:
         // casting: `Errno{errno}` asserts the host's errno numbering equals
         // the guest's. It happens to on Linux/x86-64, which is exactly why
         // the bug would survive here and surface on an ABI where it doesn't.
-        if (rc == 0) return 0;
+        if (rc == 0) {
+            if (signum == SIGCONT) continue_group(tid);
+            if (signum == SIGSTOP) stop_owed_.insert(tid);
+            return 0;
+        }
         return -static_cast<std::int64_t>(abi::wire::errno_from_host(errno));
+    }
+
+    // A traced task in group-stop sits in a ptrace stop, which SIGCONT can't
+    // wake; only the tracer can. Resume every stopped thread of tid's process
+    // so it picks up the SIGCONT and its parent sees WCONTINUED.
+    void continue_group(::pid_t tid) {
+        const ::pid_t tg = host_tgid_of(tid);
+        std::vector<::pid_t> wake;
+        for (::pid_t s : stopped_)
+            if (host_tgid_of(s) == tg) wake.push_back(s);
+        if (wake.empty()) return;
+        for (::pid_t s : wake) {
+            stopped_.erase(s);
+            resume_run(s, 0);
+        }
+        proc_events_.push_back({ProcEvent::cont, gpid_of(tg), 0, {}, {}});
     }
 
     // Reverse of gpid_of: a guest pid -> its host tid. pid 1 is the root task.
@@ -1532,6 +1720,13 @@ private:
 
     // At a task's syscall-EXIT stop, apply the action recorded at entry.
     void finalize_exit(::pid_t w, Task& t) {
+        if (t.on_exit) {
+            Regs r{};
+            (void)Regs::fetch(w, r);
+            auto fn = std::exchange(t.on_exit, {});
+            fn(static_cast<std::int64_t>(r.ret()));
+            return;
+        }
         if (t.action == Action::set_ret) {
             Regs r{};
             (void)Regs::fetch(w, r);
@@ -1578,6 +1773,10 @@ private:
                         }
                     }
                 }
+            } else if (is_getlk(r)) {
+                translate_getlk(w, r);
+            } else if (is_peercred(r)) {
+                translate_peercred(w, r);
             } else if (returns_pid(r.nr())) {
                 auto host = static_cast<::pid_t>(static_cast<long long>(r.ret()));
                 if (host > 0) {
@@ -1625,8 +1824,10 @@ private:
             if (WIFEXITED(st) || WIFSIGNALED(st)) {
                 int code = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
                 if (w == root_pid_) exit_code_ = code;
-                if (auto it = gpid_.find(w); it != gpid_.end())
+                if (auto it = gpid_.find(w); it != gpid_.end()) {
                     proc_events_.push_back({ProcEvent::reap, it->second, 0, {}, {}});
+                    reparent_orphans_of(it->second);
+                }
                 // Retained past exit — see the note in next(): the parent's
                 // wait4 still needs to translate this reaped pid.
                 tasks_.erase(w);
@@ -1643,9 +1844,12 @@ private:
                 if (np && tasks_.emplace(child, Task{}).second)
                     ++live_;
                 if (np && event != PTRACE_EVENT_CLONE) {
-                    gppid_[gpid_of(child)] = gpid_of(w);
+                    const std::int32_t gppid = gpid_of(host_tgid_of(w));
+                    gppid_[gpid_of(child)] = gppid;
                     proc_events_.push_back({ProcEvent::spawn, gpid_of(child),
-                                            gpid_of(w), {}, {}});
+                                            gppid, {}, {}});
+                } else if (np) {
+                    note_thread(w, child);
                 }
                 ::ptrace(PTRACE_SYSCALL, w, 0, 0);
                 continue;
@@ -1728,16 +1932,38 @@ private:
     }
 
     // A host task's thread-group id, from /proc. Returns 0 when unknown.
-    [[nodiscard]] static ::pid_t tgid_of(::pid_t tid) {
+    [[nodiscard]] static ::pid_t tgid_of(::pid_t tid) { return status_field(tid, "Tgid:"); }
+
+    // When a process dies the kernel hands its children to the nearest
+    // subreaper, or init. The host already did that (prctl is forwarded),
+    // so read where each child went and say the same in guest pids. Only
+    // a parent outside the tree means init, which is pid 1 here.
+    void reparent_orphans_of(std::int32_t dead) {
+        for (auto& [child, parent] : gppid_) {
+            if (parent != dead || child == dead) continue;
+            const ::pid_t host = host_tid_of(child);
+            if (host <= 0) continue;
+            const ::pid_t hp = status_field(host, "PPid:");
+            if (hp <= 0) continue;   // gone already
+            std::int32_t np = known_gpid_of(hp);
+            if (np <= 0 || np == dead) np = 1;
+            parent = np;
+            proc_events_.push_back({ProcEvent::reparent, child, np, {}, {}});
+        }
+    }
+
+    // One numeric field ("Tgid:", "PPid:") of /proc/<tid>/status, or 0.
+    [[nodiscard]] static ::pid_t status_field(::pid_t tid, const char* key) {
         char path[64];
         std::snprintf(path, sizeof path, "/proc/%d/status", static_cast<int>(tid));
         std::FILE* f = std::fopen(path, "r");
         if (f == nullptr) return 0;
         char line[256];
+        const std::size_t kl = std::strlen(key);
         ::pid_t out = 0;
         while (std::fgets(line, sizeof line, f) != nullptr) {
-            if (std::strncmp(line, "Tgid:", 5) == 0) {
-                out = static_cast<::pid_t>(std::atoi(line + 5));
+            if (std::strncmp(line, key, kl) == 0) {
+                out = static_cast<::pid_t>(std::atoi(line + kl));
                 break;
             }
         }
@@ -1751,6 +1977,10 @@ private:
     std::string root_;
     std::function<void()> pre_exec_;   // child hook (post-fork, pre-execve)
     std::vector<ProcEvent> proc_events_;
+    // tasks parked in a group-stop (kill -STOP, ^Z) until a SIGCONT
+    std::unordered_set<::pid_t> stopped_;
+    // SIGSTOPs we sent that the task hasn't taken yet (see the attach stop)
+    std::unordered_set<::pid_t> stop_owed_;
     std::unordered_map<::pid_t, std::int32_t> gpid_;   // host tid -> guest pid
     std::unordered_map<std::int32_t, std::int32_t> gppid_; // guest pid -> ppid
     // host tid -> host tgid. A task's tgid is fixed for its lifetime, and

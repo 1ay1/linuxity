@@ -160,20 +160,44 @@ public:
                     const int   arg2 = rd.second ? rd.second->arg : -1;
                     const auto& hp2  = rd.second ? rd.second->host_path
                                                  : empty_path();
+                    if constexpr (requires { trap_.redirect_deferred(0, std::string{}, nullptr); }) {
+                        if (rd.may_block && !rd.second && !rd.scrub) {
+                            if (rd.make_parents) make_host_parents(rd.first.host_path);
+                            auto po = locked([&] { return sys.take_pending_open(); });
+                            auto st = trap_.redirect_deferred(
+                                rd.first.arg, rd.first.host_path,
+                                [&locked, &sys, po = std::move(po)](std::int64_t ret) mutable {
+                                    locked([&] { sys.finish_pending_open(std::move(po), ret); });
+                                });
+                            if (!st) return recover(st.error());
+                            return Step::next;
+                        }
+                    }
                     if (rd.make_parents) {
                         make_host_parents(rd.first.host_path);
                         if (rd.second) make_host_parents(hp2);
                     }
+                    // PATH_MAX applies to the string, not the depth: rebase an
+                    // over-long host path onto the call's own dirfd.
+                    std::string hp1_fit = rd.first.host_path, hp2_fit = hp2;
+                    locked([&] {
+                        if (auto s = sys.rebase_on_dirfd(f.regs, rd.first.arg, hp1_fit)) hp1_fit = *s;
+                        if (rd.second)
+                            if (auto s = sys.rebase_on_dirfd(f.regs, arg2, hp2_fit)) hp2_fit = *s;
+                    });
                     auto retr = trap_.redirect(
-                        rd.first.arg, rd.first.host_path,
+                        rd.first.arg, hp1_fit,
                         [&](std::int64_t rc) {
                             // Only a successful stat has a buffer worth fixing,
                             // and only a Redirect can even carry a scrub.
                             if (rc == 0 && rd.scrub)
                                 locked([&] { sys.scrub_ids(*rd.scrub); });
+                            if constexpr (requires { trap_.set_ret_now(std::int64_t{0}); })
+                                if (rd.force_ret) trap_.set_ret_now(*rd.force_ret);
                         },
-                        arg2, hp2);
+                        arg2, hp2_fit);
                     if (!retr) return recover(retr.error());
+                    if (rd.force_ret) return Step::next;   // nothing was opened
                     locked([&] { sys.note_opened_fd(*retr); });
                     return Step::next;
                 },
@@ -320,6 +344,15 @@ public:
                 },
 
                 [&](abi::Virtualize v) {
+                    if constexpr (requires { trap_.forward_sync_then_set(std::int64_t{0}); }) {
+                        if (v.mirror_host) {
+                            // run the real call for its host effect, then
+                            // hand the guest our answer instead of its result
+                            auto fr = trap_.forward_sync_then_set(v.ret);
+                            if (!fr) return recover(fr.error());
+                            return Step::next;
+                        }
+                    }
                     // Hand the guest our answer; no real syscall runs.
                     auto st = trap_.resume(v.ret);
                     if (!st) return Step::fail;
@@ -527,9 +560,17 @@ private:
                         pi.ppid = static_cast<std::int32_t>(e.ppid);
                         pi.comm = "(spawning)";
                         pi.cmdline = "(spawning)";
-                        pi.state = 'R';
                         pi.vsize_bytes = 4u << 20;   // plausible until first exec
                         pi.rss_pages = 256;
+                        // fork copies the parent's image, so it has the same
+                        // exe, comm and argv until it execs
+                        if (const auto* pp = kernel_.procs().find(pi.ppid)) {
+                            pi.comm = pp->comm;
+                            pi.cmdline = pp->cmdline;
+                            pi.vsize_bytes = pp->vsize_bytes;
+                            pi.rss_pages = pp->rss_pages;
+                        }
+                        pi.state = 'R';
                         kernel_.procs().upsert(pi);
                         // A freshly forked child inherits a COPY of its
                         // parent's cwd AT FORK TIME. Seeding it here (rather
@@ -557,7 +598,21 @@ private:
                             kernel_.procs().upsert(np);
                         }
                         break;
+                    case EV::thread:
+                        kernel_.procs().add_thread(static_cast<std::int32_t>(e.ppid),
+                                                   static_cast<std::int32_t>(e.pid));
+                        break;
+                    case EV::stop:
+                    case EV::cont:
+                        if (auto* p = kernel_.procs().find_mut(static_cast<std::int32_t>(e.pid)))
+                            p->state = e.kind == EV::stop ? 'T' : 'R';
+                        break;
+                    case EV::reparent:
+                        if (auto* p = kernel_.procs().find_mut(static_cast<std::int32_t>(e.pid)))
+                            p->ppid = static_cast<std::int32_t>(e.ppid);
+                        break;
                     case EV::reap:
+                        kernel_.procs().drop_thread(static_cast<std::int32_t>(e.pid));
                         // pid 1 (our init) is never removed: /proc must always
                         // have a root even as the last guest thread winds down.
                         if (e.pid != 1) {

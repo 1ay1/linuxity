@@ -82,8 +82,11 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
         // native host procfs via the same redirect.)
         {
             std::string q{abs};
-            if (q == "/proc/self/fd" || q.starts_with("/proc/self/fd/") ||
-                q == "/proc/thread-self/fd" || q.starts_with("/proc/thread-self/fd/")) {
+            auto host_dir = [&](std::string_view d) {
+                return q == d || (q.starts_with(d) && q.size() > d.size() && q[d.size()] == '/');
+            };
+            if (host_dir("/proc/self/fd") || host_dir("/proc/thread-self/fd") ||
+                host_dir("/proc/self/fdinfo") || host_dir("/proc/thread-self/fdinfo")) {
                 kernel::VirtualFile vf; vf.redirect_host = std::move(q);
                 return ok(std::move(vf));
             }
@@ -368,17 +371,21 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                 }));
 
             // ---- /proc/<pid>/task : the thread group -------------------
-            // We model one main thread whose tid == pid. htop/top enumerate
-            // processes THROUGH this directory, so it must exist and its
-            // per-thread files mirror the process's own.
-            if (tail == "task")
-                return ok(dir_file({{std::to_string(I.pid), true}}));
+            // htop/top enumerate processes THROUGH this directory. Each
+            // thread's files mirror the process's own.
+            if (tail == "task") {
+                std::vector<kernel::VirtualDirent> ents{{std::to_string(I.pid), true}};
+                for (auto t : I.threads) ents.push_back({std::to_string(t), true});
+                return ok(dir_file(std::move(ents)));
+            }
             if (tail.starts_with("task/")) {
                 std::string_view rest = std::string_view{tail}.substr(5);
                 std::size_t slash = rest.find('/');
                 std::string_view tid = rest.substr(0, slash);
-                // Only the main thread (tid == pid) exists.
-                if (tid != std::to_string(I.pid))
+                const bool known = tid == std::to_string(I.pid) ||
+                    std::any_of(I.threads.begin(), I.threads.end(),
+                                [&](std::int32_t t) { return tid == std::to_string(t); });
+                if (!known)
                     return err<kernel::VirtualFile>(Errno::enoent);
                 if (slash == std::string_view::npos)  // /proc/<pid>/task/<tid>
                     return ok(dir_file({
@@ -386,8 +393,8 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                         {"cmdline",false},{"comm",false},{"maps",false},
                         {"io",false},{"children",false},
                     }));
-                // Re-target the file lookup at the thread's own file, which is
-                // identical to the process's (single-thread model).
+                // Re-target the file lookup at the thread's own file, which
+                // mirrors the process's.
                 tail = std::string{rest.substr(slash + 1)};
             }
 
@@ -419,7 +426,7 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                     s += std::to_string(ut) + " " + std::to_string(st) + " 0 0 ";
                 }
                 s += "20 0 ";                           // priority nice
-                s += "1 0 ";                            // num_threads itrealvalue
+                s += std::to_string(1 + I.threads.size()) + " 0 ";  // num_threads itrealvalue
                 s += "100 ";                            // starttime (jiffies)
                 s += std::to_string(I.vsize_bytes) + " ";           // vsize
                 s += std::to_string(I.rss_pages) + " ";             // rss (pages)
@@ -439,12 +446,18 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                 std::string s;
                 s += "Name:\t" + I.comm + "\n";
                 s += "State:\t"; s += I.state;
-                s += (I.state=='R' ? " (running)\n" : " (sleeping)\n");
+                switch (I.state) {
+                    case 'R': s += " (running)\n"; break;
+                    case 'T': s += " (stopped)\n"; break;
+                    case 'Z': s += " (zombie)\n"; break;
+                    case 'D': s += " (disk sleep)\n"; break;
+                    default:  s += " (sleeping)\n"; break;
+                }
                 s += "Tgid:\t" + std::to_string(I.pid) + "\n";
                 s += "Pid:\t" + std::to_string(I.pid) + "\n";
                 s += "PPid:\t" + std::to_string(I.ppid) + "\n";
                 s += "Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\n";
-                s += "Threads:\t1\n";
+                s += "Threads:\t" + std::to_string(1 + I.threads.size()) + "\n";
                 s += "VmSize:\t" + std::to_string(I.vsize_bytes/1024) + " kB\n";
                 s += "VmRSS:\t"  + std::to_string(I.rss_pages*4) + " kB\n";
                 return ok(text_file(std::move(s)));

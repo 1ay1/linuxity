@@ -341,12 +341,60 @@ public:
         // `normalize` takes a string_view -- the old `std::string{path}` here
         // allocated a throwaway copy of every absolute path the guest ever
         // passed, which is most of them.
-        if (!path.empty() && path.front() == '/') return normalize(path);
+        if (!path.empty() && path.front() == '/') return resolve_dotdot(path);
         std::string base = dir_path.empty() ? std::string{cwd()} : std::string{dir_path};
         if (base.empty()) base = "/";
         if (base.back() != '/') base += '/';
         base += path;
-        return normalize(base);
+        return resolve_dotdot(base);
+    }
+
+    // normalize(), except ".." after a symlink goes to the parent of the
+    // link's TARGET, as in the kernel. Popping a component that isn't a
+    // symlink is the same either way, so only those are checked.
+    [[nodiscard]] std::string resolve_dotdot(std::string_view p, int depth = 0) const {
+        if (p.find("..") == std::string_view::npos) return normalize(p);
+        std::string cur;   // "" means "/"
+        std::size_t i = 0;
+        while (i < p.size()) {
+            while (i < p.size() && p[i] == '/') ++i;
+            if (i >= p.size()) break;
+            std::size_t j = p.find('/', i);
+            if (j == std::string_view::npos) j = p.size();
+            const std::string_view c = p.substr(i, j - i);
+            i = j;
+            if (c == ".") continue;
+            if (c != "..") { cur += '/'; cur += c; continue; }
+            if (cur.empty()) continue;   // "/.." is "/"
+            const std::string phys = physical_if_symlink(cur, depth);
+            if (!phys.empty()) cur = phys == "/" ? std::string{} : phys;
+            cur.resize(cur.rfind('/'));
+        }
+        return cur.empty() ? std::string{"/"} : cur;
+    }
+
+    // If guest path `abs` is a symlink, the guest path it finally resolves
+    // to; otherwise "". Targets are guest paths (an absolute rootfs link
+    // means the guest's root), so this is walked here, not by the host.
+    [[nodiscard]] std::string physical_if_symlink(const std::string& abs, int depth = 0) const {
+#if defined(_WIN32)
+        (void)abs; (void)depth;
+        return {};
+#else
+        if (depth > 40) return {};   // ELOOP: let the host report it
+        const PathClass lc = classify(abs, false, /*follow=*/false);
+        if (lc.realm != Realm2::host_backed || lc.host_path.empty()) return {};
+        char tgt[PATH_MAX];
+        const ::ssize_t n = ::readlink(lc.host_path.c_str(), tgt, sizeof tgt - 1);
+        if (n <= 0) return {};   // not a symlink
+        const std::string_view t{tgt, static_cast<std::size_t>(n)};
+        std::string next = t.front() == '/'
+            ? std::string{t}
+            : abs.substr(0, abs.rfind('/')) + "/" + std::string{t};
+        next = resolve_dotdot(next, depth + 1);
+        const std::string deeper = physical_if_symlink(next, depth + 1);
+        return deeper.empty() ? next : deeper;
+#endif
     }
 
     // How a write-intent classify should prepare the overlay upper layer.
@@ -1083,7 +1131,46 @@ private:
 
     static bool exists(const char* path) {
         struct ::stat st{};
-        return ::lstat(path, &st) == 0;
+        if (::lstat(path, &st) == 0) return true;
+        if (errno != ENAMETOOLONG) return false;
+        return at_long_parent(path, [&](int dfd, const char* leaf) {
+            return ::fstatat(dfd, leaf, &st, AT_SYMLINK_NOFOLLOW) == 0;
+        });
+    }
+
+    // Run fn(dirfd, leaf) for a path too long for the host, by opening its
+    // parent a component at a time. Returns false if that walk fails.
+    template <class F>
+    static bool at_long_parent(const char* path, F&& fn) {
+#if defined(_WIN32)
+        (void)path; (void)fn;
+        return false;
+#else
+        const std::string_view p{path};
+        const std::size_t cut = p.rfind('/');
+        if (cut == std::string_view::npos || cut + 1 >= p.size()) return false;
+        int fd = ::open("/", O_PATH | O_DIRECTORY | O_CLOEXEC);
+        std::size_t i = 0;
+        while (fd >= 0 && i < cut) {
+            while (i < cut && p[i] == '/') ++i;
+            if (i >= cut) break;
+            const std::size_t j = std::min(p.find('/', i), cut);
+            const std::string part{p.substr(i, j - i)};
+            i = j;
+            const int nfd = ::openat(fd, part.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
+            const int e = errno;
+            ::close(fd);
+            fd = nfd;
+            errno = e;
+        }
+        if (fd < 0) return false;
+        const std::string leaf{p.substr(cut + 1)};
+        const bool ok = fn(fd, leaf.c_str());
+        const int e = errno;
+        ::close(fd);
+        errno = e;
+        return ok;
+#endif
     }
 
     // One readlink answers the three questions the overlay read path asks of
@@ -1108,7 +1195,12 @@ private:
     enum class Probe { symlink, present, absent, notdir };
     static Probe probe_link(const char* path, std::string& out) {
         char buf[4096];
-        const ::ssize_t n = ::readlink(path, buf, sizeof buf - 1);
+        ::ssize_t n = ::readlink(path, buf, sizeof buf - 1);
+        if (n < 0 && errno == ENAMETOOLONG)
+            (void)at_long_parent(path, [&](int dfd, const char* leaf) {
+                n = ::readlinkat(dfd, leaf, buf, sizeof buf - 1);
+                return n >= 0;
+            });
         if (n >= 0) { out.assign(buf, static_cast<std::size_t>(n)); return Probe::symlink; }
         if (errno == EINVAL) return Probe::present;
         return errno == ENOTDIR ? Probe::notdir : Probe::absent;
@@ -1116,7 +1208,11 @@ private:
 
     static bool is_dir(const char* path) {
         struct ::stat st{};
-        return ::stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+        if (::stat(path, &st) == 0) return S_ISDIR(st.st_mode);
+        if (errno != ENAMETOOLONG) return false;
+        return at_long_parent(path, [&](int dfd, const char* leaf) {
+            return ::fstatat(dfd, leaf, &st, 0) == 0 && S_ISDIR(st.st_mode);
+        });
     }
 
     // Transparent hash/equality so a directory-union map can be probed with a
@@ -1158,6 +1254,16 @@ private:
     // listing can report the same d_ino a later stat() will return.
     static bool merge_dir(const std::string& host_dir, NameMap& seen) {
         ::DIR* d = ::opendir(host_dir.c_str());
+#if !defined(_WIN32)
+        if (!d && errno == ENAMETOOLONG) {
+            int dfd = -1;
+            (void)at_long_parent(host_dir.c_str(), [&](int pfd, const char* leaf) {
+                dfd = ::openat(pfd, leaf, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+                return dfd >= 0;
+            });
+            if (dfd >= 0 && !(d = ::fdopendir(dfd))) ::close(dfd);
+        }
+#endif
         if (!d) return false;
         while (::dirent* e = ::readdir(d)) {
             const std::string_view name{e->d_name};

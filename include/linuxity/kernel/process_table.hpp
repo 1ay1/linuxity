@@ -58,6 +58,7 @@ struct ProcInfo {
     std::uint32_t uid{0};
     std::uint32_t gid{0};
     std::string  exe{};              // guest path of the image (/proc/<pid>/exe)
+    std::vector<std::int32_t> threads{}; // guest tids besides the main thread
 };
 
 // The virtual process table. Ordered by pid so /proc enumerates numerically.
@@ -85,9 +86,21 @@ public:
         auto& cur = procs_[p.pid];
         const std::int32_t pg = p.pgid ? p.pgid : cur.pgid;
         const std::int32_t sd = p.sid ? p.sid : cur.sid;
+        auto threads = std::move(cur.threads);   // reaped one by one, not by exec
         cur = p;
         cur.pgid = pg;
         cur.sid = sd;
+        if (cur.threads.empty()) cur.threads = std::move(threads);
+    }
+    void add_thread(std::int32_t pid, std::int32_t tid) {
+        auto it = procs_.find(pid);
+        if (it == procs_.end() || tid == pid) return;
+        auto& t = it->second.threads;
+        if (std::find(t.begin(), t.end(), tid) == t.end()) t.push_back(tid);
+    }
+    void drop_thread(std::int32_t tid) {
+        for (auto& [_, p] : procs_)
+            std::erase(p.threads, tid);
     }
     void set_comm(std::int32_t pid, std::string comm) {
         auto& p = procs_[pid]; p.pid = pid; p.comm = comm;
@@ -193,6 +206,10 @@ public:
     void remove(std::int32_t pid) { if (pid != 1) procs_.erase(pid); }
 
     [[nodiscard]] bool has(std::int32_t pid) const { return find(pid) != nullptr; }
+    [[nodiscard]] ProcInfo* find_mut(std::int32_t pid) {
+        auto it = procs_.find(pid);
+        return it == procs_.end() ? nullptr : &it->second;
+    }
     [[nodiscard]] const ProcInfo* find(std::int32_t pid) const {
         auto it = procs_.find(pid);
         if (it != procs_.end()) {

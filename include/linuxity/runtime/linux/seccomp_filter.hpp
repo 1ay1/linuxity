@@ -145,6 +145,8 @@ inline constexpr int kTrappedX86_64[] = {
     // whole kill family can be intercepted. See ptrace_trap.hpp start().
     200,                         // tkill                 (guest tid in)
     234,                         // tgkill                (guest tid in)
+    434,                         // pidfd_open            (guest pid in)
+    55,                          // getsockopt            (SO_PEERCRED pid out)
     63,                          // uname
     99,                          // sysinfo
     204,                         // sched_getaffinity
