@@ -1095,7 +1095,11 @@ private:
     // writes -- so refusing it would break every runtime that names its
     // threads through the file rather than the prctl.
     [[nodiscard]] static bool virtual_is_writable(std::string_view p) noexcept {
-        return p.ends_with("/comm");
+        return p.ends_with("/comm") || p == "/proc/sys/vm/drop_caches";
+    }
+    // Files whose mode has no read bit for anyone, root included.
+    [[nodiscard]] static bool virtual_is_write_only(std::string_view p) noexcept {
+        return p == "/proc/sys/vm/drop_caches";
     }
 
     // What a mutation of a synthesized path reports. EROFS is the intuitive
@@ -1802,6 +1806,10 @@ private:
             // why writable() is the test rather than the access-mode bits.
             const std::string& vpw = pc.virtual_path.empty() ? abs : pc.virtual_path;
             if (for_write && !virtual_is_writable(vpw)) return eno(Errno::eacces);
+            if ((flags & 3) != 1 /*not O_WRONLY*/ && virtual_is_write_only(vpw))
+                return eno(Errno::eacces);
+            // only reached when the host hides its log (else it's host-backed)
+            if (vpw == "/proc/kmsg") return eno(Errno::eperm);
             // Follow a cross-mount symlink to the RESOLVED virtual path (e.g.
             // /etc/mtab -> /proc/self/mounts); produce that, not the link.
             const std::string& vp = pc.virtual_path.empty() ? abs : pc.virtual_path;

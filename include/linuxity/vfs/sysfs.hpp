@@ -28,6 +28,10 @@
 #include "linuxity/kernel/file_namespace.hpp"
 #include "linuxity/kernel/machine.hpp"
 
+#include <dirent.h>
+#include <unistd.h>
+
+#include <cstdio>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -189,6 +193,30 @@ make_sysfs(const kernel::MachineSpec& mach) {
                     }
                 }
                 if (pol >= 0 && pol < ncpu) {
+                    // The guest runs on the host's cores, so their real,
+                    // moving clock is the honest answer when it's readable.
+                    const std::string hdir = "/sys/devices/system/cpu/cpu" + std::to_string(pol) + "/cpufreq";
+                    if (tail.empty()) {
+                        if (DIR* d = ::opendir(hdir.c_str())) {
+                            std::vector<VirtualDirent> e;
+                            while (const dirent* de = ::readdir(d))
+                                if (de->d_name[0] != '.')
+                                    e.push_back({de->d_name, de->d_type == DT_DIR});
+                            ::closedir(d);
+                            if (!e.empty()) return ok(dir(std::move(e)));
+                        }
+                    } else if (tail.find('/') == std::string_view::npos) {
+                        std::string hp = hdir + "/" + std::string{tail};
+                        // cpuinfo_cur_freq is root-only on most hosts; the
+                        // scaling one is the same clock
+                        if (tail == "cpuinfo_cur_freq" && ::access(hp.c_str(), R_OK) != 0)
+                            hp = hdir + "/scaling_cur_freq";
+                        if (::access(hp.c_str(), R_OK) == 0) {
+                            VirtualFile vf;
+                            vf.redirect_host = std::move(hp);
+                            return ok(std::move(vf));
+                        }
+                    }
                     if (tail.empty())
                         return D({{"scaling_cur_freq",false},{"scaling_min_freq",false},
                                  {"scaling_max_freq",false},{"cpuinfo_cur_freq",false},
@@ -256,17 +284,35 @@ make_sysfs(const kernel::MachineSpec& mach) {
                      {"temp1_max",false},{"temp1_crit",false},
                      {"temp2_input",false},{"temp2_label",false},
                      {"uevent",false}});
+        // The host's real temperature in millidegrees, read live: its CPU
+        // thermal zone if it shows it, else its battery sensor (Android
+        // hides the zones from apps but not the battery, in tenths of a
+        // degree), else 42 C.
+        auto host_temp = [] {
+            auto num = [](const char* p) -> long {
+                std::FILE* f = std::fopen(p, "re");
+                if (!f) return -1;
+                long v = -1;
+                if (std::fscanf(f, "%ld", &v) != 1) v = -1;
+                std::fclose(f);
+                return v;
+            };
+            if (const long t = num("/sys/class/thermal/thermal_zone0/temp"); t > 0) return t;
+            if (const long t = num("/sys/class/power_supply/battery/temp"); t > 0) return t * 100;
+            return 42000L;
+        };
+        auto temp_text = [&](long off) { return T(std::to_string(host_temp() + off) + "\n"); };
         {
             // Serve the leaf files under either the class-symlink flattening
             // or the real device path (btop opens whichever it resolved).
             auto hw_leaf = [&](std::string_view t) -> Result<kernel::VirtualFile> {
                 if (t == "name")        return T("linuxity_cpu\n");
                 if (t == "temp1_label") return T("Package id 0\n");
-                if (t == "temp1_input") return T("42000\n");   // 42.0 °C
+                if (t == "temp1_input") return temp_text(0);
                 if (t == "temp1_max")   return T("95000\n");
                 if (t == "temp1_crit")  return T("100000\n");
                 if (t == "temp2_label") return T("Core 0\n");
-                if (t == "temp2_input") return T("40000\n");
+                if (t == "temp2_input") return temp_text(-2000);
                 if (t == "uevent")      return T("");
                 return err<kernel::VirtualFile>(Errno::enoent);
             };
@@ -290,7 +336,7 @@ make_sysfs(const kernel::MachineSpec& mach) {
         if (abs == "/sys/class/thermal/thermal_zone0")
             return D({{"type",false},{"temp",false},{"policy",false}});
         if (abs == "/sys/class/thermal/thermal_zone0/type") return T("cpu-thermal\n");
-        if (abs == "/sys/class/thermal/thermal_zone0/temp") return T("42000\n");
+        if (abs == "/sys/class/thermal/thermal_zone0/temp") return temp_text(0);
         if (abs == "/sys/class/thermal/thermal_zone0/policy") return T("step_wise\n");
 
         // ---- net (loopback only, so a container-y guest is coherent) ----

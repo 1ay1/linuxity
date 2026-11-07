@@ -60,6 +60,56 @@ inline std::pair<long, std::string> split_pid(std::string_view abs) {
 
 } // namespace detail
 
+// The host's own copy of a /proc or /sys file, or "" when it hides it.
+inline std::string host_file(const char* path) {
+    std::string out;
+    if (std::FILE* f = std::fopen(path, "re")) {
+        char buf[8192];
+        for (std::size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) {
+            out.append(buf, n);
+            if (out.size() > (8u << 20)) break;
+        }
+        std::fclose(f);
+    }
+    return out;
+}
+
+// A virtual node that reads the host's live file, when the host lets us.
+inline std::optional<kernel::VirtualFile> host_redirect(const char* path) {
+    if (::access(path, R_OK) != 0) return std::nullopt;
+    kernel::VirtualFile vf;
+    vf.redirect_host = path;
+    return vf;
+}
+
+// The run state of a guest process as the host scheduler sees it ('R', 'S',
+// 'D', ...), or `fallback` when its host task can't be read.
+inline char host_state(const kernel::ProcessTable& procs, std::int32_t pid, char fallback) {
+    const int h = procs.host_of(pid);
+    if (h <= 0) return fallback;
+    const std::string s = host_file(("/proc/" + std::to_string(h) + "/stat").c_str());
+    const auto rp = s.rfind(')');
+    if (rp == std::string::npos || rp + 2 >= s.size()) return fallback;
+    // 't' is a ptrace stop: a real stop if we recorded one, else the task is
+    // waiting while linuxity serves its syscall, which on Linux is running
+    if (s[rp + 2] == 't') return fallback == 'T' ? 'T' : 'R';
+    return s[rp + 2];
+}
+
+// Guest processes running and blocked in disk sleep, for /proc/stat and
+// loadavg. The reader itself is always running.
+inline std::pair<int, int> run_counts(const kernel::ProcessTable& procs) {
+    int running = 0, blocked = 0;
+    for (const std::int32_t pid : procs.pids()) {
+        const auto* pi = procs.find(pid);
+        if (!pi) continue;
+        const char st = host_state(procs, pid, pi->state);
+        running += st == 'R';
+        blocked += st == 'D';
+    }
+    return {running < 1 ? 1 : running, blocked};
+}
+
 // Build a /proc producer bound to linuxity's process table + machine spec.
 // The spec (kernel/machine.hpp) is the SINGLE source of truth for ncpu, RAM,
 // frequency, identity and uptime; /proc reads only from it, so it can never
@@ -109,7 +159,7 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                                   "version","cmdline","filesystems","mounts",
                                   "interrupts","softirqs","swaps","partitions",
                                   "diskstats","devices","modules","misc",
-                                  "self","sys"})
+                                  "kallsyms","kmsg","self","sys"})
                 e.push_back({f, std::string_view{f} == "sys"});
             return ok(dir_file(std::move(e)));
         }
@@ -237,6 +287,34 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
             return ok(text_file(std::move(s)));
         }
         if (abs == "/proc/stat") {
+            // The guest runs natively on the host's CPUs, so the host's own
+            // jiffies, intr and ctxt are the true answer. Only the process
+            // counts are the guest's own.
+            const auto [running, blocked] = run_counts(procs);
+            const std::string tail = "processes " + std::to_string(procs.last_pid()) +
+                                     "\nprocs_running " + std::to_string(running) +
+                                     "\nprocs_blocked " + std::to_string(blocked) + "\n";
+            if (const std::string h = host_file("/proc/stat"); !h.empty()) {
+                std::string s;
+                std::size_t at = 0;
+                while (at < h.size()) {
+                    std::size_t nl = h.find('\n', at);
+                    if (nl == std::string::npos) nl = h.size();
+                    const std::string_view line{h.data() + at, nl - at};
+                    // only the CPUs this machine has (cpuN with N < ncpu)
+                    bool other_cpu = false;
+                    if (line.starts_with("cpu") && line.size() > 3 && line[3] >= '0' && line[3] <= '9')
+                        other_cpu = std::atol(std::string{line.substr(3, line.find(' ') - 3)}.c_str()) >= ncpu;
+                    if (!line.starts_with("processes ") && !line.starts_with("procs_") &&
+                        !line.empty() && !other_cpu) {
+                        s.append(line);
+                        s.push_back('\n');
+                    }
+                    at = nl + 1;
+                }
+                return ok(text_file(s + tail));
+            }
+            // The host hides it: counters that at least advance with time.
             // System-wide CPU + process counters. htop/top/btop read this
             // first, then AGAIN a second later, and compute each core's CPU%
             // from the delta. So the jiffies must ADVANCE with real time:
@@ -273,11 +351,11 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
             s += "intr " + std::to_string(total * 20) + "\n";
             s += "ctxt " + std::to_string(total * 8) + "\n";
             s += "btime " + std::to_string(mach.boot_epoch()) + "\n";
-            s += "processes " + std::to_string(nproc + 10) + "\n";
-            s += "procs_running 1\nprocs_blocked 0\n";
+            s += tail;
             return ok(text_file(std::move(s)));
         }
         if (abs == "/proc/uptime") {
+            if (std::string h = host_file("/proc/uptime"); !h.empty()) return ok(text_file(std::move(h)));
             const double up = mach.uptime_seconds();
             // idle time = uptime * ncpu * (mostly idle); a plausible ratio.
             char buf[64];
@@ -285,8 +363,35 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                           up * static_cast<double>(ncpu) * 0.9);
             return ok(text_file(std::string{buf}));
         }
-        if (abs == "/proc/loadavg")
-            return ok(text_file("0.00 0.01 0.05 1/" + std::to_string(nproc) + " 1\n"));
+        if (abs == "/proc/loadavg") {
+            // The load is the host's: the guest's work runs on its CPUs.
+            // Runnable/total and the last pid are the guest's own.
+            const int running = run_counts(procs).first;
+            std::string avg = "0.00 0.01 0.05";
+            if (const std::string h = host_file("/proc/loadavg"); !h.empty()) {
+                // first three fields
+                std::size_t at = 0;
+                for (int i = 0; i < 3 && at != std::string::npos; ++i) at = h.find(' ', at + 1);
+                if (at != std::string::npos) avg = h.substr(0, at);
+            }
+            return ok(text_file(avg + " " + std::to_string(running) + "/" + std::to_string(nproc) +
+                                " " + std::to_string(procs.last_pid()) + "\n"));
+        }
+        // Hardware the guest really runs on: the host's own files, live.
+        for (const char* f : {"/proc/interrupts", "/proc/softirqs", "/proc/modules",
+                              "/proc/kallsyms", "/proc/pressure/cpu",
+                              "/proc/pressure/memory", "/proc/pressure/io"})
+            if (abs == f)
+                if (auto vf = host_redirect(f)) return ok(std::move(*vf));
+        // the host hides its symbols: no symbols, like kptr_restrict on a
+        // locked-down kernel, but the file is there
+        if (abs == "/proc/kallsyms") return ok(text_file(""));
+        // the host hides its log: open is EPERM, as for a process without
+        // CAP_SYSLOG (syscall.hpp refuses it); the file itself exists
+        if (abs == "/proc/kmsg") {
+            if (auto vf = host_redirect("/proc/kmsg")) return ok(std::move(*vf));
+            return ok(text_file(""));
+        }
         // Interrupt counters, per CPU, in the kernel's layout (show_interrupts
         // and show_softirqs). They grow with uptime, like /proc/stat's intr.
         if (abs == "/proc/interrupts" || abs == "/proc/softirqs") {
@@ -422,6 +527,14 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                 {"/proc/sys/vm/overcommit_memory", "0", true},
                 {"/proc/sys/vm/max_map_count", "65530", true},
                 {"/proc/sys/vm/swappiness", "60", true},
+                {"/proc/sys/vm/overcommit_ratio", "50", true},
+                {"/proc/sys/vm/dirty_ratio", "20", true},
+                {"/proc/sys/vm/dirty_background_ratio", "10", true},
+                {"/proc/sys/vm/vfs_cache_pressure", "100", true},
+                {"/proc/sys/vm/min_free_kbytes", "67584", true},
+                {"/proc/sys/vm/page-cluster", "3", true},
+                // write-only: root's read is EACCES (see syscall.hpp)
+                {"/proc/sys/vm/drop_caches", "", false},
                 {"/proc/sys/net/core/somaxconn", "4096", true},
                 {"/proc/sys/net/ipv4/ip_local_port_range", "32768\t60999", true},
                 {"/proc/sys/net/ipv4/tcp_fin_timeout", "60", true},
@@ -437,7 +550,7 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                         v.assign(buf, n);
                     }
                 }
-                if (v.empty()) v = std::string{k.fallback} + "\n";
+                if (v.empty() && *k.fallback) v = std::string{k.fallback} + "\n";
                 return ok(text_file(std::move(v)));
             }
             auto dir_of = [&](std::string_view d) {
@@ -593,6 +706,7 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
             };
 
             const std::string& comm = kernel::ProcessTable::comm_of(I, self_tid);
+            const char state = host_state(procs, self_tid, I.state);
             if (tail == "comm")   return ok(text_file(comm + "\n"));
             if (tail == "cmdline") {
                 std::string cl = I.cmdline; cl.push_back('\0');  // NUL-terminated
@@ -609,7 +723,7 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                 std::string s;
                 s += std::to_string(self_tid);
                 s += " (" + comm + ") ";
-                s += I.state; s += ' ';
+                s += state; s += ' ';
                 s += std::to_string(I.ppid) + " ";      // ppid
                 // From the process table, not the pid: answering pid made
                 // `ps -o pgid` show every task as its own group leader.
@@ -652,8 +766,8 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
             if (tail == "status") {
                 std::string s;
                 s += "Name:\t" + comm + "\n";
-                s += "State:\t"; s += I.state;
-                switch (I.state) {
+                s += "State:\t"; s += state;
+                switch (state) {
                     case 'R': s += " (running)\n"; break;
                     case 'T': s += " (stopped)\n"; break;
                     case 'Z': s += " (zombie)\n"; break;

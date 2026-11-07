@@ -55,10 +55,12 @@ int main() {
     {
         auto pol = sysfs("/sys/devices/system/cpu/cpufreq");
         assert(pol && pol->is_dir && has_entry(*pol, "policy0"));
+        // the host's live clock when it shows one, so only check the shape
         auto cur = sysfs("/sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq");
-        assert(cur && str(cur->bytes) == "2400000\n");
+        assert(cur && (cur->bytes.empty() ? !cur->redirect_host.empty()
+                                          : std::stoul(str(cur->bytes)) > 0));
         auto gov = sysfs("/sys/devices/system/cpu/cpufreq/policy2/scaling_governor");
-        assert(gov && str(gov->bytes) == "performance\n");
+        assert(gov && (!gov->bytes.empty() || !gov->redirect_host.empty()));
     }
     // Per-CPU topology.
     {
@@ -67,8 +69,9 @@ int main() {
     }
     // hwmon temperature, via both the device path and the class-symlink view.
     {
+        // a real host sensor in millidegrees, or 42 C when none is readable
         auto t1 = sysfs("/sys/class/hwmon/hwmon0/temp1_input");
-        assert(t1 && str(t1->bytes) == "42000\n");
+        assert(t1 && std::stol(str(t1->bytes)) > 0);
         auto nm = sysfs("/sys/devices/virtual/hwmon/hwmon0/name");
         assert(nm && str(nm->bytes) == "linuxity_cpu\n");
     }

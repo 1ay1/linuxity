@@ -108,6 +108,7 @@ public:
     // not identity, and main.cpp re-upserting pid 1 at exec time used to
     // wipe the seed above and make the first guest process its own leader.
     void upsert(const ProcInfo& p) {
+        note_pid(p.pid);
         auto& cur = procs_[p.pid];
         const std::int32_t pg = p.pgid ? p.pgid : cur.pgid;
         const std::int32_t sd = p.sid ? p.sid : cur.sid;
@@ -131,6 +132,7 @@ public:
         cur.creds_given = false;
     }
     void add_thread(std::int32_t pid, std::int32_t tid) {
+        note_pid(tid);
         auto it = procs_.find(pid);
         if (it == procs_.end() || tid == pid) return;
         auto& t = it->second.threads;
@@ -174,7 +176,13 @@ public:
         // report getpgid(child) == child instead of the parent's group.
         p.pgid = pgid_of(ppid);
         procs_[pid] = p;
+        note_pid(pid);
     }
+
+    // Guest ids are handed out in order, so the highest one seen counts every
+    // fork and thread since start: /proc/stat's processes, loadavg's last pid.
+    void note_pid(std::int32_t id) { if (id > last_pid_) last_pid_ = id; }
+    [[nodiscard]] std::int32_t last_pid() const { return last_pid_; }
 
     // The process group of `pid`, resolving the "0 means my own pid" default.
     // An unknown pid answers its own number, which is what a flat model would
@@ -384,6 +392,7 @@ public:
 private:
     HostOf host_of_;
     std::map<std::int32_t, ProcInfo> procs_;
+    std::int32_t last_pid_{1};
     const LiveSource* live_{nullptr};
     mutable std::map<std::int32_t, ProcInfo> scratch_;
 };
