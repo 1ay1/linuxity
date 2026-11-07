@@ -480,6 +480,8 @@ public:
             case Sysno::getsockname: return do_sockname(r, false);
             case Sysno::syslog:      return do_syslog(r);
             case Sysno::unshare:     return do_unshare(r);
+            case Sysno::ptrace:      return do_ptrace(r);
+            case Sysno::wait4:       return do_wait4_traced(r);
             case Sysno::msgget:      return do_msgget(r);
             case Sysno::msgsnd:      return do_msgsnd(r);
             case Sysno::msgrcv:      return do_msgrcv(r);
@@ -2514,6 +2516,16 @@ private:
             if (!interp.empty()) {
                 std::string interp_abs = k_.files().absolutize(interp);
                 auto ipc = k_.files().classify(interp_abs);
+                // the interpreter is the same file on the host: the kernel can
+                // load both itself, with the auxv a debugger expects
+                if (ipc.realm == kernel::Realm2::host_backed && ipc.host_path == interp_abs &&
+                    extra.empty()) {
+                    // an exec waits for its other threads to be reaped, so
+                    // the tree must keep running meanwhile
+                    Redirect rd{PathArg{path_arg, std::move(pc.host_path)}};
+                    rd.may_block = true;
+                    return rd;
+                }
                 // prog_guest is the GUEST path; the loader's openat redirects.
                 ExecInterp ei{path_arg,
                               ipc.realm == kernel::Realm2::host_backed
@@ -5048,6 +5060,79 @@ private:
     }
 
 #include "linuxity/abi/sysv_handlers.inc"
+
+    // -- guest ptrace (runtime/linux/guest_ptrace.inc) ----------------------
+    // A guest tracing another guest is emulated by the backend, which is
+    // every guest task's real tracer.
+    [[nodiscard]] Outcome do_ptrace(const Regs& r) {
+        if constexpr (requires { mem_.guest_ptrace(0, 0, 0, 0); }) {
+            const auto req = static_cast<std::int64_t>(r.arg[0]);
+            const auto pid = static_cast<std::int32_t>(r.arg[1]);
+            if (req == 16 /*ATTACH*/ || req == 0x4206 /*SEIZE*/) {
+                // ptrace_may_access: CAP_SYS_PTRACE, or the same uids; then
+                // Yama (scope 1: only descendants without the capability)
+                const auto& m = me();
+                if (!creds::capable(m, 19 /*CAP_SYS_PTRACE*/)) {
+                    const auto g = global_of_view(pid);
+                    const auto* t = g > 0 ? k_.procs().find(g) : nullptr;
+                    if (!t) return eno(Errno::esrch);
+                    if (t->uids[0] != m.uids[0] || t->uids[1] != m.uids[0] || t->uids[2] != m.uids[0] ||
+                        t->gids[0] != m.gids[0] || t->gids[1] != m.gids[0] || t->gids[2] != m.gids[0])
+                        return eno(Errno::eperm);
+                    int scope = 1;
+                    if (std::FILE* f = std::fopen("/proc/sys/kernel/yama/ptrace_scope", "re")) {
+                        if (std::fscanf(f, "%d", &scope) != 1) scope = 1;
+                        std::fclose(f);
+                    }
+                    if (scope >= 2) return eno(Errno::eperm);
+                    if (scope == 1) {
+                        bool below = false;
+                        for (std::int32_t p = g, hops = 0; p > 1 && hops < 4096; ++hops) {
+                            const auto* pi = k_.procs().find(p);
+                            if (!pi) break;
+                            if (pi->ppid == ids().pid) { below = true; break; }
+                            p = pi->ppid;
+                        }
+                        if (!below) return eno(Errno::eperm);
+                    }
+                }
+            }
+            const std::int64_t ret = mem_.guest_ptrace(req, pid, r.arg[2], r.arg[3]);
+            return val(ret);
+        } else {
+            return eno(Errno::eperm);
+        }
+    }
+    // wait4 by a tracer: its tracees' stops first; with tracees but nothing
+    // to report, poll the real wait4 so real children are still reaped.
+    [[nodiscard]] Outcome do_wait4_traced(const Regs& r) {
+        if constexpr (requires { mem_.guest_wait4(0, 0, 0, 0, std::declval<std::int64_t&>()); }) {
+            const auto pid = static_cast<std::int64_t>(static_cast<std::int32_t>(r.arg[0]));
+            const int options = static_cast<int>(r.arg[2]);
+            // the backend already turned a positive pid into its host tid
+            const std::int64_t hp = pid;
+            std::int64_t ret = 0;
+            switch (mem_.guest_wait4(hp, r.arg[1], options, r.arg[3], ret)) {
+                case std::remove_reference_t<decltype(mem_)>::GtWait::answered:
+                    return val(ret);
+                case std::remove_reference_t<decltype(mem_)>::GtWait::block:
+                    if (options & 1 /*WNOHANG*/) return fwd();
+                    {
+                        // the real wait4 without blocking; a real child's exit
+                        // still comes through, otherwise wait and look again
+                        GuestCalls gc;
+                        gc.steps = {{Sysno::wait4, {r.arg[0], r.arg[1],
+                                                    static_cast<std::uint64_t>(options | 1), r.arg[3], 0, 0}}};
+                        gc.retry_if_zero_ns = 1'000'000;
+                        gc.echild_is_zero = true;
+                        return gc;
+                    }
+                case std::remove_reference_t<decltype(mem_)>::GtWait::forward:
+                    break;
+            }
+        }
+        return fwd();
+    }
 
     // -- namespaces (kernel/namespaces.hpp) ----------------------------------
     // An id of the guest's initial user namespace, as the caller's own user

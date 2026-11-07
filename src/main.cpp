@@ -923,6 +923,7 @@ int main(int argc, char** argv) {
     // procfs reads live per-task facts from the guest's real host task
     k.procs().set_host_resolver([&trap](std::int32_t g) { return static_cast<int>(trap.host_tid_of(g)); });
     k.procs().set_guest_resolver([&trap](std::int32_t h) { return static_cast<int>(trap.guest_pid_of_host(h)); });
+    k.procs().set_tracer_resolver([&trap](std::int32_t g) { return trap.guest_trace_info(g); });
     // a new mount namespace starts with its parent's guest mounts
     k.procs().set_on_new_mnt_ns([&k](std::uint64_t parent, std::uint64_t child) {
         k.files().clone_mnt_ns(parent, child);

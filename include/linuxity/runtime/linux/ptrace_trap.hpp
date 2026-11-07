@@ -129,6 +129,9 @@ public:
             // but before the tracer is armed would ENOSYS-fail.
             const int pre_pid = static_cast<int>(::syscall(SYS_getpid));
             const int pre_tid = static_cast<int>(::syscall(SYS_gettid));
+            // TRACEME before the filter: ptrace itself is trapped (guests
+            // tracing guests), so after it TRACEME would ENOSYS-fail
+            ::ptrace(PTRACE_TRACEME, 0, nullptr, nullptr);
             // Install the seccomp trap filter so ONLY the syscalls linuxity
             // intercepts stop into the tracer; everything else runs natively.
             // Report the outcome to the parent, then let the filter be
@@ -142,7 +145,6 @@ public:
                 (void)!::write(seccomp_pipe[1], &ok_byte, 1);
                 ::close(seccomp_pipe[1]);
             }
-            ::ptrace(PTRACE_TRACEME, 0, nullptr, nullptr);
             // Stop here so the parent can arm PTRACE_O_TRACESECCOMP before the
             // first (now TRACE-filtered) execve runs; otherwise that exec
             // traps with no tracer listening and ENOSYS-aborts (_exit 127).
@@ -200,6 +202,7 @@ public:
                    PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK |
                    PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC;
         if (seccomp_) opts |= PTRACE_O_TRACESECCOMP;
+        base_opts_ = opts;
         ::ptrace(PTRACE_SETOPTIONS, pid, 0, opts);
         root_pid_ = pid;
         tasks_[pid];                       // create, at-entry state
@@ -214,6 +217,22 @@ public:
     // the whole tree has exited.
     [[nodiscard]] Result<bool> next(TrapFrame& f) {
         for (;;) {
+            // a syscall entry the guest tracer just let go (no seccomp: every
+            // entry stop is ours to dispatch, after the tracer saw it)
+            while (!redispatch_.empty()) {
+                const ::pid_t w = redispatch_.front();
+                redispatch_.pop_front();
+                if (!tasks_.count(w)) continue;
+                Regs rr{};
+                if (!Regs::fetch(w, rr)) continue;
+                Task& t = tasks_[w];
+                cur_ = w;
+                t.regs = rr;
+                t.in_call = true;
+                translate_entry_args(w, rr, t);
+                fill_frame(f, rr);
+                return ok(true);
+            }
             int st = 0;
             ::pid_t w;
             if (draining_) {
@@ -250,6 +269,7 @@ public:
                 int code = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
                 if (WIFSIGNALED(st)) trace_killed(w, WTERMSIG(st));
                 if (w == root_pid_) exit_code_ = code;
+                gt_on_exit(w, st);
                 if (auto it = gpid_.find(w); it != gpid_.end()) {
                     proc_events_.push_back({ProcEvent::reap, it->second, 0, {}, {}});
                     reparent_orphans_of(it->second);
@@ -336,7 +356,18 @@ public:
                 // the returned host pid to a guest pid. Step to that exit with
                 // PTRACE_SYSCALL rather than letting CONT run past it — else $!
                 // and jobs would show a host pid. Otherwise run free.
+                gt_on_fork_event(w, event, child);
+                if (auto gt = gtr_.find(w); gt != gtr_.end() && !gt->second.q.empty()) {
+                    gt_park(w);   // the tracer sees the event first
+                    continue;
+                }
                 resume_after_event(w);
+                continue;
+            }
+            if (event == PTRACE_EVENT_EXIT) {
+                // a traced task about to exit: its tracer sees it first
+                if (gt_on_exit_event(w)) continue;
+                resume_run(w, 0);
                 continue;
             }
             if (event == PTRACE_EVENT_EXEC) {
@@ -348,6 +379,7 @@ public:
                 proc_events_.push_back({ProcEvent::exec, gpid_of(w), 0,
                                         comm_of(w), cmdline_of(w)});
                 tasks_[w] = Task{};        // fresh image, back at-entry
+                gt_on_exec(w);
                 resume_run(w, 0);
                 continue;
             }
@@ -417,12 +449,14 @@ public:
                     (si.si_code == SI_USER && si.si_pid == 0));
                 if (attach) {
                     if (tasks_.try_emplace(w).second) ++live_;
+                    if (gt_on_new_task(w)) continue;
                     // A guest SIGSTOP sent before the attach stop was taken
                     // merged into it (one pending SIGSTOP max). Deliver it.
                     resume_run(w, stop_owed_.erase(w) ? SIGSTOP : 0);
                     continue;
                 }
                 if (sig == SIGSTOP) stop_owed_.erase(w);
+                if (gt_on_signal_stop(w, sig)) continue;
             }
             if (sig == SIGTRAP) {
                 // ...but only when it IS that attach stop. A SIGTRAP from a
@@ -443,13 +477,15 @@ public:
                     sig == SIGTRAP &&
                     ::ptrace(PTRACE_GETSIGINFO, w, 0, &si) == 0 &&
                     (si.si_code == TRAP_BRKPT || si.si_code == TRAP_TRACE ||
-                     si.si_code == SI_KERNEL);
+                     si.si_code == TRAP_HWBKPT || si.si_code == SI_KERNEL);
                 if (!real_trap) {
                     if (tasks_.try_emplace(w).second) ++live_;
+                    if (gt_on_new_task(w)) continue;
                     resume_run(w, 0);
                     continue;
                 }
                 trace_fault(w, sig);
+                if (gt_on_signal_stop(w, sig)) continue;   // a breakpoint or a step
                 resume_run(w, sig);
                 continue;
             }
@@ -460,6 +496,8 @@ public:
             // and the exit, distinguished by the -ENOSYS-primed RAX.
             if (sig == (SIGTRAP | 0x80)) {
                 Task& t = tasks_[w];
+                // a stop the guest tracer asked for (PTRACE_SYSCALL)
+                if (gt_on_sys_stop(w, t)) continue;
                 Regs rr{};
                 (void)Regs::fetch(w, rr);
                 bool is_entry = !seccomp_
@@ -497,6 +535,15 @@ public:
             // Any other signal: deliver it to the task. Rewrite si_pid first,
             // so a SA_SIGINFO handler sees the SENDER's guest pid rather than
             // a host pid that does not exist in its namespace.
+            if (gt_on_signal_stop(w, sig)) continue;   // its tracer decides
+            if (sig == SIGCHLD) {
+                siginfo_t csi{};
+                if (::ptrace(PTRACE_GETSIGINFO, w, 0, &csi) == 0 && gt_fix_chld(w, csi)) {
+                    ::ptrace(PTRACE_SETSIGINFO, w, 0, &csi);
+                    resume_run(w, sig);
+                    continue;
+                }
+            }
             rewrite_siginfo_pid(w);
             trace_fault(w, sig);
             resume_run(w, sig);
@@ -706,6 +753,12 @@ public:
     // seccomp filter is active (only filtered syscalls stop), PTRACE_SYSCALL
     // otherwise (every syscall entry/exit stops). `sig` is delivered on resume.
     void resume_run(::pid_t w, int sig) {
+        // a guest-traced task with a stop queued waits for its tracer
+        if (auto it = gtr_.find(w); it != gtr_.end()) {
+            if (!it->second.q.empty()) { if (sig) it->second.carry_sig = sig; gt_park(w); return; }
+            gt_plain_resume(w, sig);
+            return;
+        }
         ::ptrace(seccomp_ ? PTRACE_CONT : PTRACE_SYSCALL, w, 0, sig);
     }
 
@@ -733,7 +786,7 @@ public:
             r.set_ret(static_cast<std::int64_t>(ret));
             if (!store_and_skip(r)) return err(Errno::eio);
             t.action = Action::none;
-            t.in_call = false;
+            sys_done(cur_, /*kernel_owes_exit=*/true);
             const int sig = t.pending_sig;
             t.pending_sig = 0;
             resume_run(cur_, sig);
@@ -967,8 +1020,9 @@ public:
         // it as fork-ret != child-getpid) and the two drive modes diverged
         // (run_seccomp, 15 vs 0). The exit stop is where that translation
         // happens, so skipping it is only safe per-syscall.
-        if (seccomp_ && !owes_exit_stop(t.regs.nr()) && !needs_out_fixup(t.regs) && !t.on_exit) {
-            t.in_call = false;
+        if (seccomp_ && !owes_exit_stop(t.regs.nr()) && !needs_out_fixup(t.regs) && !t.on_exit &&
+            !gt_wants_exit(cur_)) {
+            sys_done(cur_);
             resume_run(cur_, 0);
             return ok(std::int64_t{0});
         }
@@ -990,7 +1044,7 @@ public:
         Regs rr{};
         (void)Regs::fetch(cur_, rr);
         std::int64_t ret = static_cast<std::int64_t>(rr.ret());
-        tasks_[cur_].in_call = false;
+        sys_done(cur_);
         if (post_exit) post_exit(ret);
         resume_task(cur_);
         return ok(ret);
@@ -1020,7 +1074,8 @@ public:
     struct GuestCall { abi::Sysno nr; std::array<std::uint64_t, 6> a; };
     [[nodiscard]] Result<std::int64_t> run_in_guest(const std::vector<GuestCall>& calls,
                                                     const std::vector<std::string>& strings = {},
-                                                    int result_of = -1) {
+                                                    int result_of = -1, std::int64_t retry_if_zero_ns = 0,
+                                                    bool echild_is_zero = false) {
         Task& t = tasks_[cur_];
         const Regs entry = t.regs;
         // scratch for the strings, well below the red zone
@@ -1050,6 +1105,12 @@ public:
             Regs after{};
             (void)Regs::fetch(cur_, after);
             prev = static_cast<std::int64_t>(after.ret());
+            // a real wait4 here reports a host pid; the guest gets its own
+            if (calls[i].nr == abi::Sysno::wait4 && prev > 0) {
+                const std::int32_t g = known_gpid_of(static_cast<::pid_t>(prev));
+                const std::int32_t l = local_pid(known_gpid_of(host_tgid_of(cur_)), g);
+                prev = l > 0 ? l : g;
+            }
             rets.push_back(prev);
             if (i + 1 < calls.size()) {
                 if (prev < 0 && prev >= -4095) break;   // a step failed
@@ -1066,13 +1127,27 @@ public:
         const bool failed = prev < 0 && prev >= -4095;
         if (!failed && result_of >= 0 && static_cast<std::size_t>(result_of) < rets.size())
             prev = rets[static_cast<std::size_t>(result_of)];
+        if (echild_is_zero && prev == -ECHILD) prev = 0;
+        if (prev == 0 && retry_if_zero_ns > 0) {
+            // nothing yet: back to the guest's own call, wait, run it again
+            Regs again{};
+            (void)Regs::fetch(cur_, again);
+            again.rewind_to_syscall();
+            (void)again.store(cur_);
+            if (!step_to_entry(cur_)) return ok(std::int64_t{-1});
+            Regs orig = entry;
+            (void)orig.store(cur_);
+            t.regs = entry;
+            if (auto st = wait_then_retry(retry_if_zero_ns); !st) return err<std::int64_t>(st.error());
+            return ok(std::int64_t{0});
+        }
         Regs out{};
         (void)Regs::fetch(cur_, out);
         Regs keep = entry;
         for (int k = 0; k < 6; ++k) out.set_arg(k, keep.arg(k));
         out.set_ret(prev);
         (void)out.store(cur_);
-        t.in_call = false;
+        sys_done(cur_);
         t.action = Action::none;
         resume_task(cur_);
         return ok(prev);
@@ -1159,7 +1234,7 @@ public:
             Regs rr0{};
             (void)Regs::fetch(cur_, rr0);
             std::int64_t ret0 = static_cast<std::int64_t>(rr0.ret());
-            tasks_[cur_].in_call = false;
+            sys_done(cur_);
             if (post_exit) post_exit(ret0);
             resume_task(cur_);
             return ok(ret0);
@@ -1182,7 +1257,7 @@ public:
         Regs rr{};
         (void)Regs::fetch(cur_, rr);
         std::int64_t ret = static_cast<std::int64_t>(rr.ret());
-        tasks_[cur_].in_call = false;
+        sys_done(cur_);
         // Run the caller's post-exit patch WHILE the task is still stopped at
         // its syscall-exit (e.g. scrub a stat buffer the kernel just filled).
         // This must precede the resume below: once the task runs it may read
@@ -1248,7 +1323,7 @@ public:
         Regs rr{};
         (void)Regs::fetch(cur_, rr);
         const std::int64_t ret = static_cast<std::int64_t>(rr.ret());
-        tasks_[cur_].in_call = false;
+        sys_done(cur_);
         if (post_exit) post_exit(ret);
         resume_task(cur_);
         return ok(ret);
@@ -1392,7 +1467,9 @@ public:
         // Forward: the kernel runs the (rewritten) execve; on success it
         // replaces the image and we get a PTRACE_EVENT_EXEC. Don't step here.
         t.action = Action::none;
-        resume_run(cur_, 0);
+        // the exec is still to happen: run to it (a traced task too)
+        if (gtr_.count(cur_)) ::ptrace(PTRACE_SYSCALL, cur_, 0, 0);
+        else resume_run(cur_, 0);
         return ok(std::int64_t{0});
     }
 
@@ -1810,6 +1887,8 @@ public:
         si.si_code  = SI_QUEUE;
         si.si_pid   = gpid_of(cur_);
         si.si_uid   = 0;                 // the guest runs as root
+        // marks it as a kill(2), turned back into SI_USER at delivery
+        si.si_value.sival_int = kKillMark;
 
         // signal 0 queues nothing -- it is a pure permission/liveness probe --
         // so it must go through the plain form.
@@ -2281,7 +2360,7 @@ private:
             }
         }
         t.action = Action::none;
-        t.in_call = false;
+        sys_done(w);
     }
 
     // The forwarded syscalls whose successful return value IS a pid. We
@@ -2336,6 +2415,7 @@ private:
             if (WIFEXITED(st) || WIFSIGNALED(st)) {
                 int code = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
                 if (w == root_pid_) exit_code_ = code;
+                gt_on_exit(w, st);
                 if (auto it = gpid_.find(w); it != gpid_.end()) {
                     proc_events_.push_back({ProcEvent::reap, it->second, 0, {}, {}});
                     reparent_orphans_of(it->second);
@@ -2369,6 +2449,9 @@ private:
                 } else if (np) {
                     note_thread(w, child);
                 }
+                // traced with fork/clone options: the child becomes a tracee;
+                // the parent's event stop is shown once this call returns
+                gt_on_fork_event(w, event, child);
                 ::ptrace(PTRACE_SYSCALL, w, 0, 0);
                 continue;
             }
@@ -2379,6 +2462,7 @@ private:
                 proc_events_.push_back({ProcEvent::exec, gpid_of(w), 0,
                                         comm_of(w), cmdline_of(w)});
                 tasks_[w] = Task{};
+                gt_on_exec(w);
                 return true;
             }
             if (WSTOPSIG(st) == (SIGTRAP | 0x80)) {
@@ -2424,6 +2508,13 @@ private:
             si.si_code != -6)
             return;
         if (si.si_pid <= 0) return;
+        // a kill(2) we had to queue: the tracer may set SI_USER, so it does
+        if (si.si_code == SI_QUEUE && si.si_value.sival_int == kKillMark) {
+            si.si_code = SI_USER;
+            si.si_value.sival_int = 0;
+            ::ptrace(PTRACE_SETSIGINFO, w, 0, &si);
+            return;
+        }
 
         // LOOK UP ONLY -- never allocate. gpid_of() mints a fresh guest pid
         // for an unknown tid, so calling it here invented pid 3 for a sender
@@ -2435,6 +2526,9 @@ private:
         si.si_pid = g;
         ::ptrace(PTRACE_SETSIGINFO, w, 0, &si);
     }
+
+    // A known guest pid for a host id we have ALREADY seen, or 0.
+    static constexpr int kKillMark = 0x4c58eb1d;
 
     // The guest pid for a host id we have ALREADY seen, or 0. Pure lookup, so
     // it cannot perturb the pid allocator the way gpid_of does.
@@ -2526,7 +2620,10 @@ private:
     bool draining_{false};
     std::chrono::steady_clock::time_point drain_deadline_{};
     bool seccomp_{false};          // trap filter active -> drive with PTRACE_CONT
+    int base_opts_{0};             // linuxity's own ptrace options on every task
     std::unordered_map<::pid_t, Task> tasks_;
+#include "linuxity/runtime/linux/guest_ptrace.inc"
+
 };
 
 // The Linux backend is the reference implementation: it has every capability,

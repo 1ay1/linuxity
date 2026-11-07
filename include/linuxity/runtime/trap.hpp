@@ -120,11 +120,12 @@ public:
                 [&](const abi::GuestCalls& gc) {
                     // Run the chain inside the task, where only it can make the
                     // thing (a shared mapping in its own memory).
-                    if constexpr (requires { trap_.run_in_guest({}, {}, -1); }) {
+                    if constexpr (requires { trap_.run_in_guest({}, {}, -1, 0, false); }) {
                         using GC = typename T::GuestCall;
                         std::vector<GC> calls;
                         for (const auto& s : gc.steps) calls.push_back(GC{s.nr, s.a});
-                        auto rr = trap_.run_in_guest(calls, gc.strings, gc.result_of);
+                        auto rr = trap_.run_in_guest(calls, gc.strings, gc.result_of, gc.retry_if_zero_ns,
+                                                     gc.echild_is_zero);
                         if (!rr) return recover(rr.error());
                         if (gc.done) locked([&] { gc.done(*rr); });
                         return Step::next;

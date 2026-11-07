@@ -66,6 +66,99 @@ inline std::pair<long, std::string> split_pid(std::string_view abs) {
 
 } // namespace detail
 
+namespace detail {
+// The kernel's auxv for host task `h`, with the entries a debugger uses
+// (AT_PHDR, AT_PHNUM, AT_ENTRY, AT_BASE) put back the way a direct exec
+// sets them when linuxity started the program as `ld.so prog`: then the
+// kernel's copy describes the loader, and AT_BASE is 0.
+inline std::string fixed_auxv(int h) {
+    std::string raw;
+#if !defined(_WIN32)
+    if (std::FILE* f = std::fopen(("/proc/" + std::to_string(h) + "/auxv").c_str(), "re")) {
+        char buf[1024];
+        for (std::size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) raw.append(buf, n);
+        std::fclose(f);
+    }
+    if (raw.size() % 16) return raw;
+    auto get = [&](std::uint64_t key) -> std::uint64_t {
+        for (std::size_t i = 0; i + 16 <= raw.size(); i += 16) {
+            std::uint64_t k, v;
+            std::memcpy(&k, raw.data() + i, 8);
+            std::memcpy(&v, raw.data() + i + 8, 8);
+            if (k == key) return v;
+        }
+        return 0;
+    };
+    auto set = [&](std::uint64_t key, std::uint64_t val) {
+        for (std::size_t i = 0; i + 16 <= raw.size(); i += 16) {
+            std::uint64_t k;
+            std::memcpy(&k, raw.data() + i, 8);
+            if (k == key) { std::memcpy(raw.data() + i + 8, &val, 8); return; }
+        }
+    };
+    if (get(7 /*AT_BASE*/) != 0) return raw;   // a direct exec: already right
+    // the program's file and lowest mapping (ld.so has mapped it by now)
+    char exe[4096];
+    const ::ssize_t n = ::readlink(("/proc/" + std::to_string(h) + "/exe").c_str(), exe, sizeof exe - 1);
+    if (n <= 0) return raw;
+    exe[n] = '\0';
+    const std::string ldso = exe;   // the kernel ran the loader
+    std::string prog;
+    std::uint64_t prog_lo = 0, ld_lo = 0;
+    if (std::FILE* m = std::fopen(("/proc/" + std::to_string(h) + "/maps").c_str(), "re")) {
+        char line[4352];
+        while (std::fgets(line, sizeof line, m)) {
+            unsigned long lo, hi, off;
+            char perms[8], path[4096] = {0};
+            if (std::sscanf(line, "%lx-%lx %7s %lx %*s %*s %4095[^\n]", &lo, &hi, perms, &off, path) < 4) continue;
+            std::string p = path;
+            while (!p.empty() && p.front() == ' ') p.erase(0, 1);
+            if (p.empty() || p[0] != '/' || off != 0) continue;
+            if (p == ldso) { if (!ld_lo) ld_lo = lo; continue; }
+            if (prog.empty() && !p.ends_with(".so") && p.find(".so.") == std::string::npos) {
+                prog = p;
+                prog_lo = lo;
+            }
+        }
+        std::fclose(m);
+    }
+    if (prog.empty() || !prog_lo) return raw;   // not mapped yet
+    // the program's ELF header: phoff, phnum, entry, and its first PT_LOAD
+    std::FILE* f = std::fopen(prog.c_str(), "rb");
+    if (!f) return raw;
+    unsigned char eh[64];
+    const bool got = std::fread(eh, 1, sizeof eh, f) == sizeof eh;
+    std::uint64_t entry = 0, phoff = 0, first_vaddr = 0;
+    std::uint16_t phnum = 0, etype = 0;
+    if (got) {
+        std::memcpy(&etype, eh + 16, 2);
+        std::memcpy(&entry, eh + 24, 8);
+        std::memcpy(&phoff, eh + 32, 8);
+        std::memcpy(&phnum, eh + 56, 2);
+        for (std::uint16_t i = 0; i < phnum; ++i) {
+            unsigned char ph[56];
+            if (std::fseek(f, static_cast<long>(phoff + 56u * i), SEEK_SET) != 0 ||
+                std::fread(ph, 1, sizeof ph, f) != sizeof ph) break;
+            std::uint32_t type;
+            std::memcpy(&type, ph, 4);
+            if (type == 1 /*PT_LOAD*/) { std::memcpy(&first_vaddr, ph + 16, 8); break; }
+        }
+    }
+    std::fclose(f);
+    if (!got) return raw;
+    // a PIE (ET_DYN) is loaded at prog_lo - its first vaddr; a fixed one at 0
+    const std::uint64_t bias = etype == 3 ? prog_lo - (first_vaddr & ~0xfffull) : 0;
+    set(3 /*AT_PHDR*/, bias + first_vaddr + phoff);
+    set(5 /*AT_PHNUM*/, phnum);
+    set(9 /*AT_ENTRY*/, bias + entry);
+    set(7 /*AT_BASE*/, ld_lo);
+#else
+    (void)h;
+#endif
+    return raw;
+}
+} // namespace detail
+
 // The host's own copy of a /proc or /sys file, or "" when it hides it.
 inline std::string host_file(const char* path) {
     std::string out;
@@ -886,6 +979,7 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                     {"environ",false},{"fdinfo",true},{"mountinfo",false},
                     {"mounts",false},{"limits",false},{"ns",true},{"net",true},
                     {"uid_map",false},{"gid_map",false},{"setgroups",false},
+                    {"mem",false},{"auxv",false},
                 }));
             // one network namespace, shared with the host
             if (tail == "net" || tail.starts_with("net/"))
@@ -1007,7 +1101,22 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
             };
 
             const std::string& comm = kernel::ProcessTable::comm_of(I, self_tid);
-            const char state = host_state(procs, self_tid, I.state);
+            // its real memory: the host task's file
+            if (tail == "mem") {
+                const int h = procs.host_of(self_tid);
+                if (h <= 0) return err<kernel::VirtualFile>(Errno::enoent);
+                kernel::VirtualFile vf;
+                vf.redirect_host = "/proc/" + std::to_string(h) + "/" + tail;
+                return ok(std::move(vf));
+            }
+            // auxv as a direct exec shows it, even when linuxity started the
+            // program through its loader (debuggers find the program by it)
+            if (tail == "auxv") {
+                const int h = procs.host_of(self_tid);
+                if (h <= 0) return err<kernel::VirtualFile>(Errno::enoent);
+                return ok(text_file(detail::fixed_auxv(h)));
+            }
+            const char state = procs.tracer_of(self_tid).second ? 't' : host_state(procs, self_tid, I.state);
             if (tail == "comm")   return ok(text_file(comm + "\n"));
             if (tail == "cmdline") {
                 std::string cl = I.cmdline; cl.push_back('\0');  // NUL-terminated
@@ -1070,6 +1179,7 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                 s += "State:\t"; s += state;
                 switch (state) {
                     case 'R': s += " (running)\n"; break;
+                    case 't': s += " (tracing stop)\n"; break;
                     case 'T': s += " (stopped)\n"; break;
                     case 'Z': s += " (zombie)\n"; break;
                     case 'D': s += " (disk sleep)\n"; break;
@@ -1078,7 +1188,7 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                 s += "Tgid:\t" + std::to_string(procs.view_pid(I.pid)) + "\n";
                 s += "Pid:\t" + std::to_string(procs.view_pid(self_tid)) + "\n";
                 s += "PPid:\t" + std::to_string(procs.view_pid(I.ppid)) + "\n";
-                s += "TracerPid:\t0\n";
+                s += "TracerPid:\t" + std::to_string(procs.view_pid(procs.tracer_of(self_tid).first)) + "\n";
                 auto ids = [](const std::array<std::uint32_t, 4>& v) {
                     return std::to_string(v[0]) + "\t" + std::to_string(v[1]) + "\t" +
                            std::to_string(v[2]) + "\t" + std::to_string(v[3]) + "\n";

@@ -501,6 +501,10 @@ inline std::string Scenario::key() const {
     // mount(2) really runs and can be compared. It happens in a forked
     // child because joining a mount namespace is irreversible.
     //
+    // ptrace: a guest tracing a guest. linuxity is every guest's real
+    // tracer and emulates the guest's, so this pins stops, wait statuses,
+    // register and memory access, breakpoints and stepping.
+    v.push_back(Scenario{"ptrace", "ptrace"}.exercising(abi::Sysno::ptrace));
     // sysvipc: message queues, semaphores and shared memory. Android has no
     // SysV IPC (ENOSYS natively); linuxity serves it there.
     v.push_back(Scenario{"sysvipc", "sysvipc"}

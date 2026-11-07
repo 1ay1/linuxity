@@ -1,0 +1,33 @@
+# linuxity conformance trace
+# scenario: ptrace
+# arch: x86_64
+# recorded-by: live Linux kernel on this host
+# kernel: Linux 7.2.14-zen1-1-zen
+ptrace = -ESRCH | PEEKDATA on an untraced task is ESRCH
+ptrace = -ESRCH | CONT on a missing pid is ESRCH
+ptrace = -EPERM | attaching to yourself is EPERM
+ptrace = 1 | TRACEME + exec stops with SIGTRAP
+ptrace = 0 | SETOPTIONS
+ptrace = -EINVAL | SETOPTIONS with an unknown bit is EINVAL
+ptrace = 1 | PTRACE_SYSCALL stops at a syscall entry (TRACESYSGOOD)
+ptrace = 1 | GETREGSET shows a syscall number
+ptrace = 1 | ...and at its exit
+ptrace = 0 | GETSIGINFO at a syscall stop
+ptrace = 1 | ...is SIGTRAP
+ptrace = 1 | a traced /bin/true exits 0
+ptrace = 1 | an odd number of stops: pairs plus exit_group
+ptrace = -ESRCH | CONT after the exit is ESRCH
+ptrace = 1 | a traced task's SIGSTOP stops it
+ptrace = 1 | PEEKDATA reads the tracee
+ptrace = 0 | POKEDATA writes it
+ptrace = -errno(5) | PEEKDATA of an unmapped address is EIO
+ptrace = 1 | a breakpoint stops with SIGTRAP
+ptrace = 1 | ...at the breakpoint's address
+ptrace = 0 | SINGLESTEP
+ptrace = 1 | ...stops after one instruction
+ptrace = 1 | it finishes with the poked value
+ptrace = 0 | SEIZE a running child
+ptrace = 0 | INTERRUPT it
+ptrace = 1 | ...it stops with PTRACE_EVENT_STOP
+ptrace = 0 | DETACH
+ptrace = 1 | a detached child runs on and exits

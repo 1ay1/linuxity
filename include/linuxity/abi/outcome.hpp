@@ -319,6 +319,12 @@ struct GuestCalls {
     std::vector<std::string> strings;
     // which step's result the guest gets (-1 = the last one)
     int result_of{-1};
+    // if the result is 0, wait this long and run the guest's own call again
+    // (a blocking wait made of non-blocking ones); 0 = never
+    std::int64_t retry_if_zero_ns{0};
+    // ...and treat -ECHILD from the last step like 0 (a tracer waiting for a
+    // tracee that isn't its real child)
+    bool echild_is_zero{false};
     // called with the final result before the guest sees it
     std::function<void(std::int64_t)> done{};
 };

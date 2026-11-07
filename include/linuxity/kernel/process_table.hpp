@@ -407,6 +407,12 @@ public:
     // (0 if it was never one of ours)
     void set_guest_resolver(HostOf f) { guest_of_ = std::move(f); }
     [[nodiscard]] std::int32_t guest_of(int host) const { return guest_of_ && host > 0 ? guest_of_(host) : 0; }
+    // who ptraces guest task `tid` (0 = nobody), and is it stopped for them
+    using TracerOf = std::function<std::pair<std::int32_t, bool>(std::int32_t)>;
+    void set_tracer_resolver(TracerOf f) { tracer_of_ = std::move(f); }
+    [[nodiscard]] std::pair<std::int32_t, bool> tracer_of(std::int32_t tid) const {
+        return tracer_of_ ? tracer_of_(tid) : std::pair<std::int32_t, bool>{0, false};
+    }
 
     // -- pid namespaces ------------------------------------------------------
     // A process in a child pid namespace has a second, local number there
@@ -544,6 +550,7 @@ public:
 private:
     HostOf host_of_;
     HostOf guest_of_;
+    TracerOf tracer_of_;
     std::map<std::int32_t, ProcInfo> procs_;
     std::int32_t last_pid_{1};
     Namespaces ns_;

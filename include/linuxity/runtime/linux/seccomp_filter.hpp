@@ -130,6 +130,7 @@ inline constexpr int kTrappedX86_64[] = {
     // arms TRACESECCOMP) is handled in start(): the child tgkill-SIGSTOPs
     // itself after TRACEME so the parent arms options first.
     61,                          // wait4                 (pid translated both ways)
+    101,                         // ptrace (a guest tracing a guest is emulated)
     247,                         // waitid    (id in, siginfo.si_pid out, both xlated)
     62,                          // kill                  (signal to guest pid)
     // tkill(200)/tgkill(234) ARE trapped. The old note claimed "a guest tgkill
