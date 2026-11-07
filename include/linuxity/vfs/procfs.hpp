@@ -231,8 +231,10 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
         // ---- /proc root: enumerate every pid + the well-known files -----
         if (abs == "/proc") {
             std::vector<kernel::VirtualDirent> e;
+            // only the pids the reader's pid namespace can see, by its numbers
             for (std::int32_t pid : procs.pids())
-                e.push_back({std::to_string(pid), true});
+                if (const auto v = procs.view_pid(pid); v > 0)
+                    e.push_back({std::to_string(v), true});
             for (const char* f : {"stat","meminfo","vmstat","cpuinfo","uptime","loadavg",
                                   "version","cmdline","filesystems","mounts",
                                   "interrupts","softirqs","swaps","partitions",
@@ -678,7 +680,15 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
             }
         }
         if (abs == "/proc/sys/kernel/osrelease") return ok(text_file(release + "\n"));
-        if (abs == "/proc/sys/kernel/hostname")  return ok(text_file(nodename + "\n"));
+        if (abs == "/proc/sys/kernel/hostname" || abs == "/proc/sys/kernel/domainname") {
+            // the reader's UTS namespace; the initial one is the machine
+            const auto uid = procs.ns_of(procs.reader()).id[static_cast<int>(kernel::NsKind::uts)];
+            const auto& names = procs.ns().uts(uid);
+            const bool dom = abs.ends_with("domainname");
+            const std::string v = uid ? (dom ? names.second : names.first)
+                                      : (dom ? std::string{"(none)"} : nodename);
+            return ok(text_file(v + "\n"));
+        }
         if (abs == "/proc/sys/kernel/pid_max")   return ok(text_file("32768\n"));
         // random/: login profiles, systemd tools and Python's uuid read these.
         // uuid is a fresh v4 per read; boot_id is fixed for this boot.
@@ -714,6 +724,12 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
         // ---- per-process /proc/<pid>/* ----------------------------------
         auto [pid, tail] = detail::split_pid(p);
         if (pid >= 0) {
+            // the number in the path is the reader's (its pid namespace's)
+            if (const auto pns = procs.reader_pid_ns(); pns) {
+                const auto g = procs.pid_from(pns, static_cast<std::int32_t>(pid));
+                if (g <= 0) return err<kernel::VirtualFile>(Errno::enoent);
+                pid = g;
+            }
             const kernel::ProcInfo* pi = procs.find(static_cast<std::int32_t>(pid));
             std::int32_t self_tid = static_cast<std::int32_t>(pid);   // names the thread
             // /proc/<tid> of a non-main thread is unlisted but resolves, like Linux
@@ -730,28 +746,73 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                     {"io",false},{"oom_score",false},{"task",true},
                     {"environ",false},{"fdinfo",true},{"mountinfo",false},
                     {"mounts",false},{"limits",false},{"ns",true},{"net",true},
+                    {"uid_map",false},{"gid_map",false},{"setgroups",false},
                 }));
             // one network namespace, shared with the host
             if (tail == "net" || tail.starts_with("net/"))
                 if (auto r = net_view(tail.size() > 4 ? std::string_view{tail}.substr(4) : std::string_view{}))
                     return std::move(*r);
+            // ---- namespaces: the process's own (syscall.hpp sends a process
+            // still in all the initial ones to the host's real links) ------
+            if (tail == "ns" || tail.starts_with("ns/")) {
+                const auto& reg = procs.ns();
+                const auto& s = I.ns;
+                auto id_of = [&](std::string_view n) -> std::uint64_t {
+                    for (int k = 0; k < kernel::kNsKinds; ++k) {
+                        const auto kd = static_cast<kernel::NsKind>(k);
+                        if (n == kernel::kNsName[k]) return reg.resolve(s, kd);
+                        if (n == std::string{kernel::kNsName[k]} + "_for_children") {
+                            const auto c = kd == kernel::NsKind::pid ? s.pid_for_children
+                                         : kd == kernel::NsKind::time ? s.time_for_children : 0;
+                            return c ? c : reg.resolve(s, kd);
+                        }
+                    }
+                    return 0;
+                };
+                if (tail == "ns") {
+                    std::vector<kernel::VirtualDirent> e;
+                    for (const auto n : kernel::kNsName) e.push_back({std::string{n}, false});
+                    e.push_back({"pid_for_children", false});
+                    e.push_back({"time_for_children", false});
+                    return ok(dir_file(std::move(e)));
+                }
+                std::string n = tail.substr(3);
+                const auto id = id_of(n);
+                if (!id) return err<kernel::VirtualFile>(Errno::enoent);
+                if (n.ends_with("_for_children")) n.resize(n.size() - 13);
+                kernel::VirtualFile vf;
+                vf.symlink_target = n + ":[" + std::to_string(id) + "]";
+                return ok(std::move(vf));
+            }
+            if (tail == "uid_map" || tail == "gid_map") {
+                const auto un = I.ns.id[static_cast<int>(kernel::NsKind::user)];
+                return ok(text_file(procs.ns().map_text(un, tail == "gid_map")));
+            }
+            if (tail == "setgroups") {
+                const auto un = I.ns.id[static_cast<int>(kernel::NsKind::user)];
+                const auto* u = procs.ns().user_ns(un);
+                return ok(text_file(!u || u->setgroups_allowed ? "allow\n" : "deny\n"));
+            }
 
             // ---- /proc/<pid>/task : the thread group -------------------
             // htop/top enumerate processes THROUGH this directory. Each
             // thread's files mirror the process's own.
             if (tail == "task") {
-                std::vector<kernel::VirtualDirent> ents{{std::to_string(I.pid), true}};
-                for (auto t : I.threads) ents.push_back({std::to_string(t), true});
+                std::vector<kernel::VirtualDirent> ents{{std::to_string(procs.view_pid(I.pid)), true}};
+                for (auto t : I.threads)
+                    if (const auto v = procs.view_pid(t); v > 0) ents.push_back({std::to_string(v), true});
                 return ok(dir_file(std::move(ents)));
             }
             if (tail.starts_with("task/")) {
                 std::string_view rest = std::string_view{tail}.substr(5);
                 std::size_t slash = rest.find('/');
                 std::string_view tid = rest.substr(0, slash);
-                const bool known = tid == std::to_string(I.pid) ||
-                    std::any_of(I.threads.begin(), I.threads.end(),
-                                [&](std::int32_t t) { return tid == std::to_string(t); });
-                if (!known)
+                // the reader's number for the thread -> its global tid
+                std::int32_t global_tid = 0;
+                if (tid == std::to_string(procs.view_pid(I.pid))) global_tid = I.pid;
+                for (const auto t : I.threads)
+                    if (tid == std::to_string(procs.view_pid(t))) global_tid = t;
+                if (!global_tid)
                     return err<kernel::VirtualFile>(Errno::enoent);
                 if (slash == std::string_view::npos)  // /proc/<pid>/task/<tid>
                     return ok(dir_file({
@@ -760,9 +821,8 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                         {"io",false},{"children",false},
                     }));
                 // Re-target the file lookup at the thread's own file, which
-                // mirrors the process's but names the thread. Parse tid
-                // first: it views into tail.
-                self_tid = static_cast<std::int32_t>(std::atol(std::string{tid}.c_str()));
+                // mirrors the process's but names the thread.
+                self_tid = global_tid;
                 tail = std::string{rest.substr(slash + 1)};
             }
 
@@ -823,10 +883,10 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                     return i - 3 < hs.size() ? hs[i - 3] : std::string{dflt};
                 };
                 std::string s;
-                s += std::to_string(self_tid);
+                s += std::to_string(procs.view_pid(self_tid));
                 s += " (" + comm + ") ";
                 s += state; s += ' ';
-                s += std::to_string(I.ppid) + " ";      // ppid
+                s += std::to_string(procs.view_pid(I.ppid)) + " ";      // ppid
                 // From the process table, not the pid: answering pid made
                 // `ps -o pgid` show every task as its own group leader.
                 s += std::to_string(procs.pgid_of(I.pid)) + " ";  // pgrp
@@ -876,9 +936,9 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                     case 'D': s += " (disk sleep)\n"; break;
                     default:  s += " (sleeping)\n"; break;
                 }
-                s += "Tgid:\t" + std::to_string(I.pid) + "\n";
-                s += "Pid:\t" + std::to_string(self_tid) + "\n";
-                s += "PPid:\t" + std::to_string(I.ppid) + "\n";
+                s += "Tgid:\t" + std::to_string(procs.view_pid(I.pid)) + "\n";
+                s += "Pid:\t" + std::to_string(procs.view_pid(self_tid)) + "\n";
+                s += "PPid:\t" + std::to_string(procs.view_pid(I.ppid)) + "\n";
                 s += "TracerPid:\t0\n";
                 auto ids = [](const std::array<std::uint32_t, 4>& v) {
                     return std::to_string(v[0]) + "\t" + std::to_string(v[1]) + "\t" +
@@ -894,8 +954,16 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                         s += std::to_string(g[i]) + " ";
                 }
                 s += "\n";
-                s += "NStgid:\t" + std::to_string(I.pid) + "\n";
-                s += "NSpid:\t" + std::to_string(self_tid) + "\n";
+                // one number per pid namespace from the reader's down
+                auto ns_chain = [&](std::int32_t g) {
+                    std::string out = std::to_string(procs.view_pid(g));
+                    const auto own = kernel::ProcessTable::pid_ns(I.ns);
+                    if (own && own != procs.reader_pid_ns())
+                        if (const auto l = procs.pid_in(own, g); l > 0) out += "\t" + std::to_string(l);
+                    return out;
+                };
+                s += "NStgid:\t" + ns_chain(I.pid) + "\n";
+                s += "NSpid:\t" + ns_chain(self_tid) + "\n";
                 s += "NSpgid:\t" + std::to_string(procs.pgid_of(I.pid)) + "\n";
                 s += "NSsid:\t" + std::to_string(procs.sid_of(I.pid)) + "\n";
                 // memory, as the task really uses it

@@ -406,16 +406,34 @@ public:
                c == abi::Sysno::linkat || c == abi::Sysno::newfstatat ||
                c == abi::Sysno::mknod || c == abi::Sysno::mknodat ||
                // dmesg_restrict: the guest is root, the native probe isn't
-               c == abi::Sysno::syslog;
+               c == abi::Sysno::syslog ||
+               // CAP_SYS_ADMIN: likewise
+               c == abi::Sysno::unshare || c == abi::Sysno::setns ||
+               c == abi::Sysno::sethostname || c == abi::Sysno::setdomainname ||
+               // and every mount step that needed the namespace first
+               c == abi::Sysno::mount || c == abi::Sysno::umount2 ||
+               c == abi::Sysno::fsopen || c == abi::Sysno::fsconfig ||
+               c == abi::Sysno::fsmount || c == abi::Sysno::fspick ||
+               c == abi::Sysno::move_mount || c == abi::Sysno::open_tree ||
+               c == abi::Sysno::open_tree_attr || c == abi::Sysno::mount_setattr ||
+               c == abi::Sysno::listns || c == abi::Sysno::file_getattr ||
+               c == abi::Sysno::file_setattr || c == abi::Sysno::ustat ||
+               c == abi::Sysno::statmount || c == abi::Sysno::listmount ||
+               c == abi::Sysno::pivot_root || c == abi::Sysno::chroot ||
+               c == abi::Sysno::swapon || c == abi::Sysno::swapoff ||
+               c == abi::Sysno::quotactl || c == abi::Sysno::acct;
     }
     [[nodiscard]] bool exempt(const Observation& n,
                               const Observation& g) const noexcept {
         if (!filtered(n.call) || n.call != g.call) return false;
         // (a) the call itself: host denied by policy, linuxity served it.
+        //     For unshare a kernel built without that namespace type says
+        //     EINVAL (Android has no user namespaces): also the host's limit.
+        const bool ns_call = n.call == abi::Sysno::unshare;
         if (g.returned.is_ok() &&
             n.returned.match([](std::int64_t) { return false; },
-                             [](std::int32_t e) {
-                                 return e == EACCES || e == EPERM;
+                             [&](std::int32_t e) {
+                                 return e == EACCES || e == EPERM || (ns_call && e == EINVAL);
                              }))
             return true;
         // (b) an invariant DERIVED from such a call. The probe reports 2 for

@@ -160,6 +160,8 @@ inline constexpr int kTrappedX86_64[] = {
     251, 252,                    // ioprio_set/get
     298,                         // perf_event_open (pid in arg1)
     103,                         // syslog (the guest's own kernel log)
+    272, 308,                    // unshare/setns (the guest's own namespaces)
+    170, 171,                    // sethostname/setdomainname (per UTS namespace)
     115,                         // getgroups (the guest's own list, not the host user's)
     // -- session / process groups ------------------------------------------
     111, 121, 124, 112, 109,     // getpgrp/getpgid/getsid/setsid/setpgid

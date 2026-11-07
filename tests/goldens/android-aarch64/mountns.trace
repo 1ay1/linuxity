@@ -3,9 +3,9 @@
 # arch: aarch64
 # recorded-by: live Linux kernel on this host
 # kernel: Linux 6.1.162-android14-11-g9dd05ae3a1de-ab16261587
-unshare = 0 | unshare a user+mount namespace
+unshare = 2 | unshare a user+mount namespace
 mount = 2 | mount a private tmpfs
-openat = 2 | the tmpfs is writable
+mount = 2 | the tmpfs is writable
 mount = 2 | mount --bind a directory onto itself
 mount = 2 | MS_PRIVATE on the bind
 umount2 = 2 | umount2 the bind with MNT_DETACH

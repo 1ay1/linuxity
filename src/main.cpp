@@ -922,10 +922,29 @@ int main(int argc, char** argv) {
     runtime::Cpu cpu{trap, k, trap, conform::host_arch()};
     // procfs reads live per-task facts from the guest's real host task
     k.procs().set_host_resolver([&trap](std::int32_t g) { return static_cast<int>(trap.host_tid_of(g)); });
+    // a new mount namespace starts with its parent's guest mounts
+    k.procs().set_on_new_mnt_ns([&k](std::uint64_t parent, std::uint64_t child) {
+        k.files().clone_mnt_ns(parent, child);
+    });
     trap.set_guest_ids([&k](std::int32_t g) {
         const auto* p = k.procs().find(g);
         return p ? std::pair{p->uids[1], p->gids[1]} : std::pair<std::uint32_t, std::uint32_t>{0, 0};
     });
+    // pid namespaces: how one guest process numbers another
+    trap.set_pid_view(
+        [&k](std::int32_t viewer, std::int32_t pid) {
+            auto& t = k.procs();
+            const auto ns = kernel::ProcessTable::pid_ns(t.ns_of(viewer));
+            if (!ns) return pid;
+            if (const auto l = t.pid_in(ns, pid); l > 0) return l;
+            // a child forked a moment ago, before its spawn event lands
+            t.assign_ns_pid_from(pid, viewer);
+            return t.pid_in(ns, pid);
+        },
+        [&k](std::int32_t viewer, std::int32_t pid) {
+            const auto ns = kernel::ProcessTable::pid_ns(k.procs().ns_of(viewer));
+            return k.procs().pid_from(ns, pid);
+        });
 
     auto rc = cpu.run(uaddr(0), uaddr(0));
 

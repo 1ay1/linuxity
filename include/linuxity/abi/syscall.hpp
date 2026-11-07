@@ -128,6 +128,8 @@ public:
         {
             auto id = ids();
             k_.files().set_current_pid(id.pid, id.ppid);
+            k_.procs().set_reader(id.pid);
+            k_.files().set_current_mnt_ns(k_.procs().ns_of(id.pid).id[static_cast<int>(kernel::NsKind::mnt)]);
             // A task can trap before its spawn event is folded in; build its
             // fork-time record now so no handler sees a half-made one.
             if constexpr (requires { mem_.host_tid(); })
@@ -195,15 +197,21 @@ public:
             //    process.
             case Sysno::getpid:  case Sysno::gettid:  case Sysno::getppid: {
                 const auto i = ids();
-                if (auto a = identity_answer(sc, {i.pid, i.tid, i.ppid}))
+                // as the caller's pid namespace numbers them; a parent
+                // outside it reads as 0, like on Linux
+                const auto pns = kernel::ProcessTable::pid_ns(k_.procs().ns_of(i.pid));
+                const auto& t = k_.procs();
+                if (auto a = identity_answer(sc, {t.pid_in(pns, i.pid), t.pid_in(pns, i.tid),
+                                                  t.pid_in(pns, i.ppid)}))
                     return val(*a);
                 return fwd();
             }
-            // The guest's own credentials, tracked per process (abi/creds.hpp).
-            case Sysno::getuid:  return val(me().uids[0]);
-            case Sysno::geteuid: return val(me().uids[1]);
-            case Sysno::getgid:  return val(me().gids[0]);
-            case Sysno::getegid: return val(me().gids[1]);
+            // The guest's own credentials, tracked per process (abi/creds.hpp),
+            // as its user namespace names them.
+            case Sysno::getuid:  return val(ns_id(me().uids[0], false));
+            case Sysno::geteuid: return val(ns_id(me().uids[1], false));
+            case Sysno::getgid:  return val(ns_id(me().gids[0], true));
+            case Sysno::getegid: return val(ns_id(me().gids[1], true));
 
             // -- getresuid(ruid*,euid*,suid*) / getresgid(rgid*,egid*,sgid*):
             //    bash and sudo read these at startup to populate $UID/$EUID.
@@ -468,6 +476,10 @@ public:
             case Sysno::socket:      return do_socket(r);
             case Sysno::getsockname: return do_sockname(r, false);
             case Sysno::syslog:      return do_syslog(r);
+            case Sysno::unshare:     return do_unshare(r);
+            case Sysno::setns:       return do_setns(r);
+            case Sysno::sethostname: return do_set_uts(r, false);
+            case Sysno::setdomainname: return do_set_uts(r, true);
             case Sysno::getpeername: return do_sockname(r, true);
 
             // -- chroot(path): a guest chroot would chroot our HOST child to
@@ -626,8 +638,31 @@ public:
                 // matching umount2 has to agree -- otherwise a program that
                 // mounts and then unmounts its own scratch tree gets EINVAL
                 // for an unmount that should obviously work.
-                if (const std::string tgt = read_cstr(uaddr(r.arg[1])); !tgt.empty())
-                    guest_mounts_.insert(k_.files().absolutize(tgt, k_.files().cwd()));
+                // In a mount namespace of its own the guest's tmpfs and bind
+                // mounts are real: a scratch dir (or the bind's source) at the
+                // target, seen only there. In the shared one they stay
+                // remembered no-ops, so nothing outside changes.
+                if (const std::string tgt = read_cstr(uaddr(r.arg[1])); !tgt.empty()) {
+                    const std::string abs_tgt = k_.files().absolutize(tgt, k_.files().cwd());
+                    const auto mns = me().ns.id[static_cast<int>(kernel::NsKind::mnt)];
+                    if (mns && !(r.arg[3] & 0x20 /*MS_REMOUNT*/) && !(r.arg[3] & 0x40000 /*MS_PRIVATE*/) &&
+                        !(r.arg[3] & 0x80000 /*MS_SLAVE*/) && !(r.arg[3] & 0x100000 /*MS_SHARED*/)) {
+                        std::string host_dir;
+                        if (r.arg[3] & kMsBind) {
+                            const auto pc = k_.files().classify(
+                                k_.files().absolutize(read_cstr(uaddr(r.arg[0])), k_.files().cwd()));
+                            if (pc.realm == kernel::Realm2::host_backed) host_dir = pc.host_path;
+                        } else if (type == "tmpfs" || type == "ramfs") {
+                            char tmpl[] = "/tmp/linuxity-tmpfs-XXXXXX";
+                            if (::mkdtemp(tmpl)) host_dir = tmpl;
+                        }
+                        if (!host_dir.empty()) {
+                            k_.files().mount_guest(abs_tgt, host_dir, mns);
+                            return val(0);
+                        }
+                    }
+                    guest_mounts_.insert(abs_tgt);
+                }
                 return val(0);
             }
             case Sysno::umount2: {
@@ -638,6 +673,8 @@ public:
                 if (raw.empty()) return eno(Errno::efault);
                 const std::string tgt =
                     k_.files().absolutize(raw, k_.files().cwd());
+                const auto mns = me().ns.id[static_cast<int>(kernel::NsKind::mnt)];
+                if (mns && k_.files().umount_guest(tgt, mns)) return val(0);
                 if (!guest_mounts_.erase(tgt) &&
                     !k_.files().is_mount_point(tgt))
                     return eno(Errno::einval);
@@ -767,12 +804,12 @@ public:
             //    a drop to an unprivileged user sticks and later checks see
             //    it. The host process is never changed: one host user runs
             //    the whole tree, and ownership is ours to present anyway.
-            case Sysno::setuid:    return creds_result(creds::set_one(me(), me().uids, creds::kCapSetuid, u32(r, 0)));
-            case Sysno::setgid:    return creds_result(creds::set_one(me(), me().gids, creds::kCapSetgid, u32(r, 0)));
-            case Sysno::setreuid:  return creds_result(creds::setre(me(), me().uids, creds::kCapSetuid, u32(r, 0), u32(r, 1)));
-            case Sysno::setregid:  return creds_result(creds::setre(me(), me().gids, creds::kCapSetgid, u32(r, 0), u32(r, 1)));
-            case Sysno::setresuid: return creds_result(creds::setres(me(), me().uids, creds::kCapSetuid, u32(r, 0), u32(r, 1), u32(r, 2)));
-            case Sysno::setresgid: return creds_result(creds::setres(me(), me().gids, creds::kCapSetgid, u32(r, 0), u32(r, 1), u32(r, 2)));
+            case Sysno::setuid:    return creds_result(creds::set_one(me(), me().uids, creds::kCapSetuid, in_ns(u32(r, 0), false)));
+            case Sysno::setgid:    return creds_result(creds::set_one(me(), me().gids, creds::kCapSetgid, in_ns(u32(r, 0), true)));
+            case Sysno::setreuid:  return creds_result(creds::setre(me(), me().uids, creds::kCapSetuid, in_ns(u32(r, 0), false), in_ns(u32(r, 1), false)));
+            case Sysno::setregid:  return creds_result(creds::setre(me(), me().gids, creds::kCapSetgid, in_ns(u32(r, 0), true), in_ns(u32(r, 1), true)));
+            case Sysno::setresuid: return creds_result(creds::setres(me(), me().uids, creds::kCapSetuid, in_ns(u32(r, 0), false), in_ns(u32(r, 1), false), in_ns(u32(r, 2), false)));
+            case Sysno::setresgid: return creds_result(creds::setres(me(), me().gids, creds::kCapSetgid, in_ns(u32(r, 0), true), in_ns(u32(r, 1), true), in_ns(u32(r, 2), true)));
             case Sysno::setfsuid:  return val(creds::set_fs(me(), me().uids, creds::kCapSetuid, u32(r, 0)));
             case Sysno::setfsgid:  return val(creds::set_fs(me(), me().gids, creds::kCapSetgid, u32(r, 0)));
             case Sysno::setgroups: return do_setgroups(r);
@@ -1096,7 +1133,9 @@ private:
     // writes -- so refusing it would break every runtime that names its
     // threads through the file rather than the prctl.
     [[nodiscard]] static bool virtual_is_writable(std::string_view p) noexcept {
-        return p.ends_with("/comm") || p == "/proc/sys/vm/drop_caches" || p == "/dev/kmsg";
+        return p.ends_with("/comm") || p == "/proc/sys/vm/drop_caches" || p == "/dev/kmsg" ||
+               p.ends_with("/uid_map") || p.ends_with("/gid_map") || p.ends_with("/setgroups") ||
+               p == "/proc/sys/kernel/hostname" || p == "/proc/sys/kernel/domainname";
     }
     // Files whose mode has no read bit for anyone, root included.
     [[nodiscard]] static bool virtual_is_write_only(std::string_view p) noexcept {
@@ -1508,6 +1547,9 @@ private:
         };
         if (!abs.starts_with("/proc/")) return abs;
         const auto id = ids();
+        // Paths stay in the reader's own pid numbering (procfs maps them to
+        // global pids), so a dirfd bound to one re-resolves the same way.
+        const auto vpid = k_.procs().view_pid(id.pid), vtid = k_.procs().view_pid(id.tid);
         // The caller's OWN fds stay in (or are folded into) /proc/self/fd form.
         // The guest is a real host process, so the host kernel's
         // /proc/self/fd/N, resolved in the guest's context, IS the guest's fd
@@ -1517,7 +1559,7 @@ private:
         // failed, and `script -c tty` printed "Inappropriate ioctl for device"
         // on a perfectly good pty. Same for open("/proc/self/fd/1").
         {
-            const std::string own = "/proc/" + std::to_string(id.pid);
+            const std::string own = "/proc/" + std::to_string(vpid);
             for (const std::string_view who : {std::string_view{"/proc/self"},
                                                std::string_view{own}}) {
                 for (const std::string_view leaf : {std::string_view{"/fd"},
@@ -1528,13 +1570,13 @@ private:
                 }
             }
         }
-        if (rebind("/proc/self", id.pid)) return ns_to_host(std::move(abs));
+        if (rebind("/proc/self", vpid)) return ns_to_host(std::move(abs));
         // thread-self is a TID, not a pid: /proc/thread-self is
         // /proc/<pid>/task/<tid> on a real kernel.
         if (abs == "/proc/thread-self" || abs.starts_with("/proc/thread-self/")) {
             const std::string rest = abs.substr(std::string_view{"/proc/thread-self"}.size());
-            abs = "/proc/" + std::to_string(id.pid) + "/task/" +
-                  std::to_string(id.tid) + rest;
+            abs = "/proc/" + std::to_string(vpid) + "/task/" +
+                  std::to_string(vtid) + rest;
         }
         return ns_to_host(std::move(abs));
     }
@@ -1556,7 +1598,15 @@ private:
         if (v != "/ns" && !v.starts_with("/ns/")) return abs;
         std::int32_t pid = 0;
         for (const char c : who) pid = pid * 10 + (c - '0');
+        if (const auto pns = k_.procs().reader_pid_ns(); pns) pid = k_.procs().pid_from(pns, pid);
+        if (pid <= 0) return abs;
         if (!k_.procs().find(pid) && !k_.procs().thread_group_of(pid)) return abs;
+        // a process in a namespace of its own reads its links from procfs;
+        // everyone else shares the host's
+        const std::int32_t owner = k_.procs().find(pid) ? pid : k_.procs().thread_group_of(pid);
+        const auto set = k_.procs().ns_of(owner);
+        for (const auto id : set.id) if (id) return abs;
+        if (set.pid_for_children || set.time_for_children) return abs;
         return "/proc/self" + std::string{v};
     }
     [[nodiscard]] std::string expand_proc_links(std::string abs, bool follow_leaf) {
@@ -1818,6 +1868,7 @@ private:
             // /etc/mtab -> /proc/self/mounts); produce that, not the link.
             const std::string& vp = pc.virtual_path.empty() ? abs : pc.virtual_path;
             if (!comm_files_.empty()) apply_comm_writes();
+            else if (!map_files_.empty()) apply_map_writes();
             auto vf = k_.files().produce(vp);
             if (!vf) return eno(vf.error());
             // /proc/<pid>/maps is a STUB in procfs -- it has no idea what the
@@ -1836,6 +1887,20 @@ private:
             pending_flags_ = 0;   // a virtual file is never a terminal
             pending_comm_ = for_write && vp.ends_with("/comm") ? comm_target(vp)
                                                                : std::pair<std::int32_t, std::int32_t>{0, 0};
+            pending_map_ = {};
+            if (for_write)
+                for (const char* leaf : {"/uid_map", "/gid_map", "/setgroups"})
+                    if (vp.ends_with(leaf)) {
+                        std::int32_t pid = 0;
+                        if (std::sscanf(vp.c_str(), "/proc/%d/", &pid) == 1 && pid > 0)
+                            pending_map_ = {global_of_view(pid), leaf + 1};
+                    }
+            if (for_write && (vp == "/proc/sys/kernel/hostname" || vp == "/proc/sys/kernel/domainname")) {
+                // needs CAP_SYS_ADMIN, like sethostname
+                if (!creds::capable(me(), 21)) return eno(Errno::eacces);
+                pending_map_ = {ids().pid, vp.ends_with("hostname") ? "hostname" : "domainname"};
+            }
+            if (!pending_map_.second.empty()) vf->bytes.clear();
             // a write sets the name to just what was written, so start empty
             if (pending_comm_.first) vf->bytes.clear();
             // A virtual DIRECTORY: stash its entries so getdents64 on the
@@ -2169,15 +2234,16 @@ private:
                                          : std::string_view{}));
             const std::size_t bi0 = static_cast<std::size_t>(path_arg) + 1;
             const auto id = ids();
+            const auto vp = k_.procs().view_pid(id.pid), vt = k_.procs().view_pid(id.tid);
             if (pre == "/proc/self")
                 return write_link(uaddr(r.arg[bi0]),
                                   static_cast<std::size_t>(r.arg[bi0 + 1]),
-                                  std::to_string(id.pid));
+                                  std::to_string(vp));
             if (pre == "/proc/thread-self")
                 return write_link(uaddr(r.arg[bi0]),
                                   static_cast<std::size_t>(r.arg[bi0 + 1]),
-                                  std::to_string(id.pid) + "/task/" +
-                                      std::to_string(id.tid));
+                                  std::to_string(vp) + "/task/" +
+                                      std::to_string(vt));
             // A synthesized symlink outside /proc (/dev/stdin -> /proc/self/fd/0,
             // /dev/fd): its own target, before resolve_arg expands the leaf
             // through it.
@@ -2721,9 +2787,50 @@ private:
         return fwd();   // let the child actually close its real fd
     }
 
+    // uid_map/gid_map/setgroups writes: each is set once per user namespace,
+    // like the kernel (a second uid_map write is EPERM there).
+    void apply_map_writes() {
+        for (auto it = map_files_.begin(); it != map_files_.end();) {
+            std::string text;
+            if (const int h = ::open(it->host.c_str(), O_RDONLY | O_CLOEXEC); h >= 0) {
+                char buf[4096];
+                const ::ssize_t n = ::read(h, buf, sizeof buf);
+                ::close(h);
+                if (n > 0) text.assign(buf, static_cast<std::size_t>(n));
+            }
+            if (text.empty()) { ++it; continue; }   // not written yet
+            auto* p = k_.procs().find_mut(it->pid);
+            auto& reg = k_.procs().ns();
+            if (p) {
+                const auto un = p->ns.id[static_cast<int>(kernel::NsKind::user)];
+                if (it->which == "hostname" || it->which == "domainname") {
+                    while (!text.empty() && text.back() == '\n') text.pop_back();
+                    if (text.size() > 64) text.resize(64);
+                    const auto uid = p->ns.id[static_cast<int>(kernel::NsKind::uts)];
+                    if (it->which == "domainname") reg.set_domainname(uid, text);
+                    else if (uid) reg.set_hostname(uid, text);
+                    else {
+                        if constexpr (requires { k_.machine().nodename = text; }) k_.machine().nodename = text;
+                    }
+                } else if (auto* u = reg.user_ns(un)) {
+                    if (it->which == "setgroups") u->setgroups_allowed = !text.starts_with("deny");
+                    else if (it->which == "uid_map" && !u->uid_set) {
+                        u->uid_map = kernel::Namespaces::parse_map(text);
+                        u->uid_set = true;
+                    } else if (it->which == "gid_map" && !u->gid_set) {
+                        u->gid_map = kernel::Namespaces::parse_map(text);
+                        u->gid_set = true;
+                    }
+                }
+            }
+            it = map_files_.erase(it);
+        }
+    }
+
     // A write to a comm file lands in its backing temp file. Pick up any that
     // changed and rename the thread, before anything reads a name.
     void apply_comm_writes() {
+        apply_map_writes();
         for (auto it = comm_files_.begin(); it != comm_files_.end();) {
             auto& c = *it;
             const int h = k_.procs().find(c.pid) ? ::open(c.host.c_str(), O_RDONLY | O_CLOEXEC) : -1;
@@ -2739,6 +2846,12 @@ private:
         }
     }
 
+    // A pid as the caller numbers it (its pid namespace) -> the global pid.
+    [[nodiscard]] std::int32_t global_of_view(std::int32_t pid) const {
+        const auto pns = k_.procs().reader_pid_ns();
+        return pns ? k_.procs().pid_from(pns, pid) : pid;
+    }
+
     // /proc/<pid>/comm, /proc/<pid>/task/<tid>/comm or /proc/<tid>/comm ->
     // the (process, thread) it names, or {0, 0}
     [[nodiscard]] std::pair<std::int32_t, std::int32_t> comm_target(std::string_view vp) const {
@@ -2751,10 +2864,10 @@ private:
         };
         if (!vp.starts_with("/proc/")) return {0, 0};
         vp.remove_prefix(6);
-        const std::int32_t a = num(vp);
+        const std::int32_t a = global_of_view(num(vp));
         std::int32_t b = 0;
-        if (vp.starts_with("/task/")) { vp.remove_prefix(6); b = num(vp); }
-        if (!a || vp != "/comm") return {0, 0};
+        if (vp.starts_with("/task/")) { vp.remove_prefix(6); b = global_of_view(num(vp)); }
+        if (a <= 0 || b < 0 || vp != "/comm") return {0, 0};
         if (k_.procs().find(a)) return {a, b ? b : a};
         if (const auto tg = k_.procs().thread_group_of(a)) return {tg, a};
         return {0, 0};
@@ -4777,11 +4890,12 @@ private:
     // caught by diffing against the live kernel.
     [[nodiscard]] Outcome do_getres(const Regs& r, const std::array<std::uint32_t, 4>& ids) {
         if (!r.arg[0] || !r.arg[1] || !r.arg[2]) return eno(Errno::efault);
+        const bool gid = &ids == &me().gids;
         // A non-null pointer can still be unwritable. put_u32 used to
         // swallow that, so writing through 0x1 reported success where the
         // kernel says EFAULT -- the null check caught only the easy half.
-        if (!put_u32(r.arg[0], ids[0]) || !put_u32(r.arg[1], ids[1]) ||
-            !put_u32(r.arg[2], ids[2]))
+        if (!put_u32(r.arg[0], ns_id(ids[0], gid)) || !put_u32(r.arg[1], ns_id(ids[1], gid)) ||
+            !put_u32(r.arg[2], ns_id(ids[2], gid)))
             return eno(Errno::efault);
         return val(0);
     }
@@ -4909,11 +5023,112 @@ private:
             pi.keepcaps = pp->keepcaps;
             pi.no_new_privs = pp->no_new_privs;
             pi.nice = pp->nice;
+            k_.procs().inherit_ns(pi, *pp, 0);
         }
         pi.creds_given = true;
         pi.live_seen = true;
         k_.procs().upsert(pi);
+        if (id.ppid > 0) k_.procs().assign_ns_pid_from(id.pid, id.ppid);
         return *k_.procs().find_mut(id.pid);
+    }
+
+    // -- namespaces (kernel/namespaces.hpp) ----------------------------------
+    // An id of the guest's initial user namespace, as the caller's own user
+    // namespace names it (the overflow id 65534 when it isn't mapped).
+    [[nodiscard]] std::uint32_t ns_id(std::uint32_t id, bool gid) {
+        if (!map_files_.empty()) apply_map_writes();
+        const auto un = me().ns.id[static_cast<int>(kernel::NsKind::user)];
+        return un ? k_.procs().ns().to_ns(un, id, gid) : id;
+    }
+    // The reverse, for an id the caller passes in. An unmapped id becomes
+    // one no credential holds, so the set call fails EINVAL/EPERM like Linux.
+    [[nodiscard]] std::uint32_t in_ns(std::uint32_t id, bool gid) {
+        if (id == creds::kKeep) return id;
+        if (!map_files_.empty()) apply_map_writes();
+        const auto un = me().ns.id[static_cast<int>(kernel::NsKind::user)];
+        if (!un) return id;
+        return k_.procs().ns().from_ns(un, id, gid).value_or(0xfffffffeu);
+    }
+    // Who may make namespaces: CAP_SYS_ADMIN, or anyone for a user namespace
+    // (and anything alongside a new one, which grants them CAP_SYS_ADMIN in it).
+    [[nodiscard]] Errno ns_allowed(const kernel::ProcInfo& p, std::uint64_t flags) const {
+        if (flags & ~(kernel::kCloneNewMask | 0x00000200 /*CLONE_FS*/ | 0x00000400 /*FILES*/ |
+                      0x00040000 /*SYSVSEM*/ | 0x00000100 /*VM*/ | 0x00000800 /*SIGHAND*/ |
+                      0x00010000 /*THREAD*/))
+            return Errno::einval;
+        const bool newuser = flags & 0x10000000;
+        if (!newuser && (flags & kernel::kCloneNewMask) && !creds::capable(p, 21 /*CAP_SYS_ADMIN*/))
+            return Errno::eperm;
+        return Errno::ok;
+    }
+    // unshare(flags)
+    [[nodiscard]] Outcome do_unshare(const Regs& r) {
+        auto& p = me();
+        const std::uint64_t flags = r.arg[0];
+        if (const Errno e = ns_allowed(p, flags); e != Errno::ok) return eno(e);
+        // a multithreaded process can't change its user namespace
+        if ((flags & 0x10000000) && !p.threads.empty()) return eno(Errno::einval);
+        k_.procs().unshare_ns(p, flags & kernel::kCloneNewMask);
+        if (flags & 0x10000000) {
+            // the creator holds every capability in its new user namespace,
+            // and until a map is written its ids read as the overflow id
+            p.cap_eff = p.cap_prm = p.cap_bnd = kernel::ProcInfo::kAllCaps;
+        }
+        // the non-namespace bits (CLONE_FS, FILES, SYSVSEM) are per-task
+        // sharing the host already gives an unshared process
+        return val(0);
+    }
+    // setns(fd, nstype): join the namespace an /proc/<pid>/ns/* fd names
+    [[nodiscard]] Outcome do_setns(const Regs& r) {
+        auto& p = me();
+        const int fd = static_cast<int>(r.arg[0]);
+        const std::uint64_t want = r.arg[1];
+        const std::string gp{k_.files().path_of_fd(fd)};
+        if (gp.empty()) {
+            // not one of ours: EBADF if it isn't open at all
+            if (const int h = open_tracee_fd(fd); h >= 0) ::close(h);
+            else return eno(Errno::ebadf);
+        }
+        // the guest path names the target: /proc/<pid>/ns/<kind>
+        std::int32_t pid = 0;
+        std::string kind;
+        if (std::sscanf(gp.c_str(), "/proc/%d/ns/", &pid) == 1) {
+            kind = gp.substr(gp.rfind('/') + 1);
+            pid = global_of_view(pid);
+        }
+        if (gp.starts_with("/proc/self/ns/")) { pid = ids().pid; kind = gp.substr(14); }
+        if (pid <= 0 || kind.empty()) return eno(Errno::einval);
+        int k = -1;
+        for (int i = 0; i < kernel::kNsKinds; ++i)
+            if (kind == kernel::kNsName[i] || kind == std::string{kernel::kNsName[i]} + "_for_children") k = i;
+        if (k < 0) return eno(Errno::einval);
+        if (want && want != kernel::kNsFlag[k]) return eno(Errno::einval);
+        if (!creds::capable(p, 21 /*CAP_SYS_ADMIN*/)) return eno(Errno::eperm);
+        const auto target = k_.procs().ns_of(pid);
+        const auto kd = static_cast<kernel::NsKind>(k);
+        if (kd == kernel::NsKind::pid) p.ns.pid_for_children = k_.procs().ns().resolve(target, kd);
+        else if (kd == kernel::NsKind::time) p.ns.time_for_children = k_.procs().ns().resolve(target, kd);
+        else p.ns.id[k] = target.id[k];
+        return val(0);
+    }
+    // sethostname/setdomainname: per UTS namespace
+    [[nodiscard]] Outcome do_set_uts(const Regs& r, bool domain) {
+        auto& p = me();
+        if (!creds::capable(p, 21 /*CAP_SYS_ADMIN*/)) return eno(Errno::eperm);
+        const auto len = static_cast<std::size_t>(r.arg[1]);
+        if (len > 64) return eno(Errno::einval);
+        std::vector<std::byte> raw(len);
+        if (len && !mem_.copy_in(uaddr(r.arg[0]), raw)) return eno(Errno::efault);
+        std::string s(reinterpret_cast<const char*>(raw.data()), len);
+        auto& ns = k_.procs().ns();
+        const auto id = p.ns.id[static_cast<int>(kernel::NsKind::uts)];
+        if (domain) ns.set_domainname(id, std::move(s));
+        else if (id) ns.set_hostname(id, std::move(s));
+        else {
+            // the initial namespace is the machine
+            if constexpr (requires { k_.machine().nodename = s; }) k_.machine().nodename = std::move(s);
+        }
+        return val(0);
     }
     [[nodiscard]] static std::uint32_t u32(const Regs& r, int i) {
         return static_cast<std::uint32_t>(r.arg[static_cast<std::size_t>(i)]);
@@ -5015,12 +5230,16 @@ private:
             std::size_t i = 0; for (; s[i] && i < 64; ++i) dst[i] = s[i]; dst[i] = 0;
         };
         set(u.sysname,  "Linux");
+        if (!map_files_.empty()) apply_map_writes();
         const auto& m = machine();
-        set(u.nodename, m.nodename.c_str());
+        // the caller's UTS namespace; the initial one is the machine's name
+        const auto uts_id = me().ns.id[static_cast<int>(kernel::NsKind::uts)];
+        const auto& names = k_.procs().ns().uts(uts_id);
+        set(u.nodename, uts_id ? names.first.c_str() : m.nodename.c_str());
         set(u.release,  m.release.c_str());
         set(u.version,  "#1 linuxity portable Linux ABI");
         set(u.machine,  m.machine_arch.c_str());
-        set(u.domainname, "(none)");
+        set(u.domainname, uts_id ? names.second.c_str() : "(none)");
         if (!mem_.copy_out(buf, {reinterpret_cast<const std::byte*>(&u), sizeof u}))
             return val(-static_cast<std::int64_t>(Errno::efault));
         return val(0);
@@ -5042,6 +5261,10 @@ private:
         std::string seen;    // what it held last time we looked
     };
     std::vector<CommFile> comm_files_;
+    // an id-map file opened for write: (pid, "uid_map"|"gid_map"|"setgroups")
+    std::pair<std::int32_t, std::string> pending_map_;
+    struct MapFile { std::string host; std::int32_t pid; std::string which; };
+    std::vector<MapFile> map_files_;
     // The guest's kernel log: /dev/kmsg, /proc/kmsg and syslog(2) read it,
     // writes to /dev/kmsg append to it.
     struct KmsgRec { std::uint64_t seq; std::uint64_t ts_us; int prio; std::string text; };
@@ -5656,6 +5879,9 @@ public:
                     });
                     comm_files_.push_back({std::move(host), cp, ct, {}});
                 }
+            if (auto pm = std::exchange(pending_map_, {}); pm.first)
+                if (auto host = tracee_fd_target(static_cast<int>(fd)); !host.empty())
+                    map_files_.push_back({std::move(host), pm.first, std::move(pm.second)});
             // The create succeeded, so an upper-layer file now shadows the
             // lower one: the path is no longer deleted. classify() leaves the
             // whiteout in place for a parents_only create (it must still be

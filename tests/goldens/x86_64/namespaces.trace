@@ -1,0 +1,13 @@
+# linuxity conformance trace
+# scenario: namespaces
+# arch: x86_64
+# recorded-by: live Linux kernel on this host
+# kernel: Linux 7.2.14-zen1-1-zen
+unshare = -EPERM | unshare a UTS namespace
+sethostname = -EPERM | set its hostname
+setdomainname = -EPERM | set its domainname
+sethostname = 2 | uname reports the new hostname
+sethostname = -EPERM | a 65-byte name is EINVAL
+setns = -EPERM | setns back into the parent's UTS namespace
+setns = -EINVAL | setns with the wrong type is EINVAL
+setns = -EBADF | setns on a bad fd is EBADF

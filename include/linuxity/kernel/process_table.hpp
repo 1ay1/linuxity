@@ -16,6 +16,7 @@
 #pragma once
 
 #include "linuxity/abi/types.hpp"
+#include "linuxity/kernel/namespaces.hpp"
 
 #include <algorithm>
 #include <array>
@@ -82,6 +83,8 @@ struct ProcInfo {
     bool live_seen{false};
     // owner ids of a set-user/group-ID file the pending execve runs
     std::uint32_t exec_setuid{0xffffffffu}, exec_setgid{0xffffffffu};
+    // the namespaces it is in (copied at fork, changed by unshare/setns)
+    NsSet ns{};
 
     static constexpr std::uint64_t kAllCaps = (std::uint64_t{1} << 41) - 1;   // 0..40
 };
@@ -135,10 +138,21 @@ public:
         note_pid(tid);
         auto it = procs_.find(pid);
         if (it == procs_.end() || tid == pid) return;
+        // a thread shares its process's pid namespaces and takes a number there
+        for (std::uint64_t ns = it->second.ns.id[static_cast<int>(NsKind::pid)]; ns;) {
+            auto& p = pidns_[ns];
+            if (!p.local_of.count(tid)) {
+                const auto n = p.next++;
+                p.local_of[tid] = n;
+                p.global_of[n] = tid;
+            }
+            ns = p.parent;
+        }
         auto& t = it->second.threads;
         if (std::find(t.begin(), t.end(), tid) == t.end()) t.push_back(tid);
     }
     void drop_thread(std::int32_t tid) {
+        drop_ns_pid(tid);
         for (auto& [_, p] : procs_) {
             std::erase(p.threads, tid);
             std::erase_if(p.thread_comms, [&](const auto& e) { return e.first == tid; });
@@ -389,10 +403,152 @@ public:
     void set_host_resolver(HostOf f) { host_of_ = std::move(f); }
     [[nodiscard]] int host_of(std::int32_t gpid) const { return host_of_ ? host_of_(gpid) : -1; }
 
+    // -- pid namespaces ------------------------------------------------------
+    // A process in a child pid namespace has a second, local number there
+    // (1 for the first). Guest pids in the initial namespace stay the global
+    // ones the rest of linuxity uses; these translate at the edges.
+    struct PidNs { std::uint64_t parent{0}; std::int32_t next{1};
+                   std::map<std::int32_t, std::int32_t> local_of, global_of; };
+    // Give `pid` its numbers in its pid namespace and every one above it.
+    void assign_ns_pid(std::int32_t pid) {
+        const auto set = ns_of(pid);
+        std::uint64_t ns = set.id[static_cast<int>(NsKind::pid)];
+        while (ns) {
+            auto& p = pidns_[ns];
+            if (!p.local_of.count(pid)) {
+                const auto n = p.next++;
+                p.local_of[pid] = n;
+                p.global_of[n] = pid;
+            }
+            ns = p.parent;
+        }
+    }
+    void new_pid_ns(std::uint64_t id, std::uint64_t parent) { pidns_[id].parent = parent; }
+    // Number `pid`, a child of `parent` whose record hasn't arrived yet, in
+    // the pid namespace it was born into (the parent's pid_for_children).
+    void assign_ns_pid_from(std::int32_t pid, std::int32_t parent) {
+        const auto ps = ns_of(parent);
+        std::uint64_t ns = ps.pid_for_children ? ps.pid_for_children
+                                               : ps.id[static_cast<int>(NsKind::pid)];
+        while (ns) {
+            auto& p = pidns_[ns];
+            if (!p.local_of.count(pid)) {
+                const auto n = p.next++;
+                p.local_of[pid] = n;
+                p.global_of[n] = pid;
+            }
+            ns = p.parent;
+        }
+    }
+    // The pid namespace a set's processes live in (0 = initial).
+    [[nodiscard]] static std::uint64_t pid_ns(const NsSet& s) { return s.id[static_cast<int>(NsKind::pid)]; }
+    // `global` as seen from pid namespace `ns`; 0 when it isn't visible there.
+    [[nodiscard]] std::int32_t pid_in(std::uint64_t ns, std::int32_t global) const {
+        if (!ns || global <= 0) return global;
+        auto it = pidns_.find(ns);
+        if (it == pidns_.end()) return 0;
+        auto l = it->second.local_of.find(global);
+        return l == it->second.local_of.end() ? 0 : l->second;
+    }
+    // A pid named inside `ns`, back to the global one; -1 when unknown.
+    [[nodiscard]] std::int32_t pid_from(std::uint64_t ns, std::int32_t local) const {
+        if (!ns || local <= 0) return local;
+        auto it = pidns_.find(ns);
+        if (it == pidns_.end()) return -1;
+        auto g = it->second.global_of.find(local);
+        return g == it->second.global_of.end() ? -1 : g->second;
+    }
+    void drop_ns_pid(std::int32_t pid) {
+        for (auto& [_, p] : pidns_)
+            if (auto it = p.local_of.find(pid); it != p.local_of.end()) {
+                p.global_of.erase(it->second);
+                p.local_of.erase(it);
+            }
+    }
+
+    // The guest process making the current call, so views that depend on
+    // who looks (procfs under a pid namespace) can ask. 0 = nobody.
+    void set_reader(std::int32_t pid) { reader_ = pid; }
+    [[nodiscard]] std::int32_t reader() const { return reader_; }
+    // The reader's pid namespace (0 = initial) and its view of a pid.
+    [[nodiscard]] std::uint64_t reader_pid_ns() const { return pid_ns(ns_of(reader_)); }
+    [[nodiscard]] std::int32_t view_pid(std::int32_t global) const {
+        return pid_in(reader_pid_ns(), global);
+    }
+
+    [[nodiscard]] Namespaces& ns() { return ns_; }
+    [[nodiscard]] const Namespaces& ns() const { return ns_; }
+    // A pid's namespaces (the initial ones for an unknown pid).
+    [[nodiscard]] NsSet ns_of(std::int32_t pid) const {
+        auto it = procs_.find(pid);
+        return it == procs_.end() ? NsSet{} : it->second.ns;
+    }
+    // CLONE_NEW* flags a pending clone asked for, keyed by the parent;
+    // applied to the child when it appears.
+    void set_clone_ns(std::int32_t parent, std::uint64_t flags) { clone_ns_[parent] = flags; }
+    [[nodiscard]] std::uint64_t take_clone_ns(std::int32_t parent) {
+        auto it = clone_ns_.find(parent);
+        if (it == clone_ns_.end()) return 0;
+        const auto f = it->second;
+        clone_ns_.erase(it);
+        return f;
+    }
+    // Give `p` a fresh namespace of each kind in `flags`, as unshare(2)
+    // does (pid and time apply to its future children).
+    void unshare_ns(ProcInfo& p, std::uint64_t flags) {
+        for (int k = 0; k < kNsKinds; ++k) {
+            if (!(flags & kNsFlag[k])) continue;
+            const auto kind = static_cast<NsKind>(k);
+            const std::uint64_t old = ns_.resolve(p.ns, kind);
+            const std::uint64_t id = ns_.fresh();
+            if (kind == NsKind::pid) {
+                new_pid_ns(id, p.ns.id[k]);
+                p.ns.pid_for_children = id;
+                continue;
+            }
+            if (kind == NsKind::time) { p.ns.time_for_children = id; continue; }
+            if (kind == NsKind::uts) ns_.copy_uts(old == ns_.initial(kind) ? 0 : old, id);
+            if (kind == NsKind::user) ns_.new_user_ns(id, old == ns_.initial(kind) ? 0 : old);
+            if (kind == NsKind::mnt && on_new_mnt_ns_) on_new_mnt_ns_(p.ns.id[k], id);
+            p.ns.id[k] = id;
+        }
+    }
+    // A forked child's namespaces: the parent's, its pid/time-for-children
+    // made current, plus whatever the clone asked for.
+    void inherit_ns(ProcInfo& child, const ProcInfo& parent, std::uint64_t clone_flags) {
+        child.ns = parent.ns;
+        if (parent.ns.pid_for_children) child.ns.id[static_cast<int>(NsKind::pid)] = parent.ns.pid_for_children;
+        if (parent.ns.time_for_children) child.ns.id[static_cast<int>(NsKind::time)] = parent.ns.time_for_children;
+        child.ns.pid_for_children = child.ns.time_for_children = 0;
+        if (clone_flags) {
+            unshare_ns(child, clone_flags);
+            if (child.ns.pid_for_children) {
+                child.ns.id[static_cast<int>(NsKind::pid)] = child.ns.pid_for_children;
+                child.ns.pid_for_children = 0;
+            }
+            if (child.ns.time_for_children) {
+                child.ns.id[static_cast<int>(NsKind::time)] = child.ns.time_for_children;
+                child.ns.time_for_children = 0;
+            }
+        }
+    }
+
 private:
     HostOf host_of_;
     std::map<std::int32_t, ProcInfo> procs_;
     std::int32_t last_pid_{1};
+    Namespaces ns_;
+    std::map<std::uint64_t, PidNs> pidns_;
+    std::int32_t reader_{0};
+    std::map<std::int32_t, std::uint64_t> clone_ns_;
+    std::function<void(std::uint64_t, std::uint64_t)> on_new_mnt_ns_;
+public:
+    // Called with (parent, child) when a mount namespace is made, so the
+    // file namespace can copy its mounts.
+    void set_on_new_mnt_ns(std::function<void(std::uint64_t, std::uint64_t)> f) {
+        on_new_mnt_ns_ = std::move(f);
+    }
+private:
     const LiveSource* live_{nullptr};
     mutable std::map<std::int32_t, ProcInfo> scratch_;
 };

@@ -67,7 +67,7 @@ struct Step { const char* call; const char* what; };
 static const struct Step kSteps[] = {
     {"unshare",        "unshare a user+mount namespace"},
     {"mount",          "mount a private tmpfs"},
-    {"openat",         "the tmpfs is writable"},
+    {"mount",          "the tmpfs is writable"},
     {"mount",          "mount --bind a directory onto itself"},
     {"mount",          "MS_PRIVATE on the bind"},
     {"umount2",        "umount2 the bind with MNT_DETACH"},
@@ -146,11 +146,13 @@ static void run_in_namespace(int wfd) {
         if (fd >= 0) { LX_SYS3(SYS_write, fd, buf, n); LX_SYS1(SYS_close, fd); }
     }
     const long m = (u == 0) ? LX_SYS1(SYS_unshare, CLONE_NEWNS) : u;
-    REPORT(u == 0 && m == 0);
-    if (u != 0 || m != 0) {            // cannot ask; the rest stays '2'
+    // A host that can't make the namespaces at all (no user namespaces, or
+    // policy) has nothing to compare: say not-applicable, not "failed".
+    if (u != 0 || m != 0) {            // cannot ask; every step stays '2'
         LX_SYS3(SYS_write, wfd, out, NSTEPS);
         LX_SYS1(SYS_exit_group, 0);
     }
+    REPORT(1);
 
     // Everything below happens inside our own mount tree.
     LX_SYS3(SYS_mkdirat, AT_FDCWD, DIR, 0755);

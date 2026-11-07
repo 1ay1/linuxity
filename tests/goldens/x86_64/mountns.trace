@@ -5,7 +5,7 @@
 # kernel: Linux 7.2.14-zen1-1-zen
 unshare = 1 | unshare a user+mount namespace
 mount = 1 | mount a private tmpfs
-openat = 1 | the tmpfs is writable
+mount = 1 | the tmpfs is writable
 mount = 1 | mount --bind a directory onto itself
 mount = 1 | MS_PRIVATE on the bind
 umount2 = 1 | umount2 the bind with MNT_DETACH

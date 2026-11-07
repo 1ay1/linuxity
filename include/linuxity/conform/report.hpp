@@ -501,13 +501,21 @@ inline std::string Scenario::key() const {
     // mount(2) really runs and can be compared. It happens in a forked
     // child because joining a mount namespace is irreversible.
     //
-    // Android cannot do this at all: user namespaces are compiled out and
-    // unshare returns EINVAL. The probe detects that and reports every step
-    // not-applicable, which keeps the traces the same length and tells the
-    // truth -- on that host these syscalls are UNPROVEN rather than agreed.
+    // namespaces: unshare, setns and the per-UTS-namespace names. Natively
+    // an unprivileged probe is refused (EPERM) where the guest, root, is
+    // served; the law exempts that direction only.
+    v.push_back(Scenario{"namespaces", "namespaces"}
+                    .exercising(abi::Sysno::unshare)
+                    .exercising(abi::Sysno::sethostname)
+                    .exercising(abi::Sysno::setdomainname)
+                    .exercising(abi::Sysno::setns));
+    // (mountns, below:) Android cannot do this at all: user namespaces are
+    // compiled out and unshare returns EINVAL. The probe detects that and
+    // reports every step not-applicable, which keeps the traces the same
+    // length and tells the truth -- on that host these syscalls are UNPROVEN
+    // rather than agreed.
     v.push_back(Scenario{"mountns", "mountns"}
                     .exercising(abi::Sysno::unshare)
-                    .exercising(abi::Sysno::openat)
                     .exercising(abi::Sysno::mount)
                     .exercising(abi::Sysno::umount2)
                     .exercising(abi::Sysno::pivot_root)

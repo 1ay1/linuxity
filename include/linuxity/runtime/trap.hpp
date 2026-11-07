@@ -608,6 +608,11 @@ private:
     // drain_proc_events now fails ReportsProcEvents where it declares itself,
     // instead of silently reporting no process events forever.
     void apply_proc_events() {
+        // the CLONE_NEW* a spawn carries, on backends that report them
+        auto ns_flags_of = [](const auto& e) -> std::uint64_t {
+            if constexpr (requires { e.ns_flags; }) return e.ns_flags;
+            else return 0;
+        };
         if constexpr (runtime::ReportsProcEvents<T>) {
             for (auto& e : trap_.drain_proc_events()) {
                 using EV = std::decay_t<decltype(e)>;
@@ -640,6 +645,7 @@ private:
                             pi.no_new_privs = pp->no_new_privs;
                             pi.nice = pp->nice;
                             pi.creds_given = true;
+                            kernel_.procs().inherit_ns(pi, *pp, kernel_.procs().take_clone_ns(pi.ppid) | ns_flags_of(e));
                         }
                         pi.state = 'R';
                         // The child may have run (and setsid/setpgid/setuid'd)
@@ -651,12 +657,15 @@ private:
                                 existing->comm = pi.comm;
                                 existing->cmdline = pi.cmdline;
                             }
+                            existing->ns = pi.ns;   // as of the fork, incl. CLONE_NEW*
+                            kernel_.procs().assign_ns_pid(existing->pid);
                             kernel_.files().inherit_cwd(
                                 static_cast<std::int32_t>(e.pid),
                                 static_cast<std::int32_t>(e.ppid));
                             break;
                         }
                         kernel_.procs().upsert(pi);
+                        kernel_.procs().assign_ns_pid(pi.pid);
                         // A freshly forked child inherits a COPY of its
                         // parent's cwd AT FORK TIME. Seeding it here (rather
                         // than lazily on the child's first syscall) means the
@@ -706,6 +715,7 @@ private:
                         // pid 1 (our init) is never removed: /proc must always
                         // have a root even as the last guest thread winds down.
                         if (e.pid != 1) {
+                            kernel_.procs().drop_ns_pid(static_cast<std::int32_t>(e.pid));
                             kernel_.procs().remove(static_cast<std::int32_t>(e.pid));
                             // Drop the exited pid's cwd record so a later pid
                             // REUSE starts from its real parent's cwd instead

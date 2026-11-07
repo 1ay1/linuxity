@@ -40,6 +40,7 @@
 #include <algorithm>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -886,6 +887,7 @@ public:
             return host.size() == base.size() || host[base.size()] == '/';
         };
         for (const Mount& m : mounts_) {
+            if (!visible(m)) continue;
             if (under(m.upper) && m.upper.size() > best_len) {
                 best = &m; best_len = m.upper.size(); via_upper = true;
             }
@@ -906,7 +908,41 @@ public:
     [[nodiscard]] bool is_mount_point(std::string_view abs) const {
         const std::string n = normalize(abs);
         for (const Mount& m : mounts_)
-            if (m.prefix == n) return true;
+            if (m.prefix == n && visible(m)) return true;
+        return false;
+    }
+
+    // -- mounts the guest makes, private to its mount namespace -------------
+    // The current call's mount namespace (0 = the initial one).
+    void set_current_mnt_ns(std::uint64_t ns) const noexcept { cur_mnt_ns_ = ns; }
+    [[nodiscard]] std::uint64_t current_mnt_ns() const noexcept { return cur_mnt_ns_; }
+    // A new mount namespace starts as a copy of its parent's guest mounts.
+    void clone_mnt_ns(std::uint64_t parent, std::uint64_t child) {
+        mnt_parent_[child] = parent;
+        std::vector<Mount> copies;
+        for (const auto& m : mounts_)
+            if (m.guest && m.mnt_ns == parent) {
+                Mount c = m;
+                c.mnt_ns = child;
+                copies.push_back(std::move(c));
+            }
+        for (auto& c : copies) mounts_.push_back(std::move(c));
+    }
+    // Mount a real host directory at a guest path, seen only in mount
+    // namespace `ns` (a tmpfs is a fresh scratch dir; a bind is its source).
+    void mount_guest(std::string prefix, std::string host_dir, std::uint64_t ns) {
+        prefix = normalize(prefix);
+        Mount m{std::move(prefix), std::move(host_dir), {}, {}, ns, true};
+        mounts_.push_back(std::move(m));
+    }
+    // Remove the newest guest mount at `prefix` in `ns`; false if none.
+    bool umount_guest(std::string_view prefix, std::uint64_t ns) {
+        const std::string n = normalize(prefix);
+        for (auto it = mounts_.rbegin(); it != mounts_.rend(); ++it)
+            if (it->guest && it->prefix == n && it->mnt_ns == ns) {
+                mounts_.erase(std::next(it).base());
+                return true;
+            }
         return false;
     }
 
@@ -965,7 +1001,17 @@ private:
         std::string host_base;   // real (lower) dir; empty for virtual mounts
         std::string upper;       // writable overlay upper dir; empty = no COW
         Producer    producer;    // set for virtual mounts
+        std::uint64_t mnt_ns{0}; // the mount namespace that sees it; 0 = everyone
+        bool        guest{false}; // mounted by the guest (umount may remove it)
     };
+    // A mount namespace as a copy of its parent's guest mounts: a fork of
+    // the table, so later mounts on either side stay private.
+    std::map<std::uint64_t, std::uint64_t> mnt_parent_;
+    mutable std::uint64_t cur_mnt_ns_{0};
+    [[nodiscard]] bool visible(const Mount& m) const {
+        if (m.mnt_ns == 0) return true;
+        return m.mnt_ns == cur_mnt_ns_;
+    }
 
     static std::string join_host(std::string_view base, std::string_view rel) {
         std::string p{base};
@@ -1527,6 +1573,7 @@ private:
         const Mount* best = nullptr;
         std::size_t best_len = 0;
         for (const auto& m : mounts_) {
+            if (!visible(m)) continue;
             const std::string& pre = m.prefix;
             bool match = pre == "/" ? true
                 : (abs.starts_with(pre) &&

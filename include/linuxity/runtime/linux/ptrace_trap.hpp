@@ -322,7 +322,12 @@ public:
                     std::int32_t gppid = gpid_of(host_tgid_of(w));   // a thread's child belongs to its process
                     gppid_[gpid] = gppid;
                     tgid_cache_[child] = child;
-                    proc_events_.push_back({ProcEvent::spawn, gpid, gppid, {}, {}});
+                    std::uint64_t nsf = 0;
+                    if (auto it = pending_clone_ns_.find(w); it != pending_clone_ns_.end()) {
+                        nsf = it->second;
+                        pending_clone_ns_.erase(it);
+                    }
+                    proc_events_.push_back({ProcEvent::spawn, gpid, gppid, {}, {}, nsf});
                 } else if (np) {
                     note_thread(w, child);
                 }
@@ -578,6 +583,33 @@ public:
     // (returns_pid). pid<=0 (any child / process group) passes through.
     void translate_entry_args(::pid_t w, Regs& rr, Task& t) {
         const abi::Sysno sc = abi::decode(kTraceeArch, rr.nr());
+        // CLONE_NEW*: linuxity keeps the guest's namespaces itself, so the
+        // host never sees them (Android refuses them). The flags are noted
+        // for the child; the clone itself is an ordinary one.
+        if (sc == abi::Sysno::clone || sc == abi::Sysno::clone3) {
+            constexpr std::uint64_t kNew = 0x7e020080;
+            std::uint64_t flags = 0;
+            if (sc == abi::Sysno::clone) flags = rr.arg(0);
+            else {
+                errno = 0;
+                const long f = ::ptrace(PTRACE_PEEKDATA, w, reinterpret_cast<void*>(rr.arg(0)), 0);
+                if (errno) return;
+                flags = static_cast<std::uint64_t>(f);
+            }
+            if (!(flags & kNew)) return;
+            pending_clone_ns_[w] = flags & kNew;
+            if (sc == abi::Sysno::clone) {
+                Regs wr = rr;
+                wr.set_arg(0, flags & ~kNew);
+                (void)wr.store(w);
+                t.regs = wr;
+                rr = wr;
+            } else {
+                ::ptrace(PTRACE_POKEDATA, w, reinterpret_cast<void*>(rr.arg(0)),
+                         reinterpret_cast<void*>(flags & ~kNew));
+            }
+            return;
+        }
         if (sc == abi::Sysno::pidfd_open) {
             // A guest pid; one outside the tree must be ESRCH, not some
             // unrelated host process. No host pid is ever INT_MAX.
@@ -832,6 +864,19 @@ public:
     // host passes along (SCM_CREDENTIALS, SO_PEERCRED).
     void set_guest_ids(std::function<std::pair<std::uint32_t, std::uint32_t>(std::int32_t)> f) {
         guest_ids_of_ = std::move(f);
+    }
+    // How guest process `viewer` numbers global guest pid `pid` (its pid
+    // namespace), and the reverse. Unset means one flat namespace.
+    void set_pid_view(std::function<std::int32_t(std::int32_t, std::int32_t)> to_local,
+                      std::function<std::int32_t(std::int32_t, std::int32_t)> to_global) {
+        pid_to_local_ = std::move(to_local);
+        pid_to_global_ = std::move(to_global);
+    }
+    [[nodiscard]] std::int32_t local_pid(std::int32_t viewer, std::int32_t pid) const {
+        return pid_to_local_ && pid > 0 ? pid_to_local_(viewer, pid) : pid;
+    }
+    [[nodiscard]] std::int32_t global_pid(std::int32_t viewer, std::int32_t pid) const {
+        return pid_to_global_ && pid > 0 ? pid_to_global_(viewer, pid) : pid;
     }
 
     // struct ucred {pid, uid, gid}. A peer in the guest tree is a guest
@@ -1389,10 +1434,13 @@ public:
         ::pid_t ppid;         // parent (spawn), owning process (thread)
         std::string comm;     // program name (exec only)
         std::string cmdline;  // full argv, space-joined (exec only)
+        std::uint64_t ns_flags{0};   // spawn: the CLONE_NEW* the clone asked for
     };
     [[nodiscard]] std::vector<ProcEvent> drain_proc_events() {
         return std::exchange(proc_events_, {});
     }
+    // CLONE_NEW* flags of a clone a task is in, by host tid
+    std::unordered_map<::pid_t, std::uint64_t> pending_clone_ns_;
 
     // The current guest tid, so the loop can attribute a syscall to a pid.
     [[nodiscard]] ::pid_t current_tid() const noexcept { return cur_; }
@@ -2107,10 +2155,13 @@ private:
                 auto host = static_cast<::pid_t>(static_cast<long long>(r.ret()));
                 if (host > 0) {
                     const std::int32_t g = gpid_of(host);
-                    r.set_ret(static_cast<std::int64_t>(g));
+                    // as the caller's pid namespace numbers it
+                    const std::int32_t me = gpid_of(host_tgid_of(w));
+                    const std::int32_t l = local_pid(me, g);
+                    r.set_ret(static_cast<std::int64_t>(l > 0 ? l : g));
                     (void)r.store(w);
                     // entry regs: on aarch64 x0 is already the return value
-                    translate_clone_tids(w, t.regs, host, g);
+                    translate_clone_tids(w, t.regs, host, l > 0 ? l : g);
                 }
             }
         }
@@ -2317,6 +2368,7 @@ private:
     std::function<void()> pre_exec_;   // child hook (post-fork, pre-execve)
     std::vector<ProcEvent> proc_events_;
     std::function<std::pair<std::uint32_t, std::uint32_t>(std::int32_t)> guest_ids_of_;
+    std::function<std::int32_t(std::int32_t, std::int32_t)> pid_to_local_, pid_to_global_;
     // guest process groups that also exist on the host (setpgid mirrored)
     std::unordered_set<std::int32_t> host_groups_;
     // tasks parked in a group-stop (kill -STOP, ^Z) until a SIGCONT

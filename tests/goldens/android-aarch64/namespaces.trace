@@ -1,0 +1,13 @@
+# linuxity conformance trace
+# scenario: namespaces
+# arch: aarch64
+# recorded-by: live Linux kernel on this host
+# kernel: Linux 6.1.162-android14-11-g9dd05ae3a1de-ab16261587
+unshare = -EPERM | unshare a UTS namespace
+sethostname = -EPERM | set its hostname
+setdomainname = -EPERM | set its domainname
+sethostname = 2 | uname reports the new hostname
+sethostname = -EPERM | a 65-byte name is EINVAL
+setns = -EACCES | setns back into the parent's UTS namespace
+setns = 2 | setns with the wrong type is EINVAL
+setns = -EBADF | setns on a bad fd is EBADF
