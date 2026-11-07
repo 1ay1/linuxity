@@ -31,6 +31,7 @@
 #include <dirent.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -65,6 +66,124 @@ inline long index_after(std::string_view s, std::string_view prefix) {
     long n = 0;
     for (char c : s) { if (c < '0' || c > '9') return -1; n = n * 10 + (c - '0'); }
     return n;
+}
+
+// CPU caches. The host's /sys tree when it has one; an attribute it omits
+// (Android exposes only level/type) comes from the core's published specs,
+// keyed by the MIDR part number in /proc/cpuinfo.
+struct CoreCache { unsigned l1d_kb, l1i_kb, l1_ways, l2_kb, l2_ways; };
+inline CoreCache core_cache(long cpu) {
+    unsigned part = 0;
+    if (std::FILE* f = std::fopen("/proc/cpuinfo", "re")) {
+        char line[256];
+        long cur = -1;
+        while (std::fgets(line, sizeof line, f)) {
+            long n;
+            unsigned p;
+            if (std::sscanf(line, "processor : %ld", &n) == 1) cur = n;
+            else if (cur == cpu && std::sscanf(line, "CPU part : %x", &p) == 1) { part = p; break; }
+        }
+        std::fclose(f);
+    }
+    switch (part) {
+        case 0xd05: return {32, 32, 4, 128, 4};     // Cortex-A55
+        case 0xd0b: return {64, 64, 4, 256, 8};     // Cortex-A76
+        case 0xd0d: return {64, 64, 4, 512, 8};     // Cortex-A77
+        case 0xd41: return {64, 64, 4, 512, 8};     // Cortex-A78
+        case 0xd44: return {64, 64, 4, 1024, 8};    // Cortex-X1
+        case 0xd46: return {64, 64, 4, 512, 8};     // Cortex-A510
+        case 0xd47: return {64, 64, 4, 512, 8};     // Cortex-A710
+        case 0xd48: return {64, 64, 4, 1024, 8};    // Cortex-X2
+        case 0xd03: return {32, 32, 4, 512, 16};    // Cortex-A53
+        default:    return {32, 32, 4, 512, 8};
+    }
+}
+inline std::string read_text(const std::string& p) {
+    std::string out;
+    if (std::FILE* f = std::fopen(p.c_str(), "re")) {
+        char buf[512];
+        for (std::size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) out.append(buf, n);
+        std::fclose(f);
+    }
+    return out;
+}
+inline Result<VirtualFile> cpu_cache(long cpu, std::string_view rel, long ncpu) {
+    while (!rel.empty() && rel.front() == '/') rel.remove_prefix(1);
+    const std::string base = "/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/cache";
+    const std::string hp = rel.empty() ? base : base + "/" + std::string{rel};
+    static constexpr std::string_view kAttrs[] = {
+        "coherency_line_size", "id", "level", "number_of_sets", "physical_line_partition",
+        "shared_cpu_list", "shared_cpu_map", "size", "type", "uevent", "ways_of_associativity"};
+    auto text = [](std::string s) { VirtualFile vf; vf.bytes.assign(reinterpret_cast<const std::byte*>(s.data()), reinterpret_cast<const std::byte*>(s.data() + s.size())); return vf; };
+    auto dir_of = [](std::vector<VirtualDirent> e) { VirtualFile vf; vf.is_dir = true; vf.entries = std::move(e); return vf; };
+    // the indexes the host has; on a host with no cache tree, L1d and L1i
+    std::vector<std::string> idx;
+    if (DIR* d = ::opendir(base.c_str())) {
+        while (const dirent* de = ::readdir(d))
+            if (std::string_view{de->d_name}.starts_with("index")) idx.emplace_back(de->d_name);
+        ::closedir(d);
+    }
+    if (idx.empty()) idx = {"index0", "index1"};
+    std::sort(idx.begin(), idx.end());
+    if (rel.empty()) {
+        std::vector<VirtualDirent> e;
+        for (const auto& i : idx) e.push_back({i, true});
+        e.push_back({"uevent", false});
+        return ok(dir_of(std::move(e)));
+    }
+    if (rel == "uevent") return ok(text(""));
+    const auto slash = rel.find('/');
+    const std::string ix{rel.substr(0, slash)};
+    if (std::find(idx.begin(), idx.end(), ix) == idx.end()) return err<VirtualFile>(Errno::enoent);
+    if (slash == std::string_view::npos) {
+        std::vector<VirtualDirent> e;
+        for (const auto a : kAttrs) e.push_back({std::string{a}, false});
+        return ok(dir_of(std::move(e)));
+    }
+    const std::string_view attr = rel.substr(slash + 1);
+    if (std::find(std::begin(kAttrs), std::end(kAttrs), attr) == std::end(kAttrs))
+        return err<VirtualFile>(Errno::enoent);
+    // the host's value when it gives one
+    if (::access(hp.c_str(), R_OK) == 0) {
+        VirtualFile vf;
+        vf.redirect_host = hp;
+        return ok(std::move(vf));
+    }
+    // otherwise from the core's specs, for this index's level and type
+    const std::string idir = base + "/" + ix;
+    std::string type = read_text(idir + "/type");
+    while (!type.empty() && type.back() == '\n') type.pop_back();
+    long level = std::atol(read_text(idir + "/level").c_str());
+    const long n = std::atol(ix.c_str() + 5);
+    if (type.empty()) type = n == 0 ? "Data" : n == 1 ? "Instruction" : "Unified";
+    if (level <= 0) level = n <= 1 ? 1 : n;
+    const auto cc = core_cache(cpu);
+    const unsigned kb = level == 1 ? (type == "Instruction" ? cc.l1i_kb : cc.l1d_kb) : cc.l2_kb;
+    const unsigned ways = level == 1 ? cc.l1_ways : cc.l2_ways;
+    const unsigned line = 64;
+    const std::string me = std::to_string(cpu);
+    if (attr == "level") return ok(text(std::to_string(level) + "\n"));
+    if (attr == "type") return ok(text(type + "\n"));
+    if (attr == "size") return ok(text(std::to_string(kb) + "K\n"));
+    if (attr == "ways_of_associativity") return ok(text(std::to_string(ways) + "\n"));
+    if (attr == "coherency_line_size") return ok(text(std::to_string(line) + "\n"));
+    if (attr == "number_of_sets") return ok(text(std::to_string(kb * 1024 / (ways * line)) + "\n"));
+    if (attr == "physical_line_partition") return ok(text("1\n"));
+    if (attr == "id") return ok(text(me + "\n"));
+    if (attr == "shared_cpu_list") return ok(text(me + "\n"));
+    if (attr == "shared_cpu_map") {
+        std::string out;
+        for (long w = (ncpu + 31) / 32 - 1; w >= 0; --w) {
+            unsigned v = 0;
+            if (cpu / 32 == w) v = 1u << (cpu % 32);
+            char buf[16];
+            std::snprintf(buf, sizeof buf, "%08x", v);
+            out += buf;
+            if (w) out += ',';
+        }
+        return ok(text(out + "\n"));
+    }
+    return ok(text(""));
 }
 
 } // namespace sysfs_detail
@@ -237,6 +356,11 @@ make_sysfs(const kernel::MachineSpec& mach) {
                     const auto self = [&](long c) { return c == cpu; };
                     const auto all  = [&](long c) { return c < ncpu; };
                     const std::string one = std::to_string(cpu) + "\n";
+                    // ---- cache/indexN: the host's own cache description,
+                    // with any attribute the host leaves out filled from the
+                    // core's published L1/L2 sizes (sysfs_detail::core_cache)
+                    if (tail == "cache" || tail.starts_with("cache/"))
+                        return sysfs_detail::cpu_cache(cpu, tail.substr(5), ncpu);
                     if (tail.empty())
                         return D({{"topology",true},{"cache",true},
                                  {"cpufreq",true},{"online",false}});
