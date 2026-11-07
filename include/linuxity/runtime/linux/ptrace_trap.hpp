@@ -261,6 +261,8 @@ public:
                 tasks_.erase(w);
                 stopped_.erase(w);
                 stop_owed_.erase(w);
+                // the host may hand this tid to an unrelated new process
+                tgid_cache_.erase(w);
                 --live_;
                 // The ROOT task is the guest's init/session leader. When it
                 // exits the foreground session is over and control returns to
@@ -575,6 +577,28 @@ public:
                 const ::pid_t host = host_tid_of(gpid);
                 Regs wr = rr;
                 wr.set_arg(0, static_cast<std::uint64_t>(host > 0 ? host : 0x7fffffff));
+                (void)wr.store(w);
+                t.regs = wr;
+                rr = wr;
+            }
+            return;
+        }
+        // Calls whose pid (0 = self) names a task: map a guest pid to its host
+        // task, so sched_setaffinity(pid) pins OUR child, not a host stranger.
+        if (const int at = pid_arg_of(sc); at >= 0) {
+            auto gpid = static_cast<std::int32_t>(static_cast<long long>(rr.arg(at)));
+            // ioprio's `who` is only a pid for IOPRIO_WHO_PROCESS (1)
+            const bool is_pid = (sc != abi::Sysno::ioprio_get && sc != abi::Sysno::ioprio_set) ||
+                                rr.arg(0) == 1;
+            if (gpid > 0 && is_pid) {
+                const ::pid_t host = host_tid_of(gpid);
+                Regs wr = rr;
+                wr.set_arg(at, static_cast<std::uint64_t>(host > 0 ? host : 0x7fffffff));
+                if (sc == abi::Sysno::kcmp) {
+                    const auto g2 = static_cast<std::int32_t>(static_cast<long long>(rr.arg(1)));
+                    const ::pid_t h2 = g2 > 0 ? host_tid_of(g2) : -1;
+                    if (g2 > 0) wr.set_arg(1, static_cast<std::uint64_t>(h2 > 0 ? h2 : 0x7fffffff));
+                }
                 (void)wr.store(w);
                 t.regs = wr;
                 rr = wr;
@@ -1251,7 +1275,10 @@ public:
     std::int32_t gpid_of(::pid_t tid) {
         if (tid == root_pid_) return 1;
         auto [it, fresh] = gpid_.try_emplace(tid, 0);
-        if (fresh) it->second = next_gpid_++;
+        if (fresh) {
+            it->second = next_gpid_++;
+            host_of_gpid_[it->second] = tid;
+        }
         return it->second;
     }
 
@@ -1559,18 +1586,35 @@ public:
         proc_events_.push_back({ProcEvent::cont, gpid_of(tg), 0, {}, {}});
     }
 
-    // Reverse of gpid_of: a guest pid -> its host tid. pid 1 is the root task.
-    // Because fork/clone are FORWARDED, the guest actually learns the real
-    // HOST pid of its children (that's what $! / clone's return value carry),
-    // so a kill target may already BE a host tid we trace. Accept either: a
-    // known guest pid (our tiny namespace) or a raw traced host tid.
+    // Which argument of `sc` is a pid/tid the host would resolve, or -1.
+    [[nodiscard]] static int pid_arg_of(abi::Sysno sc) noexcept {
+        using S = abi::Sysno;
+        switch (sc) {
+            case S::sched_setaffinity: case S::sched_setscheduler:
+            case S::sched_getscheduler: case S::sched_setparam:
+            case S::sched_getparam: case S::sched_rr_get_interval:
+            case S::sched_setattr: case S::sched_getattr:
+            case S::prlimit64: case S::process_vm_readv:
+            case S::process_vm_writev: case S::kcmp:
+                return 0;
+            case S::ioprio_get: case S::ioprio_set:
+                return 1;
+            default:
+                return -1;
+        }
+    }
+
+    // Reverse of gpid_of: a guest pid -> its host tid, or -1. pid 1 is the
+    // root task.
+    //
+    // Only guest pids. This used to also accept a raw traced host tid, from
+    // when fork returned host pids to the guest; it doesn't any more, and on
+    // a host with a small pid_max (Android's is 32768) host pids wrap into
+    // the same range guest pids reach, so waitpid(child) sometimes landed on
+    // an unrelated tracee and got ECHILD.
     [[nodiscard]] ::pid_t host_tid_of(std::int32_t pid) const {
         if (pid == 1) return root_pid_;
-        if (pid == root_pid_) return root_pid_;
-        auto host = static_cast<::pid_t>(pid);
-        if (tasks_.find(host) != tasks_.end()) return host;  // a traced host tid
-        for (const auto& [tid, g] : gpid_)
-            if (g == pid) return tid;                         // a guest pid
+        if (auto it = host_of_gpid_.find(pid); it != host_of_gpid_.end()) return it->second;
         return -1;
     }
 
@@ -1872,6 +1916,9 @@ private:
                 // Retained past exit — see the note in next(): the parent's
                 // wait4 still needs to translate this reaped pid.
                 tasks_.erase(w);
+                stopped_.erase(w);
+                stop_owed_.erase(w);
+                tgid_cache_.erase(w);
                 if (--live_ <= 0) exited_ = true;
                 return false;
             }
@@ -1965,10 +2012,14 @@ private:
         if (host == root_pid_) return 1;
         if (auto it = gpid_.find(host); it != gpid_.end()) return it->second;
         // si_pid carries the sender's THREAD-GROUP id; our map is keyed by
-        // the tid we attached to. For a single-threaded task those are equal,
-        // but check the task table too rather than guessing.
-        for (const auto& [tid, gp] : gpid_)
-            if (tgid_of(tid) == host) return gp;
+        // the tid we attached to. They differ only once the group's leader
+        // thread is gone, so look among the live tasks for one in that group.
+        for (const auto& [tid, _] : tasks_) {
+            auto c = tgid_cache_.find(tid);
+            const ::pid_t tg = c != tgid_cache_.end() ? c->second : tgid_of(tid);
+            if (tg == host)
+                if (auto it = gpid_.find(tid); it != gpid_.end()) return it->second;
+        }
         return 0;
     }
 
@@ -2023,6 +2074,7 @@ private:
     // SIGSTOPs we sent that the task hasn't taken yet (see the attach stop)
     std::unordered_set<::pid_t> stop_owed_;
     std::unordered_map<::pid_t, std::int32_t> gpid_;   // host tid -> guest pid
+    std::unordered_map<std::int32_t, ::pid_t> host_of_gpid_; // guest pid -> host tid
     std::unordered_map<std::int32_t, std::int32_t> gppid_; // guest pid -> ppid
     // host tid -> host tgid. A task's tgid is fixed for its lifetime, and
     // tgid_of() reads /proc, so this is looked up once per task rather than

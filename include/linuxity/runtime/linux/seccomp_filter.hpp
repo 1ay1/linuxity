@@ -150,6 +150,12 @@ inline constexpr int kTrappedX86_64[] = {
     63,                          // uname
     99,                          // sysinfo
     204,                         // sched_getaffinity
+    // pid in, translated at entry (see pid_arg_of in ptrace_trap.hpp):
+    203, 144, 145, 142, 143, 148, // sched_setaffinity/setscheduler/getscheduler/setparam/getparam/rr_get_interval
+    314, 315,                    // sched_setattr/getattr
+    302, 310, 311, 312,          // prlimit64/process_vm_readv/writev/kcmp
+    251, 252,                    // ioprio_set/get
+    115,                         // getgroups (the guest's own list, not the host user's)
     // -- session / process groups ------------------------------------------
     111, 121, 124, 112, 109,     // getpgrp/getpgid/getsid/setsid/setpgid
     140, 141,                    // getpriority/setpriority

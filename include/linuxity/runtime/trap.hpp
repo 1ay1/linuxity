@@ -576,6 +576,8 @@ private:
                             pi.cmdline = pp->cmdline;
                             pi.vsize_bytes = pp->vsize_bytes;
                             pi.rss_pages = pp->rss_pages;
+                            pi.groups = pp->groups;
+                            pi.groups_set = pp->groups_set;
                         }
                         pi.state = 'R';
                         kernel_.procs().upsert(pi);

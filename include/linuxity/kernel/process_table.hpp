@@ -59,6 +59,9 @@ struct ProcInfo {
     std::uint32_t gid{0};
     std::string  exe{};              // guest path of the image (/proc/<pid>/exe)
     std::vector<std::int32_t> threads{}; // guest tids besides the main thread
+    // setgroups(2) list; inherited across fork, root's [0] until set
+    std::vector<std::uint32_t> groups{};
+    bool groups_set{false};
 };
 
 // The virtual process table. Ordered by pid so /proc enumerates numerically.
@@ -87,10 +90,13 @@ public:
         const std::int32_t pg = p.pgid ? p.pgid : cur.pgid;
         const std::int32_t sd = p.sid ? p.sid : cur.sid;
         auto threads = std::move(cur.threads);   // reaped one by one, not by exec
+        auto groups = std::move(cur.groups);     // exec keeps credentials
+        const bool groups_set = cur.groups_set;
         cur = p;
         cur.pgid = pg;
         cur.sid = sd;
         if (cur.threads.empty()) cur.threads = std::move(threads);
+        if (!cur.groups_set) { cur.groups = std::move(groups); cur.groups_set = groups_set; }
     }
     void add_thread(std::int32_t pid, std::int32_t tid) {
         auto it = procs_.find(pid);
@@ -168,7 +174,14 @@ public:
         // Resolving only through sid_of missed that -- sid_of(2) is 2, which
         // has no ctty of its own, so bash saw ENOTTY on its own terminal and
         // printed "no job control in this shell".
+        //
+        // Only within the session, though. A setsid() child starts with no
+        // ctty, and walking on into its parent found the parent's, so a
+        // pty.fork() child's TIOCSCTTY was EPERM whenever its parent sat on
+        // a terminal.
+        const std::int32_t sess = leader;
         for (const ProcInfo* p = find(pid); p != nullptr; ) {
+            if (sid_of(p->pid) != sess) break;
             if (p->ctty >= 0) return p->ctty;
             if (p->ppid == 0 || p->ppid == p->pid) break;
             p = find(p->ppid);
@@ -206,6 +219,19 @@ public:
     void remove(std::int32_t pid) { if (pid != 1) procs_.erase(pid); }
 
     [[nodiscard]] bool has(std::int32_t pid) const { return find(pid) != nullptr; }
+    // The supplementary groups `pid` holds. fork copies the parent's (see
+    // the spawn event), so an unset record means a root login's [0].
+    [[nodiscard]] std::vector<std::uint32_t> groups_of(std::int32_t pid) const {
+        const ProcInfo* p = find(pid);
+        if (p != nullptr && p->groups_set) return p->groups;
+        return {0};
+    }
+    void set_groups(std::int32_t pid, std::vector<std::uint32_t> g) {
+        auto& p = procs_[pid];
+        if (p.pid == 0) p.pid = pid;
+        p.groups = std::move(g);
+        p.groups_set = true;
+    }
     [[nodiscard]] ProcInfo* find_mut(std::int32_t pid) {
         auto it = procs_.find(pid);
         return it == procs_.end() ? nullptr : &it->second;

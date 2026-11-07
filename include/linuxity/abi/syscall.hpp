@@ -727,8 +727,9 @@ public:
             case Sysno::setuid:     case Sysno::setgid:
             case Sysno::setreuid:   case Sysno::setregid:
             case Sysno::setresuid:  case Sysno::setresgid:
-            case Sysno::setfsuid:   case Sysno::setfsgid:
-            case Sysno::setgroups:  return val(0);
+            case Sysno::setfsuid:   case Sysno::setfsgid:   return val(0);
+            case Sysno::setgroups:  return do_setgroups(r);
+            case Sysno::getgroups:  return do_getgroups(r);
 
             // -- LANDLOCK (pacman 7's download sandbox). We cannot apply an
             //    LSM ruleset to a ptraced tree, but linuxity's own namespace
@@ -876,9 +877,10 @@ private:
     [[nodiscard]] std::int32_t flat_pgrp() {
         return k_.procs().pgid_of(ids().pid);
     }
-    // The terminal's foreground group. One per tree is right for now: the
-    // guest has one controlling tty. 0 = unclaimed, answer the caller's own.
-    std::int32_t fg_pgrp_{0};
+    // Each terminal's foreground group, by pty slave number. Absent means
+    // unclaimed: answer the caller's own group. Per terminal, because a
+    // pty.fork() child's new session must not see the outer shell's job.
+    std::unordered_map<std::int32_t, std::int32_t> fg_pgrp_;
 
     // The trapped task's guest identity. When the memory backend also exposes
     // the live task map (the ptrace trap does), report that task's real
@@ -4144,16 +4146,60 @@ private:
         long ncpu = machine().ncpu;
         std::size_t bytes = ((static_cast<std::size_t>(ncpu) + 63) / 64) * 8;
         if (bytes < 8) bytes = 8;
-        if (cap < bytes) bytes = cap;           // honor the caller's buffer
-        if (bytes == 0) return eno(Errno::einval);
+        // like the kernel: the buffer must hold the whole mask, in longs
+        if (cap < bytes || cap % sizeof(long) != 0) return eno(Errno::einval);
         std::vector<std::byte> buf(bytes, std::byte{0});
-        for (long c = 0; c < ncpu; ++c) {
-            std::size_t byte = static_cast<std::size_t>(c) / 8;
-            if (byte >= bytes) break;
-            buf[byte] |= static_cast<std::byte>(1u << (static_cast<unsigned>(c) & 7u));
+        for (long c = 0; c < ncpu; ++c)
+            buf[static_cast<std::size_t>(c) / 8] |=
+                static_cast<std::byte>(1u << (static_cast<unsigned>(c) & 7u));
+        // The task's REAL mask, so sched_setaffinity reads back. Clipped to
+        // the CPUs we advertise; if that leaves none, the advertised set.
+        if constexpr (requires { mem_.host_tid(); mem_.host_tid_of(0); }) {
+            const auto pid = static_cast<std::int32_t>(r.arg[0]);
+            if (pid < 0) return eno(Errno::esrch);
+            const ::pid_t host = pid == 0 ? mem_.host_tid() : mem_.host_tid_of(pid);
+            if (host <= 0) return eno(Errno::esrch);
+            ::cpu_set_t real;
+            CPU_ZERO(&real);
+            if (::sched_getaffinity(host, sizeof real, &real) == 0) {
+                std::vector<std::byte> clip(bytes, std::byte{0});
+                bool any = false;
+                for (long c = 0; c < ncpu && c < CPU_SETSIZE; ++c)
+                    if (CPU_ISSET(static_cast<int>(c), &real)) {
+                        clip[static_cast<std::size_t>(c) / 8] |=
+                            static_cast<std::byte>(1u << (static_cast<unsigned>(c) & 7u));
+                        any = true;
+                    }
+                if (any) buf = std::move(clip);
+            } else if (errno == ESRCH) {
+                return eno(Errno::esrch);
+            }
         }
         if (!mem_.copy_out(mask, buf)) return eno(Errno::efault);
         return val(static_cast<std::int64_t>(bytes));
+    }
+
+    // setgroups(size, list): root may set anything up to NGROUPS_MAX.
+    [[nodiscard]] Outcome do_setgroups(const Regs& r) {
+        const std::size_t n = static_cast<std::size_t>(r.arg[0]);
+        if (n > 65536) return eno(Errno::einval);
+        std::vector<std::uint32_t> g(n);
+        if (n && !mem_.copy_in(uaddr(r.arg[1]), std::as_writable_bytes(std::span{g})))
+            return eno(Errno::efault);
+        k_.procs().set_groups(ids().pid, std::move(g));
+        return val(0);
+    }
+
+    // getgroups(size, list): size 0 asks for the count only.
+    [[nodiscard]] Outcome do_getgroups(const Regs& r) {
+        const auto g = k_.procs().groups_of(ids().pid);
+        const auto size = static_cast<std::int32_t>(r.arg[0]);
+        if (size < 0) return eno(Errno::einval);
+        if (size == 0) return val(static_cast<std::int64_t>(g.size()));
+        if (static_cast<std::size_t>(size) < g.size()) return eno(Errno::einval);
+        if (!g.empty() && !mem_.copy_out(uaddr(r.arg[1]), std::as_bytes(std::span{g})))
+            return eno(Errno::efault);
+        return val(static_cast<std::int64_t>(g.size()));
     }
 
     // ioctl(fd, request, argp): MOST requests act on a real host fd (TCGETS,
@@ -4251,6 +4297,8 @@ private:
                 if (have >= 0 && have != n && r.arg[2] != 1)
                     return eno(Errno::eperm);
                 k_.procs().set_ctty(me, n);
+                // a terminal a session just took has no foreground group yet
+                fg_pgrp_.erase(n);
                 // Best effort on the host too, so the pty's own ^C and
                 // hangup reach this session. Android refuses it; that's fine.
                 return Virtualize::mirrored(0);
@@ -4308,18 +4356,15 @@ private:
                 // takes the terminal back. But it must not be true while a
                 // JOB holds the tty, or a shell can never tell that the job
                 // is in the foreground and not itself.
-                // The sentinel must not escape through the TTY, though it is
-                // right everywhere else. kInheritedPgid means "born into
-                // linuxity's own group, never a leader" -- pid 1's seed, so
-                // its first setsid() is not EPERM, and getpgrp/getpgid agree
-                // on it (the creds and proclife probes check exactly that).
-                // But a shell reads tcgetpgrp and feeds it straight back to
-                // tcsetpgrp, so handing out 0x7fff0000 made bash report
-                // "cannot set terminal process group (2147418112)" and drop
-                // job control. For the terminal's purposes an un-grouped
-                // process is its own leader, so report the pid.
-                std::int32_t fg = fg_pgrp_ ? fg_pgrp_ : flat_pgrp();
-                if (fg == kernel::ProcessTable::kInheritedPgid) fg = ids().pid;
+                // The sentinel is pid 1's group (born into linuxity's group,
+                // never a leader, so its first setsid() isn't EPERM), and
+                // getpgrp reports it. tcgetpgrp has to say the same, or
+                // bash's "loop until tcgetpgrp == getpgrp" never ends and it
+                // prints "no job control in background". bash then makes
+                // itself a leader and hands the terminal to that group.
+                const std::int32_t tty = k_.procs().ctty_of(ids().pid);
+                const auto it = fg_pgrp_.find(tty);
+                const std::int32_t fg = it != fg_pgrp_.end() ? it->second : flat_pgrp();
                 if (!put_u32(r.arg[2], static_cast<std::uint32_t>(fg)))
                     return eno(Errno::efault);
                 return val(0);
@@ -4361,11 +4406,14 @@ private:
                 // value straight back, so if 0x7fff0000 ever escaped it
                 // would be stored here and re-served forever. Treat it as
                 // the caller claiming the terminal for itself.
+                // Handing back the sentinel (what tcgetpgrp reported for an
+                // unclaimed tty) means "my own group", i.e. unclaimed again.
+                const std::int32_t tty = k_.procs().ctty_of(ids().pid);
                 if (want == static_cast<std::uint32_t>(
                                 kernel::ProcessTable::kInheritedPgid))
-                    fg_pgrp_ = ids().pid;
+                    fg_pgrp_.erase(tty);
                 else if (want != 0)
-                    fg_pgrp_ = static_cast<std::int32_t>(want);
+                    fg_pgrp_[tty] = static_cast<std::int32_t>(want);
                 return val(0);
             }
             default:

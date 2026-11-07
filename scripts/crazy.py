@@ -1408,6 +1408,43 @@ def clocks():
     return f"400k monotonic reads, 0.1s cpu took {wall:.2f}s, sleeps {dt:.3f}s"
 
 
+@test
+def sched_and_creds():
+    every = os.sched_getaffinity(0)
+    check(every and len(every) <= os.cpu_count(), f"affinity {every}")
+    one = min(every)
+    os.sched_setaffinity(0, {one})
+    check(os.sched_getaffinity(0) == {one}, "sched_setaffinity didn't read back")
+    r, w = os.pipe()
+
+    def child():
+        os.write(w, str(sorted(os.sched_getaffinity(0))).encode())
+        time.sleep(5)
+
+    pid = spawn(child)
+    check(os.read(r, 100) == str([one]).encode(), "a forked child didn't inherit the mask")
+    os.sched_setaffinity(pid, every)
+    check(os.sched_getaffinity(pid) == every, "sched_setaffinity(child pid) missed the child")
+    os.kill(pid, signal.SIGKILL)
+    reap(pid)
+    expect_errno(errno.ESRCH, "affinity of a pid that doesn't exist",
+                 os.sched_getaffinity, 4_000_000)
+
+    if os.getuid() == 0:
+        os.setgroups([0, 10, 998])
+        check(sorted(os.getgroups()) == [0, 10, 998], f"setgroups read back {os.getgroups()}")
+        pid = spawn(lambda: 0 if sorted(os.getgroups()) == [0, 10, 998] else 1)
+        check(reap(pid) == 0, "a forked child didn't inherit the groups")
+
+    for f in ("interrupts", "softirqs", "swaps", "partitions", "devices", "modules"):
+        with open(f"/proc/{f}") as fh:
+            fh.read()
+    with open("/proc/interrupts") as fh:
+        head = fh.readline().split()
+    check(head == [f"CPU{i}" for i in range(os.cpu_count())], f"/proc/interrupts header {head}")
+    return "affinity set/inherit/by pid, setgroups/getgroups, system procfs files"
+
+
 # ------------------------------------------------------------------- runner
 
 def run_one(fn, wake):

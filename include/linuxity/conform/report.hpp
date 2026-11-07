@@ -365,6 +365,7 @@ inline std::string Scenario::key() const {
                     .exercising(abi::Sysno::setfsuid)
                     .exercising(abi::Sysno::setfsgid)
                     .exercising(abi::Sysno::setgroups)
+                    .exercising(abi::Sysno::getgroups)
                     .exercising(abi::Sysno::getsid)
                     .exercising(abi::Sysno::getpgid)
                     .exercising(abi::Sysno::getpriority)

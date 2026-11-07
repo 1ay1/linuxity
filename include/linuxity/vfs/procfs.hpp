@@ -105,6 +105,8 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                 e.push_back({std::to_string(pid), true});
             for (const char* f : {"stat","meminfo","vmstat","cpuinfo","uptime","loadavg",
                                   "version","cmdline","filesystems","mounts",
+                                  "interrupts","softirqs","swaps","partitions",
+                                  "diskstats","devices","modules","misc",
                                   "self","sys"})
                 e.push_back({f, std::string_view{f} == "sys"});
             return ok(dir_file(std::move(e)));
@@ -283,6 +285,77 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
         }
         if (abs == "/proc/loadavg")
             return ok(text_file("0.00 0.01 0.05 1/" + std::to_string(nproc) + " 1\n"));
+        // Interrupt counters, per CPU, in the kernel's layout (show_interrupts
+        // and show_softirqs). They grow with uptime, like /proc/stat's intr.
+        if (abs == "/proc/interrupts" || abs == "/proc/softirqs") {
+            const auto ticks = static_cast<std::uint64_t>(mach.uptime_seconds() * 100);
+            const bool arm = mach.machine_arch == "aarch64";
+            const bool soft = abs == "/proc/softirqs";
+            std::string s(soft ? 20 : 11, ' ');
+            char cell[32];
+            for (long c = 0; c < ncpu; ++c) {
+                std::snprintf(cell, sizeof cell, "CPU%-8ld", c);
+                s += cell;
+            }
+            s += '\n';
+            struct Row { const char* name; std::uint64_t per_100; const char* desc; };
+            std::vector<Row> rows;
+            if (soft)
+                rows = {{"HI", 0, ""}, {"TIMER", 100, ""}, {"NET_TX", 1, ""},
+                        {"NET_RX", 4, ""}, {"BLOCK", 2, ""}, {"IRQ_POLL", 0, ""},
+                        {"TASKLET", 1, ""}, {"SCHED", 40, ""}, {"HRTIMER", 0, ""},
+                        {"RCU", 30, ""}};
+            else if (arm)
+                rows = {{"11", 100, "    GICv3  27 Level     arch_timer"},
+                        {"IPI0", 30, "      Rescheduling interrupts"},
+                        {"IPI1", 10, "      Function call interrupts"},
+                        {"IPI2", 0, "      CPU stop interrupts"},
+                        {"IPI3", 0, "      CPU stop NMIs"},
+                        {"IPI4", 0, "      Timer broadcast interrupts"},
+                        {"IPI5", 2, "      IRQ work interrupts"},
+                        {"IPI6", 0, "      CPU backtrace interrupts"},
+                        {"IPI7", 0, "      KGDB roundup interrupts"}};
+            else
+                rows = {{"0", 0, "  IO-APIC    2-edge      timer"},
+                        {"1", 0, "  IO-APIC    1-edge      i8042"},
+                        {"8", 0, "  IO-APIC    8-edge      rtc0"},
+                        {"9", 0, "  IO-APIC    9-fasteoi   acpi"},
+                        {"NMI", 0, "  Non-maskable interrupts"},
+                        {"LOC", 100, "  Local timer interrupts"},
+                        {"RES", 30, "  Rescheduling interrupts"},
+                        {"CAL", 10, "  Function call interrupts"},
+                        {"TLB", 5, "  TLB shootdowns"}};
+            for (const Row& r : rows) {
+                std::snprintf(cell, sizeof cell, soft ? "%12s:" : "%3s: ", r.name);
+                s += cell;
+                for (long c = 0; c < ncpu; ++c) {
+                    // spread a little per CPU so the columns aren't identical
+                    const std::uint64_t v = ticks * r.per_100 / 100 * (90 + static_cast<std::uint64_t>(c * 7 % 20)) / 100;
+                    std::snprintf(cell, sizeof cell, soft ? " %10llu" : "%10llu ",
+                                  static_cast<unsigned long long>(v));
+                    s += cell;
+                }
+                s += r.desc;
+                s += '\n';
+            }
+            if (!soft) s += arm ? "Err:          0\n" : "ERR:          0\nMIS:          0\n";
+            return ok(text_file(std::move(s)));
+        }
+        if (abs == "/proc/swaps")
+            return ok(text_file("Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n"));
+        // No block devices: the guest's root is a directory, not a disk.
+        if (abs == "/proc/partitions")
+            return ok(text_file("major minor  #blocks  name\n\n"));
+        if (abs == "/proc/diskstats")
+            return ok(text_file(""));
+        if (abs == "/proc/devices")
+            return ok(text_file("Character devices:\n  1 mem\n  4 /dev/vc/0\n  4 tty\n"
+                                "  5 /dev/tty\n  5 /dev/console\n  5 /dev/ptmx\n"
+                                " 10 misc\n136 pts\n\nBlock devices:\n"));
+        if (abs == "/proc/modules")
+            return ok(text_file(""));
+        if (abs == "/proc/misc")
+            return ok(text_file("183 hw_random\n229 fuse\n"));
         if (abs == "/proc/filesystems")
             return ok(text_file("nodev\tproc\nnodev\tsysfs\nnodev\ttmpfs\n\text4\n"));
         // The mount table. /etc/mtab -> /proc/self/mounts, and pacman/df read

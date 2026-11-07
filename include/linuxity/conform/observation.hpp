@@ -384,7 +384,10 @@ private:
 //     adb shell can reach allows a hardlink at all -- so linuxity emulates
 //     it by copying and tracking the link set, which is the only reason a
 //     package that ships hardlinked aliases installs. gcc ships /usr/bin/gcc,
-//     g++, cc and five more that way, so without it there is no compiler).
+//     g++, cc and five more that way, so without it there is no compiler),
+//     and mknod/mknodat (Android's SELinux refuses mkfifo for the shell in
+//     every directory it can write, so linuxity emulates named FIFOs; make's
+//     jobserver is one of them).
 //
 // The effect: the aarch64 golden still RECORDS the denial as the kernel's
 // truth, and the guest is still held to every other observation.
@@ -398,7 +401,8 @@ public:
         // succeeded, answers it. Clause (b) below pairs the two up.
         return c == abi::Sysno::ioctl || c == abi::Sysno::bind ||
                c == abi::Sysno::connect || c == abi::Sysno::link ||
-               c == abi::Sysno::linkat || c == abi::Sysno::newfstatat;
+               c == abi::Sysno::linkat || c == abi::Sysno::newfstatat ||
+               c == abi::Sysno::mknod || c == abi::Sysno::mknodat;
     }
     [[nodiscard]] bool exempt(const Observation& n,
                               const Observation& g) const noexcept {
