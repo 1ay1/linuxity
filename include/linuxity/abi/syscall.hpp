@@ -480,6 +480,7 @@ public:
             case Sysno::getsockname: return do_sockname(r, false);
             case Sysno::syslog:      return do_syslog(r);
             case Sysno::unshare:     return do_unshare(r);
+            case Sysno::fstat:       return stat_fd(static_cast<int>(r.arg[0]), uaddr(r.arg[1]), false);
             case Sysno::ptrace:      return do_ptrace(r);
             case Sysno::wait4:       return do_wait4_traced(r);
             case Sysno::msgget:      return do_msgget(r);
@@ -1976,6 +1977,61 @@ private:
 
     // stat/lstat/newfstatat: redirect host-backed to the real path; for
     // virtual files synthesize a stat buffer into guest memory ourselves.
+    // fstat(fd, buf), and the AT_EMPTY_PATH forms: the inode the fd is open
+    // on, owned the way the guest's world says (root, or what it chown'd),
+    // exactly as a stat by path reports it.
+    [[nodiscard]] Outcome stat_fd(int fd, UAddr buf, bool statx) {
+        const std::string gp{k_.files().path_of_fd(fd)};
+        if (!gp.empty()) {
+            auto pc = k_.files().classify(gp);
+            if (pc.realm == kernel::Realm2::virtual_file) {
+                const std::string& vp = pc.virtual_path.empty() ? gp : pc.virtual_path;
+                if (auto vf = k_.files().produce(vp); vf && vf->redirect_host.empty())
+                    return statx ? write_statx(buf, vf->is_dir, vf->bytes.size())
+                                 : write_statbuf(buf, vf->is_dir, vf->bytes.size());
+            }
+        }
+        if constexpr (!requires { mem_.host_tid(); }) {
+            return fwd();
+        } else {
+            // the inode itself, through the task's fd (works for unlinked
+            // files, pipes and sockets too)
+            char link[64];
+            std::snprintf(link, sizeof link, "/proc/%d/fd/%d", mem_.host_tid(), fd);
+            struct ::stat st{};
+            if (::stat(link, &st) != 0) return eno(errno == ENOENT ? Errno::ebadf : wire::errno_from_host(errno));
+            wire::StatFields h;
+            h.mode     = static_cast<std::uint32_t>(st.st_mode);
+            h.dev      = static_cast<std::uint64_t>(st.st_dev);
+            h.ino      = static_cast<std::uint64_t>(st.st_ino);
+            h.nlink    = static_cast<std::uint64_t>(st.st_nlink);
+            h.rdev     = static_cast<std::uint64_t>(st.st_rdev);
+            h.size     = static_cast<std::uint64_t>(st.st_size);
+            h.blksize  = static_cast<std::int64_t>(st.st_blksize);
+            h.blocks   = static_cast<std::int64_t>(st.st_blocks);
+            h.mtime_ns = static_cast<std::uint64_t>(st.st_mtim.tv_sec) * 1'000'000'000ull +
+                         static_cast<std::uint64_t>(st.st_mtim.tv_nsec);
+            h.atime_ns = static_cast<std::uint64_t>(st.st_atim.tv_sec) * 1'000'000'000ull +
+                         static_cast<std::uint64_t>(st.st_atim.tv_nsec);
+            h.ctime_ns = static_cast<std::uint64_t>(st.st_ctim.tv_sec) * 1'000'000'000ull +
+                         static_cast<std::uint64_t>(st.st_ctim.tv_nsec);
+            // the same inode by path: fill in what a path stat would (emulated
+            // link counts, socket placeholders), only if it IS that inode
+            if (!gp.empty()) {
+                auto pc = k_.files().classify(gp);
+                if (pc.realm == kernel::Realm2::host_backed)
+                    if (auto f = fast_stat(pc.host_path, gp); f && f->ino == h.ino && f->dev == h.dev) {
+                        h.nlink = f->nlink;
+                        h.mode = f->mode;
+                    }
+            }
+            const Outcome out = statx ? write_statx(buf, h) : write_statbuf(buf, h);
+            // owner: root, or what the guest chown/chmod'd on this path
+            scrub_ids(Scrub{statx ? Scrub::Layout::statx : Scrub::Layout::stat, buf, gp});
+            return out;
+        }
+    }
+
     [[nodiscard]] Outcome path_stat(const Regs& r, int path_arg, bool at,
                                     bool follow = true) {
         // Syntax first: an empty path is ENOENT (not the cwd), and a trailing
@@ -1990,7 +2046,7 @@ private:
         const PathSyntax syn = path_syntax(raw);
         if (syn == PathSyntax::empty)
             return wire::has_at(at_flags, wire::AtFlag::empty_path)
-                       ? fwd()
+                       ? stat_fd(static_cast<int>(r.arg[0]), uaddr(r.arg[2]), false)
                        : eno(Errno::enoent);
 
         // A dirfd we cannot resolve means we'd resolve the path against the
@@ -2091,22 +2147,8 @@ private:
         // which fstats the fd correctly.
         std::uint64_t flags = r.arg[2];
         std::string raw1 = read_cstr(uaddr(r.arg[1]));
-        if (raw1.empty() && wire::has_at(flags, wire::AtFlag::empty_path)) {
-            std::string_view gp = k_.files().path_of_fd(static_cast<int>(r.arg[0]));
-            if (gp.empty()) return fwd();   // untracked fd: kernel fstats it
-            auto pc = k_.files().classify(std::string{gp});
-            if (pc.realm == kernel::Realm2::virtual_file) {
-                const std::string& vp = pc.virtual_path.empty()
-                                            ? std::string{gp} : pc.virtual_path;
-                auto vf = k_.files().produce(vp);
-                if (!vf) return eno(vf.error());
-                return write_statx(uaddr(r.arg[4]), vf->is_dir, vf->bytes.size());
-            }
-            // A host-backed fd is already open on the correct inode — the
-            // kernel fstats it directly; forward unchanged (do NOT re-resolve
-            // the empty path, which would wrongly stat the cwd/root).
-            return fwd();
-        }
+        if (raw1.empty() && wire::has_at(flags, wire::AtFlag::empty_path))
+            return stat_fd(static_cast<int>(r.arg[0]), uaddr(r.arg[4]), true);
         bool nofollow = wire::has_at(flags, wire::AtFlag::symlink_nofollow);
         if (empty_path_arg(r, 1)) return eno(Errno::enoent);
         // A "."/".." component does not excuse the components before it.

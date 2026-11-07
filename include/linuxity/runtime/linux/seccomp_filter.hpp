@@ -193,6 +193,7 @@ inline constexpr int kTrappedX86_64[] = {
     // refuse, rather than letting the host resolve the path.
     433,                         // fspick
     4, 6, 262,                   // stat/lstat/newfstatat
+    5,                           // fstat (owner as the guest's world says)
     332,                         // statx
     137,                         // statfs        (path -> overlay redirect)
     // fstatfs on an fd linuxity synthesized (/proc, /sys, /dev) must report

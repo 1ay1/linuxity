@@ -106,3 +106,35 @@ def sticky_and_setgid_dirs():
 
         eq(reap(spawn(other_user)), 0, "another user deleting in a sticky dir")
     return "setgid group + bit inherit, sticky"
+
+
+@test
+def fd_and_path_stat_agree():
+    """fstat, statx(AT_EMPTY_PATH) and stat by path report the same owner and mode."""
+    import ctypes
+    import struct
+    libc = ctypes.CDLL(None, use_errno=True)
+
+    def statx_fd(fd):
+        b = ctypes.create_string_buffer(256)
+        check(libc.statx(fd, b"", 0x1000, 0xfff, b) == 0, "statx AT_EMPTY_PATH")
+        uid, gid = struct.unpack_from("II", b.raw, 20)
+        mode = struct.unpack_from("H", b.raw, 28)[0]
+        return uid, gid, mode
+
+    os.mkdir("d")
+    with open("f", "w") as fh:
+        fh.write("x")
+    if os.getuid() == 0:
+        os.chown("f", 1234, 5678)
+    os.chmod("f", 0o640)
+    for p, flags in (("d", os.O_RDONLY | os.O_DIRECTORY), ("f", os.O_RDONLY), ("d", os.O_PATH)):
+        fd = os.open(p, flags)
+        try:
+            s, f = os.stat(p), os.fstat(fd)
+            eq((f.st_uid, f.st_gid, f.st_mode, f.st_ino), (s.st_uid, s.st_gid, s.st_mode, s.st_ino),
+               f"fstat vs stat of {p}")
+            eq(statx_fd(fd), (s.st_uid, s.st_gid, s.st_mode & 0xffff), f"statx(fd) vs stat of {p}")
+        finally:
+            os.close(fd)
+    return "dir, file, O_PATH"
