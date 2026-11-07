@@ -111,3 +111,36 @@ def shared_memory():
     finally:
         libc.shmctl(h, IPC_RMID, None)
     return "shared across fork and attaches, IPC_RMID while attached"
+
+
+@test
+def proc_sysvipc():
+    """/proc/sysvipc lists the same objects IPC_STAT sees, in the kernel's layout."""
+    heads = {
+        "msg": "       key      msqid perms      cbytes       qnum lspid lrpid   uid   gid  cuid  cgid      stime      rtime      ctime\n",
+        "sem": "       key      semid perms      nsems   uid   gid  cuid  cgid      otime      ctime\n",
+        "shm": "       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime                   rss                  swap\n",
+    }
+    for f, h in heads.items():
+        with open(f"/proc/sysvipc/{f}") as fh:
+            eq(fh.readline(), h, f"{f} header")
+    q = ok(libc.msgget(0x4c58ab07, IPC_CREAT | 0o640), "msgget")
+    h = ok(libc.shmget(IPC_PRIVATE, 8192, IPC_CREAT | 0o600), "shmget")
+    try:
+        ok(libc.msgsnd(q, ctypes.byref(Msg(1, b"abc")), 3, 0), "msgsnd")
+        with open("/proc/sysvipc/msg") as fh:
+            row = next(l for l in fh if l.split()[1:2] == [str(q)])
+        want = "%10d %10d  %4o  %10d %10d %5d %5d %5d %5d %5d %5d %10d %10d %10d\n"
+        f = row.split()
+        eq(row, want % (0x4c58ab07, q, 0o640, 3, 1, int(f[5]), 0, *map(int, f[7:11]), int(f[11]), 0, int(f[13])),
+           "msg row, byte for byte")
+        eq(int(f[5]), os.getpid(), "lspid is the sender")
+        with open("/proc/sysvipc/shm") as fh:
+            srow = next(l.split() for l in fh if l.split()[1:2] == [str(h)])
+        eq((srow[2], srow[3], srow[6]), ("600", "8192", "0"), "shm perms, size, nattch")
+    finally:
+        libc.msgctl(q, IPC_RMID, None)
+        libc.shmctl(h, IPC_RMID, None)
+    with open("/proc/sysvipc/msg") as fh:
+        check(not any(l.split()[1:2] == [str(q)] for l in fh), "a removed queue leaves the file")
+    return "headers, an exact row, shm columns, removal"

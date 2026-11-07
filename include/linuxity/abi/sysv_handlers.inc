@@ -2,21 +2,10 @@
 // Forwarded where the host has SysV IPC; served from kernel/sysv_ipc.hpp
 // where it doesn't (Android builds its kernel with CONFIG_SYSVIPC off).
 
-    [[nodiscard]] static bool host_has_sysv() {
-#if defined(_WIN32)
-        return false;
-#else
-        static const bool has = [] {
-            // test the emulated path on a host that has SysV IPC
-            if (std::getenv("LINUXITY_EMULATE_SYSV")) return false;
-            const long id = ::syscall(SYS_msgget, 0 /*IPC_PRIVATE*/, 01000 | 0600);
-            if (id < 0) return errno != ENOSYS;
-            ::syscall(SYS_msgctl, id, 0 /*IPC_RMID*/, nullptr);
-            return true;
-        }();
-        return has;
-#endif
-    }
+    // The host's objects for the initial IPC namespace; linuxity's own for
+    // any namespace a guest made (the host has only the one) and on hosts
+    // without SysV IPC at all.
+    [[nodiscard]] bool host_has_sysv() { return kernel::SysvIpc::host_backed() && ipc_ns() == 0; }
     [[nodiscard]] std::uint64_t ipc_ns() { return me().ns.id[static_cast<int>(kernel::NsKind::ipc)]; }
     [[nodiscard]] kernel::IpcSpace& ipc_space() { return k_.procs().ipc().space(ipc_ns()); }
     [[nodiscard]] static std::int64_t now_s() { return static_cast<std::int64_t>(std::time(nullptr)); }
@@ -550,8 +539,8 @@
                 if (!mem_.copy_out(uaddr(r.arg[2]), b)) return eno(Errno::efault);
                 return val(cmd == 2 ? 0 : it->first);
             }
-            case 11: case 12:   // SHM_LOCK, SHM_UNLOCK
-                if (!ipc_owner(g.perm)) return eno(Errno::eperm);
+            case 11: case 12:   // SHM_LOCK, SHM_UNLOCK: CAP_IPC_LOCK, or the owner
+                if (!creds::capable(me(), 14 /*CAP_IPC_LOCK*/) && !ipc_owner(g.perm)) return eno(Errno::eperm);
                 if (cmd == 11) g.perm.mode |= 02000; else g.perm.mode &= ~02000u;
                 return val(0);
             default: return eno(Errno::einval);

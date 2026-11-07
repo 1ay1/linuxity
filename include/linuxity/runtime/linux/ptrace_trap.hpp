@@ -812,7 +812,47 @@ public:
                r.arg(3) != 0;
     }
     [[nodiscard]] bool needs_out_fixup(const Regs& r, ::pid_t w = -1) const {
-        return is_getlk(r) || is_peercred(r) || is_recv_creds(r, w);
+        return is_getlk(r) || is_peercred(r) || is_recv_creds(r, w) || ipc_pid_field(r) != 0;
+    }
+    // SysV IPC answers that carry host pids: the *ctl stat structs (msg
+    // lspid/lrpid at 96/100, shm cpid/lpid at 80/84) and semctl(GETPID)'s
+    // return. Returns 1 msg, 2 shm, 3 GETPID, 0 none. Only seen when the
+    // host has SysV IPC (otherwise linuxity answers these itself).
+    [[nodiscard]] static int ipc_pid_field(const Regs& r) {
+        const auto sc = abi::decode(kTraceeArch, r.nr());
+        const auto cmd = r.arg(sc == abi::Sysno::semctl ? 2 : 1) & ~0x100ull;
+        if (sc == abi::Sysno::msgctl && (cmd == 2 || cmd == 11 || cmd == 13) && r.arg(2)) return 1;
+        if (sc == abi::Sysno::shmctl && (cmd == 2 || cmd == 13 || cmd == 15) && r.arg(2)) return 2;
+        if (sc == abi::Sysno::semctl && cmd == 11) return 3;
+        return 0;
+    }
+    // A host pid as the calling guest names it; 0 when it isn't a guest's.
+    [[nodiscard]] std::int32_t guest_view_of_host(::pid_t w, std::int32_t host) {
+        if (host <= 0) return 0;
+        const std::int32_t g = known_gpid_of(host);
+        if (g <= 0) return 0;
+        const std::int32_t l = local_pid(known_gpid_of(host_tgid_of(w)), g);
+        return l > 0 ? l : 0;
+    }
+    void translate_ipc_pids(::pid_t w, Regs& r) {
+        const int kind = ipc_pid_field(r);
+        const auto ret = static_cast<long long>(r.ret());
+        if (ret < 0) return;
+        if (kind == 3) {
+            r.set_ret(guest_view_of_host(w, static_cast<std::int32_t>(ret)));
+            (void)r.store(w);
+            return;
+        }
+        const std::uint64_t at = r.arg(2) + (kind == 1 ? 96 : 80);
+        errno = 0;
+        const long word = ::ptrace(PTRACE_PEEKDATA, w, reinterpret_cast<void*>(at), 0);
+        if (errno) return;
+        const auto a = static_cast<std::int32_t>(static_cast<std::uint32_t>(word));
+        const auto b = static_cast<std::int32_t>(static_cast<std::uint64_t>(word) >> 32);
+        const auto na = static_cast<std::uint32_t>(guest_view_of_host(w, a));
+        const auto nb = static_cast<std::uint32_t>(guest_view_of_host(w, b));
+        const auto nw = static_cast<std::uint64_t>(na) | (static_cast<std::uint64_t>(nb) << 32);
+        ::ptrace(PTRACE_POKEDATA, w, reinterpret_cast<void*>(at), reinterpret_cast<void*>(nw));
     }
     // `w` is the task the registers belong to; at an exit stop that is not
     // necessarily cur_ any more.
@@ -878,6 +918,8 @@ public:
     [[nodiscard]] std::int32_t global_pid(std::int32_t viewer, std::int32_t pid) const {
         return pid_to_global_ && pid > 0 ? pid_to_global_(viewer, pid) : pid;
     }
+    // the guest pid a host pid had, even once it has exited; 0 if never ours
+    [[nodiscard]] std::int32_t guest_pid_of_host(::pid_t host) const { return known_gpid_of(host); }
 
     // struct ucred {pid, uid, gid}. A peer in the guest tree is a guest
     // process, so it's root like every guest; one outside shows pid 0.
@@ -2222,6 +2264,8 @@ private:
                 translate_peercred(w, r);
             } else if (is_recv_creds(r, w)) {
                 translate_recv_creds(w, r);
+            } else if (ipc_pid_field(r)) {
+                translate_ipc_pids(w, r);
             } else if (returns_pid(r.nr())) {
                 auto host = static_cast<::pid_t>(static_cast<long long>(r.ret()));
                 if (host > 0) {

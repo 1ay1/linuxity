@@ -403,6 +403,10 @@ public:
     using HostOf = std::function<int(std::int32_t)>;
     void set_host_resolver(HostOf f) { host_of_ = std::move(f); }
     [[nodiscard]] int host_of(std::int32_t gpid) const { return host_of_ ? host_of_(gpid) : -1; }
+    // and the reverse: the guest pid a host pid had, even after it exited
+    // (0 if it was never one of ours)
+    void set_guest_resolver(HostOf f) { guest_of_ = std::move(f); }
+    [[nodiscard]] std::int32_t guest_of(int host) const { return guest_of_ && host > 0 ? guest_of_(host) : 0; }
 
     // -- pid namespaces ------------------------------------------------------
     // A process in a child pid namespace has a second, local number there
@@ -539,6 +543,7 @@ public:
 
 private:
     HostOf host_of_;
+    HostOf guest_of_;
     std::map<std::int32_t, ProcInfo> procs_;
     std::int32_t last_pid_{1};
     Namespaces ns_;

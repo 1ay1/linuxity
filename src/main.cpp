@@ -922,6 +922,7 @@ int main(int argc, char** argv) {
     runtime::Cpu cpu{trap, k, trap, conform::host_arch()};
     // procfs reads live per-task facts from the guest's real host task
     k.procs().set_host_resolver([&trap](std::int32_t g) { return static_cast<int>(trap.host_tid_of(g)); });
+    k.procs().set_guest_resolver([&trap](std::int32_t h) { return static_cast<int>(trap.guest_pid_of_host(h)); });
     // a new mount namespace starts with its parent's guest mounts
     k.procs().set_on_new_mnt_ns([&k](std::uint64_t parent, std::uint64_t child) {
         k.files().clone_mnt_ns(parent, child);

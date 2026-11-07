@@ -183,6 +183,130 @@ inline std::optional<Result<kernel::VirtualFile>> net_view(std::string_view rest
 #endif
 }
 
+// /proc/sysvipc/{msg,sem,shm}, byte for byte like ipc/{msg,sem,shm}.c: a
+// header always, then one row per object in the reader's IPC namespace.
+// ids go through the reader's user namespace, pids through its pid one.
+inline std::string sysvipc_text(const kernel::ProcessTable& procs, std::string_view which) {
+    const auto set = procs.ns_of(procs.reader());
+    const auto ipc_ns = set.id[static_cast<int>(kernel::NsKind::ipc)];
+    const auto user_ns = set.id[static_cast<int>(kernel::NsKind::user)];
+    auto uid = [&](std::uint32_t v) { return user_ns ? procs.ns().to_ns(user_ns, v, false) : v; };
+    auto gid = [&](std::uint32_t v) { return user_ns ? procs.ns().to_ns(user_ns, v, true) : v; };
+    auto pid = [&](std::int32_t v) { return static_cast<unsigned>(v > 0 ? procs.view_pid(v) : 0); };
+    const kernel::IpcSpace* sp = procs.ipc().find_space(ipc_ns);
+    std::string s;
+    char row[512];
+    if (which == "msg") {
+        s = "       key      msqid perms      cbytes       qnum lspid lrpid   uid   gid  cuid  cgid      stime      rtime      ctime\n";
+        if (sp)
+            for (const auto& [id, q] : sp->msq) {
+                std::snprintf(row, sizeof row,
+                    "%10d %10d  %4o  %10lu %10lu %5u %5u %5u %5u %5u %5u %10llu %10llu %10llu\n",
+                    q.perm.key, id, q.perm.mode & 0777, static_cast<unsigned long>(q.cbytes),
+                    static_cast<unsigned long>(q.msgs.size()), pid(q.lspid), pid(q.lrpid),
+                    uid(q.perm.uid), gid(q.perm.gid), uid(q.perm.cuid), gid(q.perm.cgid),
+                    static_cast<unsigned long long>(q.stime), static_cast<unsigned long long>(q.rtime),
+                    static_cast<unsigned long long>(q.ctime));
+                s += row;
+            }
+    } else if (which == "sem") {
+        s = "       key      semid perms      nsems   uid   gid  cuid  cgid      otime      ctime\n";
+        if (sp)
+            for (const auto& [id, m] : sp->sem) {
+                std::snprintf(row, sizeof row, "%10d %10d  %4o %10u %5u %5u %5u %5u %10llu %10llu\n",
+                    m.perm.key, id, m.perm.mode & 0777, static_cast<unsigned>(m.sems.size()),
+                    uid(m.perm.uid), gid(m.perm.gid), uid(m.perm.cuid), gid(m.perm.cgid),
+                    static_cast<unsigned long long>(m.otime), static_cast<unsigned long long>(m.ctime));
+                s += row;
+            }
+    } else {
+        s = "       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime                   rss                  swap\n";
+        if (sp)
+            for (const auto& [id, g] : sp->shm) {
+                // rss: the pages actually backing the segment's file
+                unsigned long rss = 0;
+#if !defined(_WIN32)
+                struct ::stat st{};
+                if (!g.file.empty() && ::stat(g.file.c_str(), &st) == 0)
+                    rss = static_cast<unsigned long>(st.st_blocks) * 512;
+#endif
+                // the mode shows SHM_DEST/SHM_LOCKED like the kernel's
+                std::snprintf(row, sizeof row,
+                    "%10d %10d  %4o %21lu %5u %5u  %5lu %5u %5u %5u %5u %10llu %10llu %10llu %21lu %21lu\n",
+                    g.perm.key, id, g.perm.mode & 07777, static_cast<unsigned long>(g.size),
+                    pid(g.cpid), pid(g.lpid), static_cast<unsigned long>(g.nattch),
+                    uid(g.perm.uid), gid(g.perm.gid), uid(g.perm.cuid), gid(g.perm.cgid),
+                    static_cast<unsigned long long>(g.atime), static_cast<unsigned long long>(g.dtime),
+                    static_cast<unsigned long long>(g.ctime), rss, 0ul);
+                s += row;
+            }
+    }
+    return s;
+}
+
+// The host's /proc/sysvipc file, re-printed with the kernel's formats after
+// mapping its host pids to guest pids (0 when not one of ours) and the host
+// uid running linuxity to the guest's root, through the reader's user ns.
+inline std::string sysvipc_from_host(const kernel::ProcessTable& procs, const std::string& h,
+                                     std::string_view which) {
+    const auto set = procs.ns_of(procs.reader());
+    const auto user_ns = set.id[static_cast<int>(kernel::NsKind::user)];
+#if defined(_WIN32)
+    const unsigned long me = 0;
+#else
+    const unsigned long me = ::getuid(), mygid = ::getgid();
+#endif
+    auto id = [&](unsigned long v, bool gid) -> unsigned long {
+#if !defined(_WIN32)
+        if (v == (gid ? mygid : me)) v = 0;
+#endif
+        return user_ns ? procs.ns().to_ns(user_ns, static_cast<std::uint32_t>(v), gid) : v;
+    };
+    auto pid = [&](unsigned long host) -> unsigned long {
+        const auto g = procs.guest_of(static_cast<int>(host));
+        return g > 0 ? static_cast<unsigned long>(procs.view_pid(g)) : 0;
+    };
+    std::string out;
+    std::size_t at = 0;
+    bool first = true;
+    char row[512];
+    while (at < h.size()) {
+        std::size_t nl = h.find('\n', at);
+        if (nl == std::string::npos) nl = h.size();
+        const std::string line = h.substr(at, nl - at);
+        at = nl + 1;
+        if (first) { out += line + "\n"; first = false; continue; }
+        long long k = 0, i = 0;
+        unsigned long long v[16]{};
+        unsigned mode = 0;
+        if (which == "msg" &&
+            std::sscanf(line.c_str(), "%lld %lld %o %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu",
+                        &k, &i, &mode, &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8], &v[9], &v[10]) == 14) {
+            std::snprintf(row, sizeof row, "%10lld %10lld  %4o  %10llu %10llu %5lu %5lu %5lu %5lu %5lu %5lu %10llu %10llu %10llu\n",
+                          k, i, mode, v[0], v[1], pid(v[2]), pid(v[3]), id(v[4], false), id(v[5], true),
+                          id(v[6], false), id(v[7], true), v[8], v[9], v[10]);
+            out += row;
+        } else if (which == "sem" &&
+                   std::sscanf(line.c_str(), "%lld %lld %o %llu %llu %llu %llu %llu %llu %llu",
+                               &k, &i, &mode, &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6]) == 10) {
+            std::snprintf(row, sizeof row, "%10lld %10lld  %4o %10llu %5lu %5lu %5lu %5lu %10llu %10llu\n",
+                          k, i, mode, v[0], id(v[1], false), id(v[2], true), id(v[3], false), id(v[4], true),
+                          v[5], v[6]);
+            out += row;
+        } else if (which == "shm" &&
+                   std::sscanf(line.c_str(), "%lld %lld %o %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu",
+                               &k, &i, &mode, &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8], &v[9],
+                               &v[10], &v[11], &v[12]) == 16) {
+            std::snprintf(row, sizeof row,
+                          "%10lld %10lld  %4o %21llu %5lu %5lu  %5llu %5lu %5lu %5lu %5lu %10llu %10llu %10llu %21llu %21llu\n",
+                          k, i, mode, v[0], pid(v[1]), pid(v[2]), v[3], id(v[4], false), id(v[5], true),
+                          id(v[6], false), id(v[7], true), v[8], v[9], v[10], v[11], v[12]);
+            out += row;
+        }
+    }
+    return out;
+}
+
 // Build a /proc producer bound to linuxity's process table + machine spec.
 // The spec (kernel/machine.hpp) is the SINGLE source of truth for ncpu, RAM,
 // frequency, identity and uptime; /proc reads only from it, so it can never
@@ -217,6 +341,20 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
             }
         }
 
+        // ---- /proc/sysvipc: the IPC objects the syscalls see ------------
+        if (abs == "/proc/sysvipc")
+            return ok(dir_file({{"msg",false},{"sem",false},{"shm",false}}));
+        if (abs == "/proc/sysvipc/msg" || abs == "/proc/sysvipc/sem" || abs == "/proc/sysvipc/shm") {
+            // where the host has SysV IPC the syscalls go to it, so this does
+            // too, with its host pids and uids shown as the guest's. A guest's
+            // own IPC namespace is linuxity's.
+            const bool own_ipc_ns = procs.ns_of(procs.reader()).id[static_cast<int>(kernel::NsKind::ipc)] != 0;
+            if (procs.ipc().host_backed() && !own_ipc_ns)
+                if (std::string h = host_file(std::string{abs}.c_str()); !h.empty())
+                    return ok(text_file(sysvipc_from_host(procs, h, abs.substr(14))));
+            return ok(text_file(sysvipc_text(procs, abs.substr(14))));
+        }
+
         // ---- /proc/net: the host's network, which the guest shares ------
         if (abs == "/proc/net" || abs.starts_with("/proc/net/"))
             if (auto r = net_view(abs.size() > 10 ? abs.substr(10) : std::string_view{}))
@@ -239,8 +377,9 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                                   "version","cmdline","filesystems","mounts",
                                   "interrupts","softirqs","swaps","partitions",
                                   "diskstats","devices","modules","misc",
-                                  "kallsyms","kmsg","self","sys","net"})
-                e.push_back({f, std::string_view{f} == "sys" || std::string_view{f} == "net"});
+                                  "kallsyms","kmsg","self","sys","net","sysvipc"})
+                e.push_back({f, std::string_view{f} == "sys" || std::string_view{f} == "net" ||
+                                std::string_view{f} == "sysvipc"});
             return ok(dir_file(std::move(e)));
         }
 

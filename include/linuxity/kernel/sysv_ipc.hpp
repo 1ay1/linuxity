@@ -20,6 +20,7 @@
 #if !defined(_WIN32)
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #endif
 
@@ -85,6 +86,23 @@ public:
 #endif
     }
     [[nodiscard]] IpcSpace& space(std::uint64_t ns) { return spaces_[ns]; }
+    // Does the host kernel have SysV IPC? Then the syscalls (and
+    // /proc/sysvipc) are the host's; otherwise linuxity's own objects.
+    // LINUXITY_EMULATE_SYSV=1 forces the emulation, for testing.
+    [[nodiscard]] static bool host_backed() {
+#if defined(_WIN32)
+        return false;
+#else
+        static const bool has = [] {
+            if (std::getenv("LINUXITY_EMULATE_SYSV")) return false;
+            const long id = ::syscall(SYS_msgget, 0 /*IPC_PRIVATE*/, 01000 | 0600);
+            if (id < 0) return errno != ENOSYS;
+            ::syscall(SYS_msgctl, id, 0 /*IPC_RMID*/, nullptr);
+            return true;
+        }();
+        return has;
+#endif
+    }
     [[nodiscard]] const IpcSpace* find_space(std::uint64_t ns) const {
         auto it = spaces_.find(ns);
         return it == spaces_.end() ? nullptr : &it->second;
