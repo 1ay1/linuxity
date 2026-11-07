@@ -699,7 +699,7 @@ public:
             //    host) and translates only the destination.
             case Sysno::rename:     return path_mut2(r, 0, 1, false, false, true);
             case Sysno::renameat:   return path_mut2(r, 1, 3, true,  true, true);
-            case Sysno::renameat2:  return path_mut2(r, 1, 3, true,  true, true);
+            case Sysno::renameat2:  return path_mut2(r, 1, 3, true,  true, true, -1, 4);
             case Sysno::link:       return path_mut2(r, 0, 1, false, false, false);
             case Sysno::linkat:     return path_mut2(r, 1, 3, true,  true, false, 4);
             case Sysno::symlink:    return path_symlink(r, 0, 1, false);
@@ -2573,18 +2573,23 @@ private:
         // forward the unlink too.
         if (pc.whiteout_lower) {
             k_.files().add_whiteout(abs);
-            k_.files().meta().leave_link_set(abs);
             k_.files().meta().forget(abs);
             if (pc.host_path.empty()) return val(0);
         }
         if (pc.host_path.empty()) return eno(pc.error);
         // A removal drops any shadow record so a fresh file created at the same
         // path later starts from the host defaults, not a stale owner/mode.
-        // It also leaves any emulated link set, so the remaining names'
-        // st_nlink drops the way a real unlink would lower it.
         if (wi == Wi::remove) {
-            k_.files().meta().leave_link_set(abs);
             k_.files().meta().forget(abs);
+            // An emulated hardlink name: removing an alias drops it from the
+            // table; removing the backing while aliases remain must keep the
+            // data alive under one of them, as the kernel keeps an inode
+            // alive while any link remains. Done synchronously so the table
+            // only changes if the host unlink succeeds.
+            auto& lt = k_.files().links();
+            if (!lt.empty() && (lt.backing_of(pc.host_path) != nullptr ||
+                                lt.has_aliases(pc.host_path)))
+                return unlink_with_links(pc.host_path);
         }
         Redirect o{PathArg{path_arg, std::move(pc.host_path)}};
         // Only creates need their parent chain pre-built by the trap; the
@@ -2889,77 +2894,41 @@ private:
     // (it must already exist), the destination CREATES its leaf.
     [[nodiscard]] Outcome path_mut2(const Regs& r, int a1, int a2, bool at,
                                     bool /*at2*/, bool move_meta = false,
-                                    int link_flags_arg = -1) {
-        // linkat(fd, "", newdirfd, new, AT_EMPTY_PATH) links the OPEN FD to a
-        // new name, which is how a program materialises an O_TMPFILE. The
-        // source has no path of its own, so take the fd's bound path and let
-        // the ordinary two-path flow run from there. (flags are arg 4; only
-        // linkat has them, and only linkat passes link_flags_arg >= 0.)
-        std::string src_from_fd;
-        if (link_flags_arg >= 0 && empty_cstr_arg(r, a1) &&
-            wire::has_at(r.arg[static_cast<std::size_t>(link_flags_arg)],
-                         wire::AtFlag::empty_path)) {
-            std::string_view gp =
-                k_.files().path_of_fd(static_cast<int>(r.arg[0]));
-            // An O_TMPFILE's recorded path is the DIRECTORY it was opened
-            // on, not a file -- the file has no name until this very call
-            // gives it one. So "no usable source" means empty OR a path that
-            // names a directory while the fd is a regular file. Testing only
-            // for empty missed it, and the link then targeted /dev/shm
-            // itself, which is why sem_open stayed ENOENT.
-            bool tmpfile_src = gp.empty();
-            if (!tmpfile_src) {
-                const int probe = open_tracee_fd(static_cast<int>(r.arg[0]));
-                if (probe >= 0) {
-                    struct ::stat fst{};
-                    const auto pc = k_.files().classify(std::string{gp}, false,
-                                                        false);
-                    tmpfile_src = ::fstat(probe, &fst) == 0 &&
-                                  S_ISREG(fst.st_mode) &&
-                                  pc.realm == kernel::Realm2::host_backed &&
-                                  host_path_is_dir(pc.host_path);
-                    ::close(probe);
-                }
-            }
-            if (tmpfile_src) {
-                // No tracked path: an O_TMPFILE, which has none BY DESIGN --
-                // the file exists only as an fd until linkat gives it a
-                // name. glibc's sem_open does exactly this, so every
-                // multiprocessing.Lock died here with ENOENT on a host that
-                // forbids link(2).
-                //
-                // Forwarding cannot work there, and neither can the
-                // path-based emulation: /proc/<tid>/fd/<n> renders an
-                // O_TMPFILE as "/dir/#1234 (deleted)", which is not
-                // openable. The DESCRIPTOR is the only handle, so copy from
-                // it -- reopening the tracee's fd through /proc gives us one
-                // we can pread.
-                std::string dstp = resolve_second(r, a2, at);
-                auto pdt = k_.files().classify(dstp, true, false,
-                                               Wi::parents_only);
-                if (pdt.realm != kernel::Realm2::host_backed) return fwd();
-                if (host_links_work(pdt.host_path)) return fwd();
-                const int sfd = open_tracee_fd(static_cast<int>(r.arg[0]));
-                if (sfd < 0) return fwd();
-                const Errno e =
-                    k_.files().emulate_link_from_fd(sfd, pdt.host_path);
-                ::close(sfd);
-                return e == Errno::ok ? val(0) : eno(e);
-            }
-            src_from_fd = std::string{gp};
+                                    int link_flags_arg = -1,
+                                    int rename_flags_arg = -1) {
+        // A link whose SOURCE is an open fd rather than a name:
+        //   linkat(fd, "", ..., AT_EMPTY_PATH)
+        //   linkat(AT_FDCWD, "/proc/self/fd/N", ..., AT_SYMLINK_FOLLOW)
+        // Both are how a program gives an O_TMPFILE its name (the second is
+        // the unprivileged form, and what python's os.link does by default).
+        // /proc/self/fd/N is a magic link to the open file itself, not a
+        // file in procfs -- treating it as a procfs path made the link cross
+        // mounts and answered EXDEV.
+        if (link_flags_arg >= 0) {
+            const std::uint64_t lf = r.arg[static_cast<std::size_t>(link_flags_arg)];
+            int link_fd = -1;
+            if (empty_cstr_arg(r, a1) && wire::has_at(lf, wire::AtFlag::empty_path))
+                link_fd = static_cast<int>(r.arg[0]);
+            else if (wire::has_at(lf, wire::AtFlag::symlink_follow))
+                link_fd = magic_fd_of(resolve_arg(r, a1, at));
+            if (link_fd >= 0) return link_from_fd(r, link_fd, a2, at);
         }
         // BOTH operands. Checking only the source left symlinkat(x, "") and
         // renameat(x, "") absolutizing the empty destination to the cwd and
         // acting on the directory -- EEXIST where the kernel says ENOENT.
-        // An AT_EMPTY_PATH source is exempt: its "" is legal.
-        if ((src_from_fd.empty() && empty_path_arg(r, a1)) ||
-            empty_path_arg(r, a2))
+        // An AT_EMPTY_PATH source never gets here: link_from_fd took it.
+        if (empty_path_arg(r, a1) || empty_path_arg(r, a2))
             return eno(Errno::enoent);
-        std::string src = src_from_fd.empty() ? resolve_arg(r, a1, at)
-                                              : src_from_fd;
+        std::string src = resolve_arg(r, a1, at);
         std::string dst = resolve_second(r, a2, at);
-        auto ps = k_.files().classify(src, true, false, Wi::copy_leaf);
-        auto pd = k_.files().classify(dst, true, false, Wi::parents_only);
+        // rename acts on NAMES: an emulated hardlink alias must move as a
+        // name (its placeholder), not drag the shared file behind it along.
+        // link's source is the opposite -- the new name joins the inode the
+        // source NAMES, so it is alias-resolved.
+        auto ps = move_meta ? k_.files().classify_name(src, true, false, Wi::copy_leaf)
+                            : k_.files().classify(src, true, false, Wi::copy_leaf);
+        auto pd = move_meta ? k_.files().classify_name(dst, true, false, Wi::parents_only)
+                            : k_.files().classify(dst, true, false, Wi::parents_only);
         // Traversal comes first: if the kernel cannot search its way to the
         // name, EACCES is the answer and none of the slash/dot reasoning
         // below is ever reached.
@@ -3177,48 +3146,212 @@ private:
         // there, and link did the same -- both ENOENT on the kernel. The
         // destination's own parent must already exist; let the host say so.
         //
-        // A HARDLINK the host refuses gets EMULATED by copying.
+        // A HARDLINK the host refuses gets EMULATED.
         //
         // Android denies the SELinux `link` permission on /data for every
         // process -- verified natively, `ln a b` fails there outside
-        // linuxity too -- so forwarding can never work. The cost of not
-        // handling it is not cosmetic: the gcc package ships /usr/bin/gcc,
-        // g++, cc and five more as hardlink entries (`hrwxr-xr-x ... link
-        // to ...` in the archive), so EVERY ONE was missing and the guest
-        // had no compiler at all.
+        // linuxity too -- so forwarding can never work. Not handling it is
+        // not cosmetic: the gcc package ships /usr/bin/gcc, g++, cc and five
+        // more as hardlink entries, so without it there is no compiler.
         //
-        // A copy gives the guest the same content at the same mode, which is
-        // what those aliases are for. The one thing it cannot share is the
-        // inode, so st_nlink is recorded in the shadow store and reported
-        // from there -- without that the count would read 1 where Linux says
-        // 2, which is the part that made this look unacceptable at first.
-        // Probe the host once per tree rather than per call.
+        // The new name becomes an ALIAS of the existing file (see
+        // link_table.hpp): a placeholder on disk, with every open and stat
+        // of it resolved to the file the source names. Both names share one
+        // inode, so a write through either is seen through the other.
+        // Copying the content instead -- the first version -- gave two
+        // independent files that drifted apart on the first write. ps was
+        // classified with alias resolution, so linking an alias joins the
+        // same inode rather than aliasing a placeholder.
         if (!move_meta && !host_links_work(pd.host_path)) {
-            // glibc's sem_open writes a temp named sem.XXXXXX, links it to
-            // the real name, then unlinks the temp -- so the link is really
-            // a MOVE, and the two names are never both live. Saying so lets
-            // the emulation rename instead of copy, which keeps ONE inode.
-            // A copy gave parent and child separate semaphores, and python
-            // died with "semaphore or lock released too many times".
-            const std::size_t slash = src.find_last_of('/');
-            const std::string_view leaf =
-                slash == std::string::npos ? std::string_view{src}
-                                           : std::string_view{src}.substr(slash + 1);
-            const bool sem_temp = leaf.starts_with("sem.");
-            const Errno e = k_.files().emulate_hardlink(ps.host_path,
-                                                        pd.host_path,
-                                                        sem_temp);
-            if (e != Errno::ok) return eno(e);
-            // A real link(2) bumps the count on EVERY name sharing the
-            // inode, not just the two in this call -- so join the source's
-            // set rather than incrementing a pair. Updating only src and dst
-            // left an earlier sibling reading one less (`_a` stuck at 2
-            // while `_base` and `_b` said 3).
-            k_.files().meta().join_link_set(src, dst);
+            struct ::stat sst{};
+            if (::lstat(ps.host_path.c_str(), &sst) != 0)
+                return eno(static_cast<Errno>(errno));
+            if (S_ISDIR(sst.st_mode)) return eno(Errno::eperm);
+            const int fd = ::open(pd.host_path.c_str(),
+                                  O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+            if (fd < 0) return eno(static_cast<Errno>(errno));
+            ::close(fd);
+            k_.files().links().add(pd.host_path, ps.host_path);
             return val(0);
         }
+        // A rename that moves, replaces or carries a name the link table
+        // knows (an alias, a file with aliases, or a directory holding
+        // either) must keep the table in step. Do it here, synchronously, so
+        // the table is only updated if the host rename really happened.
+        if (move_meta && !k_.files().links().empty() &&
+            (k_.files().links().touches(ps.host_path) ||
+             k_.files().links().touches(pd.host_path)))
+            return rename_with_links(r, ps.host_path, pd.host_path,
+                                     rename_flags_arg);
         return Redirect{PathArg{a1, std::move(ps.host_path)}}
             .with(PathArg{a2, std::move(pd.host_path)});
+    }
+
+    // unlink of a name the link table knows.
+    [[nodiscard]] Outcome unlink_with_links(const std::string& name) {
+        auto& lt = k_.files().links();
+        if (lt.backing_of(name) != nullptr) {          // an alias: drop the name
+            if (::unlink(name.c_str()) != 0) return eno(static_cast<Errno>(errno));
+            lt.drop(name);
+            return val(0);
+        }
+        // The backing itself. Moving it onto an heir replaces the heir's
+        // placeholder and removes `name` in one atomic rename.
+        if (auto heir = lt.promote(name)) {
+            if (::rename(name.c_str(), heir->c_str()) != 0)
+                return eno(static_cast<Errno>(errno));
+            return val(0);
+        }
+        if (::unlink(name.c_str()) != 0) return eno(static_cast<Errno>(errno));
+        return val(0);
+    }
+
+    // The fd number if `p` is this process's /proc/self/fd/N magic link,
+    // else -1. Only the caller's own fds: /proc/<other>/fd/N names another
+    // process's descriptor, which linuxity cannot reach from here.
+    [[nodiscard]] int magic_fd_of(const std::string& p) {
+        const std::string own = "/proc/" + std::to_string(ids().pid) + "/fd/";
+        std::string_view s{p};
+        bool matched = false;
+        for (std::string_view pre : {std::string_view{"/proc/self/fd/"},
+                                     std::string_view{"/proc/thread-self/fd/"},
+                                     std::string_view{own}})
+            if (s.starts_with(pre)) { s.remove_prefix(pre.size()); matched = true; break; }
+        if (!matched || s.empty() || s.size() > 9 ||
+            s.find_first_not_of("0123456789") != std::string_view::npos)
+            return -1;
+        return std::atoi(std::string{s}.c_str());
+    }
+
+    // linkat with an open fd as the source: give that file a new name.
+    //
+    // Where the host allows link(2), link the fd's own inode through the
+    // supervisor's /proc/self/fd -- the unprivileged form, which works for an
+    // O_TMPFILE too. Where it does not (Android), a named file becomes an
+    // alias like any other hardlink. An O_TMPFILE has no name to alias, so it
+    // is copied: the new name gets the data written so far.
+    [[nodiscard]] Outcome link_from_fd(const Regs& r, int fd, int a2, bool at) {
+        if (empty_path_arg(r, a2)) return eno(Errno::enoent);
+        const std::string dst = resolve_second(r, a2, at);
+        auto pd = k_.files().classify(dst, true, false, Wi::parents_only);
+        if (pd.realm != kernel::Realm2::host_backed || pd.host_path.empty())
+            return eno(Errno::exdev);
+        const int sfd = open_tracee_fd(fd);
+        if (sfd < 0) return eno(Errno::ebadf);
+        struct Closer { int f; ~Closer() { ::close(f); } } closer{sfd};
+        struct ::stat st{};
+        if (::fstat(sfd, &st) != 0) return eno(static_cast<Errno>(errno));
+        if (S_ISDIR(st.st_mode)) return eno(Errno::eperm);
+        struct ::stat dt{};
+        if (::lstat(pd.host_path.c_str(), &dt) == 0) return eno(Errno::eexist);
+        if (host_links_work(pd.host_path)) {
+            const std::string self = "/proc/self/fd/" + std::to_string(sfd);
+            if (::linkat(AT_FDCWD, self.c_str(), AT_FDCWD, pd.host_path.c_str(),
+                         AT_SYMLINK_FOLLOW) != 0)
+                return eno(static_cast<Errno>(errno));
+            return val(0);
+        }
+        if (st.st_nlink == 0) {                           // O_TMPFILE: no name
+            const Errno e = k_.files().emulate_link_from_fd(sfd, pd.host_path);
+            return e == Errno::ok ? val(0) : eno(e);
+        }
+        // A named file: alias whatever host path the fd really refers to.
+        char link[64], tgt[4096];
+        std::snprintf(link, sizeof link, "/proc/self/fd/%d", sfd);
+        const ssize_t n = ::readlink(link, tgt, sizeof tgt - 1);
+        if (n <= 0) return eno(Errno::enoent);
+        tgt[n] = '\0';
+        const int out = ::open(pd.host_path.c_str(),
+                               O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (out < 0) return eno(static_cast<Errno>(errno));
+        ::close(out);
+        auto& lt = k_.files().links();
+        lt.add(pd.host_path, lt.resolve(tgt));
+        return val(0);
+    }
+
+    // rename(2) when the link table is involved. `from`/`to` are NAMES (not
+    // alias-resolved). Replacing a name that the table knows has to keep its
+    // inode's other names alive, exactly as the kernel keeps an inode alive
+    // while any link to it remains.
+    [[nodiscard]] Outcome rename_with_links(const Regs& r, const std::string& from,
+                                            const std::string& to,
+                                            int flags_arg) {
+        constexpr unsigned kNoReplace = 1, kExchange = 2;
+        const unsigned flags =
+            flags_arg >= 0 ? static_cast<unsigned>(
+                                 r.arg[static_cast<std::size_t>(flags_arg)])
+                           : 0u;
+        auto& lt = k_.files().links();
+        struct ::stat st{}, fs{};
+        if (::lstat(from.c_str(), &fs) != 0) return eno(static_cast<Errno>(errno));
+        const bool to_exists = ::lstat(to.c_str(), &st) == 0;
+        if ((flags & kNoReplace) != 0 && to_exists) return eno(Errno::eexist);
+        // Two names for the same file: Linux renames nothing and succeeds,
+        // leaving both names in place.
+        if (to_exists && (flags & kExchange) == 0 && lt.resolve(from) == lt.resolve(to))
+            return val(0);
+        std::optional<std::string> heir;
+        if ((flags & kExchange) == 0 && to_exists && to != from) {
+            // Every name the table knows is a non-directory, so the one way
+            // replacing it can fail on type is a directory source. Check
+            // BEFORE moving anything: once the destination's data has been
+            // moved onto an heir, the name is free and the kernel would let
+            // a directory take it -- rename(dir, file) answered 0, not
+            // ENOTDIR.
+            if (S_ISDIR(fs.st_mode) && !S_ISDIR(st.st_mode))
+                return eno(Errno::enotdir);
+            if (lt.backing_of(to) == nullptr) {
+                // `to` holds data other names still share: move it onto one
+                // of them before the rename overwrites it.
+                heir = lt.promote(to);
+                if (heir && ::rename(to.c_str(), heir->c_str()) != 0) {
+                    const int e = errno;
+                    lt.rename_prefix(*heir, to);
+                    lt.add(*heir, to);
+                    return eno(static_cast<Errno>(e));
+                }
+            }
+        }
+        // flags==0 is a plain rename. NOREPLACE was checked above; EXCHANGE
+        // needs the real call, which only Linux has (and only Linux-family
+        // hosts refuse link(2), the one way into this table).
+        int rc = -1;
+        if (flags == 0) {
+            rc = ::rename(from.c_str(), to.c_str());
+        } else {
+#if defined(__linux__)
+            rc = ::renameat2(AT_FDCWD, from.c_str(), AT_FDCWD, to.c_str(), flags);
+#else
+            errno = EINVAL;
+#endif
+        }
+        if (rc != 0) {
+            const int e = errno;
+            // Put the destination's data back where it was: the rename that
+            // was going to replace it did not happen.
+            if (heir) {
+                (void)::rename(heir->c_str(), to.c_str());
+                const int ph = ::open(heir->c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+                if (ph >= 0) ::close(ph);
+                lt.rename_prefix(*heir, to);
+                lt.add(*heir, to);
+            }
+            return eno(static_cast<Errno>(e));
+        }
+        // An alias that was REPLACED is gone now; only drop it from the
+        // table once the replacement really happened.
+        if ((flags & kExchange) == 0 && to_exists && lt.backing_of(to) != nullptr)
+            lt.drop(to);
+        if ((flags & kExchange) != 0) {
+            const std::string mark = from + "\x01lx-swap";
+            lt.rename_prefix(from, mark);
+            lt.rename_prefix(to, from);
+            lt.rename_prefix(mark, to);
+        } else {
+            lt.rename_prefix(from, to);
+        }
+        return val(0);
     }
 
     // symlink(target, linkpath) / symlinkat(target, newdirfd, linkpath):
@@ -3546,7 +3679,14 @@ private:
             // is right by construction. Cheap to give up: these are rare.
             if (host_path == "/proc" || host_path.starts_with("/proc/"))
                 return std::nullopt;
-            return mem_.stat_host_path(host_path);
+            auto fields = mem_.stat_host_path(host_path);
+            // An inode with emulated extra names: the host counts only the
+            // backing, so report every name, as the scrub does on the slow
+            // path. Missing this made os.stat say 1 right after a link.
+            if (fields && !k_.files().links().empty() &&
+                k_.files().links().has_aliases(host_path))
+                fields->nlink = k_.files().links().count(host_path);
+            return fields;
         } else {
             return std::nullopt;
         }
@@ -4247,15 +4387,19 @@ public:
                               kernel::MetaStore::effective_mode(host_mode, *rec));
             }
         }
-        // st_nlink, when a hardlink was EMULATED by copying because the host
-        // refused link(2). The inode is not really shared, so the host says
-        // 1 where Linux would say 2; report the count the guest established.
-        if (rec && (rec->have & kernel::MetaRecord::kNlink) != 0 &&
-            L.nlink_width != 0) {
-            if (L.nlink_width == 8)
-                (void)put_u64(base + L.nlink, rec->nlink);
-            else
-                (void)put_u32(base + L.nlink, rec->nlink);
+        // st_nlink, for an inode whose extra names are EMULATED (see
+        // link_table.hpp): the host sees one name and one placeholder per
+        // alias, so it says 1 where Linux would count every name. Ask the
+        // table, keyed by the backing file this path resolves to.
+        if (L.nlink_width != 0 && !s.guest_path.empty() &&
+            !k_.files().links().empty()) {
+            const auto pc = k_.files().classify(s.guest_path, false, false);
+            if (pc.realm == kernel::Realm2::host_backed &&
+                k_.files().links().has_aliases(pc.host_path)) {
+                const std::uint32_t n = k_.files().links().count(pc.host_path);
+                if (L.nlink_width == 8) (void)put_u64(base + L.nlink, n);
+                else                    (void)put_u32(base + L.nlink, n);
+            }
         }
     }
 
@@ -4394,6 +4538,10 @@ public:
     // /data for every process, so probing per-call would cost two syscalls
     // on every hardlink for an answer that never changes.
     [[nodiscard]] bool host_links_work(const std::string& near) {
+        // Test hook: behave as a host that refuses link(2) (Android), so the
+        // emulation can be exercised by the suite on a host where links work.
+        static const bool forced = std::getenv("LINUXITY_FORCE_LINK_EMULATION") != nullptr;
+        if (forced) return false;
         const std::size_t slash = near.find_last_of('/');
         if (slash == std::string::npos) return false;
         const std::string dir = near.substr(0, slash);

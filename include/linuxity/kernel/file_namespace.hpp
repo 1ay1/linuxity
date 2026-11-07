@@ -25,6 +25,7 @@
 #include "linuxity/abi/wire/path.hpp"
 #include "linuxity/abi/result.hpp"
 #include "linuxity/abi/types.hpp"
+#include "linuxity/kernel/link_table.hpp"
 #include "linuxity/kernel/meta_store.hpp"
 #include "linuxity/kernel/socket_ns.hpp"
 
@@ -171,6 +172,7 @@ public:
             // any helper pacman spawned, and rescanned the db per fork.
             meta_.set_host_bases({upper, host_base});
             meta_.attach(upper, /*compact=*/is_root_);
+            links_.attach(upper);
             meta_attached_ = true;
             whiteout_journal_ = upper + "/.linuxity-whiteout";
             const std::size_t wl = load_whiteouts();
@@ -189,6 +191,11 @@ public:
     // host stat results, so a uid-0 world round-trips coherently.
     [[nodiscard]] MetaStore& meta() noexcept { return meta_; }
     [[nodiscard]] const MetaStore& meta() const noexcept { return meta_; }
+
+    // Emulated hardlinks (see link_table.hpp). classify() resolves aliases,
+    // and the dispatcher's link/unlink/rename paths maintain the table.
+    [[nodiscard]] LinkTable& links() noexcept { return links_; }
+    [[nodiscard]] const LinkTable& links() const noexcept { return links_; }
 
     // The SUPERVISOR's cwd at startup -- the base mount_host() uses to make a
     // relative host path absolute. Set once by the backend, before mounting;
@@ -364,6 +371,26 @@ public:
                                      bool for_write = false,
                                      bool follow = true,
                                      WriteIntent wi = WriteIntent::copy_leaf) const {
+        PathClass pc = classify_impl(abs, for_write, follow, wi, 0);
+        // An emulated hardlink: the name is a placeholder, the data lives at
+        // the backing. Everything except removal acts on the backing, so
+        // open/stat/chmod/truncate on either name hit one inode. Removal acts
+        // on the NAME, and the dispatcher handles it (see LinkTable).
+        if (!links_.empty() && pc.realm == Realm2::host_backed &&
+            wi != WriteIntent::remove)
+            if (const std::string* b = links_.backing_of(pc.host_path))
+                pc.host_path = *b;
+        return pc;
+    }
+
+    // classify() WITHOUT alias resolution: the host path of the NAME. For the
+    // operations that act on a name rather than the file behind it -- rename
+    // moves a name, and must move a hardlink alias's placeholder, not the
+    // shared data it points at.
+    [[nodiscard]] PathClass classify_name(std::string_view abs,
+                                          bool for_write = false,
+                                          bool follow = true,
+                                          WriteIntent wi = WriteIntent::copy_leaf) const {
         return classify_impl(abs, for_write, follow, wi, 0);
     }
 
@@ -501,6 +528,7 @@ public:
         // Erase via find(): transparent erase(K&&) is C++23, but a transparent
         // find() plus erase(iterator) is C++20 and allocates nothing either.
         for (std::string_view hide : {MetaStore::journal_leaf(),
+                                      LinkTable::journal_leaf(),
                                       std::string_view{".linuxity-whiteout"}})
             if (auto it = seen.find(hide); it != seen.end()) seen.erase(it);
         // Drop names whited-out from the lower layer (removed in the overlay
@@ -551,13 +579,11 @@ public:
 
     // Materialize `dst` from an OPEN FD's contents.
     //
-    // The O_TMPFILE case: the file exists only as a descriptor and has no
-    // path at all, so emulate_hardlink's stat/open of a source path cannot
-    // work. /proc/<tid>/fd/<n> renders it "/dir/#1234 (deleted)", which is
-    // not openable either. The fd itself is the only handle, and reading
-    // from it is enough -- glibc's sem_open writes the semaphore's initial
-    // state into the temp file BEFORE linking it into place, so the bytes
-    // are already there.
+    // The O_TMPFILE case on a host that refuses link(2): the file exists
+    // only as a descriptor, with no name to alias, so the new name gets a
+    // copy of what has been written so far. glibc's sem_open writes the
+    // semaphore's state into the temp before linking it, so that is enough
+    // for the one real user.
     [[nodiscard]] Errno emulate_link_from_fd(int fd,
                                              const std::string& dst) const {
         struct ::stat st{};
@@ -584,65 +610,6 @@ public:
             off += n;
         }
         ::close(out);
-        (void)::chmod(dst.c_str(), st.st_mode & 07777);
-        return Errno::ok;
-    }
-
-    // Copy `src` to `dst` to stand in for a hardlink the host refused.
-    //
-    // Returns ok, or the errno the kernel would have given.
-    //
-    // RENAME FIRST, copy only if that fails. A copy gives two independent
-    // inodes, and for a file that is only ever a NAME that is fine -- but
-    // glibc's sem_open creates a temp, links it, then unlinks the temp, so
-    // the two names are never both live and the link is really a move. With
-    // a copy the child re-opening the semaphore by name got a DIFFERENT
-    // inode, so parent and child never shared it and python died with
-    // "semaphore or lock released too many times". A rename keeps one inode,
-    // which is what shared memory requires.
-    //
-    // Safe because the caller only reaches this when the host refuses
-    // link(2) outright: if the source survives the call the copy below is
-    // still the right answer, and rename only wins when it does not.
-    [[nodiscard]] Errno emulate_hardlink(const std::string& src,
-                                         const std::string& dst,
-                                         bool src_is_temp = false) const {
-        struct ::stat st{};
-        if (::stat(src.c_str(), &st) != 0) return static_cast<Errno>(errno);
-        if (S_ISDIR(st.st_mode)) return Errno::eperm;   // link(2) on a dir
-        // link(2) does NOT overwrite; EEXIST is the kernel's answer.
-        struct ::stat dt{};
-        if (::lstat(dst.c_str(), &dt) == 0) return Errno::eexist;
-        if (src_is_temp && ::rename(src.c_str(), dst.c_str()) == 0)
-            return Errno::ok;
-        const int in = ::open(src.c_str(), O_RDONLY | O_CLOEXEC);
-        if (in < 0) return static_cast<Errno>(errno);
-        const int out = ::open(dst.c_str(),
-                               O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
-                               st.st_mode & 07777);
-        if (out < 0) {
-            // The create's OWN errno, not a blanket EACCES. The kernel
-            // reports what it found -- ENOENT for a missing parent, ENOTDIR
-            // for a non-directory component, EROFS, ENOSPC -- and a guest
-            // that gets EACCES for all of them is not Linux. The fsmutate
-            // probe's "hardlink under a MISSING parent is ENOENT" step
-            // caught exactly this.
-            const int e = errno;
-            ::close(in);
-            return static_cast<Errno>(e);
-        }
-        char buf[65536];
-        for (;;) {
-            const ssize_t n = ::read(in, buf, sizeof buf);
-            if (n == 0) break;
-            if (n < 0 || ::write(out, buf, static_cast<std::size_t>(n)) != n) {
-                ::close(in); ::close(out); ::unlink(dst.c_str());
-                return Errno::eio;
-            }
-        }
-        ::close(in);
-        ::close(out);
-        // mkdir/open mask the mode through umask; set it exactly.
         (void)::chmod(dst.c_str(), st.st_mode & 07777);
         return Errno::ok;
     }
@@ -1020,6 +987,7 @@ private:
                     pre = std::move(next);
                     break;
                 case Probe::present:
+                case Probe::notdir:
                     // The probe already proved this is NOT a symlink, so the
                     // chase ends here. Looping would spend another readlink
                     // to be told EINVAL a second time.
@@ -1118,15 +1086,22 @@ private:
     //
     // Halving the host syscalls here matters because openat/readlinkat/statx
     // are ~33% of a real workload's calls and every one of them classifies a
-    // path. ENOTDIR and EACCES deliberately fold into "absent" for LAYER
-    // SELECTION only: if the upper can't be traversed, the lower is the right
-    // candidate, and the forwarded syscall reports the true error itself.
-    enum class Probe { symlink, present, absent };
+    // path. EACCES folds into "absent" for LAYER SELECTION only: if the upper
+    // can't be traversed, the lower is the right candidate, and the forwarded
+    // syscall reports the true error itself.
+    //
+    // ENOTDIR does NOT. It means some component in the UPPER is a
+    // non-directory, and an upper non-directory is opaque: nothing beneath
+    // it exists, whatever the lower holds at that path. Folding it into
+    // "absent" sent `open("file/x")` to the lower layer, which usually has no
+    // such parent at all and answered ENOENT where Linux says ENOTDIR.
+    enum class Probe { symlink, present, absent, notdir };
     static Probe probe_link(const char* path, std::string& out) {
         char buf[4096];
         const ::ssize_t n = ::readlink(path, buf, sizeof buf - 1);
         if (n >= 0) { out.assign(buf, static_cast<std::size_t>(n)); return Probe::symlink; }
-        return errno == EINVAL ? Probe::present : Probe::absent;
+        if (errno == EINVAL) return Probe::present;
+        return errno == ENOTDIR ? Probe::notdir : Probe::absent;
     }
 
     static bool is_dir(const char* path) {
@@ -1408,6 +1383,7 @@ private:
     mutable bool    have_inherited_fds_{false};
     mutable std::int32_t last_pid_{0};
     MetaStore meta_{};
+    LinkTable links_{};
     bool meta_attached_{false};
     bool is_root_{true};
 
