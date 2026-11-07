@@ -20,7 +20,9 @@
 #include "linuxity/vfs/sysfs.hpp"
 
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <fcntl.h>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -34,6 +36,93 @@
 extern char** environ;
 
 namespace {
+
+// Can the guest's libc load locale `name`? Looks in each layer's
+// /usr/lib/locale, as a directory or inside locale-archive.
+bool guest_has_locale(const std::vector<std::string>& layers, std::string_view name) {
+    if (name == "C" || name == "POSIX") return true;
+    // split off the codeset and normalize it the way glibc does (UTF-8 -> utf8)
+    std::string base{name}, mod;
+    if (const auto at = base.find('@'); at != std::string::npos) { mod = base.substr(at); base.resize(at); }
+    std::string lang = base, cs;
+    if (const auto dot = base.find('.'); dot != std::string::npos) {
+        lang = base.substr(0, dot);
+        for (const char c : base.substr(dot + 1))
+            if (std::isalnum(static_cast<unsigned char>(c)))
+                cs.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+    if (lang == "C" && cs == "utf8") return true;   // built into glibc and musl
+    const std::string norm = cs.empty() ? lang + mod : lang + "." + cs + mod;
+    bool any_locale_dir = false;
+    for (const auto& l : layers) {
+        const std::string dir = l + "/usr/lib/locale";
+        struct ::stat st{};
+        if (::stat(dir.c_str(), &st) != 0) continue;
+        any_locale_dir = true;
+        for (const std::string& n : {norm, std::string{name}})
+            if (::stat((dir + "/" + n + "/LC_CTYPE").c_str(), &st) == 0) return true;
+        // locale-archive keeps each name NUL-terminated; it can be large, so map it
+        const int fd = ::open((dir + "/locale-archive").c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            struct ::stat ast{};
+            bool hit = false;
+            if (::fstat(fd, &ast) == 0 && ast.st_size > 0) {
+                void* m = ::mmap(nullptr, static_cast<std::size_t>(ast.st_size), PROT_READ, MAP_PRIVATE, fd, 0);
+                if (m != MAP_FAILED) {
+                    const std::string needle = std::string(1, '\0') + norm + '\0';
+                    hit = ::memmem(m, static_cast<std::size_t>(ast.st_size), needle.data(), needle.size()) != nullptr;
+                    ::munmap(m, static_cast<std::size_t>(ast.st_size));
+                }
+            }
+            ::close(fd);
+            if (hit) return true;
+        }
+    }
+    // no locale files at all: musl, which accepts any name
+    return !any_locale_dir;
+}
+
+bool is_utf8_name(std::string_view v) {
+    std::string s;
+    for (const char c : v) s.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    return s.find("utf-8") != std::string::npos || s.find("utf8") != std::string::npos;
+}
+
+// Give the guest a locale its libc can load, the way a distro login would.
+// An unloadable one makes setlocale fail and every program falls back to
+// ASCII: tmux then draws box and block characters as '_'.
+void fix_guest_locale(std::vector<std::string>& env, const std::vector<std::string>& layers) {
+    bool chosen = false;   // LANG, LC_ALL or LC_CTYPE picks the character set
+    for (auto& kv : env) {
+        if (!kv.starts_with("LANG=") && !kv.starts_with("LC_")) continue;
+        const auto eq = kv.find('=');
+        const std::string_view v = std::string_view{kv}.substr(eq + 1);
+        if (v.empty()) continue;
+        if (!guest_has_locale(layers, v)) kv = kv.substr(0, eq + 1) + "C.UTF-8";
+        if (kv.starts_with("LANG=") || kv.starts_with("LC_ALL=") || kv.starts_with("LC_CTYPE="))
+            chosen = true;
+    }
+    if (chosen) return;
+    // nothing chose a character set: the rootfs's own choice if it is a
+    // usable UTF-8 one, else C.UTF-8 (every terminal today is UTF-8)
+    std::string pick = "C.UTF-8";
+    for (const auto& l : layers) {
+        if (FILE* f = std::fopen((l + "/etc/locale.conf").c_str(), "r")) {
+            char line[256];
+            while (std::fgets(line, sizeof line, f)) {
+                std::string_view s{line};
+                if (!s.starts_with("LANG=")) continue;
+                s.remove_prefix(5);
+                while (!s.empty() && (s.back() == '\n' || s.back() == '"' || s.back() == '\'')) s.remove_suffix(1);
+                while (!s.empty() && (s.front() == '"' || s.front() == '\'')) s.remove_prefix(1);
+                if (is_utf8_name(s) && guest_has_locale(layers, s)) pick = std::string{s};
+            }
+            std::fclose(f);
+            break;   // the top layer's file wins
+        }
+    }
+    env.emplace_back("LANG=" + pick);
+}
 
 // Copy the HOST's arm64 CPU identity into the advertised machine.
 //
@@ -329,6 +418,13 @@ int main(int argc, char** argv) {
         // exports TMPDIR=/data/local/tmp, so make put its jobserver FIFO
         // there). A distro leaves it unset and programs use /tmp.
         std::erase_if(genvp, [](const std::string& kv) { return kv.starts_with("TMPDIR="); });
+        // a locale the rootfs can actually load (top layer first)
+        {
+            std::vector<std::string> layers;
+            if (!persist.empty()) layers.push_back(persist);
+            layers.push_back(root);
+            fix_guest_locale(genvp, layers);
+        }
         // A DISTRO umask, for the same reason as the environment above: the
         // guest is a Linux distro, not this host's shell session. Every
         // distro ships 022 (via /etc/profile or pam_umask); Android's adb
