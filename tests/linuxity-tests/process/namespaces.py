@@ -132,3 +132,37 @@ def hostname_is_consistent():
     with open("/proc/sys/kernel/hostname") as f:
         eq(f.read().strip(), n, "/proc/sys/kernel/hostname")
     return n
+
+
+_TREE = r'''
+import os, sys
+def node(d):
+    if d:
+        kids = []
+        for _ in range(3):
+            p = os.fork()
+            if p == 0:
+                os._exit(node(d - 1))
+            kids.append(p)
+        for c in kids:
+            if os.waitstatus_to_exitcode(os.waitpid(c, 0)[1]) != 0:
+                return 1
+    return 0
+sys.exit(node(3))
+'''
+
+
+@test
+def wait_inside_pid_namespace():
+    """In a new pid namespace, a parent reaps each child by the pid fork gave
+    it, through a tree where pids are handed out out of order."""
+    import shutil
+    import subprocess
+    if not shutil.which("unshare"):
+        skip("no unshare")
+    r = subprocess.run(["unshare", "-U", "-r", "-p", "-f", "--mount-proc",
+                        "python3", "-c", _TREE], capture_output=True, text=True, timeout=60)
+    if r.returncode and "Operation not permitted" in r.stderr:
+        skip("no user namespaces here")
+    eq(r.returncode, 0, f"tree of 40 in a pid namespace: {r.stderr.strip()[-200:]}")
+    return "40 processes reaped by their namespace pids"

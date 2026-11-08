@@ -82,6 +82,9 @@ public:
         std::int64_t ret{0};
         int pending_sig{0};    // a signal held during a redirect, to re-inject
         Regs regs{};
+        // the registers as the GUEST issued the call, before the entry
+        // translation rewrote its pids; a retried call starts from these
+        Regs guest_regs{};
         // run at the exit stop of a redirect that didn't wait for it
         std::function<void(std::int64_t)> on_exit{};
         // the call is being forwarded as the guest issued it (so the normal
@@ -228,6 +231,7 @@ public:
                 Task& t = tasks_[w];
                 cur_ = w;
                 t.regs = rr;
+                t.guest_regs = rr;
                 t.in_call = true;
                 translate_entry_args(w, rr, t);
                 fill_frame(f, rr);
@@ -415,6 +419,7 @@ public:
                 Task& t = tasks_[w];
                 cur_ = w;
                 t.regs = rr;
+                t.guest_regs = rr;
                 t.in_call = true;
                 translate_entry_args(w, rr, t);
                 fill_frame(f, rr);
@@ -521,6 +526,7 @@ public:
                     }
                     cur_ = w;
                     t.regs = rr;
+                    t.guest_regs = rr;
                     t.in_call = true;
                     translate_entry_args(w, rr, t);
                     fill_frame(f, rr);
@@ -703,6 +709,12 @@ public:
         }
         if (sc == abi::Sysno::wait4) {
             auto gpid = static_cast<std::int32_t>(static_cast<long long>(rr.arg(0)));
+            // the pid as the caller's pid namespace numbers it, like every
+            // other pid argument; fork already returned it that way, so
+            // waiting by it inside `unshare -p` named another process
+            const std::int32_t viewer = known_gpid_of(host_tgid_of(w));
+            if (gpid > 0) gpid = global_pid(viewer, gpid);
+            else if (gpid < -1) gpid = -global_pid(viewer, -gpid);
             if (gpid > 0) {
                 ::pid_t host = host_tid_of(gpid);
                 if (host > 0) {
@@ -736,6 +748,7 @@ public:
             // P_ALL and P_PIDFD carry no guest pid.
             auto idtype = static_cast<unsigned>(rr.arg(0));
             auto gid = static_cast<std::int32_t>(static_cast<long long>(rr.arg(1)));
+            if (idtype == 1 /*P_PID*/ && gid > 0) gid = global_pid(known_gpid_of(host_tgid_of(w)), gid);
             if ((idtype == 1 /*P_PID*/ || idtype == 2 /*P_PGID*/) && gid > 0) {
                 ::pid_t host = host_tid_of(gid);
                 if (host > 0) {
@@ -1171,8 +1184,13 @@ public:
         r.set_nr(encode(kTraceeArch, abi::Sysno::ppoll));
         if (!r.store(cur_) || !r.commit_nr(cur_)) return err(Errno::eio);
         t.action = Action::none;
-        t.on_exit = [w = cur_, entry](std::int64_t) {
-            Regs back = entry;
+        // Rewind to the guest's OWN call: the rerun traps and is translated
+        // again, so re-issuing the pid-translated args translated them twice.
+        // Harmless while guest pids are small and host pids large; inside a
+        // pid namespace (claybin, unshare -p) the ranges overlap and guest 4
+        // = host 6 became host 8, so wait4 returned another child or ECHILD.
+        t.on_exit = [w = cur_, again = t.guest_regs](std::int64_t) {
+            Regs back = again;
             back.rewind_to_syscall();
             (void)back.store(w);
         };
@@ -2339,6 +2357,28 @@ private:
             // through untouched.
             Regs r{};
             (void)Regs::fetch(w, r);
+            // -ERESTART*: the call will run again, re-entering as a fresh
+            // syscall that we translate once more. With the args we already
+            // translated still in place a pid was mapped twice; inside a pid
+            // namespace, where guest and host numbers overlap, wait4(guest 2)
+            // = wait4(host 4) became wait4(host 6) and the parent got ECHILD.
+            if (const auto rv = static_cast<long long>(r.ret()); rv <= -512 && rv >= -516) {
+                // x86-64 restarts from the registers as they are now, so put
+                // the guest's own back. aarch64 restarts arg 0 from orig_x0,
+                // which the kernel saved before we rewrote x0 (and x0 holds
+                // the return here), so only x1-x5 need it.
+                bool moved = false;
+                for (int k = 0; k < 6; ++k)
+                    if (r.arg(k) != t.guest_regs.arg(k) &&
+                        (kTraceeArch != abi::Arch::aarch64 || k != 0)) {
+                        r.set_arg(k, t.guest_regs.arg(k));
+                        moved = true;
+                    }
+                if (moved) (void)r.store(w);
+                t.action = Action::none;
+                sys_done(w);
+                return;
+            }
             if (abi::decode(kTraceeArch, r.nr()) == abi::Sysno::waitid) {
                 // waitid returns 0 in RAX (not a pid) and instead fills a
                 // siginfo_t (guest ptr in rdx at entry, preserved at exit)

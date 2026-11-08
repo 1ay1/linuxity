@@ -761,7 +761,12 @@ private:
                         // pid 1 (our init) is never removed: /proc must always
                         // have a root even as the last guest thread winds down.
                         if (e.pid != kernel_.procs().init_pid()) {
-                            kernel_.procs().drop_ns_pid(static_cast<std::int32_t>(e.pid));
+                            // NOT drop_ns_pid here: like the kernel, a zombie
+                            // keeps its pid until its parent waits for it, and
+                            // the parent waits by the namespace's number. It
+                            // goes when a new process would take that number
+                            // (assign_ns_pid skips numbers still held).
+                            kernel_.procs().retire_ns_pid(static_cast<std::int32_t>(e.pid));
                             kernel_.procs().remove(static_cast<std::int32_t>(e.pid));
                             // Drop the exited pid's cwd record so a later pid
                             // REUSE starts from its real parent's cwd instead

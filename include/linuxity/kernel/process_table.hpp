@@ -185,12 +185,18 @@ public:
         if (std::find(t.begin(), t.end(), tid) == t.end()) t.push_back(tid);
     }
     void drop_thread(std::int32_t tid) {
-        drop_ns_pid(tid);
+        // a non-main thread's number goes with it; a process keeps its own
+        // until it's waited for (see retire_ns_pid)
+        if (thread_group_of(tid)) drop_ns_pid(tid);
         for (auto& [_, p] : procs_) {
             std::erase(p.threads, tid);
             std::erase_if(p.thread_comms, [&](const auto& e) { return e.first == tid; });
         }
     }
+    // A process exited. Its namespace numbers stay, so its parent can still
+    // wait for it by them, as for a zombie. Guest pids are never reused
+    // (next_gpid_ only grows), so the entry can't collide with a later one.
+    void retire_ns_pid(std::int32_t) {}
     // the process a non-main thread belongs to, or 0
     [[nodiscard]] std::int32_t thread_group_of(std::int32_t tid) const {
         for (const auto& [pid, p] : procs_)
