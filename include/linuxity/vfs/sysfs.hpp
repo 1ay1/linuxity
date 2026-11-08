@@ -717,8 +717,16 @@ make_sysfs(const kernel::MachineSpec& mach) {
             const auto depth = std::count(parent.begin(), parent.end(), '/');
             if (depth >= 3 && host_node_ok(parent)) {
                 struct ::stat st{};
-                if (::stat(parent.c_str(), &st) == 0 && S_ISDIR(st.st_mode))
-                    return err<VirtualFile>(Errno::enoent);
+                if (::stat(parent.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+                    // a file there that we may not read (RAPL energy_uj is
+                    // root-only) still opens on the host, which says EACCES
+                    if (::lstat(hp.c_str(), &st) == 0) {
+                        VirtualFile vf;
+                        vf.redirect_host = hp;
+                        return ok(std::move(vf));
+                    }
+                    return err<VirtualFile>(errno == EACCES ? Errno::eacces : Errno::enoent);
+                }
             }
         }
         return synth(abs);

@@ -187,39 +187,71 @@ inline std::optional<kernel::VirtualFile> host_redirect(const char* path) {
 #endif
 }
 
-// The host filesystem holding the guest's root: device, type and options from
-// the host mount table, the deepest mountpoint above it. Not matched on
-// st_dev: a btrfs subvolume's st_dev is not its mount's.
-struct RootMount { std::string source, fstype, opts{"rw"}, majmin{"0:1"}; };
-inline RootMount root_mount(const std::string& root_host) {
-    RootMount best;
+// The guest's mount table, as the host's mounts look through the directories
+// the guest sees: its root and each --bind. For each view the deepest host
+// mount holding the directory sits at the view's guest path (with the
+// bind's subdir in the root field, as the kernel shows a bind mount), and
+// every host mount below the directory appears at its guest path. The
+// trees linuxity serves itself (/proc, /sys, /dev, /tmp) are left out, the
+// caller lists its own. Paths are matched, not st_dev: a btrfs subvolume's
+// st_dev is not its mount's.
+struct GuestMount { std::string majmin, root, guest, opts, fstype, source; };
+inline std::vector<GuestMount>
+guest_mounts(const std::vector<std::pair<std::string, std::string>>& views) {
+    std::vector<GuestMount> out;
 #if !defined(_WIN32)
+    struct Host { std::string majmin, root, mnt, opts, fstype, source; };
+    std::vector<Host> host;
     const std::string mi = host_file("/proc/self/mountinfo");
-    std::size_t depth = 0, at = 0;
-    bool found = false;
-    while (at < mi.size()) {
+    for (std::size_t at = 0; at < mi.size();) {
         std::size_t nl = mi.find('\n', at);
         if (nl == std::string::npos) nl = mi.size();
         const std::string line = mi.substr(at, nl - at);
         at = nl + 1;
         // id parent maj:min root mountpoint opts [optional...] - fstype source superopts
-        char majmin[32] = {}, mnt[4096] = {}, opts[512] = {};
-        if (std::sscanf(line.c_str(), "%*s %*s %31s %*s %4095s %511s", majmin, mnt, opts) != 3)
+        char majmin[32] = {}, root[4096] = {}, mnt[4096] = {}, opts[512] = {};
+        if (std::sscanf(line.c_str(), "%*s %*s %31s %4095s %4095s %511s",
+                        majmin, root, mnt, opts) != 4)
             continue;
-        const std::string_view m{mnt};
-        const bool under = m == "/" || (root_host.starts_with(m) &&
-                                         (root_host.size() == m.size() || root_host[m.size()] == '/'));
-        if (!under || (found && m.size() < depth)) continue;
         const auto dash = line.find(" - ");
         if (dash == std::string::npos) continue;
         char fs[64] = {}, src[1024] = {};
         if (std::sscanf(line.c_str() + dash + 3, "%63s %1023s", fs, src) != 2) continue;
-        depth = m.size();
-        found = true;
-        best = RootMount{src, fs, opts, majmin};
+        host.push_back({majmin, root, mnt, opts, fs, src});
+    }
+    const auto under = [](std::string_view p, std::string_view dir) {
+        return dir == "/" || p == dir ||
+               (p.starts_with(dir) && p.size() > dir.size() && p[dir.size()] == '/');
+    };
+    const auto ours = [&](std::string_view g) {
+        for (const std::string_view v : {"/proc", "/sys", "/dev", "/tmp"})
+            if (under(g, v)) return true;
+        return false;
+    };
+    for (const auto& [g, h] : views) {
+        // the mount holding the view's directory
+        const Host* base = nullptr;
+        for (const Host& e : host)
+            if (under(h, e.mnt) && (!base || e.mnt.size() >= base->mnt.size())) base = &e;
+        if (base) {
+            std::string sub = base->mnt == "/" ? (h == "/" ? "" : h)
+                                                : h.substr(base->mnt.size());
+            std::string root = base->root == "/" ? (sub.empty() ? "/" : sub)
+                                                  : base->root + sub;
+            out.push_back({base->majmin, std::move(root), g, base->opts, base->fstype,
+                           base->source});
+        }
+        // mounts below it
+        for (const Host& e : host) {
+            if (e.mnt == h || !under(e.mnt, h)) continue;
+            const std::string rel = e.mnt.substr(h == "/" ? 0 : h.size());
+            const std::string gp = g == "/" ? rel : g + rel;
+            if (ours(gp)) continue;
+            out.push_back({e.majmin, e.root, gp, e.opts, e.fstype, e.source});
+        }
     }
 #endif
-    return best;
+    return out;
 }
 
 // The run state of a guest process as the host scheduler sees it ('R', 'S',
@@ -883,22 +915,37 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
         const bool mountinfo = per_pid("/mountinfo");
         if (p == "/proc/mounts" || per_pid("/mounts") || mountinfo ||
             per_pid("/mountstats")) {
-            const RootMount rm = mach.host_hw ? root_mount(mach.root_host) : RootMount{};
-            if (!rm.source.empty()) {
+            std::vector<std::pair<std::string, std::string>> views{{"/", mach.root_host}};
+            for (const auto& b : mach.binds) views.push_back(b);
+            const auto gm = mach.host_hw ? guest_mounts(views) : std::vector<GuestMount>{};
+            if (!gm.empty() && gm.front().guest == "/") {
+                // the root first, then ours, then the rest in host order
+                struct V { const char* mnt; const char* fs; const char* opts; };
+                static constexpr V kOurs[] = {
+                    {"/proc", "proc", "rw,nosuid,nodev,noexec"},
+                    {"/sys", "sysfs", "rw,nosuid,nodev,noexec"},
+                    {"/dev", "devtmpfs", "rw,nosuid"},
+                    {"/tmp", "tmpfs", "rw,nosuid,nodev"}};
                 std::string s;
-                if (mountinfo)
-                    s = "1 0 " + rm.majmin + " / / " + rm.opts + " - " + rm.fstype + " " +
-                        rm.source + " " + rm.opts + "\n"
-                        "2 1 0:2 / /proc rw,nosuid,nodev,noexec - proc proc rw\n"
-                        "3 1 0:3 / /sys rw,nosuid,nodev,noexec - sysfs sysfs rw\n"
-                        "4 1 0:4 / /dev rw,nosuid - devtmpfs devtmpfs rw\n"
-                        "5 1 0:5 / /tmp rw,nosuid,nodev - tmpfs tmpfs rw\n";
-                else
-                    s = rm.source + " / " + rm.fstype + " " + rm.opts + " 0 0\n"
-                        "proc /proc proc rw,nosuid,nodev,noexec 0 0\n"
-                        "sysfs /sys sysfs rw,nosuid,nodev,noexec 0 0\n"
-                        "devtmpfs /dev devtmpfs rw,nosuid 0 0\n"
-                        "tmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n";
+                int id = 21, minor = 2;
+                auto add = [&](const std::string& majmin, const std::string& root,
+                               const std::string& mnt, const std::string& opts,
+                               const std::string& fs, const std::string& src) {
+                    if (mountinfo)
+                        s += std::to_string(id) + " " + (id == 21 ? "1" : "21") + " " + majmin +
+                             " " + root + " " + mnt + " " + opts + " - " + fs + " " + src +
+                             " " + opts + "\n";
+                    else
+                        s += src + " " + mnt + " " + fs + " " + opts + " 0 0\n";
+                    ++id;
+                };
+                const GuestMount& r = gm.front();
+                add(r.majmin, r.root, r.guest, r.opts, r.fstype, r.source);
+                for (const V& v : kOurs)
+                    add("0:" + std::to_string(minor++), "/", v.mnt, v.opts, v.fs, v.fs);
+                for (std::size_t i = 1; i < gm.size(); ++i)
+                    add(gm[i].majmin, gm[i].root, gm[i].guest, gm[i].opts, gm[i].fstype,
+                        gm[i].source);
                 return ok(text_file(std::move(s)));
             }
             if (mountinfo)
@@ -1071,6 +1118,11 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                     {"io",false},{"oom_score",false},{"task",true},
                     {"environ",false},{"fdinfo",true},{"mountinfo",false},
                     {"mounts",false},{"limits",false},{"ns",true},{"net",true},
+                    {"smaps",false},{"smaps_rollup",false},{"oom_score_adj",false},
+                    {"oom_adj",false},{"wchan",false},{"sched",false},{"schedstat",false},
+                    {"cgroup",false},{"children",false},{"autogroup",false},
+                    {"personality",false},{"timerslack_ns",false},{"coredump_filter",false},
+                    {"loginuid",false},{"sessionid",false},{"syscall",false},{"stack",false},
                     {"uid_map",false},{"gid_map",false},{"setgroups",false},
                     {"mem",false},{"auxv",false},
                 }));
@@ -1258,6 +1310,35 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                 if (l.empty()) return err<kernel::VirtualFile>(Errno::enoent);
                 return ok(text_file(std::move(l)));
             }
+            // Per-task facts only the host kernel keeps (memory, oom, wait
+            // channel, scheduler stats): the host task's own files, live, and
+            // writable where the kernel allows (oom_score_adj).
+            static constexpr std::string_view kHostLeaves[] = {
+                "statm", "smaps", "smaps_rollup", "oom_score", "oom_score_adj",
+                "oom_adj", "wchan", "schedstat", "autogroup", "personality",
+                "timerslack_ns", "coredump_filter", "loginuid", "sessionid",
+                "syscall", "stack"};
+            if (host > 0)
+                for (const auto l : kHostLeaves)
+                    if (tail == l) {
+                        std::string hp = "/proc/" + std::to_string(host) + "/" + std::string{l};
+                        if (::access(hp.c_str(), F_OK) != 0) break;
+                        kernel::VirtualFile vf;
+                        vf.redirect_host = std::move(hp);
+                        return ok(std::move(vf));
+                    }
+            // sched names the task by its host pid; show the guest's
+            if (tail == "sched") {
+                std::string s = host_file("sched");
+                if (s.empty()) return err<kernel::VirtualFile>(Errno::enoent);
+                const std::string hp = "(" + std::to_string(host) + ",";
+                if (const auto at = s.find(hp); at != std::string::npos && at < s.find('\n'))
+                    s.replace(0, at + hp.size(),
+                              comm + " (" + std::to_string(procs.view_pid(self_tid)) + ",");
+                return ok(text_file(std::move(s)));
+            }
+            // the guest's cgroup root, which /sys/fs/cgroup describes
+            if (tail == "cgroup") return ok(text_file("0::/\n"));
             if (tail == "statm") {
                 std::uint64_t sz = I.vsize_bytes / 4096;
                 std::string s = std::to_string(sz) + " " +
@@ -1351,7 +1432,13 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                 return ok(text_file("rchar: 0\nwchar: 0\nsyscr: 0\nsyscw: 0\n"
                                     "read_bytes: 0\nwrite_bytes: 0\n"));
             }
-            if (tail == "children") return ok(text_file(""));
+            if (tail == "children") {
+                std::string s;
+                for (const std::int32_t c : procs.pids())
+                    if (const auto* ci = procs.find(c); ci && ci->ppid == I.pid && ci->pid == c)
+                        s += std::to_string(procs.view_pid(c)) + " ";
+                return ok(text_file(std::move(s)));
+            }
             if (tail == "oom_score") return ok(text_file("0\n"));
             if (tail == "maps")      return ok(text_file(""));
             if (tail == "fd") {

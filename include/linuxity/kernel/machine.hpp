@@ -46,6 +46,8 @@ public:
     bool          host_hw{false};
     // The host directory that is the guest's "/", for the mount table.
     std::string   root_host{"/"};
+    // --bind mounts as (guest path, host dir), for the mount table.
+    std::vector<std::pair<std::string, std::string>> binds;
 
     // -- Memory (bytes; the one canonical unit) ----------------------------
     std::uint64_t mem_total{std::uint64_t{2048} << 20};   // 2 GiB

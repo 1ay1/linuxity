@@ -690,6 +690,10 @@ int main(int argc, char** argv) {
     for (auto& [host_dir, guest_at] : binds) {
         std::string norm = kernel::FileNamespace::normalize(guest_at);
         k.files().mount_host(norm, host_dir);
+        if (char* rp = ::realpath(host_dir.c_str(), nullptr)) {
+            k.machine().binds.emplace_back(norm, rp);   // for the mount table
+            std::free(rp);
+        }
         std::fprintf(stderr, "linuxity: bind %s -> %s\n",
                      norm.c_str(), host_dir.c_str());
     }
