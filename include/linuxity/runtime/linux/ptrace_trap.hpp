@@ -1183,11 +1183,16 @@ public:
         for (int k = 0; k < 6; ++k) out.set_arg(k, keep.arg(k));
         out.set_ret(prev);
         (void)out.store(cur_);
+        // still stopped: fill what the chain made before the guest uses it
+        if (before_resume_) std::exchange(before_resume_, {})(prev);
         sys_done(cur_);
         t.action = Action::none;
         resume_task(cur_);
         return ok(prev);
     }
+    // Run once by the next run_in_guest, with its result, before the task
+    // resumes.
+    void set_before_resume(std::function<void(std::int64_t)> f) { before_resume_ = std::move(f); }
 
     [[nodiscard]] Status wait_then_retry(std::int64_t ns) {
         Task& t = tasks_[cur_];
@@ -2736,6 +2741,7 @@ private:
     bool draining_{false};
     std::chrono::steady_clock::time_point drain_deadline_{};
     bool host_pids_{false};        // --host-pids: guest pids are host pids
+    std::function<void(std::int64_t)> before_resume_{};
     bool seccomp_{false};          // trap filter active -> drive with PTRACE_CONT
     int base_opts_{0};             // linuxity's own ptrace options on every task
     std::unordered_map<::pid_t, Task> tasks_;

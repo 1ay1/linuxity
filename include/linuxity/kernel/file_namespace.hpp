@@ -879,6 +879,21 @@ public:
         const auto idx = static_cast<std::uint64_t>(m - mounts_.data());
         return {idx + 21, abs == m->prefix};
     }
+    // Every host directory that backs guest path `abs`: an overlay's upper
+    // and lower, a bind's one dir. Empty for our virtual trees. A sandbox
+    // rule on the guest path has to name all of them, or a write that
+    // copies up lands where the rule doesn't reach.
+    [[nodiscard]] std::vector<std::string> host_layers(std::string_view abs) const {
+        std::vector<std::string> out;
+        const Mount* m = deepest(abs);
+        if (!m || m->producer) return out;
+        std::string_view rel = abs;
+        rel.remove_prefix(m->prefix == "/" ? 0 : m->prefix.size());
+        while (!rel.empty() && rel.front() == '/') rel.remove_prefix(1);
+        if (!m->upper.empty()) out.push_back(join_host(m->upper, rel));
+        if (!m->host_base.empty()) out.push_back(join_host(m->host_base, rel));
+        return out;
+    }
     [[nodiscard]] DirStream* dir_stream(int fd) {
         auto& dirs = fds().dirs;
         auto it = dirs.find(fd);

@@ -137,6 +137,11 @@ public:
                         using GC = typename T::GuestCall;
                         std::vector<GC> calls;
                         for (const auto& s : gc.steps) calls.push_back(GC{s.nr, s.a});
+                        if constexpr (requires { trap_.set_before_resume({}); })
+                            if (gc.before_resume)
+                                trap_.set_before_resume([&](std::int64_t v) {
+                                    locked([&] { gc.before_resume(v); });
+                                });
                         auto rr = trap_.run_in_guest(calls, gc.strings, gc.result_of, gc.retry_if_zero_ns,
                                                      gc.echild_is_zero);
                         if (!rr) return recover(rr.error());
@@ -173,9 +178,12 @@ public:
                     // it. The open runs ASYNCHRONOUSLY in the child, so we must
                     // NOT unlink here -- the child hasn't opened it yet; temps
                     // are cleaned up at the end of the run.
-                    std::string tmp = in.is_dir ? materialize_dir()
+                    std::string tmp = in.is_dir ? (in.dir_host.empty() ? materialize_dir() : std::string{})
                                                 : materialize(in.content);
-                    auto fdr = trap_.redirect(in.path_arg, tmp);
+                    // a virtual directory opens the host's twin (/proc, ...):
+                    // it exists everywhere and is nothing of ours to clean
+                    const std::string& backing = tmp.empty() && in.is_dir ? in.dir_host : tmp;
+                    auto fdr = trap_.redirect(in.path_arg, backing);
 #if defined(__linux__)
                     // ptrace's redirect has run the open by now, so the fd
                     // holds the inode and the name can go. Keeping it leaked

@@ -216,3 +216,51 @@ def pressure_matches_listing():
         except PermissionError:
             pass
     return f"{opened}/{len(names)} readable"
+
+
+@test
+def landlock_walls_hold():
+    """A Landlock ruleset is the kernel's: a write outside the granted tree is
+    refused, inside it works, and a virtual /etc file still reads."""
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.syscall(444, None, 0, 1) < 1:
+        skip("no landlock on this kernel")
+    import tempfile
+    ok_dir = tempfile.mkdtemp(dir=os.getcwd())
+    no_dir = tempfile.mkdtemp(dir=os.getcwd())
+    pid = os.fork()
+    if pid == 0:
+        class Attr(ctypes.Structure):
+            _fields_ = [("h", ctypes.c_uint64)]
+        class Rule(ctypes.Structure):
+            _pack_ = 1
+            _layout_ = "ms"
+            _fields_ = [("a", ctypes.c_uint64), ("fd", ctypes.c_int32)]
+        RF, RD, WF, MKREG, EXE = 4, 8, 2, 256, 1
+        a = Attr(RF | RD | WF | MKREG | EXE)
+        rs = libc.syscall(444, ctypes.byref(a), 8, 0)
+        for p, acc in (("/usr", RF | RD | EXE), ("/etc", RF | RD), (ok_dir, RF | RD | WF | MKREG)):
+            r = Rule(acc, os.open(p, os.O_PATH))
+            if libc.syscall(445, rs, 1, ctypes.byref(r), 0) != 0:
+                os._exit(10)
+        libc.prctl(38, 1, 0, 0, 0)
+        if libc.syscall(446, rs, 0) != 0:
+            os._exit(11)
+        try:
+            open(os.path.join(ok_dir, "f"), "w").write("x")
+        except OSError:
+            os._exit(12)
+        try:
+            open(os.path.join(no_dir, "f"), "w").write("x")
+            os._exit(13)
+        except PermissionError:
+            pass
+        try:
+            open("/etc/passwd").read(1)
+        except OSError:
+            os._exit(14)
+        os._exit(0)
+    _, st = os.waitpid(pid, 0)
+    eq(os.waitstatus_to_exitcode(st), 0, "landlock child (10-14 name the failing step)")
+    return "inside allowed, outside refused, /etc readable"

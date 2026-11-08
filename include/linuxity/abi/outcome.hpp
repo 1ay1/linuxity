@@ -207,6 +207,9 @@ struct Inject {
     // The open follows links and isn't O_PATH, so it can reopen an fd of
     // ours through /proc/<pid>/fd/N (a memfd: no temp file at all).
     bool                   reopen_ok{false};
+    // A virtual directory's backing: the host's /proc, /sys or /dev, whose
+    // real entries never show (getdents is ours). Empty = a temp dir.
+    std::string            dir_host{};
 
     Inject(int pa, std::vector<std::byte> c, bool dir = false, bool keep = false,
            bool reopen = false)
@@ -334,6 +337,8 @@ struct GuestCalls {
     bool echild_is_zero{false};
     // called with the final result before the guest sees it
     std::function<void(std::int64_t)> done{};
+    // called while the task is still stopped, before it runs on
+    std::function<void(std::int64_t)> before_resume{};
 };
 
 // EXITED - the guest asked to terminate. Carries the status, nothing else.

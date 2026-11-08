@@ -848,31 +848,31 @@ public:
             case Sysno::capget:    return do_capget(r);
             case Sysno::capset:    return do_capset(r);
 
-            // -- LANDLOCK (pacman 7's download sandbox). We cannot apply an
-            //    LSM ruleset to a ptraced tree, but linuxity's own namespace
-            //    already confines the guest to the rootfs. Accept the sandbox
-            //    calls as satisfied no-ops so pacman proceeds instead of
-            //    treating the failure as fatal. create_ruleset returns a
-            //    plausible ruleset fd number (a small positive int); add_rule
-            //    and restrict_self return success.
+            // -- LANDLOCK. Real where the host has it: the ruleset and the
+            //    restriction are the host kernel's, so the guest gets the walls
+            //    it asked for, and a path rule is added for every host layer
+            //    behind the guest path (overlay upper and lower). Where the
+            //    host has none (Android's 6.1 GKI), a missing Landlock is fatal
+            //    to pacman's download sandbox, so the calls are accepted and
+            //    do nothing, which is what the guest's own path translation
+            //    already confines. That case reports ABI 0 nowhere: the guest
+            //    can't tell, but it also never could before.
             case Sysno::landlock_create_ruleset:
-                // If the guest is only querying the ABI version (flags has
-                // LANDLOCK_CREATE_RULESET_VERSION == 1 and attr==NULL), report
-                // a supported version; otherwise hand back a dummy ruleset fd.
+                if (host_has_landlock()) return fwd();
                 return val((r.arg[2] & 1u) ? 1 : 3);
             case Sysno::landlock_add_rule:
-                // Accepted as a no-op, but NOT unconditionally: the kernel
-                // validates its arguments before it ever consults policy, and
-                // a null rule_attr is EFAULT. Returning 0 for anything at all
-                // means a sandbox library probing for support with a
-                // deliberately bad call concludes the opposite of the truth.
-                // An unknown rule type is EINVAL for the same reason.
+                if (host_has_landlock()) return do_landlock_add_rule(r);
                 if (r.arg[2] == 0) return eno(Errno::efault);
-                if (r.arg[1] != 1 /*LANDLOCK_RULE_PATH_BENEATH*/ &&
-                    r.arg[1] != 2 /*LANDLOCK_RULE_NET_PORT*/)
+                if (r.arg[1] != 1 /*PATH_BENEATH*/ && r.arg[1] != 2 /*NET_PORT*/)
                     return eno(Errno::einval);
                 return val(0);
             case Sysno::landlock_restrict_self:
+                if (host_has_landlock()) {
+                    // from now on this process (and what it forks) can't open
+                    // our paths: inject differently for it (see path_open)
+                    landlocked_.insert(ids().pid);
+                    return fwd();
+                }
                 return val(0);
 
             // -- AF_UNIX bind/connect: the chroot'd guest resolves an
@@ -1959,7 +1959,44 @@ private:
             pending_entries_ = std::move(vf->entries);
             const bool reopen_ok = !wire::has_for(arch_, flags, wire::OpenFlag::nofollow) &&
                                    !wire::has_for(arch_, flags, wire::OpenFlag::path);
-            return Inject{path_arg, std::move(vf->bytes), vf->is_dir, for_write, reopen_ok};
+            Inject in{path_arg, std::move(vf->bytes), vf->is_dir, for_write, reopen_ok};
+            // A guest that put up its own Landlock walls can't open anything
+            // by our paths (/proc/<us>/fd/N, a temp file): the open itself
+            // would be refused. The guest makes the memfd instead, needing no
+            // path, and we fill it before it runs on. Only for plain reads.
+            if constexpr (requires { mem_.host_tid(); }) {
+                if (!vf->is_dir && !for_write && is_landlocked(ids().pid)) {
+                    const bool cloexec = wire::has_for(arch_, flags, wire::OpenFlag::cloexec);
+                    GuestCalls gc;
+                    gc.strings = {"linuxity-vfile"};
+                    gc.steps = {{Sysno::memfd_create, {GuestCalls::str0, cloexec ? 1u : 0u, 0, 0, 0, 0}}};
+                    gc.result_of = 0;
+                    gc.before_resume = [this, bytes = std::move(in.content)](std::int64_t fd) {
+                        if (fd < 0) return;
+                        char link[64];
+                        std::snprintf(link, sizeof link, "/proc/%d/fd/%d", mem_.host_tid(), static_cast<int>(fd));
+                        if (const int w = ::open(link, O_WRONLY | O_CLOEXEC); w >= 0) {
+                            std::size_t off = 0;
+                            while (off < bytes.size()) {
+                                const auto n = ::pwrite(w, bytes.data() + off, bytes.size() - off,
+                                                        static_cast<off_t>(off));
+                                if (n <= 0) break;
+                                off += static_cast<std::size_t>(n);
+                            }
+                            ::close(w);
+                        }
+                        note_opened_fd(fd);
+                    };
+                    return gc;
+                }
+            }
+            if (vf->is_dir && !for_write)
+                for (const char* top : {"/proc", "/sys", "/dev"})
+                    if (vp == top || (vp.starts_with(top) && vp[std::strlen(top)] == '/')) {
+                        in.dir_host = top;
+                        break;
+                    }
+            return in;
         }
         return eno(pc.error);
     }
@@ -6635,6 +6672,90 @@ public:
         } else {
             (void)fd;
         }
+    }
+
+    // Does the host kernel enforce Landlock? Asked once.
+    // guest processes that Landlocked themselves (a fork inherits it)
+    std::set<std::int32_t> landlocked_;
+    // Is `pid` under a Landlock domain? The domain is inherited, so walk up.
+    [[nodiscard]] bool is_landlocked(std::int32_t pid) const {
+        if (landlocked_.empty()) return false;
+        for (int hops = 0; hops < 64 && pid > 0; ++hops) {
+            if (landlocked_.count(pid)) return true;
+            const auto* p = k_.procs().find(pid);
+            if (!p || p->ppid == pid) return false;
+            pid = p->ppid;
+        }
+        return false;
+    }
+    [[nodiscard]] static bool host_has_landlock() {
+#if defined(__linux__)
+        static const bool yes = ::syscall(444, nullptr, 0, 1 /*VERSION*/) >= 1;
+        return yes;
+#else
+        return false;
+#endif
+    }
+
+    // Bring a guest fd into the tracer. -1 if we can't (no pidfd_getfd).
+    [[nodiscard]] int fetch_guest_fd(int fd) {
+        if constexpr (!requires { mem_.host_tid(); }) {
+            return -1;
+        } else {
+#if defined(__linux__)
+            const int pfd = static_cast<int>(::syscall(434 /*pidfd_open*/, mem_.host_tid(), 0));
+            if (pfd < 0) return -1;
+            const int out = static_cast<int>(::syscall(438 /*pidfd_getfd*/, pfd, fd, 0));
+            ::close(pfd);
+            return out;
+#else
+            (void)fd;
+            return -1;
+#endif
+        }
+    }
+
+    // landlock_add_rule(ruleset, PATH_BENEATH, {access, parent_fd}, 0): the
+    // parent fd names a guest directory, which may be several host
+    // directories (an overlay's upper and lower). Add the rule to the
+    // guest's own ruleset, through a copy of its fd, once per host layer.
+    [[nodiscard]] Outcome do_landlock_add_rule(const Regs& r) {
+#if defined(__linux__)
+        if (r.arg[1] != 1 /*PATH_BENEATH*/) return fwd();
+        if (r.arg[2] == 0) return eno(Errno::efault);
+        struct __attribute__((packed)) { std::uint64_t access; std::int32_t parent; } attr{};
+        if (!mem_.copy_in(uaddr(r.arg[2]), std::as_writable_bytes(std::span{&attr, 1})))
+            return eno(Errno::efault);
+        const std::string guest{k_.files().path_of_fd(attr.parent)};
+        const auto layers = guest.empty() ? std::vector<std::string>{} : k_.files().host_layers(guest);
+        if (layers.empty()) return fwd();   // a path we don't translate: the host's answer
+        const int rs = fetch_guest_fd(static_cast<int>(r.arg[0]));
+        if (rs < 0) return fwd();
+        // A rule granting writes on a directory that so far lives only in the
+        // lower layer must also cover the upper one, where those writes will
+        // land: make it now (with its parent chain), as a copy-up would.
+        constexpr std::uint64_t kWrites = ~std::uint64_t{(1u << 0) | (1u << 2) | (1u << 3)};
+        if ((attr.access & kWrites) && layers.size() > 1) {
+            for (std::size_t i = 1; i <= layers[0].size(); ++i)
+                if (i == layers[0].size() || layers[0][i] == '/')
+                    (void)::mkdir(layers[0].substr(0, i).c_str(), 0755);
+        }
+        int added = 0, err = 0;
+        for (const auto& h : layers) {
+            const int d = ::open(h.c_str(), O_PATH | O_CLOEXEC);
+            if (d < 0) continue;   // a layer the path doesn't exist in yet
+            struct __attribute__((packed)) { std::uint64_t a; std::int32_t p; } one{attr.access, d};
+            if (::syscall(445 /*landlock_add_rule*/, rs, 1, &one, 0) == 0) ++added;
+            else err = errno;
+            ::close(d);
+        }
+        ::close(rs);
+        if (added) return val(0);
+        return eno(wire::errno_from_host(err ? err : ENOENT));
+#else
+        (void)r;
+        return fwd();
+#endif
     }
 
     // Was this guest fd opened O_PATH?
