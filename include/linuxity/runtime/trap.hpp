@@ -107,6 +107,9 @@ public:
                 kernel_.procs().rekey_init(init);
             }
         }
+        // an instance can sit idle for minutes; apply exits as they happen
+        if constexpr (requires { trap_.set_flush_events(std::function<void()>{}); })
+            trap_.set_flush_events([&] { locked([&] { apply_proc_events(); }); });
         for (;;) {
             TrapFrame f;
             bool still_running = LX_TRY(trap_.next(f));

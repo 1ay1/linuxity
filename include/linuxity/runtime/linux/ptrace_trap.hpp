@@ -29,6 +29,7 @@
 
 #include <sys/ptrace.h>
 #include <sys/ioctl.h>
+#include <sys/signalfd.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/uio.h>
@@ -95,13 +96,54 @@ public:
     };
 
     [[nodiscard]] Status start(UAddr, UAddr) {
+        // No program: an instance. Sessions arrive later through spawn().
+        if (path_.empty()) { instance_ = true; return ok(); }
+        const ::pid_t pid = launch(path_, argv_, envp_, pre_exec_, {});
+        if (pid < 0) return err(Errno::eagain);
+        root_pid_ = pid;
+        tasks_[pid];                       // create, at-entry state
+        resume_run(pid, 0);
+        ++live_;
+        return ok();
+    }
+
+    // Instance mode: start a new session leader inside the running tree, a
+    // child of guest init. `setup` runs in the child before anything else
+    // (setsid, its fds); `pre` is the resource hook. Returns {host pid,
+    // guest pid}, or {-1, 0} if the fork failed.
+    std::pair<::pid_t, std::int32_t> spawn(const std::string& path,
+                                           const std::vector<std::string>& argv,
+                                           const std::vector<std::string>& envp,
+                                           const std::function<void()>& pre,
+                                           const std::function<void()>& setup) {
+        const ::pid_t pid = launch(path, argv, envp, pre, setup);
+        if (pid < 0) return {-1, 0};
+        tasks_[pid];
+        ++live_;
+        bootstrapping_.insert(pid);
+        tgid_cache_[pid] = pid;
+        const std::int32_t g = gpid_of(pid);
+        gppid_[g] = init_gpid();
+        resume_run(pid, 0);
+        return {pid, g};
+    }
+
+    // Fork a traced child that will execve(path), a HOST path. It comes back
+    // stopped and armed; the caller registers and resumes it. -1 on failure.
+    ::pid_t launch(const std::string& path, const std::vector<std::string>& argv,
+                   const std::vector<std::string>& envp,
+                   const std::function<void()>& pre,
+                   const std::function<void()>& setup) {
         // A tiny pipe lets the child report whether the seccomp trap filter
         // installed, so the parent knows to drive tasks with PTRACE_CONT (only
         // filtered syscalls stop) versus PTRACE_SYSCALL (every syscall stops).
         int seccomp_pipe[2] = {-1, -1};
-        (void)::pipe(seccomp_pipe);
+        (void)::pipe2(seccomp_pipe, O_CLOEXEC);
         ::pid_t pid = ::fork();
-        if (pid < 0) return err(Errno::eagain);
+        if (pid < 0) {
+            if (seccomp_pipe[0] >= 0) { ::close(seccomp_pipe[0]); ::close(seccomp_pipe[1]); }
+            return -1;
+        }
         if (pid == 0) {
             if (seccomp_pipe[0] >= 0) ::close(seccomp_pipe[0]);
             // A fresh process starts with NOTHING blocked. The mask is
@@ -124,11 +166,14 @@ public:
             if (!root_.empty()) {
                 if (::chroot(root_.c_str()) == 0) (void)::chdir("/");
             }
+            // The session and its fds first, so the resource hook below sees
+            // 0/1/2 already in place when it fills the low slots.
+            if (setup) setup();
             // Bound this task (and, by inheritance, every descendant) BEFORE
             // it starts running: the child writes its own pid into the
             // resource cgroup and installs rlimit fallbacks. Runs pre-TRACEME
             // so enforcement is in effect the instant the guest's _start runs.
-            if (pre_exec_) pre_exec_();
+            if (pre) pre();
             // Our own ids, read BEFORE the filter goes up: getpid and gettid
             // are both trapped, so calling them after the filter is installed
             // but before the tracer is armed would ENOSYS-fail.
@@ -182,12 +227,12 @@ public:
                 ::syscall(SYS_tkill, pre_tid, SIGSTOP);
             }
             std::vector<char*> cargv;
-            for (auto& a : argv_) cargv.push_back(a.data());
+            for (const auto& a : argv) cargv.push_back(const_cast<char*>(a.c_str()));
             cargv.push_back(nullptr);
             std::vector<char*> cenvp;
-            for (auto& e : envp_) cenvp.push_back(e.data());
+            for (const auto& e : envp) cenvp.push_back(const_cast<char*>(e.c_str()));
             cenvp.push_back(nullptr);
-            ::execve(path_.c_str(), cargv.data(), cenvp.data());
+            ::execve(path.c_str(), cargv.data(), cenvp.data());
             ::_exit(127);
         }
         int st = 0;
@@ -209,11 +254,7 @@ public:
         if (seccomp_) opts |= PTRACE_O_TRACESECCOMP;
         base_opts_ = opts;
         ::ptrace(PTRACE_SETOPTIONS, pid, 0, opts);
-        root_pid_ = pid;
-        tasks_[pid];                       // create, at-entry state
-        resume_run(pid, 0);
-        ++live_;
-        return ok();
+        return pid;
     }
 
     // Block until some task reaches a syscall-ENTRY stop, and fill `f` with
@@ -266,6 +307,37 @@ public:
                     (void)::sigtimedwait(&chld, nullptr, &ts);
                     continue;
                 }
+            } else if (instance_) {
+                // An instance never runs out of work: with nothing to reap it
+                // waits on SIGCHLD and the supervisor's own fds together.
+                // Drain first, then reap: a SIGCHLD after the drain is either
+                // seen by this waitpid or leaves the fd readable for poll.
+                (void)chld_fd();
+                drain_chld_fd();
+                w = ::waitpid(-1, &st, __WALL | WNOHANG);
+                if (w == 0 || (w < 0 && errno == ECHILD)) {
+                    if (flush_events_ && !proc_events_.empty()) flush_events_();
+                    if (stop_requested_ || !idle_ || !idle_(chld_fd(), true)) {
+                        kill_remaining();
+                        exited_ = true;
+                        return ok(false);
+                    }
+                    last_poll_ = std::chrono::steady_clock::now();
+                    continue;
+                }
+                if (w < 0) continue;   // EINTR
+                // a busy guest must not starve the control socket
+                if (const auto now = std::chrono::steady_clock::now();
+                    now - last_poll_ > std::chrono::milliseconds(10)) {
+                    last_poll_ = now;
+                    if (idle_ && !idle_(chld_fd(), false)) stop_requested_ = true;
+                }
+                // a host helper the supervisor ran itself (not a tracee)
+                if (!tasks_.count(w) && (WIFEXITED(st) || WIFSIGNALED(st)) &&
+                    !gpid_.count(w)) {
+                    if (on_exit_) on_exit_(w, 0, WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st));
+                    continue;
+                }
             } else {
                 w = ::waitpid(-1, &st, __WALL);
             }
@@ -276,7 +348,8 @@ public:
                 if (WIFSIGNALED(st)) trace_killed(w, WTERMSIG(st));
                 if (w == root_pid_) exit_code_ = code;
                 gt_on_exit(w, st);
-                if (const std::int32_t g = exited_gpid(w)) {
+                const std::int32_t exited_g = exited_gpid(w);
+                if (const std::int32_t g = exited_g) {
                     proc_events_.push_back({ProcEvent::reap, g, 0, {}, {}});
                     reparent_orphans_of(g);
                 }
@@ -292,7 +365,9 @@ public:
                 stop_owed_.erase(w);
                 // the host may hand this tid to an unrelated new process
                 tgid_cache_.erase(w);
+                bootstrapping_.erase(w);
                 --live_;
+                if (on_exit_) on_exit_(w, exited_g, code);
                 // The ROOT task is the guest's init/session leader. When it
                 // exits the foreground session is over and control returns to
                 // whoever launched linuxity -- exactly as a controlling
@@ -308,7 +383,7 @@ public:
                 // exit or the grace deadline passes. Releasing them
                 // untraced was a sandbox escape.
                 if (w == root_pid_) begin_drain();
-                if (live_ <= 0) { exited_ = true; return ok(false); }
+                if (live_ <= 0 && !instance_) { exited_ = true; return ok(false); }
                 continue;
             }
             if (!WIFSTOPPED(st)) continue;
@@ -385,6 +460,7 @@ public:
                 // path_ (a host path) -- mark it done so later guest execs are
                 // dispatched through path_exec.
                 if (w == root_pid_) booted_root_ = true;
+                bootstrapping_.erase(w);
                 proc_events_.push_back({ProcEvent::exec, gpid_of(w), 0,
                                         comm_of(w), cmdline_of(w)});
                 tasks_[w] = Task{};        // fresh image, back at-entry
@@ -406,7 +482,7 @@ public:
                 // after the image is live goes through the dispatcher.
                 std::uint64_t sysno = rr.nr();
                 const abi::Sysno boot_sc = abi::decode(kTraceeArch, sysno);
-                if (!booted_root_ && w == root_pid_ &&
+                if (booting(w) &&
                     (boot_sc == abi::Sysno::execve ||
                      boot_sc == abi::Sysno::execveat)) {
                     // Let this bootstrap execve run NATIVELY. At a
@@ -527,7 +603,7 @@ public:
                     // every later guest exec is dispatched normally.
                     std::uint64_t sysno = rr.nr();
                     const abi::Sysno bsc = abi::decode(kTraceeArch, sysno);
-                    if (!booted_root_ && w == root_pid_ &&
+                    if (booting(w) &&
                         (bsc == abi::Sysno::execve ||
                          bsc == abi::Sysno::execveat)) {
                         t.in_call = true;
@@ -1709,7 +1785,10 @@ public:
     void set_host_pids(bool on) noexcept { host_pids_ = on; }
     // The guest's init: the root task's pid as the guest names it.
     [[nodiscard]] std::int32_t init_gpid() const noexcept {
-        return host_pids_ ? static_cast<std::int32_t>(root_pid_) : 1;
+        // an instance has no root task; with host pids its init is us
+        if (host_pids_) return instance_ ? static_cast<std::int32_t>(::getpid())
+                                         : static_cast<std::int32_t>(root_pid_);
+        return 1;
     }
 
     [[nodiscard]] bool exited() const noexcept { return exited_; }
@@ -2773,6 +2852,48 @@ private:
     ::pid_t cur_{-1};
     ::pid_t root_pid_{-1};
     bool booted_root_{false};      // root's bootstrap execve(path_) has completed
+    // Instance mode: no root program; sessions come from spawn().
+    bool instance_{false};
+    bool stop_requested_{false};
+    std::set<::pid_t> bootstrapping_;   // spawned, first execve not done yet
+    std::function<bool(int, bool)> idle_;
+    std::chrono::steady_clock::time_point last_poll_{};
+    std::function<void(::pid_t, std::int32_t, int)> on_exit_;
+    std::function<void()> flush_events_;
+    int chld_fd_{-1};
+    [[nodiscard]] bool booting(::pid_t w) const {
+        return (w == root_pid_ && !booted_root_) || bootstrapping_.count(w) != 0;
+    }
+    int chld_fd() {
+        if (chld_fd_ < 0) {
+            ::sigset_t s;
+            ::sigemptyset(&s);
+            ::sigaddset(&s, SIGCHLD);
+            (void)::pthread_sigmask(SIG_BLOCK, &s, nullptr);
+            chld_fd_ = ::signalfd(-1, &s, SFD_NONBLOCK | SFD_CLOEXEC);
+        }
+        return chld_fd_;
+    }
+    void drain_chld_fd() {
+        if (chld_fd_ < 0) return;
+        ::signalfd_siginfo si[8];
+        while (::read(chld_fd_, si, sizeof si) > 0) {}
+    }
+public:
+    // Instance mode. `idle(chld_fd, may_block)` serves the supervisor's own
+    // fds: with may_block it should wait on them plus chld_fd (readable when
+    // a task changed state), without it just take what is ready. Return
+    // false to shut the instance down.
+    void set_idle(std::function<bool(int, bool)> f) { idle_ = std::move(f); }
+    // Called for every process that exits: (host pid, guest pid, status).
+    void set_on_exit(std::function<void(::pid_t, std::int32_t, int)> f) { on_exit_ = std::move(f); }
+    void set_flush_events(std::function<void()> f) { flush_events_ = std::move(f); }
+    void request_stop() { stop_requested_ = true; }
+    // Graceful stop: SIGTERM everything, SIGKILL what's left after the grace.
+    void shutdown() { if (!draining_) begin_drain(); }
+    [[nodiscard]] bool instance() const noexcept { return instance_; }
+    [[nodiscard]] int live_count() const noexcept { return live_; }
+private:
     int exit_code_{0};
     int live_{0};
     bool exited_{false};

@@ -2079,6 +2079,9 @@ private:
             if (abs == "/dev/tty" && pc.host_path == "/dev/tty" && k_.procs().ctty_of(ids().pid) < 0)
                 return eno(Errno::enxio);
             pending_new_ = wire::has(flags, wire::OpenFlag::creat) && !guest_exists(abs);
+            // creating a name writes its directory, like mkdir and unlink
+            if (pending_new_ && !privileged())
+                if (Errno e = dir_entry_allowed(abs, false); e != Errno::ok) return eno(e);
             // An unprivileged guest user gets the kernel's answer for the
             // mode and owner it sees; the host only ever sees its own user.
             if (!pending_new_ && !wire::has_for(arch_, flags, wire::OpenFlag::path)) {
