@@ -742,7 +742,15 @@ public:
     // getdents, and fd-relative openat can recover the path. The fd number is
     // the REAL host fd the child holds (redirect/inject both yield real fds).
     void bind_fd(int fd, std::string abs) { fds().paths[fd] = std::move(abs); }
-    void unbind_fd(int fd) { auto& t = fds(); t.paths.erase(fd); t.dirs.erase(fd); }
+    void unbind_fd(int fd) { auto& t = fds(); t.paths.erase(fd); t.dirs.erase(fd); t.ll_layers.erase(fd); }
+    // How many landlock layers the caller had when it opened `fd` (0 if it
+    // had none, or we never saw the open). The file keeps those rights.
+    void set_fd_ll_layers(int fd, std::uint32_t n) { if (n) fds().ll_layers[fd] = n; }
+    [[nodiscard]] std::uint32_t fd_ll_layers(int fd) const {
+        const auto& t = fds();
+        auto it = t.ll_layers.find(fd);
+        return it == t.ll_layers.end() ? 0 : it->second;
+    }
     // Copy the path binding AND (if any) the virtual-directory stream from
     // `from` onto `to`. Used after a dup/dup2/dup3/fcntl(F_DUPFD): the new fd
     // aliases the same open description, so an *at call or getdents on it must
@@ -757,6 +765,10 @@ public:
             t.paths[to] = it->second;
         if (auto it = t.dirs.find(from); it != t.dirs.end())
             t.dirs[to] = DirStream{it->second.entries, 0, it->second.lazy, 0};
+        if (auto it = t.ll_layers.find(from); it != t.ll_layers.end())
+            t.ll_layers[to] = it->second;
+        else
+            t.ll_layers.erase(to);
     }
     [[nodiscard]] std::string_view path_of_fd(int fd) const {
         const auto& t = fds();
@@ -857,11 +869,13 @@ public:
     struct FdTable {
         std::unordered_map<int, std::string> paths;
         std::unordered_map<int, DirStream> dirs;
+        std::unordered_map<int, std::uint32_t> ll_layers;   // see fd_ll_layers
         // A fork copies the fd table but each copy has its OWN file offset
         // for a virtual directory stream, so the child starts fresh streams.
         [[nodiscard]] FdTable copy_for_fork() const {
             FdTable t;
             t.paths = paths;
+            t.ll_layers = ll_layers;
             for (const auto& [fd, d] : dirs)
                 t.dirs[fd] = DirStream{d.entries, d.pos, d.lazy, d.byte_off};
             return t;

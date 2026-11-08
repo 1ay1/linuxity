@@ -267,6 +267,7 @@ inline constexpr int kTrappedX86_64[] = {
     91,                          // fchmod        (records mode; then fwd)
     92, 94, 93, 260,             // chown/lchown/fchown/fchownat
     76,                          // truncate
+    77,                          // ftruncate     (landlock TRUNCATE)
     235, 132, 280, 261,          // utimes/utime/utimensat/futimesat
     82, 264, 316,                // rename/renameat/renameat2
     86, 265,                     // link/linkat
@@ -349,9 +350,13 @@ inline constexpr int kTrappedX86_64[] = {
     trapped.reserve(kTrappedAll.size() + 1);
     for (const std::uint64_t nr : kTrappedAll)
         if (nr != kNoSysno) trapped.push_back(static_cast<std::uint32_t>(nr));
-    // UNTRAPPED(sendto,44): trapped by argument below, only where the host
-    // refuses generic netlink (Android) and only for fds in the band the
-    // emulated nl80211 sockets live in; every other send stays native.
+    // UNTRAPPED(sendto,44): trapped by argument below. A send with a
+    // destination address is trapped, since landlock's abstract-socket scope
+    // has to see where it goes. The filter can't read the address, and its
+    // length alone can't tell an abstract unix name from an inet one, so all
+    // of them are trapped. Connected sends pass no address and stay native,
+    // which is nearly every send. Where the host refuses generic netlink
+    // (Android) the fds the emulated nl80211 sockets live in are trapped too.
     bool emulate_genl = std::getenv("LINUXITY_EMULATE_NL80211") != nullptr;
     if (!emulate_genl) {
         const int s = ::socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, 16 /*NETLINK_GENERIC*/);
@@ -360,7 +365,7 @@ inline constexpr int kTrappedX86_64[] = {
     }
     constexpr std::uint64_t kSendto = encode(kHostArch, abi::Sysno::sendto);
     constexpr std::uint32_t kNlFdLo = 1008, kNlFdHi = 1023;   // syscall.hpp's band
-    const std::size_t kSend = emulate_genl ? 4 : 0;           // statements in that check
+    const std::size_t kSend = emulate_genl ? 8 : 6;           // statements in that check
     const std::size_t nTrapped = trapped.size();
 
     // Program layout (leaves LAST, so every match is a simple forward jump):
@@ -451,15 +456,30 @@ inline constexpr int kTrappedX86_64[] = {
         f.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
                              trapped[i], jt, 0));                // firstJeq + i
     }
-    // nr == sendto && kNlFdLo <= fd <= kNlFdHi -> TRACE, else ALLOW. A miss
-    // on nr falls through to the pread check with A still holding nr.
-    if (emulate_genl) {
+    // nr == sendto: TRACE if it has a destination address (args[4] != 0) or,
+    // where nl80211 is emulated, its fd is in that band; else ALLOW. A miss
+    // on nr falls through to the pread check with A still holding nr. Jumps
+    // are relative: from s_k the TRACE leaf is (kSend + 6 - k - 1) away and
+    // ALLOW one less.
+    {
         constexpr std::uint32_t kArg0 = offsetof(seccomp_data, args);
+        constexpr std::uint32_t kArg4 = offsetof(seccomp_data, args) + 4 * 8;
+        const auto to_trace = [&](std::size_t k) { return static_cast<std::uint8_t>(kSend + 6 - k - 1); };
+        const auto to_allow = [&](std::size_t k) { return static_cast<std::uint8_t>(kSend + 5 - k - 1); };
         f.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
-                             static_cast<std::uint32_t>(kSendto), 0, 3));
-        f.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, kArg0));
-        f.push_back(BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, kNlFdLo, 0, 6));   // -> ALLOW
-        f.push_back(BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K, kNlFdHi, 5, 6));   // ALLOW / TRACE
+                             static_cast<std::uint32_t>(kSendto), 0,
+                             static_cast<std::uint8_t>(kSend - 1)));              // s0 -> pread check
+        f.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, kArg4));                  // s1
+        f.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, to_trace(2)));     // s2
+        f.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, kArg4 + 4));              // s3
+        f.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, to_trace(4)));     // s4
+        if (emulate_genl) {
+            f.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, kArg0));              // s5
+            f.push_back(BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, kNlFdLo, 0, to_allow(6)));            // s6
+            f.push_back(BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K, kNlFdHi, to_allow(7), to_trace(7)));  // s7
+        } else {
+            f.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));           // s5
+        }
     }
     // nr == pread64 && args[3] == 0 -> TRACE, else ALLOW (little-endian words)
     constexpr std::uint32_t kArg3 = offsetof(seccomp_data, args) + 3 * 8;

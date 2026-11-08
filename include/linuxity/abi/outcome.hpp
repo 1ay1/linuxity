@@ -170,6 +170,8 @@ struct Redirect {
     // on success this call created `created` (a dir if created_dir)
     std::optional<std::string> created{};
     bool                   created_dir{false};
+    // on success, guest path `moved->first` is now `moved->second` (rename)
+    std::optional<std::pair<std::string, std::string>> moved{};
     std::optional<Scrub>   scrub{};
     std::optional<ArgBlob> blob{};
 
@@ -196,7 +198,7 @@ struct Redirect {
     // Asked by the trap loop (the single Redirect consumer), so the 14 sites
     // that BUILD a Redirect do not each need to know about the optimisation.
     [[nodiscard]] bool is_noop() const noexcept {
-        return !second && !make_parents && !scrub && !blob && !force_ret && !created && first.arg >= 0 &&
+        return !second && !make_parents && !scrub && !blob && !force_ret && !created && !moved && first.arg >= 0 &&
                !first.rewrites;
     }
 };

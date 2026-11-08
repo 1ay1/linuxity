@@ -273,6 +273,8 @@ public:
                                 locked([&] { sys.scrub_ids(*rd.scrub); });
                             if (rc == 0 && rd.created)
                                 locked([&] { sys.note_created(*rd.created, rd.created_dir); });
+                            if (rc == 0 && rd.moved)
+                                locked([&] { sys.note_moved(rd.moved->first, rd.moved->second); });
                             if constexpr (requires { trap_.set_ret_now(std::int64_t{0}); })
                                 if (rd.force_ret) trap_.set_ret_now(*rd.force_ret);
                         },

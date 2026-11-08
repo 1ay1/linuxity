@@ -264,3 +264,95 @@ def landlock_walls_hold():
     _, st = os.waitpid(pid, 0)
     eq(os.waitstatus_to_exitcode(st), 0, "landlock child (10-14 name the failing step)")
     return "inside allowed, outside refused, /etc readable"
+
+
+def _landlock(libc, handled_fs, rules, scoped=0):
+    """In the calling (child) process: restrict to `rules`, a list of
+    (path, access). Returns False if any step failed."""
+    import ctypes
+    class Attr(ctypes.Structure):
+        _fields_ = [("fs", ctypes.c_uint64), ("net", ctypes.c_uint64), ("sc", ctypes.c_uint64)]
+    class Rule(ctypes.Structure):
+        _pack_ = 1
+        _layout_ = "ms"
+        _fields_ = [("a", ctypes.c_uint64), ("fd", ctypes.c_int32)]
+    a = Attr(handled_fs, 0, scoped)
+    rs = libc.syscall(444, ctypes.byref(a), 24, 0)
+    if rs < 0:
+        return False
+    for p, acc in rules:
+        r = Rule(acc, os.open(p, os.O_PATH))
+        if libc.syscall(445, rs, 1, ctypes.byref(r), 0) != 0:
+            return False
+    libc.prctl(38, 1, 0, 0, 0)
+    return libc.syscall(446, rs, 0) == 0
+
+
+@test
+def landlock_finer_points():
+    """Landlock as the kernel does it: a rule follows its directory through a
+    rename, ftruncate is judged by the rights the file was opened with, and
+    the abstract-socket scope keeps a walled process from reaching a socket
+    bound outside its walls."""
+    import ctypes
+    import errno
+    import tempfile
+    libc = ctypes.CDLL(None, use_errno=True)
+    abi = libc.syscall(444, None, 0, 1)
+    if abi < 6:
+        skip(f"landlock ABI {abi}, need 6")
+    RF, WF, RD, RMF, MKREG, MKDIR, REFER, TRUNC = 4, 2, 8, 32, 256, 128, 1 << 13, 1 << 14
+    base = tempfile.mkdtemp(dir=os.getcwd())
+    os.makedirs(f"{base}/a/inner")
+    with open(f"{base}/keep", "w") as f:
+        f.write("x")
+    early = os.open(f"{base}/keep", os.O_RDWR)    # opened before the walls
+    outside = socket.socket(socket.AF_UNIX)
+    name = b"\0lxt-scope-%d" % os.getpid()
+    outside.bind(name)
+    outside.listen(1)
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        res = {}
+        ok = _landlock(libc, RF | WF | RD | RMF | MKREG | MKDIR | REFER | TRUNC,
+                       [("/", RF | RD), (base, RF | WF | RD | RMF | MKREG | MKDIR | REFER),
+                        (f"{base}/a", TRUNC)], scoped=1)
+        res["restrict"] = ok
+        def e(fn):
+            try:
+                fn()
+                return "ok"
+            except OSError as x:
+                return errno.errorcode.get(x.errno, str(x.errno))
+        # the TRUNCATE rule on a/ follows a/ to b/
+        res["rename"] = e(lambda: os.rename(f"{base}/a", f"{base}/b"))
+        with open(f"{base}/b/inner/t", "w") as f:   # made in b: MKREG from base
+            pass
+        res["trunc in b"] = e(lambda: os.truncate(f"{base}/b/inner/t", 0))
+        with open(f"{base}/n", "w"):
+            pass
+        res["trunc outside"] = e(lambda: os.truncate(f"{base}/n", 0))
+        # ftruncate: a file opened after the walls keeps their rights; one
+        # opened before keeps none of them
+        fd = os.open(f"{base}/n", os.O_WRONLY)
+        res["ftrunc new fd"] = e(lambda: os.ftruncate(fd, 0))
+        res["ftrunc early fd"] = e(lambda: os.ftruncate(early, 0))
+        # abstract sockets: one bound by the parent is outside the walls,
+        # one bound by ourselves is inside
+        s = socket.socket(socket.AF_UNIX)
+        res["connect outside"] = e(lambda: s.connect(name))
+        mine = socket.socket(socket.AF_UNIX)
+        mine.bind(name + b"-in")
+        mine.listen(1)
+        s2 = socket.socket(socket.AF_UNIX)
+        res["connect inside"] = e(lambda: s2.connect(name + b"-in"))
+        os.write(w, repr(res).encode())
+        os._exit(0)
+    os.waitpid(pid, 0)
+    got = eval(os.read(r, 4096).decode())
+    want = {"restrict": True, "rename": "ok", "trunc in b": "ok", "trunc outside": "EACCES",
+            "ftrunc new fd": "EACCES", "ftrunc early fd": "ok",
+            "connect outside": "EPERM", "connect inside": "ok"}
+    eq(got, want, "landlock answers")
+    return "rename, ftruncate, abstract scope"

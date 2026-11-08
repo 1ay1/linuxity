@@ -66,10 +66,14 @@ using Domain = std::shared_ptr<const std::vector<Layer>>;
 
 // May `want` happen on guest path `path` under `d`? `path` must be absolute,
 // normalized and with symlinks resolved (the kernel checks the object, not a
-// name for it).
-[[nodiscard]] inline bool allows(const Domain& d, std::string_view path, std::uint64_t want) {
+// name for it). Only the first `upto` layers count: a file keeps the rights
+// it was opened with, so one opened before a restriction isn't judged by it.
+[[nodiscard]] inline bool allows(const Domain& d, std::string_view path, std::uint64_t want,
+                                 std::size_t upto = ~std::size_t{0}) {
     if (!d || want == 0) return true;
+    std::size_t n = 0;
     for (const Layer& l : *d) {
+        if (n++ >= upto) break;
         const std::uint64_t handled = l.rules.handled_fs | kRefer;   // REFER is always handled
         std::uint64_t need = want & handled;
         if (need == 0) continue;
@@ -80,6 +84,24 @@ using Domain = std::shared_ptr<const std::vector<Layer>>;
         if ((need & ~granted) != 0) return false;
     }
     return true;
+}
+
+// Device ioctls IOCTL_DEV never covers, as in fs/landlock: they act on the
+// open file or the filesystem, not the device.
+[[nodiscard]] inline bool ioctl_always_ok(std::uint32_t cmd) {
+    switch (cmd) {
+        case 0x5451: case 0x5450:        // FIOCLEX, FIONCLEX
+        case 0x5421: case 0x5452:        // FIONBIO, FIOASYNC
+        case 0x5460:                     // FIOQSIZE
+        case 0xC0045877: case 0xC0045878:  // FIFREEZE, FITHAW
+        case 0xC020660B:                 // FS_IOC_FIEMAP
+        case 2:                          // FIGETBSZ
+        case 0x40049409: case 0x4020940D: case 0xC0189436:  // FICLONE, FICLONERANGE, FIDEDUPERANGE
+        case 0x81111500: case 0x80811501:  // FS_IOC_GETFSUUID, FS_IOC_GETFSSYSFSPATH
+            return true;
+        default:
+            return false;
+    }
 }
 
 // May a TCP bind/connect on `port` happen? `want` is kBindTcp or kConnectTcp.

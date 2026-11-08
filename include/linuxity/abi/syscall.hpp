@@ -4187,8 +4187,11 @@ private:
              k_.files().links().touches(pd.host_path)))
             return rename_with_links(r, ps.host_path, pd.host_path,
                                      rename_flags_arg);
-        return Redirect{PathArg{a1, std::move(ps.host_path)}}
-            .with(PathArg{a2, std::move(pd.host_path)});
+        Redirect rd{PathArg{a1, std::move(ps.host_path)}};
+        rd.second = PathArg{a2, std::move(pd.host_path)};
+        // a rename (not a link): tell note_moved what moved where
+        if (link_flags_arg < 0) rd.moved = std::pair{src, dst};
+        return rd;
     }
 
     // unlink of a name the link table knows.
@@ -6470,6 +6473,34 @@ public:
         note_opened_fd(fd);
     }
 
+    // A rename went through: guest path `from` is now `to`. The kernel ties a
+    // landlock rule to the inode, so the rule moves with it; ours are keyed
+    // by path, so rewrite them, in rule sets being built and in live domains.
+    void note_moved(const std::string& from, const std::string& to) {
+        namespace ll = kernel::landlock;
+        if (ll_sets_.empty() && ll_layers_ == 0) return;
+        auto fix = [&](std::string& p) {
+            if (ll::under(p, from) && from != "/") p = to + p.substr(from.size());
+        };
+        for (auto& [ino, rs] : ll_sets_)
+            for (auto& rule : rs.paths) fix(rule.path);
+        // a domain is shared by every process that inherited it: give each
+        // distinct one a single rewritten copy
+        std::map<const void*, ll::Domain> done;
+        for (const std::int32_t pid : k_.procs().pids()) {
+            auto* p = k_.procs().find_mut(pid);
+            if (!p || !p->landlock) continue;
+            auto [it, fresh] = done.try_emplace(p->landlock.get());
+            if (fresh) {
+                auto layers = *p->landlock;
+                for (auto& l : layers)
+                    for (auto& rule : l.rules.paths) fix(rule.path);
+                it->second = std::make_shared<const std::vector<ll::Layer>>(std::move(layers));
+            }
+            p->landlock = it->second;
+        }
+    }
+
     // A file this guest process just created: its owner is the creator's
     // fsuid, its group the fsgid or, under a setgid directory, the
     // directory's group (and a new subdirectory inherits the setgid bit).
@@ -6540,6 +6571,11 @@ public:
             k_.files().unbind_fd(static_cast<int>(fd));
         }
         if (fd >= 0 && !pending_open_.empty()) {
+            // the rights this file keeps: those of the layers in force now
+            if (ll_layers_ > 0)
+                if (const auto* p = k_.procs().find(ids().pid); p && p->landlock)
+                    k_.files().set_fd_ll_layers(static_cast<int>(fd),
+                                                static_cast<std::uint32_t>(p->landlock->size()));
             k_.files().bind_fd(static_cast<int>(fd), pending_open_);
             if (const auto [cp, ct] = std::exchange(pending_comm_, {0, 0}); cp)
                 if (auto host = tracee_fd_target(static_cast<int>(fd)); !host.empty()) {
@@ -7163,6 +7199,25 @@ public:
             case Sysno::execve:  return need(obj(0, false), ll::kExecute);
             case Sysno::execveat:return need(obj(1, true), ll::kExecute);
             case Sysno::truncate:return need(obj(0, false), ll::kTruncate);
+            case Sysno::ftruncate:
+            case Sysno::ioctl: {
+                const int fd = static_cast<int>(r.arg[0]);
+                const std::uint32_t upto = k_.files().fd_ll_layers(fd);
+                if (upto == 0) return Errno::ok;   // opened before any restriction
+                const std::string p{k_.files().path_of_fd(fd)};
+                if (p.empty()) return Errno::ok;
+                const std::string real = k_.files().resolve_links(p);
+                if (sc == Sysno::ftruncate)
+                    return ll::allows(d, real, ll::kTruncate, upto) ? Errno::ok : Errno::eacces;
+                // IOCTL_DEV covers char and block devices only
+                if (ll::ioctl_always_ok(static_cast<std::uint32_t>(r.arg[1]))) return Errno::ok;
+                const auto pc = k_.files().classify(real);
+                struct ::stat st{};
+                if (pc.realm != kernel::Realm2::host_backed || ::stat(pc.host_path.c_str(), &st) != 0 ||
+                    !(S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode)))
+                    return Errno::ok;
+                return ll::allows(d, real, ll::kIoctlDev, upto) ? Errno::ok : Errno::eacces;
+            }
             case Sysno::mkdir:   return need(parent(obj(0, false, false)), ll::kMakeDir);
             case Sysno::mkdirat: return need(parent(obj(1, true, false)), ll::kMakeDir);
             case Sysno::mknod:   return need(parent(obj(0, false, false)), make_right(static_cast<std::uint32_t>(r.arg[1])));
@@ -7191,6 +7246,8 @@ public:
             }
             case Sysno::bind:
             case Sysno::connect: {
+                if (sc == Sysno::connect)
+                    if (const Errno e = ll_abstract_scope(d, r.arg[1], r.arg[2]); e != Errno::ok) return e;
                 // TCP ports, for an inet stream socket
                 std::array<std::byte, 4> sa{};
                 if (r.arg[1] == 0 || !mem_.copy_in(uaddr(r.arg[1]), sa)) return Errno::ok;
@@ -7210,8 +7267,90 @@ public:
                 const std::uint64_t port = (std::to_integer<unsigned>(sa[2]) << 8) | std::to_integer<unsigned>(sa[3]);
                 return ll::allows_port(d, port, want) ? Errno::ok : Errno::eacces;
             }
+            case Sysno::sendto:
+                return ll_abstract_scope(d, r.arg[4], r.arg[5]);
+            case Sysno::sendmsg: {
+                // msghdr: msg_name at +0, msg_namelen (u32) at +8
+                if (r.arg[1] == 0) return Errno::ok;
+                const std::uint64_t name = u64_at(r.arg[1]);
+                const std::uint64_t namelen = u64_at(r.arg[1] + 8) & 0xffffffffu;
+                return ll_abstract_scope(d, name, namelen);
+            }
             default:
                 return Errno::ok;
+        }
+    }
+
+    // LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET: a scoped process may only reach an
+    // abstract socket whose owner is in its own domain or one nested inside.
+    // The owner is found when asked (the netns's socket table, then which
+    // process holds that socket), so a failed bind can't claim a name.
+    [[nodiscard]] Errno ll_abstract_scope(const kernel::landlock::Domain& d, std::uint64_t addr,
+                                          std::uint64_t len) {
+        namespace ll = kernel::landlock;
+        if (!ll::scopes(d, ll::kScopeAbstractUnix) || addr == 0 || len < 3 || len > 110) return Errno::ok;
+        std::vector<std::byte> sa(len);
+        if (!mem_.copy_in(uaddr(addr), sa)) return Errno::ok;
+        if (std::to_integer<unsigned>(sa[0]) != 1 || std::to_integer<unsigned>(sa[1]) != 0) return Errno::ok;
+        if (std::to_integer<unsigned>(sa[2]) != 0) return Errno::ok;   // a path, not abstract
+        // the table shows an abstract name as '@' + name, NULs as '@' too
+        std::string want = "@";
+        for (std::size_t i = 3; i < len; ++i) {
+            const char c = static_cast<char>(std::to_integer<unsigned>(sa[i]));
+            want += c == '\0' ? '@' : c;
+        }
+        if constexpr (!requires { mem_.host_tid(); }) {
+            return Errno::ok;
+        } else {
+            std::set<std::string> inodes;
+            {
+                const std::string table = "/proc/" + std::to_string(mem_.host_tid()) + "/net/unix";
+                FILE* f = std::fopen(table.c_str(), "r");
+                if (!f) return Errno::ok;
+                char line[512];
+                while (std::fgets(line, sizeof line, f)) {
+                    std::string l{line};
+                    while (!l.empty() && (l.back() == '\n' || l.back() == '\r')) l.pop_back();
+                    // Num RefCount Protocol Flags Type St Inode Path
+                    std::size_t pos = 0;
+                    std::vector<std::string> cols;
+                    for (int c = 0; c < 7; ++c) {
+                        while (pos < l.size() && l[pos] == ' ') ++pos;
+                        const auto end = l.find(' ', pos);
+                        cols.push_back(l.substr(pos, end - pos));
+                        pos = end == std::string::npos ? l.size() : end;
+                    }
+                    while (pos < l.size() && l[pos] == ' ') ++pos;
+                    if (cols.size() == 7 && l.substr(pos) == want) inodes.insert(cols[6]);
+                }
+                std::fclose(f);
+            }
+            if (inodes.empty()) return Errno::ok;   // nobody bound it: the host says ECONNREFUSED
+            // which of our processes holds it
+            for (const std::int32_t pid : k_.procs().pids()) {
+                const int host = k_.procs().host_of(pid);
+                if (host <= 0) continue;
+                const std::string dir = "/proc/" + std::to_string(host) + "/fd";
+                DIR* dd = ::opendir(dir.c_str());
+                if (!dd) continue;
+                bool held = false;
+                while (const auto* e = ::readdir(dd)) {
+                    char tgt[64];
+                    const std::string link = dir + "/" + e->d_name;
+                    const ::ssize_t n = ::readlink(link.c_str(), tgt, sizeof tgt - 1);
+                    if (n <= 9) continue;
+                    tgt[n] = '\0';
+                    std::string_view t{tgt};
+                    if (t.starts_with("socket:[") && t.ends_with("]") &&
+                        inodes.count(std::string{t.substr(8, t.size() - 9)})) { held = true; break; }
+                }
+                ::closedir(dd);
+                if (held) {
+                    const auto* owner = k_.procs().find(pid);
+                    return owner && ll::within(owner->landlock, d) ? Errno::ok : Errno::eperm;
+                }
+            }
+            return Errno::eperm;   // held outside the guest tree: outside the domain
         }
     }
     // Is `pid` under a Landlock domain? The domain is inherited, so walk up.
