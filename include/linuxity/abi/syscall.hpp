@@ -57,6 +57,7 @@
 #include <unistd.h>
 #endif
 #include <ctime>
+#include "linuxity/host/real_netns.hpp"
 
 // -- Host portability: lstat ------------------------------------------------
 // The core calls lstat(2) in exactly one place (is_symlink below), to avoid a
@@ -3089,6 +3090,13 @@ private:
     // real host socket.
     [[nodiscard]] Outcome do_socket(const Regs& r) {
         constexpr std::uint64_t kAfNetlink = 16, kNetlinkAudit = 9, kNetlinkGeneric = 16;
+        // a network namespace the host couldn't make real is one on paper:
+        // its sockets would be on the host's network. Refuse those, so the
+        // guest is as cut off as it asked to be.
+        constexpr std::uint64_t kAfInet = 2, kAfInet6 = 10, kAfPacket = 17;
+        if ((r.arg[0] == kAfInet || r.arg[0] == kAfInet6 || r.arg[0] == kAfPacket) &&
+            k_.procs().net_isolated(ids().pid) && !host::host_can_netns())
+            return eno(Errno::eacces);
         if (r.arg[0] == kAfNetlink && r.arg[2] == kNetlinkAudit)
             return eno(Errno::eprotonosupport);
         // Generic netlink where the host refuses it (Android's shell): a
@@ -5587,6 +5595,18 @@ private:
         }
         // the non-namespace bits (CLONE_FS, FILES, SYSVSEM) are per-task
         // sharing the host already gives an unshared process
+        if constexpr (requires { mem_.host_tid(); }) {
+            // a network namespace only on paper leaves the guest on the
+            // host's network, so make it for real where the host can
+            if ((flags & host::kCloneNewnet) && host::host_can_netns()) {
+                GuestCalls gc;
+                gc.steps = {{Sysno::unshare, {host::real_netns_flags(), 0, 0, 0, 0, 0}}};
+                gc.before_resume = [this](std::int64_t rc) {
+                    if (rc == 0) (void)host::write_identity_maps(mem_.host_tid());
+                };
+                return gc;
+            }
+        }
         return val(0);
     }
     // setns(fd, nstype): join the namespace an /proc/<pid>/ns/* fd names

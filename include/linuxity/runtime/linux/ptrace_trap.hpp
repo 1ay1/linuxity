@@ -50,6 +50,8 @@
 #include <utility>
 #include <vector>
 #include <fcntl.h>
+#include <set>
+#include "linuxity/host/real_netns.hpp"
 
 namespace lx::runtime {
 
@@ -351,6 +353,9 @@ public:
                         nsf = it->second;
                         pending_clone_ns_.erase(it);
                     }
+                    // its user namespace needs maps before it runs a step
+                    if (pending_real_netns_.erase(w))
+                        (void)host::write_identity_maps(static_cast<int>(child));
                     proc_events_.push_back({ProcEvent::spawn, gpid, gppid, {}, {}, nsf});
                 } else if (np) {
                     note_thread(w, child);
@@ -657,7 +662,9 @@ public:
         const abi::Sysno sc = abi::decode(kTraceeArch, rr.nr());
         // CLONE_NEW*: linuxity keeps the guest's namespaces itself, so the
         // host never sees them (Android refuses them). The flags are noted
-        // for the child; the clone itself is an ordinary one.
+        // for the child; the clone itself is an ordinary one. Except a
+        // network namespace, which only the host can make real: that one
+        // goes through, with a user namespace to allow it.
         if (sc == abi::Sysno::clone || sc == abi::Sysno::clone3) {
             constexpr std::uint64_t kNew = 0x7e020080;
             std::uint64_t flags = 0;
@@ -670,15 +677,21 @@ public:
             }
             if (!(flags & kNew)) return;
             pending_clone_ns_[w] = flags & kNew;
+            std::uint64_t keep = 0;
+            if ((flags & host::kCloneNewnet) && host::host_can_netns()) {
+                keep = host::real_netns_flags();
+                pending_real_netns_.insert(w);
+            }
+            const std::uint64_t out = (flags & ~kNew) | keep;
             if (sc == abi::Sysno::clone) {
                 Regs wr = rr;
-                wr.set_arg(0, flags & ~kNew);
+                wr.set_arg(0, out);
                 (void)wr.store(w);
                 t.regs = wr;
                 rr = wr;
             } else {
                 ::ptrace(PTRACE_POKEDATA, w, reinterpret_cast<void*>(rr.arg(0)),
-                         reinterpret_cast<void*>(flags & ~kNew));
+                         reinterpret_cast<void*>(out));
             }
             return;
         }
@@ -2771,6 +2784,7 @@ private:
     std::function<void(std::int64_t)> before_resume_{};
     int blob_arg_{-1};             // set_arg_blob: pending for the next redirect
     std::string blob_{};
+    std::set<::pid_t> pending_real_netns_;   // clones making a real netns
     bool seccomp_{false};          // trap filter active -> drive with PTRACE_CONT
     int base_opts_{0};             // linuxity's own ptrace options on every task
     std::unordered_map<::pid_t, Task> tasks_;

@@ -318,12 +318,15 @@ inline std::string android_wireless_line() {
     return cache;
 }
 
-inline std::optional<Result<kernel::VirtualFile>> net_view(std::string_view rest) {
+inline std::optional<Result<kernel::VirtualFile>> net_view(std::string_view rest, int host_pid = 0) {
 #if defined(_WIN32)
     (void)rest;
+    (void)host_pid;
     return std::nullopt;
 #else
-    const std::string host = rest.empty() ? "/proc/net" : "/proc/net/" + std::string{rest};
+    // a task in a real network namespace of its own reads that one
+    const std::string base = host_pid > 0 ? "/proc/" + std::to_string(host_pid) + "/net" : "/proc/net";
+    const std::string host = rest.empty() ? base : base + "/" + std::string{rest};
     if (rest.empty()) {
         DIR* d = ::opendir(host.c_str());
         if (!d) return std::nullopt;
@@ -558,7 +561,8 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
 
         // ---- /proc/net: the host's network, which the guest shares ------
         if (abs == "/proc/net" || abs.starts_with("/proc/net/"))
-            if (auto r = net_view(abs.size() > 10 ? abs.substr(10) : std::string_view{}))
+            if (auto r = net_view(abs.size() > 10 ? abs.substr(10) : std::string_view{},
+                                  procs.net_isolated(procs.reader()) ? procs.host_of(procs.reader()) : 0))
                 return std::move(*r);
 
         // ---- /proc/self -> /proc/<pid 1> canonicalization ---------------
@@ -1215,9 +1219,10 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                     {"uid_map",false},{"gid_map",false},{"setgroups",false},
                     {"mem",false},{"auxv",false},
                 }));
-            // one network namespace, shared with the host
+            // the process's network namespace
             if (tail == "net" || tail.starts_with("net/"))
-                if (auto r = net_view(tail.size() > 4 ? std::string_view{tail}.substr(4) : std::string_view{}))
+                if (auto r = net_view(tail.size() > 4 ? std::string_view{tail}.substr(4) : std::string_view{},
+                                      procs.net_isolated(self_tid) ? procs.host_of(self_tid) : 0))
                     return std::move(*r);
             // ---- namespaces: the process's own (syscall.hpp sends a process
             // still in all the initial ones to the host's real links) ------

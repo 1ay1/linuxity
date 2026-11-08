@@ -186,6 +186,52 @@ def pivot_into_private_root():
     return "only the new root is reachable, the bind is read-only"
 
 
+@test(host=True)
+def new_network_namespace_is_cut_off():
+    """After unshare(CLONE_NEWNET) the only link is a downed loopback and
+    nothing routes out, while ids and file ownership stay as they were."""
+    CLONE_NEWNET = 0x40000000
+    before = (os.getuid(), os.getgid())
+
+    def child():
+        rc = enter(CLONE_NEWNET)
+        if rc:
+            return rc
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        except PermissionError:
+            # a host that can't make a real one: linuxity refuses inet
+            # sockets in its place, which cuts off just as well
+            return 50
+        try:
+            s.connect(("192.0.2.1", 9))
+            return 2
+        except OSError as e:
+            if e.errno != errno.ENETUNREACH:
+                return 3
+        links = sorted(n for _, n in socket.if_nameindex())
+        if links != ["lo"]:
+            return 4
+        with open("/proc/net/dev") as f:
+            if sorted(l.split(":")[0].strip() for l in f.readlines()[2:]) != ["lo"]:
+                return 5
+        with open("owned", "w"):
+            pass
+        st = os.stat("owned")
+        if os.getuid() == before[0] and (st.st_uid, st.st_gid) != before:
+            return 6
+        return 0
+
+    rc = reap(spawn(child))
+    if rc >= 100:
+        skip(f"unshare refused: {errno.errorcode.get(rc - 100, rc - 100)}")
+    if rc == 50:
+        return "inet sockets refused"
+    eq(rc, 0, "step that failed")
+    check(len(socket.if_nameindex()) >= 1, "our own links are still there")
+    return "only lo, no route out"
+
+
 @test
 def hostname_is_consistent():
     """uname, gethostname and /proc agree on the hostname."""

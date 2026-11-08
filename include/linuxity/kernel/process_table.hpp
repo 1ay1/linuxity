@@ -533,6 +533,11 @@ public:
 
     [[nodiscard]] Namespaces& ns() { return ns_; }
     [[nodiscard]] const Namespaces& ns() const { return ns_; }
+    // Is `pid` in a network namespace of its own (one the host made real)?
+    [[nodiscard]] bool net_isolated(std::int32_t pid) const {
+        auto it = procs_.find(pid);
+        return it != procs_.end() && ns_.net_isolated(it->second.ns);
+    }
     // System V IPC objects, one set per IPC namespace (kernel/sysv_ipc.hpp)
     [[nodiscard]] SysvIpc& ipc() { return ipc_; }
     [[nodiscard]] const SysvIpc& ipc() const { return ipc_; }
