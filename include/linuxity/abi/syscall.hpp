@@ -1957,7 +1957,9 @@ private:
             // empty directory so O_DIRECTORY opens succeed).
             pending_dir_ = vf->is_dir;
             pending_entries_ = std::move(vf->entries);
-            return Inject{path_arg, std::move(vf->bytes), vf->is_dir, for_write};
+            const bool reopen_ok = !wire::has_for(arch_, flags, wire::OpenFlag::nofollow) &&
+                                   !wire::has_for(arch_, flags, wire::OpenFlag::path);
+            return Inject{path_arg, std::move(vf->bytes), vf->is_dir, for_write, reopen_ok};
         }
         return eno(pc.error);
     }

@@ -43,6 +43,9 @@
 #include <string>
 #include <vector>
 #if !defined(_WIN32)
+#include <fcntl.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #else
 #include <io.h>
@@ -93,6 +96,8 @@ public:
             const char* t = std::getenv("LINUXITY_TRACE");
             return (t && *t) ? t : nullptr;
         }();
+        // before the first child exists, so its waitpid can't take a guest's
+        (void)memfd_reopen_ok();
         LX_TRY(trap_.start(entry, sp));
         // with host pids, init is the root task's real pid, known only now
         if constexpr (requires { trap_.init_gpid(); }) {
@@ -145,6 +150,22 @@ public:
                 },
 
                 [&](const abi::Inject& in) {
+#if defined(__linux__)
+                    // A file: a memfd of ours that the guest's open reopens
+                    // through /proc/<us>/fd/N, with exactly the flags it asked
+                    // for. No temp file, nothing under /tmp for a sandbox to
+                    // hide, and the same inode refresh_virtual_fd rewrites.
+                    if (!in.is_dir && !in.keep_name && in.reopen_ok && memfd_reopen_ok())
+                        if (const int m = memfd_of(in.content); m >= 0) {
+                            const std::string via = "/proc/" + std::to_string(::getpid()) +
+                                                    "/fd/" + std::to_string(m);
+                            auto fdr = trap_.redirect(in.path_arg, via);
+                            ::close(m);   // the guest's open holds it now
+                            if (!fdr) return recover(fdr.error());
+                            locked([&] { sys.note_opened_fd(*fdr); });
+                            return Step::next;
+                        }
+#endif
                     // A purely virtual node: back it with a real host temp -- a
                     // temp FILE (with the synthesized bytes) for a file, or an
                     // empty temp DIRECTORY for a virtual dir so O_DIRECTORY
@@ -796,6 +817,24 @@ private:
         return f;
     }
 
+    // A memfd holding `bytes`, or -1. The guest reopens it by path.
+    static int memfd_of(const std::vector<std::byte>& bytes) {
+#if defined(__linux__)
+        const int fd = static_cast<int>(::syscall(SYS_memfd_create, "linuxity-vfile", 1u /*MFD_CLOEXEC*/));
+        if (fd < 0) return -1;
+        std::size_t off = 0;
+        while (off < bytes.size()) {
+            const auto n = ::write(fd, bytes.data() + off, bytes.size() - off);
+            if (n <= 0) { ::close(fd); return -1; }
+            off += static_cast<std::size_t>(n);
+        }
+        return fd;
+#else
+        (void)bytes;
+        return -1;
+#endif
+    }
+
     // Write bytes to a fresh host temp file, return its path ("" on failure).
     // Used to back an INJECT (virtual file) with a real, mmappable fd.
     static std::string materialize(const std::vector<std::byte>& bytes) {
@@ -850,6 +889,32 @@ private:
     M& mem_;
     abi::Arch arch_;
     std::vector<std::string> temps_;
+
+    // Can a child of ours reopen one of our memfds through /proc/<us>/fd/N?
+    // Android's SELinux says no (the fd's label isn't the opener's). Asked
+    // once, by a forked child: it runs as the guest will.
+    static bool memfd_reopen_ok() {
+#if defined(__linux__)
+        static const bool ok = [] {
+            const int m = memfd_of({std::byte{'x'}});
+            if (m < 0) return false;
+            const std::string via = "/proc/" + std::to_string(::getpid()) + "/fd/" + std::to_string(m);
+            const ::pid_t c = ::fork();
+            if (c == 0) {
+                const int f = ::open(via.c_str(), O_RDONLY | O_CLOEXEC);
+                char b = 0;
+                ::_exit(f >= 0 && ::read(f, &b, 1) == 1 && b == 'x' ? 0 : 1);
+            }
+            int st = 0;
+            const bool good = c > 0 && ::waitpid(c, &st, 0) == c && WIFEXITED(st) && WEXITSTATUS(st) == 0;
+            ::close(m);
+            return good;
+        }();
+        return ok;
+#else
+        return false;
+#endif
+    }
 };
 
 } // namespace lx::runtime

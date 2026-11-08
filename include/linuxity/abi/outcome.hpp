@@ -204,9 +204,13 @@ struct Inject {
     // The temp is read back by path later (a write to comm, uid_map, ...),
     // so it must outlive the open.
     bool                   keep_name{false};
+    // The open follows links and isn't O_PATH, so it can reopen an fd of
+    // ours through /proc/<pid>/fd/N (a memfd: no temp file at all).
+    bool                   reopen_ok{false};
 
-    Inject(int pa, std::vector<std::byte> c, bool dir = false, bool keep = false)
-        : path_arg{pa}, content{std::move(c)}, is_dir{dir}, keep_name{keep} {}
+    Inject(int pa, std::vector<std::byte> c, bool dir = false, bool keep = false,
+           bool reopen = false)
+        : path_arg{pa}, content{std::move(c)}, is_dir{dir}, keep_name{keep}, reopen_ok{reopen} {}
 };
 
 // RAISE - the guest issued kill/tgkill/tkill against a GUEST pid. Guest pids
