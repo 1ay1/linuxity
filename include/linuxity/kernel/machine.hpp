@@ -39,6 +39,14 @@ public:
     long          ncpu{1};                 // logical CPUs
     std::uint64_t cpu_hz{3'000'000'000};   // nominal core frequency, Hz
 
+    // Show the host's real hardware (cpuinfo, disks, sensors, GPU, battery)
+    // in /proc, /sys and /dev, falling back to the synthesized machine where
+    // the host hides a node. The guest runs on that hardware, so it is the
+    // truth. Off by default so tests see a fixed machine.
+    bool          host_hw{false};
+    // The host directory that is the guest's "/", for the mount table.
+    std::string   root_host{"/"};
+
     // -- Memory (bytes; the one canonical unit) ----------------------------
     std::uint64_t mem_total{std::uint64_t{2048} << 20};   // 2 GiB
     std::uint64_t swap_total{0};

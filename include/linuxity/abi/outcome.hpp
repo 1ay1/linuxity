@@ -201,9 +201,12 @@ struct Inject {
     int                    path_arg;  // register holding the char* path
     std::vector<std::byte> content;   // empty for a directory
     bool                   is_dir{false};
+    // The temp is read back by path later (a write to comm, uid_map, ...),
+    // so it must outlive the open.
+    bool                   keep_name{false};
 
-    Inject(int pa, std::vector<std::byte> c, bool dir = false)
-        : path_arg{pa}, content{std::move(c)}, is_dir{dir} {}
+    Inject(int pa, std::vector<std::byte> c, bool dir = false, bool keep = false)
+        : path_arg{pa}, content{std::move(c)}, is_dir{dir}, keep_name{keep} {}
 };
 
 // RAISE - the guest issued kill/tgkill/tkill against a GUEST pid. Guest pids

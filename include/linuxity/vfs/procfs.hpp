@@ -30,6 +30,7 @@
 #if !defined(_WIN32)
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 #endif
 
@@ -184,6 +185,41 @@ inline std::optional<kernel::VirtualFile> host_redirect(const char* path) {
     vf.redirect_host = path;
     return vf;
 #endif
+}
+
+// The host filesystem holding the guest's root: device, type and options from
+// the host mount table, the deepest mountpoint above it. Not matched on
+// st_dev: a btrfs subvolume's st_dev is not its mount's.
+struct RootMount { std::string source, fstype, opts{"rw"}, majmin{"0:1"}; };
+inline RootMount root_mount(const std::string& root_host) {
+    RootMount best;
+#if !defined(_WIN32)
+    const std::string mi = host_file("/proc/self/mountinfo");
+    std::size_t depth = 0, at = 0;
+    bool found = false;
+    while (at < mi.size()) {
+        std::size_t nl = mi.find('\n', at);
+        if (nl == std::string::npos) nl = mi.size();
+        const std::string line = mi.substr(at, nl - at);
+        at = nl + 1;
+        // id parent maj:min root mountpoint opts [optional...] - fstype source superopts
+        char majmin[32] = {}, mnt[4096] = {}, opts[512] = {};
+        if (std::sscanf(line.c_str(), "%*s %*s %31s %*s %4095s %511s", majmin, mnt, opts) != 3)
+            continue;
+        const std::string_view m{mnt};
+        const bool under = m == "/" || (root_host.starts_with(m) &&
+                                         (root_host.size() == m.size() || root_host[m.size()] == '/'));
+        if (!under || (found && m.size() < depth)) continue;
+        const auto dash = line.find(" - ");
+        if (dash == std::string::npos) continue;
+        char fs[64] = {}, src[1024] = {};
+        if (std::sscanf(line.c_str() + dash + 3, "%63s %1023s", fs, src) != 2) continue;
+        depth = m.size();
+        found = true;
+        best = RootMount{src, fs, opts, majmin};
+    }
+#endif
+    return best;
 }
 
 // The run state of a guest process as the host scheduler sees it ('R', 'S',
@@ -483,6 +519,10 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
         if (abs == "/proc/cmdline")
             return ok(text_file("BOOT_IMAGE=/boot/linuxity root=linuxity ro\n"));
         if (abs == "/proc/cpuinfo") {
+            // The real CPU when the guest sees all of it; a --cpus limit needs
+            // the synthesized file so the processor count agrees.
+            if (mach.host_hw && ncpu == ::sysconf(_SC_NPROCESSORS_ONLN))
+                if (auto vf = host_redirect("/proc/cpuinfo")) return ok(std::move(*vf));
             char mhz[32];
             std::snprintf(mhz, sizeof mhz, "%.3f", mach.cpu_mhz());
             std::string s;
@@ -771,6 +811,15 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
             if (!soft) s += arm ? "Err:          0\n" : "ERR:          0\nMIS:          0\n";
             return ok(text_file(std::move(s)));
         }
+        if (mach.host_hw) {
+            for (const char* f : {"/proc/swaps", "/proc/partitions", "/proc/diskstats",
+                                  "/proc/devices", "/proc/misc", "/proc/filesystems"})
+                if (abs == f)
+                    if (auto vf = host_redirect(f)) return ok(std::move(*vf));
+            // GPU drivers publish here (nvidia-smi reads /proc/driver/nvidia)
+            if (abs == "/proc/driver" || abs.starts_with("/proc/driver/"))
+                if (auto vf = host_redirect(std::string{abs}.c_str())) return ok(std::move(*vf));
+        }
         if (abs == "/proc/swaps")
             return ok(text_file("Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n"));
         // No block devices: the guest's root is a directory, not a disk.
@@ -808,6 +857,24 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
         const bool mountinfo = per_pid("/mountinfo");
         if (p == "/proc/mounts" || per_pid("/mounts") || mountinfo ||
             per_pid("/mountstats")) {
+            const RootMount rm = mach.host_hw ? root_mount(mach.root_host) : RootMount{};
+            if (!rm.source.empty()) {
+                std::string s;
+                if (mountinfo)
+                    s = "1 0 " + rm.majmin + " / / " + rm.opts + " - " + rm.fstype + " " +
+                        rm.source + " " + rm.opts + "\n"
+                        "2 1 0:2 / /proc rw,nosuid,nodev,noexec - proc proc rw\n"
+                        "3 1 0:3 / /sys rw,nosuid,nodev,noexec - sysfs sysfs rw\n"
+                        "4 1 0:4 / /dev rw,nosuid - devtmpfs devtmpfs rw\n"
+                        "5 1 0:5 / /tmp rw,nosuid,nodev - tmpfs tmpfs rw\n";
+                else
+                    s = rm.source + " / " + rm.fstype + " " + rm.opts + " 0 0\n"
+                        "proc /proc proc rw,nosuid,nodev,noexec 0 0\n"
+                        "sysfs /sys sysfs rw,nosuid,nodev,noexec 0 0\n"
+                        "devtmpfs /dev devtmpfs rw,nosuid 0 0\n"
+                        "tmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n";
+                return ok(text_file(std::move(s)));
+            }
             if (mountinfo)
                 return ok(text_file(
                     "1 1 0:1 / / rw - rootfs rootfs rw\n"
@@ -1253,13 +1320,39 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                 }
                 return ok(text_file(std::move(s)));
             }
-            if (tail == "io")
+            if (tail == "io") {
+                if (std::string h = host_file("io"); !h.empty()) return ok(text_file(std::move(h)));
                 return ok(text_file("rchar: 0\nwchar: 0\nsyscr: 0\nsyscw: 0\n"
                                     "read_bytes: 0\nwrite_bytes: 0\n"));
+            }
             if (tail == "children") return ok(text_file(""));
             if (tail == "oom_score") return ok(text_file("0\n"));
             if (tail == "maps")      return ok(text_file(""));
-            if (tail == "fd")        return ok(dir_file({{"0",false},{"1",false},{"2",false}}));
+            if (tail == "fd") {
+                // the host task's real fd numbers; links resolve through the
+                // dispatcher (own fds) or the fd/N arm below (sockets, pipes)
+                std::vector<kernel::VirtualDirent> e;
+                if (host > 0)
+                    if (DIR* d = ::opendir(("/proc/" + std::to_string(host) + "/fd").c_str())) {
+                        while (const dirent* de = ::readdir(d))
+                            if (de->d_name[0] != '.')
+                                e.push_back({de->d_name, kernel::DType::symlink});
+                        ::closedir(d);
+                    }
+                if (e.empty()) e = {{"0",false},{"1",false},{"2",false}};
+                return ok(dir_file(std::move(e)));
+            }
+            if (tail.starts_with("fd/") && host > 0) {
+                // A socket or pipe has no path; its link text is the host's.
+                char tgt[256];
+                const std::string l = "/proc/" + std::to_string(host) + "/" + tail;
+                const ::ssize_t n = ::readlink(l.c_str(), tgt, sizeof tgt - 1);
+                if (n > 0 && tgt[0] != '/') {
+                    kernel::VirtualFile vf;
+                    vf.symlink_target.assign(tgt, static_cast<std::size_t>(n));
+                    return ok(std::move(vf));
+                }
+            }
             if (tail == "cwd" || tail == "root" || tail == "exe") {
                 // Symlinks whose targets only the dispatcher knows (it has
                 // the live task and the backend's exe table). Mark them so

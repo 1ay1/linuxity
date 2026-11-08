@@ -406,10 +406,17 @@ inline constexpr int kTrappedX86_64[] = {
         (emit_x32 ? 1u : 0u) + (emit_uring ? 2u : 0u);
     const std::size_t firstJeq = 4 + nGates;
 
-    // Jump distance to the ENOSYS leaf, which sits after the n JEQs plus the
-    // ALLOW and TRACE leaves.
+    // Jump distance to the ENOSYS leaf, which sits after the n JEQs, the
+    // pread64 check and the ALLOW and TRACE leaves.
+    //
+    // pread64 is trapped only at offset 0: that is how a monitor rereads a
+    // kept-open /proc file, which linuxity must regenerate. Every other
+    // pread (databases, linkers) stays native.
+    // UNTRAPPED(pread64,17): trapped below by argument, offset 0 only
+    constexpr std::uint64_t kPread = encode(kHostArch, abi::Sysno::pread64);
+    constexpr std::size_t kPre = 5;   // statements in the pread64 check
     const auto to_enosys = [&](std::size_t idx) {
-        return static_cast<std::uint8_t>((firstJeq + nTrapped + 2) - idx - 1);
+        return static_cast<std::uint8_t>((firstJeq + nTrapped + kPre + 2) - idx - 1);
     };
     if (emit_x32) {
         f.push_back(BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, kX32Bit,
@@ -425,13 +432,21 @@ inline constexpr int kTrappedX86_64[] = {
                              to_enosys(f.size())));
     }
     for (std::size_t i = 0; i < nTrapped; ++i) {
-        std::uint8_t jt = static_cast<std::uint8_t>((nTrapped - 1 - i) + 1);
+        std::uint8_t jt = static_cast<std::uint8_t>((nTrapped - 1 - i) + kPre + 1);
         f.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
                              trapped[i], jt, 0));                // firstJeq + i
     }
-    f.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));  // 7 + n
-    f.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE));  // 7 + n + 1
-    f.push_back(BPF_STMT(BPF_RET | BPF_K, kEnosys));            // 7 + n + 2
+    // nr == pread64 && args[3] == 0 -> TRACE, else ALLOW (little-endian words)
+    constexpr std::uint32_t kArg3 = offsetof(seccomp_data, args) + 3 * 8;
+    f.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                         static_cast<std::uint32_t>(kPread), 0, 4));
+    f.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, kArg3));
+    f.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 2));
+    f.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, kArg3 + 4));
+    f.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 1, 0));
+    f.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));  // 7 + n + kPre
+    f.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE));  // + 1
+    f.push_back(BPF_STMT(BPF_RET | BPF_K, kEnosys));            // + 2
 
     sock_fprog prog{
         static_cast<unsigned short>(f.size()),

@@ -277,9 +277,13 @@ public:
     // TIOCSCTTY: make pty slave `n` the ctty of `pid`'s session.
     void set_ctty(std::int32_t pid, std::int32_t n) {
         const std::int32_t leader = sid_of(pid);
-        auto& l = procs_[leader];
-        if (l.pid == 0) l.pid = leader;
-        l.ctty = n;
+        // the inherited session's leader is outside the guest; recording the
+        // tty on it made a fake process at that pid show up in /proc
+        if (leader != kInheritedPgid) {
+            auto& l = procs_[leader];
+            if (l.pid == 0) l.pid = leader;
+            l.ctty = n;
+        }
         // Record it on the caller too, so a caller that is not (yet) the
         // leader still sees its own claim.
         auto& p = procs_[pid];

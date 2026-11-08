@@ -516,6 +516,11 @@ int main(int argc, char** argv) {
 #endif
         spec.release = "6.6.0-linuxity";
         spec.nodename = "linuxity";
+        // the guest runs on the host's hardware, so show it (LINUXITY_SYNTH_HW=1
+        // keeps the fixed virtual machine)
+        spec.host_hw = !std::getenv("LINUXITY_SYNTH_HW");
+        if (!root.empty())
+            if (char* rp = ::realpath(root.c_str(), nullptr)) { spec.root_host = rp; std::free(rp); }
         // On arm64 the guest's /proc/cpuinfo "Features" must be the HOST's.
         // The guest executes natively, so libgcrypt (and anything else that
         // picks an instruction path from this line) will run what it reads: a
@@ -639,7 +644,7 @@ int main(int argc, char** argv) {
         k.files().mount_virtual("/sys", vfs::make_sysfs(k.machine()));
         k.files().mount_virtual("/dev", vfs::make_devfs(
             [&k] { return k.procs().ctty_of(k.files().current_pid()); },
-            shm_dir));
+            shm_dir, k.machine().host_hw));
     } else {
         // No rootfs: the guest lives in the real host tree (paths translate
         // 1:1), but /proc and /sys are STILL synthesized so uname/pid/mounts
@@ -649,7 +654,7 @@ int main(int argc, char** argv) {
         k.files().mount_virtual("/sys", vfs::make_sysfs(k.machine()));
         k.files().mount_virtual("/dev", vfs::make_devfs(
             [&k] { return k.procs().ctty_of(k.files().current_pid()); },
-            shm_dir));
+            shm_dir, k.machine().host_hw));
     }
 
     // Private /tmp (see `private_tmp` above). Registered BEFORE --bind so an

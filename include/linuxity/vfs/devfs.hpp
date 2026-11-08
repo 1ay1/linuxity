@@ -48,8 +48,9 @@ namespace lx::vfs {
 // the simple case where the guest inherited the host's own terminal.
 [[nodiscard]] inline kernel::FileNamespace::Producer make_devfs(
     std::function<int()> ctty = nullptr,
-    std::string shm_dir = "/dev/shm") {
-    return [ctty = std::move(ctty), shm = std::move(shm_dir)]
+    std::string shm_dir = "/dev/shm",
+    bool host_hw = false) {
+    return [ctty = std::move(ctty), shm = std::move(shm_dir), host_hw]
            (std::string_view abs) -> Result<kernel::VirtualFile> {
         // The character devices we pass straight through to the host. Each is
         // a genuine host device node with the exact semantics the guest wants.
@@ -77,6 +78,22 @@ namespace lx::vfs {
                 }
             return std::string{};
         };
+        // GPU and disk nodes, when the guest is shown the host's hardware:
+        // nvidia-smi needs /dev/nvidia*, a GPU app /dev/dri, a SMART tool the
+        // disk. Opening one is still the host's call.
+        auto hw_node = [host_hw](std::string_view rel) {
+            if (!host_hw || rel.empty()) return false;
+            const std::string_view top = rel.substr(0, rel.find('/'));
+            static constexpr std::string_view kPre[] = {
+                "nvidia", "dri", "kfd", "nvme", "sd", "mmcblk", "vd"};
+            bool hit = false;
+            for (const auto p : kPre) hit |= top.starts_with(p);
+            if (!hit || rel.find("..") != std::string_view::npos) return false;
+            struct ::stat st{};
+            if (::stat(("/dev/" + std::string{rel}).c_str(), &st) != 0) return false;
+            return S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode) ||
+                   (S_ISDIR(st.st_mode) && (top == "dri" || top.starts_with("nvidia")));
+        };
         // The pseudo-symlinks a POSIX /dev provides, pointing into /proc. All
         // four are real symlinks (lstat says S_IFLNK, readlink gives the
         // /proc path); opening one follows the link to the guest's own fd,
@@ -97,6 +114,15 @@ namespace lx::vfs {
             for (auto& l : kLinks) vf.entries.push_back({std::string{l.name}, false});
             for (auto n : kHostDev)
                 if (host_dev_ok(n)) vf.entries.push_back({std::string{n}, false});
+            if (host_hw)
+                if (DIR* d = ::opendir("/dev")) {
+                    while (const dirent* de = ::readdir(d)) {
+                        const std::string_view n{de->d_name};
+                        if (n.find('/') == std::string_view::npos && hw_node(n))
+                            vf.entries.push_back({std::string{n}, de->d_type == DT_DIR});
+                    }
+                    ::closedir(d);
+                }
             // Common subdirs programs probe; empty is fine (getdents enumerates
             // nothing, but the dir exists so opendir/stat succeed).
             vf.entries.push_back({"shm", true});
@@ -173,6 +199,11 @@ namespace lx::vfs {
                 vf.redirect_host = std::string{"/dev/"} + std::string{n};
                 return ok(std::move(vf));
             }
+        }
+        if (hw_node(abs.substr(5))) {
+            kernel::VirtualFile vf;
+            vf.redirect_host = std::string{abs};
+            return ok(std::move(vf));
         }
 
         // A pseudo-symlink / redirect into /proc.

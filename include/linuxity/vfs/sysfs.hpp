@@ -23,12 +23,18 @@
 // Values are steady + plausible so tools render a coherent machine: one
 // virtual socket with `Ncpu` cores, a single hwmon reporting a mild CPU temp,
 // and one virtual block device.
+//
+// With MachineSpec::host_hw the host's own /sys is shown wherever the host
+// lets us read it (sensors, battery, disks, GPU, network), and the tree above
+// fills the gaps. The cpu, node, memory, cgroup and kernel subtrees stay ours
+// so they agree with ncpu and the resource limits.
 #pragma once
 
 #include "linuxity/kernel/file_namespace.hpp"
 #include "linuxity/kernel/machine.hpp"
 
 #include <dirent.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -46,6 +52,7 @@ namespace sysfs_detail {
 
 using kernel::VirtualFile;
 using kernel::VirtualDirent;
+using kernel::DType;
 
 inline VirtualFile text(std::string s) {
     VirtualFile vf;
@@ -190,6 +197,36 @@ inline Result<VirtualFile> cpu_cache(long cpu, std::string_view rel, long ncpu) 
 
 namespace sysfs_detail {
 
+// Can the guest use the host's node at this path? A directory must list and a
+// file must open: Android shows /sys/class/thermal but SELinux refuses it, and
+// then the synthesized node is the better answer.
+inline bool host_node_ok(const std::string& p) {
+    struct ::stat st{};
+    if (::stat(p.c_str(), &st) != 0) return false;
+    if (S_ISDIR(st.st_mode)) {
+        DIR* d = ::opendir(p.c_str());
+        if (!d) return false;
+        ::closedir(d);
+        return true;
+    }
+    return ::access(p.c_str(), R_OK) == 0 || ::access(p.c_str(), W_OK) == 0;
+}
+
+// Add the host directory's entries to `e`, the host's winning on a clash.
+inline void host_entries(const std::string& p, std::vector<VirtualDirent>& e) {
+    DIR* d = ::opendir(p.c_str());
+    if (!d) return;
+    while (const dirent* de = ::readdir(d)) {
+        const std::string_view n{de->d_name};
+        if (n == "." || n == "..") continue;
+        const DType t = de->d_type == DT_DIR ? DType::dir
+                      : de->d_type == DT_LNK ? DType::symlink : DType::regular;
+        std::erase_if(e, [&](const VirtualDirent& x) { return x.name == n; });
+        e.push_back({std::string{n}, t});
+    }
+    ::closedir(d);
+}
+
 inline long read_long(const char* p) {
     std::FILE* f = std::fopen(p, "re");
     if (!f) return -1;
@@ -246,7 +283,7 @@ inline long cpu_temp_mc() {
 // /proc. One physical package, `ncpu` cores, no SMT.
 [[nodiscard]] inline kernel::FileNamespace::Producer
 make_sysfs(const kernel::MachineSpec& mach) {
-    return [&mach](std::string_view abs) -> Result<kernel::VirtualFile> {
+    auto synth = [&mach](std::string_view abs) -> Result<kernel::VirtualFile> {
         using namespace sysfs_detail;
         const long ncpu = mach.ncpu < 1 ? 1 : mach.ncpu;
         const long khz  = mach.cpu_khz();
@@ -625,6 +662,37 @@ make_sysfs(const kernel::MachineSpec& mach) {
             return D({});
 
         return err<kernel::VirtualFile>(Errno::enoent);
+    };
+    return [&mach, synth](std::string_view abs) -> Result<kernel::VirtualFile> {
+        using namespace sysfs_detail;
+        if (!mach.host_hw) return synth(abs);
+        const std::string hp{abs};
+        // Trees we own: they must agree with ncpu and the resource limits. The
+        // host fills in only what we don't synthesize.
+        for (const std::string_view own : {"/sys/devices/system/cpu", "/sys/devices/system/node",
+                                           "/sys/devices/system/memory", "/sys/fs/cgroup",
+                                           "/sys/kernel"})
+            if (abs == own || (abs.starts_with(own) && abs[own.size()] == '/')) {
+                auto r = synth(abs);
+                if (r || r.error() != Errno::enoent) return r;
+                if (host_node_ok(hp)) { VirtualFile vf; vf.redirect_host = hp; return ok(std::move(vf)); }
+                return r;
+            }
+        // Top-level dirs list both, so a synthesized fallback child shows up.
+        for (const std::string_view top : {"/sys", "/sys/class", "/sys/devices",
+                                           "/sys/devices/system", "/sys/devices/virtual"})
+            if (abs == top) {
+                auto r = synth(abs);
+                std::vector<VirtualDirent> e = r && r->is_dir ? r->entries : std::vector<VirtualDirent>{};
+                host_entries(hp, e);
+                return ok(dir(std::move(e)));
+            }
+        if (host_node_ok(hp)) {
+            VirtualFile vf;
+            vf.redirect_host = hp;
+            return ok(std::move(vf));
+        }
+        return synth(abs);
     };
 }
 

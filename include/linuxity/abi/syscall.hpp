@@ -465,6 +465,13 @@ public:
                     ds->byte_off = cur;
                     return val(static_cast<std::int64_t>(ds->byte_off));
                 }
+                if (r.arg[1] == 0 && r.arg[2] == 0) refresh_virtual_fd(fd);
+                return fwd();
+            }
+            // pread at offset 0 (the filter only traps that offset) rereads
+            // a kept-open /proc file, which the kernel regenerates.
+            case Sysno::pread64: {
+                if (r.arg[3] == 0) refresh_virtual_fd(static_cast<int>(r.arg[0]));
                 return fwd();
             }
 
@@ -1926,7 +1933,7 @@ private:
             // empty directory so O_DIRECTORY opens succeed).
             pending_dir_ = vf->is_dir;
             pending_entries_ = std::move(vf->entries);
-            return Inject{path_arg, std::move(vf->bytes), vf->is_dir};
+            return Inject{path_arg, std::move(vf->bytes), vf->is_dir, for_write};
         }
         return eno(pc.error);
     }
@@ -2440,8 +2447,12 @@ private:
                         if (fd >= 0) {
                             std::string_view gp =
                                 k_.files().path_of_fd(fd);
-                            if (!gp.empty())
-                                return std::string{gp} + (host_fd_deleted(fd) ? " (deleted)" : "");
+                            if (!gp.empty()) {
+                                // a synthesized file's temp is unlinked on open
+                                const bool virt = k_.files().classify(std::string{gp}).realm ==
+                                                  kernel::Realm2::virtual_file;
+                                return std::string{gp} + (!virt && host_fd_deleted(fd) ? " (deleted)" : "");
+                            }
                         }
                     }
                 }
@@ -6386,6 +6397,38 @@ public:
             std::snprintf(link, sizeof link, "/proc/%d/fd/%d",
                           mem_.host_tid(), fd);
             return ::open(link, O_RDONLY | O_CLOEXEC);
+        }
+    }
+
+    // A synthesized file is a snapshot taken at open. Rereading it from offset
+    // 0 should give fresh contents, as the kernel's seq_file does, so produce
+    // it again and rewrite the temp behind the guest's fd. Monitors keep
+    // /proc/<pid>/stat open and pread it every tick.
+    void refresh_virtual_fd(int fd) {
+        if constexpr (requires { mem_.host_tid(); }) {
+            const std::string gp{k_.files().path_of_fd(fd)};
+            if (gp.empty() || k_.files().is_virtual_dir_fd(fd)) return;
+            const auto pc = k_.files().classify(gp);
+            if (pc.realm != kernel::Realm2::virtual_file) return;
+            const std::string& vp = pc.virtual_path.empty() ? gp : pc.virtual_path;
+            auto vf = k_.files().produce(vp);
+            if (!vf || vf->is_dir || !vf->redirect_host.empty() || !vf->symlink_target.empty())
+                return;
+            char link[64];
+            std::snprintf(link, sizeof link, "/proc/%d/fd/%d", mem_.host_tid(), fd);
+            const int w = ::open(link, O_WRONLY | O_CLOEXEC);
+            if (w < 0) return;
+            std::size_t off = 0;
+            while (off < vf->bytes.size()) {
+                const auto n = ::pwrite(w, vf->bytes.data() + off, vf->bytes.size() - off,
+                                        static_cast<off_t>(off));
+                if (n <= 0) break;
+                off += static_cast<std::size_t>(n);
+            }
+            if (off == vf->bytes.size()) (void)::ftruncate(w, static_cast<off_t>(off));
+            ::close(w);
+        } else {
+            (void)fd;
         }
     }
 

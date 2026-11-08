@@ -147,6 +147,15 @@ public:
                     std::string tmp = in.is_dir ? materialize_dir()
                                                 : materialize(in.content);
                     auto fdr = trap_.redirect(in.path_arg, tmp);
+#if defined(__linux__)
+                    // ptrace's redirect has run the open by now, so the fd
+                    // holds the inode and the name can go. Keeping it leaked
+                    // one temp per /proc read until exit, and forever on a kill.
+                    if (!tmp.empty() && !in.keep_name) {
+                        if (in.is_dir) ::rmdir(tmp.c_str()); else ::unlink(tmp.c_str());
+                        tmp.clear();
+                    }
+#endif
                     if (!fdr) return recover(fdr.error());
                     if (!tmp.empty()) temps_.push_back(std::move(tmp));
                     locked([&] { sys.note_opened_fd(*fdr); });
