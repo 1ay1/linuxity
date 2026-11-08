@@ -85,14 +85,14 @@ namespace lx::vfs {
             if (!host_hw || rel.empty()) return false;
             const std::string_view top = rel.substr(0, rel.find('/'));
             static constexpr std::string_view kPre[] = {
-                "nvidia", "dri", "kfd", "nvme", "sd", "mmcblk", "vd"};
+                "nvidia", "dri", "kfd", "nvme", "sd", "mmcblk", "vd", "bus"};
             bool hit = false;
             for (const auto p : kPre) hit |= top.starts_with(p);
             if (!hit || rel.find("..") != std::string_view::npos) return false;
             struct ::stat st{};
             if (::stat(("/dev/" + std::string{rel}).c_str(), &st) != 0) return false;
             return S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode) ||
-                   (S_ISDIR(st.st_mode) && (top == "dri" || top.starts_with("nvidia")));
+                   (S_ISDIR(st.st_mode) && (top == "dri" || top == "bus" || top.starts_with("nvidia")));
         };
         // The pseudo-symlinks a POSIX /dev provides, pointing into /proc. All
         // four are real symlinks (lstat says S_IFLNK, readlink gives the

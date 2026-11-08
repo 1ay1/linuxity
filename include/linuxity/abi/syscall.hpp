@@ -1994,7 +1994,7 @@ private:
             if (pc.realm == kernel::Realm2::virtual_file) {
                 const std::string& vp = pc.virtual_path.empty() ? gp : pc.virtual_path;
                 if (auto vf = k_.files().produce(vp); vf && vf->redirect_host.empty())
-                    return statx ? write_statx(buf, vf->is_dir, vf->bytes.size())
+                    return statx ? write_statx(buf, vf->is_dir, vf->bytes.size(), false, gp)
                                  : write_statbuf(buf, vf->is_dir, vf->bytes.size());
             }
         }
@@ -2032,7 +2032,7 @@ private:
                         h.mode = f->mode;
                     }
             }
-            const Outcome out = statx ? write_statx(buf, h) : write_statbuf(buf, h);
+            const Outcome out = statx ? write_statx(buf, h, gp) : write_statbuf(buf, h);
             // owner: root, or what the guest chown/chmod'd on this path
             scrub_ids(Scrub{statx ? Scrub::Layout::statx : Scrub::Layout::stat, buf, gp});
             return out;
@@ -2168,7 +2168,7 @@ private:
         auto pc = k_.files().classify(abs, /*for_write=*/false, /*follow=*/!nofollow);
         if (pc.realm == kernel::Realm2::host_backed) {
             if (auto fast = fast_stat(pc.host_path, abs))
-                return write_statx(uaddr(r.arg[4]), *fast);
+                return write_statx(uaddr(r.arg[4]), *fast, abs);
             return Redirect{PathArg{1, std::move(pc.host_path)}}
                 .with(Scrub{Scrub::Layout::statx, uaddr(r.arg[4]), abs});
         }
@@ -2195,7 +2195,7 @@ private:
             }
             if (!vf) return eno(vf.error());
             return write_statx(uaddr(r.arg[4]), vf->is_dir, vf->bytes.size(),
-                               !vf->symlink_target.empty());
+                               !vf->symlink_target.empty(), abs);
         }
         return eno(pc.error);
     }
@@ -4368,8 +4368,8 @@ private:
     // Synthesize a `struct statx` (the flat, versioned stat the kernel fills
     // for statx(2)) for a virtual node into the guest buffer.
     [[nodiscard]] Outcome write_statx(UAddr buf, bool is_dir, std::uint64_t size,
-                                      bool is_link = false) {
-        return write_statx(buf, synth_hstat(is_dir, size, is_link));
+                                      bool is_link = false, std::string_view guest = {}) {
+        return write_statx(buf, synth_hstat(is_dir, size, is_link), guest);
     }
 
     // The HStat a VIRTUAL node implies. Built once, here, so the synthesized
@@ -4389,7 +4389,8 @@ private:
     }
 
     // The HStat form: a REAL host file. See write_statbuf's overload.
-    [[nodiscard]] Outcome write_statx(UAddr buf, const wire::StatFields& h) {
+    [[nodiscard]] Outcome write_statx(UAddr buf, const wire::StatFields& h,
+                                      std::string_view guest = {}) {
         struct Statx {
             std::uint32_t stx_mask, stx_blksize;
             std::uint64_t stx_attributes;
@@ -4438,6 +4439,18 @@ private:
         sx.stx_rdev_minor = minor_of(h.rdev);
         sx.stx_dev_major  = major_of(h.dev);
         sx.stx_dev_minor  = minor_of(h.dev);
+        // Mount id and mount-root, from our mount table. systemd's path walk
+        // (libudev, so lsusb) demands STATX_MNT_ID back and gave up at "/"
+        // when the mask lacked it.
+        if (!guest.empty()) {
+            const auto mo = k_.files().mount_of(guest);
+            constexpr std::uint32_t kMntId = 0x1000, kMntIdUnique = 0x4000;
+            constexpr std::uint64_t kMountRoot = 0x2000;
+            sx.stx_mask |= kMntId | kMntIdUnique;
+            sx.stx_mnt_id = mo.id;
+            sx.stx_attributes_mask |= kMountRoot;
+            if (mo.root) sx.stx_attributes |= kMountRoot;
+        }
         if (!mem_.copy_out(buf, {reinterpret_cast<const std::byte*>(&sx), sizeof sx}))
             return eno(Errno::efault);
         return val(0);

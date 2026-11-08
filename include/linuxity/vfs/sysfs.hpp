@@ -402,6 +402,23 @@ make_sysfs(const kernel::MachineSpec& mach) {
                         return D({{"topology",true},{"cache",true},
                                  {"cpufreq",true},{"online",false}});
                     if (tail == "online") return T("1\n");
+                    // The real SMT and cluster layout, when the guest sees
+                    // every host CPU (a --cpus limit keeps the flat one).
+                    if (mach.host_hw && ncpu == ::sysconf(_SC_NPROCESSORS_ONLN) &&
+                        tail.starts_with("topology")) {
+                        const std::string hp = "/sys/devices/system/cpu/cpu" +
+                                               std::to_string(cpu) + "/" + std::string{tail};
+                        if (host_node_ok(hp)) {
+                            if (tail == "topology") {
+                                std::vector<VirtualDirent> e;
+                                host_entries(hp, e);
+                                return ok(dir(std::move(e)));
+                            }
+                            VirtualFile vf;
+                            vf.redirect_host = hp;
+                            return ok(std::move(vf));
+                        }
+                    }
                     if (tail == "topology")
                         return D({{"core_id",false},{"physical_package_id",false},
                                  {"cluster_id",false},{"die_id",false},
@@ -691,6 +708,18 @@ make_sysfs(const kernel::MachineSpec& mach) {
             VirtualFile vf;
             vf.redirect_host = hp;
             return ok(std::move(vf));
+        }
+        // Below a device the host shows, its answer is final: falling back
+        // made a fake hwmon0/temp1_label appear next to the real hwmon0. Not
+        // for /sys/class/<x> itself, where our fallback fills a hidden class.
+        {
+            const std::string parent = hp.substr(0, hp.rfind('/'));
+            const auto depth = std::count(parent.begin(), parent.end(), '/');
+            if (depth >= 3 && host_node_ok(parent)) {
+                struct ::stat st{};
+                if (::stat(parent.c_str(), &st) == 0 && S_ISDIR(st.st_mode))
+                    return err<VirtualFile>(Errno::enoent);
+            }
         }
         return synth(abs);
     };

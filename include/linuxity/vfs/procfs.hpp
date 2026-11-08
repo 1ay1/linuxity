@@ -509,7 +509,34 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                                   "kallsyms","kmsg","self","sys","net","sysvipc"})
                 e.push_back({f, std::string_view{f} == "sys" || std::string_view{f} == "net" ||
                                 std::string_view{f} == "sysvipc"});
+            for (const char* d : {"pressure", "driver"})
+                if ((mach.host_hw || d[0] == 'p') &&
+                    ::access((std::string{"/proc/"} + d).c_str(), F_OK) == 0)
+                    e.push_back({d, true});
             return ok(dir_file(std::move(e)));
+        }
+        // PSI: the host's own files. A file the host lists but hides (Android
+        // shows io and refuses cpu and memory) still redirects, so the open
+        // fails with the host's EACCES rather than a made-up ENOENT.
+        if (abs == "/proc/pressure" || abs.starts_with("/proc/pressure/")) {
+            std::vector<kernel::VirtualDirent> e;
+            bool listed = false;
+            if (DIR* d = ::opendir("/proc/pressure")) {
+                listed = true;
+                while (const dirent* de = ::readdir(d))
+                    if (de->d_name[0] != '.') e.push_back({de->d_name, false});
+                ::closedir(d);
+            }
+            if (!listed) return err<kernel::VirtualFile>(Errno::enoent);
+            if (abs == "/proc/pressure") return ok(dir_file(std::move(e)));
+            const std::string_view leaf = abs.substr(15);
+            for (const auto& x : e)
+                if (x.name == leaf) {
+                    kernel::VirtualFile vf;
+                    vf.redirect_host = std::string{abs};
+                    return ok(std::move(vf));
+                }
+            return err<kernel::VirtualFile>(Errno::enoent);
         }
 
         // ---- system-wide files ------------------------------------------
@@ -735,8 +762,7 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
         }
         // Hardware the guest really runs on: the host's own files, live.
         for (const char* f : {"/proc/interrupts", "/proc/softirqs", "/proc/modules",
-                              "/proc/kallsyms", "/proc/pressure/cpu",
-                              "/proc/pressure/memory", "/proc/pressure/io"})
+                              "/proc/kallsyms"})
             if (abs == f)
                 if (auto vf = host_redirect(f)) return ok(std::move(*vf));
         // the host hides its symbols: no symbols, like kptr_restrict on a

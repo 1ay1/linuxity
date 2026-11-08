@@ -490,9 +490,21 @@ public:
             // A device node backed by a real host device (/dev/null, ...):
             // resolve to the host path so open/read/write/mmap ride the true
             // character device with native semantics.
-            if (!vf->redirect_host.empty())
+            if (!vf->redirect_host.empty()) {
+                // /sys/class/hwmon/hwmon4 is a host symlink into /sys/devices;
+                // a following lookup lands on its target, kept inside /sys or
+                // /dev so a redirect can't lead the guest elsewhere. Never for
+                // /proc: /proc/self there is linuxity, not the guest.
+                if (follow && (vf->redirect_host.starts_with("/sys/") ||
+                               vf->redirect_host.starts_with("/dev/")))
+                    if (char* rp = ::realpath(vf->redirect_host.c_str(), nullptr)) {
+                        const std::string_view r{rp};
+                        if (r.starts_with("/sys/") || r.starts_with("/dev/")) vf->redirect_host = rp;
+                        std::free(rp);
+                    }
                 return PathClass{Realm2::host_backed,
                                  std::move(vf->redirect_host), Errno::enoent, {}};
+            }
             return PathClass{Realm2::virtual_file, {}, Errno::enoent,
                              std::string{abs}};
         }
@@ -848,6 +860,16 @@ public:
     }
     [[nodiscard]] bool is_virtual_dir_fd(int fd) const {
         return fds().dirs.count(fd) != 0;
+    }
+    // statx's stx_mnt_id for a guest path: which of OUR mounts holds it,
+    // and whether the path is that mount's root (STATX_ATTR_MOUNT_ROOT).
+    // Path walkers (systemd's chase, so libudev and lsusb) need both.
+    struct MountOf { std::uint64_t id{0}; bool root{false}; };
+    [[nodiscard]] MountOf mount_of(std::string_view abs) const {
+        const Mount* m = deepest(abs);
+        if (!m) return {};
+        const auto idx = static_cast<std::uint64_t>(m - mounts_.data());
+        return {idx + 21, abs == m->prefix};
     }
     [[nodiscard]] DirStream* dir_stream(int fd) {
         auto& dirs = fds().dirs;
