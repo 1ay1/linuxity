@@ -41,6 +41,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <map>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -273,6 +275,59 @@ inline long cpu_temp_mc() {
     if (const long b = read_long("/sys/class/power_supply/battery/temp"); b > 0)
         return b * 100 + static_cast<long>(smoothed_load() * 40000.0) + 3000;
     return 42000;
+}
+
+// Android hides /sys/class/thermal from apps and adb, but its thermal HAL
+// answers `dumpsys thermalservice` for the shell user: every zone (skin, TPU,
+// battery, modem...) and its throttling thresholds. Read it at most once a
+// second; empty off Android or when the service refuses.
+struct HalZone { std::string name; long mc; long hot_mc; };
+inline std::vector<HalZone> android_zones() {
+    static std::vector<HalZone> cache;
+    static std::chrono::steady_clock::time_point at{};
+    static const bool have = ::access("/system/bin/dumpsys", X_OK) == 0;
+    if (!have) return {};
+    const auto now = std::chrono::steady_clock::now();
+    if (at.time_since_epoch().count() && now - at < std::chrono::seconds(1)) return cache;
+    at = now;
+    std::vector<HalZone> z;
+    std::map<std::string, long> hot;
+    if (std::FILE* p = ::popen("/system/bin/dumpsys thermalservice 2>/dev/null", "re")) {
+        char line[512];
+        bool cur = false;
+        while (std::fgets(line, sizeof line, p)) {
+            const std::string_view l{line};
+            if (l.starts_with("Current temperatures from HAL")) { cur = true; continue; }
+            if (cur && !l.starts_with("\t")) cur = false;
+            char name[128] = {};
+            double v = 0;
+            if (cur && std::sscanf(line, " Temperature{mValue=%lf, mType=%*d, mName=%127[^,]", &v, name) == 2) {
+                // a HAL reports an unwired sensor as a nonsense value
+                if (v > -40 && v < 150 && v != 0.0)
+                    z.push_back({name, static_cast<long>(v * 1000.0), 0});
+                continue;
+            }
+            // first finite hot throttling threshold, the "high" mark
+            if (std::sscanf(line, " TemperatureThreshold{mType=%*d, mName=%127[^,]", name) == 1) {
+                const char* h = std::strstr(line, "mHotThrottlingThresholds=[");
+                if (!h) continue;
+                h += 26;
+                while (*h && *h != ']') {
+                    char* e = nullptr;
+                    const double t = std::strtod(h, &e);
+                    if (e == h) { while (*h && *h != ',' && *h != ']') ++h; }
+                    else { if (t == t) { hot[name] = static_cast<long>(t * 1000.0); break; } h = e; }
+                    if (*h == ',') ++h;
+                    while (*h == ' ') ++h;
+                }
+            }
+        }
+        ::pclose(p);
+    }
+    for (auto& x : z)
+        if (auto it = hot.find(x.name); it != hot.end()) x.hot_mc = it->second;
+    cache = std::move(z);
+    return cache;
 }
 
 } // namespace sysfs_detail
@@ -533,8 +588,55 @@ make_sysfs(const kernel::MachineSpec& mach) {
         // One virtual hwmon exposing a CPU package temperature.
         if (abs == "/sys/devices/virtual")
             return D({{"hwmon",true},{"net",true}});
+        // Android's thermal HAL (see android_zones): its real sensors as a
+        // second hwmon, temps labelled by zone, so `sensors` and monitors show
+        // skin, TPU, battery and modem temperatures. Only with host hardware.
+        const auto hal = mach.host_hw ? sysfs_detail::android_zones()
+                                      : std::vector<sysfs_detail::HalZone>{};
+        auto hal_index = [&](std::string_view t, std::string_view pre, std::string_view post) -> long {
+            if (!t.starts_with(pre) || !t.ends_with(post)) return -1;
+            const std::string_view n = t.substr(pre.size(), t.size() - pre.size() - post.size());
+            long i = 0;
+            for (char c : n) { if (c < '0' || c > '9') return -1; i = i * 10 + (c - '0'); }
+            return n.empty() || i < 1 || i > static_cast<long>(hal.size()) ? -1 : i - 1;
+        };
+        for (std::string_view base : {"/sys/devices/virtual/hwmon/hwmon1", "/sys/class/hwmon/hwmon1"}) {
+            if (hal.empty() || !(abs == base || abs.starts_with(std::string{base} + "/"))) continue;
+            if (abs == base) {
+                std::vector<VirtualDirent> e{{"name", false}, {"uevent", false}};
+                for (std::size_t i = 1; i <= hal.size(); ++i)
+                    for (const char* s : {"_input", "_label", "_max"})
+                        e.push_back({"temp" + std::to_string(i) + s, false});
+                return ok(dir(std::move(e)));
+            }
+            const std::string_view t = abs.substr(base.size() + 1);
+            if (t == "name")   return T("android_thermal\n");
+            if (t == "uevent") return T("");
+            if (const long i = hal_index(t, "temp", "_input"); i >= 0)
+                return T(std::to_string(hal[static_cast<std::size_t>(i)].mc) + "\n");
+            if (const long i = hal_index(t, "temp", "_label"); i >= 0)
+                return T(hal[static_cast<std::size_t>(i)].name + "\n");
+            if (const long i = hal_index(t, "temp", "_max"); i >= 0 &&
+                hal[static_cast<std::size_t>(i)].hot_mc > 0)
+                return T(std::to_string(hal[static_cast<std::size_t>(i)].hot_mc) + "\n");
+            return err<kernel::VirtualFile>(Errno::enoent);
+        }
+        if (!hal.empty() && abs.starts_with("/sys/class/thermal/thermal_zone")) {
+            const std::string_view t = abs.substr(31);
+            const auto slash = t.find('/');
+            if (const long i = hal_index(t.substr(0, slash), "", ""); i >= 0) {
+                const auto& z = hal[static_cast<std::size_t>(i)];
+                if (slash == std::string_view::npos)
+                    return D({{"type", false}, {"temp", false}, {"mode", false}});
+                const std::string_view leaf = t.substr(slash + 1);
+                if (leaf == "type") return T(z.name + "\n");
+                if (leaf == "temp") return T(std::to_string(z.mc) + "\n");
+                if (leaf == "mode") return T("enabled\n");
+                return err<kernel::VirtualFile>(Errno::enoent);
+            }
+        }
         if (abs == "/sys/devices/virtual/hwmon")
-            return D({{"hwmon0",true}});
+            return hal.empty() ? D({{"hwmon0",true}}) : D({{"hwmon0",true},{"hwmon1",true}});
         if (abs == "/sys/devices/virtual/hwmon/hwmon0" ||
             abs == "/sys/class/hwmon/hwmon0")
             return D({{"name",false},{"temp1_input",false},{"temp1_label",false},
@@ -573,12 +675,17 @@ make_sysfs(const kernel::MachineSpec& mach) {
             return D({{"hwmon",true},{"power_supply",true},{"net",true},
                      {"block",true},{"thermal",true},{"drm",true},
                      {"backlight",true}});
-        if (abs == "/sys/class/hwmon")        return D({{"hwmon0",true}});
+        if (abs == "/sys/class/hwmon")
+            return hal.empty() ? D({{"hwmon0",true}}) : D({{"hwmon0",true},{"hwmon1",true}});
         if (abs == "/sys/class/power_supply") return D({});     // no battery
         if (abs == "/sys/class/backlight")    return D({});
         if (abs == "/sys/class/drm")          return D({});
-        if (abs == "/sys/class/thermal")
-            return D({{"thermal_zone0",true}});
+        if (abs == "/sys/class/thermal") {
+            std::vector<VirtualDirent> e{{"thermal_zone0", true}};
+            for (std::size_t i = 1; i <= hal.size(); ++i)
+                e.push_back({"thermal_zone" + std::to_string(i), true});
+            return ok(dir(std::move(e)));
+        }
         if (abs == "/sys/class/thermal/thermal_zone0")
             return D({{"type",false},{"temp",false},{"policy",false},{"mode",false},
                       {"trip_point_0_temp",false},{"trip_point_0_type",false},
