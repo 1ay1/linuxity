@@ -155,6 +155,14 @@ public:
                 },
 
                 [&](const abi::Inject& in) {
+                    // openat2's open_how, resolve cleared: our reopen path is
+                    // ours, not the guest's, so RESOLVE_* must not judge it
+                    auto arm_blob = [&] {
+                        if constexpr (requires { trap_.set_arg_blob(0, std::string{}); })
+                            if (in.blob)
+                                trap_.set_arg_blob(in.blob->arg, std::string(
+                                    reinterpret_cast<const char*>(in.blob->bytes.data()), in.blob->bytes.size()));
+                    };
 #if defined(__linux__)
                     // A file: a memfd of ours that the guest's open reopens
                     // through /proc/<us>/fd/N, with exactly the flags it asked
@@ -164,6 +172,7 @@ public:
                         if (const int m = memfd_of(in.content); m >= 0) {
                             const std::string via = "/proc/" + std::to_string(::getpid()) +
                                                     "/fd/" + std::to_string(m);
+                            arm_blob();
                             auto fdr = trap_.redirect(in.path_arg, via);
                             ::close(m);   // the guest's open holds it now
                             if (!fdr) return recover(fdr.error());
@@ -183,6 +192,7 @@ public:
                     // a virtual directory opens the host's twin (/proc, ...):
                     // it exists everywhere and is nothing of ours to clean
                     const std::string& backing = tmp.empty() && in.is_dir ? in.dir_host : tmp;
+                    arm_blob();
                     auto fdr = trap_.redirect(in.path_arg, backing);
 #if defined(__linux__)
                     // ptrace's redirect has run the open by now, so the fd
@@ -225,6 +235,10 @@ public:
                     const int   arg2 = rd.second ? rd.second->arg : -1;
                     const auto& hp2  = rd.second ? rd.second->host_path
                                                  : empty_path();
+                    if constexpr (requires { trap_.set_arg_blob(0, std::string{}); })
+                        if (rd.blob)
+                            trap_.set_arg_blob(rd.blob->arg, std::string(
+                                reinterpret_cast<const char*>(rd.blob->bytes.data()), rd.blob->bytes.size()));
                     if constexpr (requires { trap_.redirect_deferred(0, std::string{}, nullptr); }) {
                         if (rd.may_block && !rd.second && !rd.scrub) {
                             if (rd.make_parents) make_host_parents(rd.first.host_path);

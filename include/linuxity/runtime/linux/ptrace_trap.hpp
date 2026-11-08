@@ -1193,6 +1193,23 @@ public:
     // Run once by the next run_in_guest, with its result, before the task
     // resumes.
     void set_before_resume(std::function<void(std::int64_t)> f) { before_resume_ = std::move(f); }
+    // Bytes the NEXT redirect hands the host through pointer arg `arg`
+    // (openat2's open_how with resolve cleared). One-shot.
+    void set_arg_blob(int arg, std::string bytes) { blob_arg_ = arg; blob_ = std::move(bytes); }
+
+    // Poke the pending blob below `floor` and point its arg at it. Returns
+    // the guest's own pointer for that arg, or nothing if there was no blob.
+    [[nodiscard]] std::optional<std::pair<int, std::uint64_t>> place_blob(Regs& r, std::uint64_t floor) {
+        if (blob_arg_ < 0) return std::nullopt;
+        const int arg = std::exchange(blob_arg_, -1);
+        const std::string bytes = std::exchange(blob_, {});
+        const std::uint64_t at = (floor - 256 - bytes.size() - 1) & ~std::uint64_t{15};
+        if (!poke_path(at, bytes, /*dead_scratch=*/true)) return std::nullopt;
+        const std::uint64_t old = r.arg(arg);
+        set_arg(r, arg, at);
+        return std::pair{arg, old};
+    }
+    void drop_blob() noexcept { blob_arg_ = -1; blob_.clear(); }
 
     [[nodiscard]] Status wait_then_retry(std::int64_t ns) {
         Task& t = tasks_[cur_];
@@ -1264,6 +1281,7 @@ public:
         std::uint64_t scratch =
             (t.regs.sp() - 256 - need) & ~std::uint64_t{15};
         if (!poke_path(scratch, host_path, /*dead_scratch=*/true)) {
+            drop_blob();
             // The path could not be written into this task's memory at all
             // (PTRACE_POKEDATA -> EIO and process_vm_writev -> EPERM). This
             // happens for a DAEMONIZED guest task: gpg spawns gpg-agent, which
@@ -1290,14 +1308,19 @@ public:
         // in a distinct, non-overlapping scratch slot below the first and
         // rewrite its register too. Both operands are then translated before
         // the kernel runs the single syscall.
+        std::uint64_t lowest = scratch;
         if (path_arg2 >= 0 && !host_path2.empty()) {
             std::size_t need2 = host_path2.size() + 1;
             std::uint64_t scratch2 =
                 (scratch - 256 - need2) & ~std::uint64_t{15};
-            if (!poke_path(scratch2, host_path2, /*dead_scratch=*/true))
+            if (!poke_path(scratch2, host_path2, /*dead_scratch=*/true)) {
+                drop_blob();
                 return err<std::int64_t>(Errno::efault);
+            }
             set_arg(r, path_arg2, scratch2);
+            lowest = scratch2;
         }
+        (void)place_blob(r, lowest);
         (void)r.store(cur_);
         if (!step_to_exit(cur_)) return ok(std::int64_t{-1});   // task exited
         Regs rr{};
@@ -1325,15 +1348,18 @@ public:
         Regs r = t.regs;
         const std::size_t need = host_path.size() + 1;
         const std::uint64_t scratch = (t.regs.sp() - 256 - need) & ~std::uint64_t{15};
+        std::optional<std::pair<int, std::uint64_t>> blob;
         if (poke_path(scratch, host_path, /*dead_scratch=*/true)) {
             set_arg(r, path_arg, scratch);
+            blob = place_blob(r, scratch);
             (void)r.store(cur_);
         } else {
+            drop_blob();
             (void)t.regs.store(cur_);   // same fallback as redirect()
         }
         t.action = Action::none;
         const std::uint64_t guest_ptr = t.regs.arg(path_arg);
-        t.on_exit = [w = cur_, path_arg, guest_ptr,
+        t.on_exit = [w = cur_, path_arg, guest_ptr, blob,
                      fn = std::move(on_exit)](std::int64_t ret) {
             // -ERESTART*: the kernel re-runs the call with these registers,
             // and a signal handler may overwrite the scratch path on the
@@ -1342,6 +1368,7 @@ public:
                 Regs now{};
                 if (Regs::fetch(w, now)) {
                     set_arg(now, path_arg, guest_ptr);
+                    if (blob) set_arg(now, blob->first, blob->second);
                     (void)now.store(w);
                 }
             }
@@ -2742,6 +2769,8 @@ private:
     std::chrono::steady_clock::time_point drain_deadline_{};
     bool host_pids_{false};        // --host-pids: guest pids are host pids
     std::function<void(std::int64_t)> before_resume_{};
+    int blob_arg_{-1};             // set_arg_blob: pending for the next redirect
+    std::string blob_{};
     bool seccomp_{false};          // trap filter active -> drive with PTRACE_CONT
     int base_opts_{0};             // linuxity's own ptrace options on every task
     std::unordered_map<::pid_t, Task> tasks_;

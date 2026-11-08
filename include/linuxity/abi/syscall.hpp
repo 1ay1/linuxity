@@ -603,8 +603,11 @@ public:
             //    classic mount(2) + the procfs mount views we serve.
             case Sysno::fsopen:        case Sysno::fsconfig:
             case Sysno::fsmount:       case Sysno::move_mount:
-            case Sysno::open_tree:     case Sysno::mount_setattr:
+            case Sysno::open_tree:
             case Sysno::statmount:     case Sysno::listmount:
+                return eno(Errno::enosys);
+            case Sysno::mount_setattr:
+                return do_mount_setattr(r);
             // fspick takes a PATH, so refusing it here (rather than letting it
             // fall through to the host) is what keeps that path inside our
             // namespace. It was neither trapped nor handled before.
@@ -649,8 +652,8 @@ public:
                 // name or ignored entirely. Accepting a bind from a missing
                 // directory tells the guest its tree is in two places when
                 // it is in neither.
-                constexpr std::uint64_t kMsBind = 0x1000;
-                if (r.arg[3] & kMsBind) {
+                constexpr std::uint64_t kMsBind = 0x1000, kMsRemount = 0x20;
+                if ((r.arg[3] & kMsBind) && !(r.arg[3] & kMsRemount)) {
                     const std::string src = read_cstr(uaddr(r.arg[0]));
                     if (!src.empty()) {
                         const auto pc = k_.files().classify(
@@ -676,22 +679,7 @@ public:
                 if (const std::string tgt = read_cstr(uaddr(r.arg[1])); !tgt.empty()) {
                     const std::string abs_tgt = k_.files().absolutize(tgt, k_.files().cwd());
                     const auto mns = me().ns.id[static_cast<int>(kernel::NsKind::mnt)];
-                    if (mns && !(r.arg[3] & 0x20 /*MS_REMOUNT*/) && !(r.arg[3] & 0x40000 /*MS_PRIVATE*/) &&
-                        !(r.arg[3] & 0x80000 /*MS_SLAVE*/) && !(r.arg[3] & 0x100000 /*MS_SHARED*/)) {
-                        std::string host_dir;
-                        if (r.arg[3] & kMsBind) {
-                            const auto pc = k_.files().classify(
-                                k_.files().absolutize(read_cstr(uaddr(r.arg[0])), k_.files().cwd()));
-                            if (pc.realm == kernel::Realm2::host_backed) host_dir = pc.host_path;
-                        } else if (type == "tmpfs" || type == "ramfs") {
-                            char tmpl[] = "/tmp/linuxity-tmpfs-XXXXXX";
-                            if (::mkdtemp(tmpl)) host_dir = tmpl;
-                        }
-                        if (!host_dir.empty()) {
-                            k_.files().mount_guest(abs_tgt, host_dir, mns);
-                            return val(0);
-                        }
-                    }
+                    if (mns) return mount_in_ns(r, type, abs_tgt, mns);
                     guest_mounts_.insert(abs_tgt);
                 }
                 return val(0);
@@ -705,7 +693,12 @@ public:
                 const std::string tgt =
                     k_.files().absolutize(raw, k_.files().cwd());
                 const auto mns = me().ns.id[static_cast<int>(kernel::NsKind::mnt)];
-                if (mns && k_.files().umount_guest(tgt, mns)) return val(0);
+                if (mns) {
+                    const bool detach = r.arg[1] & 0x2;   // MNT_DETACH
+                    const Errno e = k_.files().umount_guest(tgt, mns, detach);
+                    if (e == Errno::ok) return val(0);
+                    if (e == Errno::ebusy) return eno(e);
+                }
                 if (!guest_mounts_.erase(tgt) &&
                     !k_.files().is_mount_point(tgt))
                     return eno(Errno::einval);
@@ -720,6 +713,7 @@ public:
             //    cleanly the way the real kernel would for an unprivileged or
             //    unsupported caller.
             case Sysno::pivot_root:
+                return do_pivot_root(r);
             case Sysno::swapon:
             case Sysno::swapoff:
             case Sysno::acct:
@@ -984,6 +978,96 @@ private:
     // a program that mounts and then unmounts its own scratch tree should
     // not get EINVAL. Only the targets are kept; nothing is really mounted.
     std::set<std::string> guest_mounts_;
+
+    // mount(2) in a mount namespace of the guest's own: changes our mount
+    // table, seen only there. tmpfs is a fresh scratch dir, proc/sysfs/devpts
+    // a copy of ours, a bind copies the mount holding its source.
+    [[nodiscard]] Outcome mount_in_ns(const Regs& r, const std::string& type,
+                                      const std::string& tgt, std::uint64_t ns) {
+        constexpr std::uint64_t kRdonly = 0x1, kRemount = 0x20, kBind = 0x1000, kMove = 0x2000,
+                                kRec = 0x4000, kPropagation = 0x40000 | 0x80000 | 0x100000 | 0x20000;
+        const std::uint64_t f = r.arg[3];
+        auto& fs = k_.files();
+        if (f & kPropagation) return val(0);   // we have no propagation to change
+        const auto tc = fs.classify(tgt);
+        if (tc.realm == kernel::Realm2::absent) return eno(tc.error);
+        if (f & kRemount) {
+            // a bind remount changes this mount's flags; a plain one would
+            // change the filesystem's, which for us is the same thing
+            if (!fs.set_mount_ro(tgt, ns, f & kRdonly, false)) return eno(Errno::einval);
+            return val(0);
+        }
+        const std::string src = fs.absolutize(read_cstr(uaddr(r.arg[0])), fs.cwd());
+        if (f & kMove) {
+            if (!fs.move_guest(src, tgt, ns)) return eno(Errno::einval);
+            return val(0);
+        }
+        if (f & kBind) {
+            if (!fs.bind_guest(src, tgt, ns, f & kRec)) return eno(Errno::enoent);
+            return val(0);
+        }
+        std::string host_dir;
+        if (type == "tmpfs" || type == "ramfs") {
+            char tmpl[] = "/tmp/linuxity-tmpfs-XXXXXX";
+            if (!::mkdtemp(tmpl)) return eno(Errno::enospc);
+            host_dir = tmpl;
+            fs.mount_guest(tgt, host_dir, ns, f & kRdonly);
+            return val(0);
+        }
+        const char* origin = type == "proc" ? "/proc" : type == "sysfs" ? "/sys"
+                           : type == "devpts" ? "/dev/pts" : type == "devtmpfs" ? "/dev"
+                           : type == "mqueue" ? "/dev/mqueue" : nullptr;
+        if (origin && fs.mount_like(origin, tgt, ns)) {
+            if (f & kRdonly) (void)fs.set_mount_ro(tgt, ns, true, false);
+            return val(0);
+        }
+        // a filesystem we can't make (ext4 on a device, overlay): remember
+        // it, as outside a namespace
+        guest_mounts_.insert(tgt);
+        return val(0);
+    }
+
+    // pivot_root(new_root, put_old), on our mount table. Only inside a mount
+    // namespace of the guest's own; elsewhere it is the host's root.
+    [[nodiscard]] Outcome do_pivot_root(const Regs& r) {
+        const auto mns = me().ns.id[static_cast<int>(kernel::NsKind::mnt)];
+        if (!mns) return eno(Errno::eperm);
+        auto& fs = k_.files();
+        const std::string nr = fs.absolutize(read_cstr(uaddr(r.arg[0])), fs.cwd());
+        const std::string po = fs.absolutize(read_cstr(uaddr(r.arg[1])), fs.cwd());
+        for (const auto* p : {&nr, &po}) {
+            const auto pc = fs.classify(*p);
+            if (pc.realm == kernel::Realm2::absent) return eno(pc.error);
+        }
+        std::vector<std::int32_t> pids;
+        for (const std::int32_t p : k_.procs().pids())
+            if (k_.procs().ns_of(p).id[static_cast<int>(kernel::NsKind::mnt)] == mns) pids.push_back(p);
+        if (const Errno e = fs.pivot_root(mns, nr, po, pids); e != Errno::ok) return eno(e);
+        return val(0);
+    }
+
+    // mount_setattr(dfd, path, flags, attr, size): only the read-only bit
+    // means anything to us; inside a mount namespace it changes our table.
+    [[nodiscard]] Outcome do_mount_setattr(const Regs& r) {
+        const auto mns = me().ns.id[static_cast<int>(kernel::NsKind::mnt)];
+        if (!mns) return eno(Errno::enosys);
+        if (r.arg[4] < 32) return eno(Errno::einval);
+        std::array<std::byte, 16> a{};
+        if (!mem_.copy_in(uaddr(r.arg[3]), a)) return eno(Errno::efault);
+        auto u64 = [&](std::size_t at) {
+            std::uint64_t v = 0;
+            for (std::size_t i = 0; i < 8; ++i)
+                v |= static_cast<std::uint64_t>(std::to_integer<unsigned>(a[at + i])) << (i * 8);
+            return v;
+        };
+        const std::uint64_t set = u64(0), clr = u64(8);
+        const std::string path = resolve_arg(r, 1, /*at=*/true);
+        const bool rec = r.arg[2] & 0x8000;   // AT_RECURSIVE
+        if (!k_.files().is_mount_point(path)) return eno(Errno::einval);
+        if ((set | clr) & 0x1)
+            if (!k_.files().set_mount_ro(path, mns, set & 0x1, rec)) return eno(Errno::einval);
+        return val(0);
+    }
 
     // Is this a filesystem type our namespace actually offers? The set is
     // the one /proc/filesystems advertises, so a guest that reads that file
@@ -1556,6 +1640,18 @@ private:
                                           bool at, bool follow_leaf = true) {
         std::string_view dir = at ? dir_of(static_cast<std::int64_t>(r.arg[0]))
                                   : std::string_view{};
+        // /proc/self/cwd/.. is the parent of the cwd, not /proc/self: swap
+        // the link for its target before the .. walk folds it lexically
+        if (raw.starts_with("/proc/") && raw.find("/..") != std::string::npos) {
+            const auto s1 = raw.find('/', 6);
+            const auto s2 = s1 == std::string::npos ? s1 : raw.find('/', s1 + 1);
+            if (s2 != std::string::npos) {
+                const std::string link = bind_proc_self(raw.substr(0, s2));
+                if (proc_is_link(link))
+                    if (const std::string tgt = proc_symlink_target(link); !tgt.empty() && tgt.front() == '/')
+                        return resolve_raw(r, tgt + raw.substr(s2), at, follow_leaf);
+            }
+        }
         std::string abs = k_.files().absolutize(raw, dir);
         // A synthesized symlink at the leaf (/dev/stdin -> /proc/self/fd/0)
         // is followed like any link when the call follows: opening
@@ -1688,21 +1784,162 @@ private:
     // `struct open_how` at arg[2] (the layout is { __u64 flags; __u64 mode;
     // __u64 resolve; }). Read them from guest memory, then drive the same
     // translation/injection core as openat. path_arg is 1 (dirfd is arg[0]).
+    //
+    // RESOLVE_* is about the guest's tree, so we walk it here and give the
+    // host an open_how with resolve cleared. Left in, it would judge our
+    // absolute host path (EXDEV for BENEATH) or our /proc/<us>/fd reopen.
     [[nodiscard]] Outcome path_openat2(const Regs& r) {
-        std::uint64_t flags = 0;
-        std::array<std::byte, 8> raw{};
-        if (mem_.copy_in(uaddr(r.arg[2]), raw)) {
+        const std::size_t size = static_cast<std::size_t>(r.arg[3]);
+        if (size < 24) return eno(Errno::einval);
+        if (size > 4096) return eno(Errno::e2big);
+        std::vector<std::byte> how(size);
+        if (!mem_.copy_in(uaddr(r.arg[2]), how)) return eno(Errno::efault);
+        auto u64 = [&](std::size_t at) {
+            std::uint64_t v = 0;
             for (std::size_t i = 0; i < 8; ++i)
-                flags |= static_cast<std::uint64_t>(std::to_integer<unsigned>(raw[i])) << (i * 8);
+                v |= static_cast<std::uint64_t>(std::to_integer<unsigned>(how[at + i])) << (i * 8);
+            return v;
+        };
+        const std::uint64_t flags = u64(0), resolve = u64(16);
+        if (resolve == 0) return path_open_flags(r, /*path_arg=*/1, /*at=*/true, flags);
+
+        constexpr std::uint64_t kNoXdev = 0x01, kNoMagic = 0x02, kNoSym = 0x04,
+                                kBeneath = 0x08, kInRoot = 0x10, kCached = 0x20;
+        if (resolve & ~std::uint64_t{0x3f}) return eno(Errno::einval);
+        if ((resolve & kBeneath) && (resolve & kInRoot)) return eno(Errno::einval);
+        if ((resolve & kCached) &&
+            (wire::has(flags, wire::OpenFlag::creat) || wire::has(flags, wire::OpenFlag::trunc)))
+            return eno(Errno::eagain);
+        const std::string raw = read_cstr(uaddr(r.arg[1]));
+        if (raw.empty()) return eno(Errno::enoent);   // openat2 has no AT_EMPTY_PATH
+        const bool follow_leaf =
+            !wire::has_for(arch_, flags, wire::OpenFlag::nofollow) &&
+            !(wire::has(flags, wire::OpenFlag::creat) && wire::has(flags, wire::OpenFlag::excl));
+        auto walked = resolve_walk(dir_base(r, /*at=*/true), raw, resolve & (kNoXdev | kNoMagic | kNoSym | kBeneath | kInRoot),
+                                   follow_leaf);
+        if (!walked) return eno(walked.error());
+
+        for (std::size_t i = 16; i < 24; ++i) how[i] = std::byte{0};
+        Outcome o = path_open_flags(r, /*path_arg=*/1, /*at=*/true, flags, &*walked);
+        return std::move(o).match(
+            [&](Redirect rd) -> Outcome { rd.blob = ArgBlob{2, std::move(how)}; return rd; },
+            [&](Inject in) -> Outcome { in.blob = ArgBlob{2, std::move(how)}; return in; },
+            [](auto other) -> Outcome { return other; });
+    }
+
+    // The guest path an openat2 lands on, walked a component at a time with
+    // the kernel's RESOLVE_* rules (fs/namei.c), or the errno it gives.
+    [[nodiscard]] Result<std::string> resolve_walk(const std::string& base, const std::string& raw,
+                                                   std::uint64_t resolve, bool follow_leaf) {
+        constexpr std::uint64_t kNoXdev = 0x01, kNoMagic = 0x02, kNoSym = 0x04,
+                                kBeneath = 0x08, kInRoot = 0x10;
+        const bool scoped = resolve & (kBeneath | kInRoot);
+        const std::string root = (resolve & kInRoot) ? base : std::string{"/"};
+        auto split = [](std::string_view p, std::vector<std::string>& out) {
+            std::vector<std::string> comps;
+            for (std::size_t i = 0, n = 0; i <= p.size(); ++i)
+                if (i == p.size() || p[i] == '/') {
+                    if (n < i) comps.emplace_back(p.substr(n, i - n));
+                    n = i + 1;
+                }
+            // `out` is a stack, next component last
+            out.insert(out.end(), comps.rbegin(), comps.rend());
+        };
+        auto join = [](const std::string& d, const std::string& n) {
+            return d == "/" ? "/" + n : d + "/" + n;
+        };
+        auto parent = [](const std::string& d) {
+            const auto s = d.rfind('/');
+            return s == 0 || s == std::string::npos ? std::string{"/"} : d.substr(0, s);
+        };
+        auto mnt = [&](const std::string& p) { return k_.files().mount_of(p).id; };
+
+        std::string cur = base.empty() ? std::string{"/"} : base;
+        if (!raw.empty() && raw.front() == '/') {
+            if (resolve & kBeneath) return err<std::string>(Errno::exdev);
+            cur = root;
         }
-        return path_open_flags(r, /*path_arg=*/1, /*at=*/true, flags);
+        std::vector<std::string> todo;
+        split(raw, todo);
+        int links = 0;
+        while (!todo.empty()) {
+            std::string c = std::move(todo.back());
+            todo.pop_back();
+            if (c == ".") continue;
+            if (c == "..") {
+                if (cur == root || cur == "/") {
+                    if (resolve & kBeneath) return err<std::string>(Errno::exdev);
+                    continue;
+                }
+                if ((resolve & kBeneath) && cur == base) return err<std::string>(Errno::exdev);
+                const std::string up = parent(cur);
+                if ((resolve & kNoXdev) && mnt(up) != mnt(cur)) return err<std::string>(Errno::exdev);
+                cur = up;
+                continue;
+            }
+            const std::string next = join(cur, c);
+            if ((resolve & kNoXdev) && mnt(next) != mnt(cur)) return err<std::string>(Errno::exdev);
+            if (todo.empty() && !follow_leaf) { cur = next; break; }
+            // a /proc magic link jumps rather than naming a path
+            if (is_magic_link(next)) {
+                if (resolve & kNoMagic) return err<std::string>(Errno::eloop);
+                if (resolve & kNoSym) return err<std::string>(Errno::eloop);
+                if (scoped) return err<std::string>(Errno::exdev);
+                cur = next;
+                for (auto it = todo.rbegin(); it != todo.rend(); ++it) cur = join(cur, *it);
+                return cur;
+            }
+            std::string target;
+            const auto pc = k_.files().classify(next, false, /*follow=*/false);
+            if (pc.realm == kernel::Realm2::host_backed && !pc.host_path.empty()) {
+                char buf[PATH_MAX];
+                const ::ssize_t n = ::readlink(pc.host_path.c_str(), buf, sizeof buf - 1);
+                if (n > 0) target.assign(buf, static_cast<std::size_t>(n));
+            } else if (pc.realm == kernel::Realm2::virtual_file) {
+                if (auto vf = k_.files().produce(next); vf && vf->symlink_target != "(proc-link)")
+                    target = vf->symlink_target;
+            }
+            if (target.empty()) { cur = next; continue; }
+            if (resolve & kNoSym) return err<std::string>(Errno::eloop);
+            if (++links > 40) return err<std::string>(Errno::eloop);
+            if (target.front() == '/') {
+                if (resolve & kBeneath) return err<std::string>(Errno::exdev);
+                cur = root;
+            }
+            split(target, todo);
+        }
+        return cur;
+    }
+
+    // /proc/<pid>/{exe,cwd,root,fd/N,map_files/X,ns/X}, self and task forms too.
+    [[nodiscard]] static bool is_magic_link(std::string_view p) {
+        if (!p.starts_with("/proc/")) return false;
+        p.remove_prefix(6);
+        auto take = [&] {
+            const auto s = p.find('/');
+            const auto c = p.substr(0, s);
+            p = s == std::string_view::npos ? std::string_view{} : p.substr(s + 1);
+            return c;
+        };
+        auto num = [](std::string_view c) {
+            return !c.empty() && c.find_first_not_of("0123456789") == std::string_view::npos;
+        };
+        const auto who = take();
+        if (who != "self" && who != "thread-self" && !num(who)) return false;
+        if (p.starts_with("task/")) { take(); if (!num(take())) return false; }
+        const auto a = take();
+        if (p.empty()) return a == "exe" || a == "cwd" || a == "root";
+        const auto b = take();
+        return p.empty() && !b.empty() && (a == "fd" || a == "map_files" || a == "ns");
     }
 
     // The shared open core: `flags` is already resolved (from a register for
     // open/openat, or from the open_how struct for openat2). Selects the
     // overlay upper layer on write intent and REDIRECTs or INJECTs.
+    // `walked`: the guest path openat2 already resolved, used as is.
     [[nodiscard]] Outcome path_open_flags(const Regs& r, int path_arg, bool at,
-                                          std::uint64_t flags) {
+                                          std::uint64_t flags,
+                                          const std::string* walked = nullptr) {
         // An empty path string is NOT the root directory. openat(dirfd,"",...)
         // without AT_EMPTY_PATH is ENOENT per the kernel; resolving "" to "/"
         // (and then REDIRECTing to the overlay root, a directory) is wrong and
@@ -1717,9 +1954,10 @@ private:
         }
         // A "."/".." component does not excuse the components before it:
         // the kernel walks the path, so open("gone/../f1") is ENOENT.
-        if (const Errno e = dot_prefix_error(r, path_arg, at); e != Errno::ok)
-            return eno(e);
-        std::string abs = resolve_arg(r, path_arg, at);
+        if (!walked)
+            if (const Errno e = dot_prefix_error(r, path_arg, at); e != Errno::ok)
+                return eno(e);
+        std::string abs = walked ? resolve_raw(r, *walked, at) : resolve_arg(r, path_arg, at);
         // Write intent (O_WRONLY / O_RDWR / O_CREAT / O_TRUNC) selects the
         // overlay upper layer.
         // Guest open flags come from abi/wire/open_flags.hpp -- the one
@@ -6726,7 +6964,12 @@ public:
         struct __attribute__((packed)) { std::uint64_t access; std::int32_t parent; } attr{};
         if (!mem_.copy_in(uaddr(r.arg[2]), std::as_writable_bytes(std::span{&attr, 1})))
             return eno(Errno::efault);
-        const std::string guest{k_.files().path_of_fd(attr.parent)};
+        // the fd was opened through any symlink in its name, so the rule is
+        // for where that lands
+        const std::string guest = [&] {
+            std::string g{k_.files().path_of_fd(attr.parent)};
+            return g.empty() ? g : k_.files().resolve_links(g);
+        }();
         const auto layers = guest.empty() ? std::vector<std::string>{} : k_.files().host_layers(guest);
         if (layers.empty()) return fwd();   // a path we don't translate: the host's answer
         const int rs = fetch_guest_fd(static_cast<int>(r.arg[0]));

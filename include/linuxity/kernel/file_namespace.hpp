@@ -41,6 +41,7 @@
 #include <cstring>
 #include <functional>
 #include <map>
+#include <set>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -441,6 +442,15 @@ public:
                                      bool follow = true,
                                      WriteIntent wi = WriteIntent::copy_leaf) const {
         PathClass pc = classify_impl(abs, for_write, follow, wi, 0);
+        // a write through a read-only mount; device nodes are exempt, as in
+        // the kernel
+        if (for_write && pc.realm == Realm2::host_backed && read_only(abs)) {
+            struct ::stat st{};
+            const bool special = ::lstat(pc.host_path.c_str(), &st) == 0 &&
+                                 (S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode) ||
+                                  S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode));
+            if (!special) return PathClass{Realm2::absent, {}, Errno::erofs, {}};
+        }
         // An emulated hardlink: the name is a placeholder, the data lives at
         // the backing. Everything except removal acts on the backing, so
         // open/stat/chmod/truncate on either name hit one inode. Removal acts
@@ -471,7 +481,7 @@ public:
         const Mount* m = deepest(abs);
         if (!m) return PathClass{Realm2::absent, {}, Errno::enoent, {}};
         if (m->producer) {
-            auto vf = m->producer(abs);
+            auto vf = run_producer(*m, abs);
             if (!vf) {
                 // As the kernel's walk: if an existing ancestor is not a
                 // directory, the answer is ENOTDIR, not ENOENT.
@@ -487,7 +497,7 @@ public:
                         bool dir = false;
                         if (pc.realm == Realm2::host_backed)
                             dir = is_dir(pc.host_path.c_str());
-                        else if (auto pv = m->producer(up))
+                        else if (auto pv = run_producer(*m, up))
                             dir = pv->is_dir;
                         if (!dir) e = Errno::enotdir;
                         break;
@@ -609,7 +619,7 @@ public:
     [[nodiscard]] Result<VirtualFile> produce(std::string_view abs) const {
         const Mount* m = deepest(abs);
         if (!m || !m->producer) return err<VirtualFile>(Errno::enoent);
-        return m->producer(abs);
+        return run_producer(*m, abs);
     }
 
     // The UNION listing of a host-backed directory across an overlay: entries
@@ -959,11 +969,15 @@ public:
 
     // -- mounts the guest makes, private to its mount namespace -------------
     // The current call's mount namespace (0 = the initial one).
-    void set_current_mnt_ns(std::uint64_t ns) const noexcept { cur_mnt_ns_ = ns; }
+    void set_current_mnt_ns(std::uint64_t ns) const noexcept {
+        cur_mnt_ns_ = ns;
+        cur_pivoted_ = ns != 0 && pivoted_.count(ns) != 0;
+    }
     [[nodiscard]] std::uint64_t current_mnt_ns() const noexcept { return cur_mnt_ns_; }
     // A new mount namespace starts as a copy of its parent's guest mounts.
     void clone_mnt_ns(std::uint64_t parent, std::uint64_t child) {
         mnt_parent_[child] = parent;
+        if (pivoted_.count(parent)) pivoted_.insert(child);
         std::vector<Mount> copies;
         for (const auto& m : mounts_)
             if (m.guest && m.mnt_ns == parent) {
@@ -975,20 +989,150 @@ public:
     }
     // Mount a real host directory at a guest path, seen only in mount
     // namespace `ns` (a tmpfs is a fresh scratch dir; a bind is its source).
-    void mount_guest(std::string prefix, std::string host_dir, std::uint64_t ns) {
+    void mount_guest(std::string prefix, std::string host_dir, std::uint64_t ns, bool ro = false) {
         prefix = normalize(prefix);
         Mount m{std::move(prefix), std::move(host_dir), {}, {}, ns, true};
+        m.ro = ro;
         mounts_.push_back(std::move(m));
     }
-    // Remove the newest guest mount at `prefix` in `ns`; false if none.
-    bool umount_guest(std::string_view prefix, std::uint64_t ns) {
+    // Bind guest path `src` at `target` in `ns` by copying the mount that
+    // holds it (a virtual tree like /proc, or an overlay) instead of naming
+    // one host dir. `rec` brings the mounts under `src` along.
+    bool bind_guest(std::string_view src, std::string target, std::uint64_t ns, bool rec) {
+        src = trim_root(src);
+        target = normalize(target);
+        const Mount* m = deepest(src);
+        if (!m) return false;
+        std::vector<Mount> add;
+        add.push_back(sub_mount(*m, src, target, ns));
+        if (rec)
+            for (const Mount& c : mounts_)
+                if (&c != m && visible(c) && strictly_under(c.prefix, src))
+                    add.push_back(sub_mount(c, c.prefix, join_guest(target, c.prefix.substr(src.size())), ns));
+        for (auto& a : add) mounts_.push_back(std::move(a));
+        return true;
+    }
+    // A fresh instance of one of our filesystems (mount -t proc at
+    // `target`): a copy of the initial namespace's mount at `origin`.
+    bool mount_like(std::string_view origin, std::string target, std::uint64_t ns) {
+        const Mount* best = nullptr;
+        for (const Mount& m : mounts_)
+            if (m.mnt_ns == 0 && m.producer && under(origin, m.prefix) &&
+                (!best || m.prefix.size() >= best->prefix.size()))
+                best = &m;
+        if (!best) return false;
+        Mount c = sub_mount(*best, origin, normalize(target), ns);
+        mounts_.push_back(std::move(c));
+        return true;
+    }
+    // Remove the newest guest mount at `prefix` in `ns`. `detach` takes the
+    // mounts stacked on it too; without it those make the unmount EBUSY.
+    Errno umount_guest(std::string_view prefix, std::uint64_t ns, bool detach = true) {
         const std::string n = normalize(prefix);
-        for (auto it = mounts_.rbegin(); it != mounts_.rend(); ++it)
-            if (it->guest && it->prefix == n && it->mnt_ns == ns) {
-                mounts_.erase(std::next(it).base());
-                return true;
+        for (std::size_t i = mounts_.size(); i-- > 0;) {
+            if (!(mounts_[i].guest && mounts_[i].prefix == n && mounts_[i].mnt_ns == ns)) continue;
+            std::vector<std::size_t> kids;
+            for (std::size_t j = i + 1; j < mounts_.size(); ++j)
+                if (mounts_[j].mnt_ns == ns && under(mounts_[j].prefix, n)) kids.push_back(j);
+            if (!kids.empty() && !detach) return Errno::ebusy;
+            for (auto k = kids.rbegin(); k != kids.rend(); ++k)
+                mounts_.erase(mounts_.begin() + static_cast<std::ptrdiff_t>(*k));
+            mounts_.erase(mounts_.begin() + static_cast<std::ptrdiff_t>(i));
+            return Errno::ok;
+        }
+        return Errno::einval;
+    }
+    // MS_MOVE: the guest mount at `src` and those under it move to `target`.
+    bool move_guest(std::string_view src, std::string target, std::uint64_t ns) {
+        const std::string s = normalize(src);
+        target = normalize(target);
+        bool found = false;
+        for (const auto& m : mounts_) found |= m.mnt_ns == ns && m.prefix == s;
+        if (!found) return false;
+        for (auto& m : mounts_)
+            if (m.mnt_ns == ns && under(m.prefix, s)) {
+                if (m.producer && m.origin.empty()) m.origin = m.prefix;
+                m.prefix = join_guest(target, s == "/" ? std::string_view{m.prefix}
+                                                        : std::string_view{m.prefix}.substr(s.size()));
             }
-        return false;
+        return true;
+    }
+    // Set or clear read-only on the newest mount at `prefix` in `ns`, or on
+    // every mount at and under it with `rec`. False if it isn't a mount.
+    bool set_mount_ro(std::string_view prefix, std::uint64_t ns, bool ro, bool rec) {
+        const std::string n = normalize(prefix);
+        Mount* top = nullptr;
+        for (auto& m : mounts_)
+            if (m.mnt_ns == ns && m.prefix == n) top = &m;
+        if (!top) return false;
+        top->ro = ro;
+        if (rec)
+            for (auto& m : mounts_)
+                if (m.mnt_ns == ns && under(m.prefix, n)) m.ro = ro;
+        return true;
+    }
+    // Is the mount holding `abs` read-only?
+    [[nodiscard]] bool read_only(std::string_view abs) const {
+        const Mount* m = deepest(abs);
+        return m && m->ro;
+    }
+
+    // pivot_root in mount namespace `ns`: the mounts under `new_root` move
+    // up to "/", everything else goes under `put_old`. After the first
+    // pivot the namespace no longer sees the shared mounts, only its copies.
+    // `pids` are the tasks whose cwd and fd paths get renamed to match.
+    Errno pivot_root(std::uint64_t ns, std::string new_root, std::string put_old,
+                     const std::vector<std::int32_t>& pids) {
+        if (ns == 0) return Errno::eperm;
+        new_root = normalize(new_root);
+        put_old = normalize(put_old);
+        if (new_root == "/") return Errno::ebusy;
+        if (!is_mount_point(new_root)) return Errno::einval;
+        if (!under(put_old, new_root)) return Errno::einval;
+        const std::string old_at = put_old.size() == new_root.size()
+            ? std::string{"/"} : put_old.substr(new_root.size());
+        auto renamed = [&](const std::string& p) {
+            if (under(p, new_root))
+                return p.size() == new_root.size() ? std::string{"/"} : p.substr(new_root.size());
+            return join_guest(old_at, p);
+        };
+        std::vector<Mount> keep, old;
+        for (Mount& m : mounts_) {
+            if (!visible(m)) { keep.push_back(std::move(m)); continue; }
+            if (m.mnt_ns == ns && m.producer && m.origin.empty()) m.origin = m.prefix;
+            if (m.mnt_ns == ns && under(m.prefix, new_root)) {
+                m.prefix = renamed(m.prefix);
+                keep.push_back(std::move(m));
+            } else if (m.mnt_ns == ns) {
+                m.prefix = renamed(m.prefix);
+                old.push_back(std::move(m));
+            } else {
+                // a shared mount: this namespace gets its own copy
+                Mount c = m;
+                if (c.producer && c.origin.empty()) c.origin = c.prefix;
+                c.prefix = renamed(c.prefix);
+                c.mnt_ns = ns;
+                c.guest = true;
+                old.push_back(std::move(c));
+                keep.push_back(std::move(m));
+            }
+        }
+        // the old root lands last, so at put_old == new_root it sits on top
+        for (auto& m : old) keep.push_back(std::move(m));
+        mounts_ = std::move(keep);
+        pivoted_.insert(ns);
+        set_current_mnt_ns(cur_mnt_ns_);
+        for (const std::int32_t pid : pids) {
+            if (auto it = cwds_.find(pid); it != cwds_.end()) it->second = renamed(it->second);
+            if (auto it = fd_tables_.find(pid); it != fd_tables_.end()) {
+                for (auto& [fd, p] : it->second.paths)
+                    if (!p.empty() && p.front() == '/') p = renamed(p);
+                for (auto& [fd, d] : it->second.dirs)
+                    if (!d.lazy.empty()) d.lazy = renamed(d.lazy);
+            }
+        }
+        last_cwd_ = std::string{cwd()};
+        return Errno::ok;
     }
 
     // Is this absolute path one WE produced -- i.e. already a host-side path
@@ -1048,13 +1192,65 @@ private:
         Producer    producer;    // set for virtual mounts
         std::uint64_t mnt_ns{0}; // the mount namespace that sees it; 0 = everyone
         bool        guest{false}; // mounted by the guest (umount may remove it)
+        bool        ro{false};    // writes through it are EROFS
+        // the path the producer knows `prefix` as, when the mount was moved
+        // or bound somewhere else; empty = prefix
+        std::string origin{};
     };
+    // What the producer of `m` calls guest path `abs`.
+    [[nodiscard]] static std::string producer_path(const Mount& m, std::string_view abs) {
+        if (m.origin.empty()) return std::string{abs};
+        std::string_view rel = abs;
+        rel.remove_prefix(m.prefix == "/" ? 0 : std::min(rel.size(), m.prefix.size()));
+        if (rel.empty() || rel == "/") return m.origin;
+        return m.origin == "/" ? std::string{rel} : m.origin + std::string{rel};
+    }
+    [[nodiscard]] Result<VirtualFile> run_producer(const Mount& m, std::string_view abs) const {
+        if (m.origin.empty()) return m.producer(abs);
+        return m.producer(producer_path(m, abs));
+    }
+    // `m` seen from guest path `src` (at or under its prefix), mounted at `at`.
+    [[nodiscard]] static Mount sub_mount(const Mount& m, std::string_view src, std::string at,
+                                         std::uint64_t ns) {
+        Mount c = m;
+        std::string rel{src.substr(m.prefix == "/" ? 0 : std::min(src.size(), m.prefix.size()))};
+        if (rel == "/") rel.clear();
+        if (m.producer) {
+            c.origin = producer_path(m, src);
+        } else if (!rel.empty()) {
+            c.host_base = join_host(m.host_base, rel.substr(1));
+            if (!c.upper.empty()) c.upper = join_host(m.upper, rel.substr(1));
+        }
+        c.prefix = std::move(at);
+        c.mnt_ns = ns;
+        c.guest = true;
+        return c;
+    }
+    [[nodiscard]] static bool under(std::string_view p, std::string_view dir) {
+        if (dir == "/") return true;
+        return p.starts_with(dir) && (p.size() == dir.size() || p[dir.size()] == '/');
+    }
+    [[nodiscard]] static bool strictly_under(std::string_view p, std::string_view dir) {
+        return p.size() > dir.size() && under(p, dir);
+    }
+    [[nodiscard]] static std::string join_guest(std::string_view dir, std::string_view p) {
+        if (dir == "/") return std::string{p.empty() ? "/" : p};
+        if (p == "/" || p.empty()) return std::string{dir};
+        return std::string{dir} + std::string{p};
+    }
+    [[nodiscard]] static std::string_view trim_root(std::string_view p) {
+        while (p.size() > 1 && p.back() == '/') p.remove_suffix(1);
+        return p;
+    }
     // A mount namespace as a copy of its parent's guest mounts: a fork of
     // the table, so later mounts on either side stay private.
     std::map<std::uint64_t, std::uint64_t> mnt_parent_;
     mutable std::uint64_t cur_mnt_ns_{0};
+    // namespaces that pivot_root'ed away from the shared mounts
+    std::set<std::uint64_t> pivoted_;
+    mutable bool cur_pivoted_{false};
     [[nodiscard]] bool visible(const Mount& m) const {
-        if (m.mnt_ns == 0) return true;
+        if (m.mnt_ns == 0) return !cur_pivoted_;
         return m.mnt_ns == cur_mnt_ns_;
     }
 

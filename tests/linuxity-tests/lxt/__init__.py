@@ -205,11 +205,13 @@ SYS = {
     "x86_64": dict(getpid=39, gettid=186, getppid=110, capget=125, sethostname=170,
                    unshare=272, io_uring_setup=425, io_uring_enter=426, signalfd4=289,
                    pidfd_open=434, clone3=435, close_range=436, getrandom=318,
-                   membarrier=324, rseq=334, prctl=157, seccomp=317, bad=1023),
+                   membarrier=324, rseq=334, prctl=157, seccomp=317, openat2=437,
+                   pivot_root=155, bad=1023),
     "aarch64": dict(getpid=172, gettid=178, getppid=173, capget=90, sethostname=161,
                     unshare=97, io_uring_setup=425, io_uring_enter=426, signalfd4=74,
                     pidfd_open=434, clone3=435, close_range=436, getrandom=278,
-                    membarrier=283, rseq=293, prctl=167, seccomp=277, bad=1023),
+                    membarrier=283, rseq=293, prctl=167, seccomp=277, openat2=437,
+                    pivot_root=41, bad=1023),
 }.get(platform.machine(), {})
 
 

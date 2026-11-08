@@ -124,6 +124,68 @@ def new_mount_namespace():
     return "private tmpfs stayed private"
 
 
+@test(host=True)
+def pivot_into_private_root():
+    """What a sandbox does: a tmpfs root, a read-only bind of one dir, proc,
+    pivot_root(".", ".") and a detach of the old root. Afterwards only the
+    new tree is reachable and the bind refuses writes."""
+    os.mkdir("src")
+    with open("src/f", "w") as f:
+        f.write("data")
+    src = os.path.abspath("src").encode()
+    os.mkdir("nr")
+    nr = os.path.abspath("nr").encode()
+    MS_RDONLY, MS_REMOUNT, MS_BIND, MS_REC, MS_PRIVATE = 1, 0x20, 0x1000, 0x4000, 0x40000
+
+    def child():
+        rc = enter(CLONE_NEWNS)
+        if rc:
+            return rc
+        if libc.mount(b"none", b"/", None, MS_REC | MS_PRIVATE, None) != 0:
+            return 2
+        if libc.mount(b"tmpfs", nr, b"tmpfs", 0, None) != 0:
+            return 3
+        for d in (b"/data", b"/proc", b"/old"):
+            os.mkdir(nr + d)
+        if libc.mount(src, nr + b"/data", None, MS_BIND | MS_REC, None) != 0:
+            return 4
+        if libc.mount(b"none", nr + b"/data", None, MS_BIND | MS_REMOUNT | MS_RDONLY, None) != 0:
+            return 5
+        # a new proc instance needs a pid namespace too; a bind doesn't
+        if libc.mount(b"/proc", nr + b"/proc", None, MS_BIND | MS_REC, None) != 0:
+            return 6
+        os.chdir(nr)
+        try:
+            syscall("pivot_root", b".", b".")
+        except OSError:
+            return 7
+        if libc.umount2(b".", 2) != 0:   # MNT_DETACH: the old root, stacked on top
+            return 8
+        os.chdir("/")
+        if sorted(os.listdir("/")) != ["data", "old", "proc"]:
+            return 9
+        if open("/data/f").read() != "data":
+            return 10
+        try:
+            open("/data/g", "w")
+            return 11
+        except OSError as e:
+            if e.errno != errno.EROFS:
+                return 12
+        if not os.path.exists(f"/proc/{os.getpid()}"):
+            return 13
+        if os.path.exists(src.decode()) or os.path.exists("/usr"):
+            return 14
+        return 0
+
+    rc = reap(spawn(child))
+    if rc >= 100:
+        skip(f"unshare refused: {errno.errorcode.get(rc - 100, rc - 100)}")
+    eq(rc, 0, "step that failed")
+    eq(os.listdir("nr"), [], "the private root leaked out")
+    return "only the new root is reachable, the bind is read-only"
+
+
 @test
 def hostname_is_consistent():
     """uname, gethostname and /proc agree on the hostname."""

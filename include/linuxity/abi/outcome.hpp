@@ -101,6 +101,14 @@ struct DupMirror {
     explicit DupMirror(int f, int c = -1) noexcept : from{f}, close_first{c} {}
 };
 
+// Bytes the host call reads through pointer arg `arg`, in place of the
+// guest's own. openat2 gets its open_how with `resolve` cleared, once we've
+// done the RESOLVE_* walk in our namespace.
+struct ArgBlob {
+    int                    arg;
+    std::vector<std::byte> bytes;
+};
+
 // -- the fates -------------------------------------------------------------
 
 // VIRTUALIZE - answered from our own subsystems. Hand the guest a value; no
@@ -163,6 +171,7 @@ struct Redirect {
     std::optional<std::string> created{};
     bool                   created_dir{false};
     std::optional<Scrub>   scrub{};
+    std::optional<ArgBlob> blob{};
 
     explicit Redirect(PathArg p) : first{std::move(p)} {}
 
@@ -187,7 +196,7 @@ struct Redirect {
     // Asked by the trap loop (the single Redirect consumer), so the 14 sites
     // that BUILD a Redirect do not each need to know about the optimisation.
     [[nodiscard]] bool is_noop() const noexcept {
-        return !second && !make_parents && !scrub && !force_ret && !created && first.arg >= 0 &&
+        return !second && !make_parents && !scrub && !blob && !force_ret && !created && first.arg >= 0 &&
                !first.rewrites;
     }
 };
@@ -210,6 +219,7 @@ struct Inject {
     // A virtual directory's backing: the host's /proc, /sys or /dev, whose
     // real entries never show (getdents is ours). Empty = a temp dir.
     std::string            dir_host{};
+    std::optional<ArgBlob> blob{};
 
     Inject(int pa, std::vector<std::byte> c, bool dir = false, bool keep = false,
            bool reopen = false)

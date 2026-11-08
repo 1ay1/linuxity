@@ -233,3 +233,57 @@ def xattrs():
     os.removexattr("x", "user.lxt")
     expect_errno(errno.ENODATA, "getxattr after remove", os.getxattr, "x", "user.lxt")
     return "set/list/get/CREATE/REPLACE/remove"
+
+
+@test
+def openat2_resolve_rules():
+    """openat2's RESOLVE_* flags judge the path as the guest named it:
+    BENEATH refuses escapes by '..', absolute paths and symlinks, IN_ROOT
+    re-roots them, NO_SYMLINKS and NO_MAGICLINKS refuse links."""
+    import ctypes
+    from lxt import syscall
+    NO_MAGIC, NO_SYM, BENEATH, IN_ROOT = 0x02, 0x04, 0x08, 0x10
+    os.makedirs("root/sub")
+    with open("root/sub/f", "w") as f:
+        f.write("in")
+    with open("outside", "w") as f:
+        f.write("out")
+    os.symlink("sub/f", "root/inlink")
+    os.symlink("../outside", "root/outlink")
+    os.symlink("/sub/f", "root/abslink")
+    rfd = os.open("root", os.O_PATH | os.O_DIRECTORY)
+
+    def o2(path, resolve, dirfd=rfd, flags=os.O_RDONLY):
+        how = (ctypes.c_uint64 * 3)(flags, 0, resolve)
+        return syscall("openat2", dirfd, path.encode(), how, 24)
+
+    def read(path, resolve):
+        fd = o2(path, resolve)
+        try:
+            return os.read(fd, 16).decode()
+        finally:
+            os.close(fd)
+
+    try:
+        eq(read("sub/f", BENEATH), "in", "a plain path beneath")
+    except OSError as e:
+        if e.errno == errno.ENOSYS:
+            skip("no openat2 here")
+        raise
+    eq(read("sub/../sub/f", BENEATH), "in", "'..' that stays beneath")
+    eq(read("inlink", BENEATH), "in", "a symlink that stays beneath")
+    expect_errno(errno.EXDEV, "'..' out of the root", o2, "../outside", BENEATH)
+    expect_errno(errno.EXDEV, "an absolute path", o2, "/etc/hostname", BENEATH)
+    expect_errno(errno.EXDEV, "a symlink out", o2, "outlink", BENEATH)
+    expect_errno(errno.EXDEV, "an absolute symlink", o2, "abslink", BENEATH)
+    eq(read("abslink", IN_ROOT), "in", "IN_ROOT re-roots an absolute symlink")
+    eq(read("../../sub/f", IN_ROOT), "in", "IN_ROOT clamps '..' at the root")
+    expect_errno(errno.ELOOP, "NO_SYMLINKS on a link", o2, "inlink", NO_SYM)
+    expect_errno(errno.ELOOP, "NO_MAGICLINKS on /proc/self/cwd", o2,
+                 "/proc/self/cwd", NO_MAGIC, -100, os.O_PATH)
+    expect_errno(errno.EINVAL, "BENEATH with IN_ROOT", o2, "sub/f", BENEATH | IN_ROOT)
+    fd = o2("sub/new", BENEATH, flags=os.O_CREAT | os.O_WRONLY)
+    os.close(fd)
+    check(os.path.exists("root/sub/new"), "O_CREAT beneath made the file")
+    os.close(rfd)
+    return "BENEATH, IN_ROOT, NO_SYMLINKS, NO_MAGICLINKS"
