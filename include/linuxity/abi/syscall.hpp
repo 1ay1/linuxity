@@ -846,21 +846,22 @@ public:
             // -- LANDLOCK. Real where the host has it: the ruleset and the
             //    restriction are the host kernel's, so the guest gets the walls
             //    it asked for, and a path rule is added for every host layer
-            //    behind the guest path (overlay upper and lower). Where the
-            //    host has none (Android's 6.1 GKI), a missing Landlock is fatal
-            //    to pacman's download sandbox, so the calls are accepted and
-            //    do nothing, which is what the guest's own path translation
-            //    already confines. That case reports ABI 0 nowhere: the guest
-            //    can't tell, but it also never could before.
+            //    behind the guest path (overlay upper and lower).
+            //
+            //    Where the host has none (Android's 6.1 GKI) we say ENOSYS,
+            //    the answer a kernel without Landlock gives. These calls used
+            //    to be accepted and do nothing, for pacman's sake -- but a
+            //    sandbox told its walls are up when they are not is worse than
+            //    one told to go without: claybin's audit read `strong` and
+            //    `--require strong` passed with nothing enforced. pacman needs
+            //    DisableSandbox in pacman.conf on such a host, which is what
+            //    it documents for kernels without Landlock.
             case Sysno::landlock_create_ruleset:
                 if (host_has_landlock()) return fwd();
-                return val((r.arg[2] & 1u) ? 1 : 3);
+                return eno(Errno::enosys);
             case Sysno::landlock_add_rule:
                 if (host_has_landlock()) return do_landlock_add_rule(r);
-                if (r.arg[2] == 0) return eno(Errno::efault);
-                if (r.arg[1] != 1 /*PATH_BENEATH*/ && r.arg[1] != 2 /*NET_PORT*/)
-                    return eno(Errno::einval);
-                return val(0);
+                return eno(Errno::enosys);
             case Sysno::landlock_restrict_self:
                 if (host_has_landlock()) {
                     // from now on this process (and what it forks) can't open
@@ -868,7 +869,7 @@ public:
                     landlocked_.insert(ids().pid);
                     return fwd();
                 }
-                return val(0);
+                return eno(Errno::enosys);
 
             // -- AF_UNIX bind/connect: the chroot'd guest resolves an
             //    absolute sun_path correctly on its own, so we forward the
