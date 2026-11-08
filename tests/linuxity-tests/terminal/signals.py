@@ -130,12 +130,21 @@ def interactive_shell_job_control():
     os.write(fd, b"sleep 30\n")
     # ^Z only stops the job once bash has handed it the terminal
     wait_until(lambda: fg() not in (0, shell_group), 10, "bash to give the terminal to the job")
+    # bash reports a killed job one of two ways depending on when SIGCHLD
+    # lands, natively too: "Terminated" with `wait %1` then finding no job
+    # (rc=127), or `wait %1` reaping it (rc=143). A busy tracer makes both
+    # common, so accept either.
     for line, want in ((b"\x1a", b"Stopped"), (b"jobs", b"sleep 30"),
-                       (b"bg", b"sleep 30 &"), (b"kill %1; wait", b"Terminated"),
+                       (b"bg", b"sleep 30 &"), (b"kill %1; wait %1; echo rc=$?", b"rc=1"),
                        (b"set -o | grep monitor", b"on"), (b"exit", None)):
         os.write(fd, line + (b"" if line == b"\x1a" else b"\n"))
         if want:
             out += read_until(fd, want)
+            if want == b"rc=1":
+                if b"PROMPT> " not in out[out.rindex(b"rc=1"):]:
+                    out += read_until(fd, b"PROMPT> ")
+                check(b"rc=143" in out or (b"Terminated" in out and b"rc=127" in out),
+                      f"kill %1 didn't kill the job: {out!r}")
     out += read_until(fd)
     check(b"no job control" not in out, f"bash complained: {out!r}")
     check(b"cannot set terminal process group" not in out, f"bash complained: {out!r}")

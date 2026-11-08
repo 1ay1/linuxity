@@ -9,6 +9,14 @@ from lxt import check, eq, skip, test
 
 
 def host_pids():
+    # under linuxity without the flag the runner is the tree's pid 1. The
+    # process count alone misleads: -j8 makes our own tree bigger than 20
+    try:
+        with open("/proc/1/cmdline", "rb") as f:
+            if b"run.py" in f.read():
+                return False
+    except OSError:
+        pass
     # natively every process is visible; under linuxity only with the flag
     return len([p for p in os.listdir("/proc") if p.isdigit()]) > 20
 
