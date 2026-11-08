@@ -505,9 +505,14 @@ public:
                 if (gt_on_sys_stop(w, t)) continue;
                 Regs rr{};
                 (void)Regs::fetch(w, rr);
-                bool is_entry = !seccomp_
-                    && (static_cast<long long>(rr.ret()) == -38 /*ENOSYS*/)
-                    && !t.in_call;
+                // Entry or exit? The kernel says, since 5.3. The old test
+                // (rax primed to -ENOSYS at entry) is x86-64 only: aarch64's
+                // x0 is the first argument at entry, so on the phone every
+                // entry read as an exit and nothing was ever dispatched.
+                const int op = syscall_stop_op(w);
+                bool is_entry = !seccomp_ &&
+                    (op > 0 ? op == 1 /*ENTRY*/
+                            : static_cast<long long>(rr.ret()) == -38 /*ENOSYS*/ && !t.in_call);
                 if (is_entry) {
                     // Same bootstrap exemption as the seccomp path, for the
                     // PTRACE_SYSCALL fallback (LINUXITY_NO_SECCOMP): the ROOT's
@@ -554,6 +559,20 @@ public:
             trace_fault(w, sig);
             resume_run(w, sig);
         }
+    }
+
+    // PTRACE_GET_SYSCALL_INFO's op for a syscall stop: 1 entry, 2 exit,
+    // 3 seccomp; 0 when the kernel predates it (< 5.3).
+    [[nodiscard]] static int syscall_stop_op(::pid_t w) {
+        struct { std::uint8_t op; std::uint8_t pad[7]; std::uint64_t rest[10]; } info{};
+        constexpr long kGetSyscallInfo = 0x420e;
+#if defined(__GLIBC__)
+        const auto req = static_cast<__ptrace_request>(kGetSyscallInfo);
+#else
+        const auto req = static_cast<int>(kGetSyscallInfo);
+#endif
+        const long n = ::ptrace(req, w, reinterpret_cast<void*>(sizeof info), &info);
+        return n > 0 ? info.op : 0;
     }
 
     // A guest died on a signal. Under LINUXITY_TRACE say so, because the

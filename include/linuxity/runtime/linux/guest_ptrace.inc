@@ -658,6 +658,11 @@ private:
             return true;
         }
         if (exit_stop || (!gt_prog_mapped(w) && --tr.defer_left > 0)) {
+            // Without seccomp this entry stop is the only time linuxity sees
+            // the loader's call, and the loader is still opening the program
+            // by its guest path: it has to be served, not stepped past (it
+            // ran raw and failed "cannot open /usr/bin/true" on the phone).
+            if (!seccomp_ && (!exit_stop || tasks_[w].in_call)) return false;
             ::ptrace(PTRACE_SYSCALL, w, 0, 0);
             return true;
         }
