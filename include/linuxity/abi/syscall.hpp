@@ -15,6 +15,7 @@
 #include "linuxity/abi/types.hpp"
 #include "linuxity/kernel/file_namespace.hpp"
 #include "linuxity/kernel/machine.hpp"
+#include "linuxity/kernel/nl80211.hpp"
 #include "linuxity/kernel/process_table.hpp"
 #include "linuxity/kernel/subsystem.hpp"
 #include "linuxity/abi/identity.hpp"
@@ -47,6 +48,11 @@
 #if !defined(_WIN32)
 #include <sys/resource.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <net/if.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
@@ -943,6 +949,24 @@ public:
             //    accept TIOCSPGRP as a satisfied no-op.
             case Sysno::ioctl:
                 return do_ioctl(r);
+
+            // -- a request on an emulated nl80211 socket (see do_socket);
+            //    anything else is the host's
+            case Sysno::sendto:
+                if (auto o = nl_answer(static_cast<int>(r.arg[0]), uaddr(r.arg[1]),
+                                       static_cast<std::size_t>(r.arg[2])))
+                    return std::move(*o);
+                return fwd();
+            case Sysno::sendmsg:
+                if (!nl_socks_.empty()) {
+                    // msghdr: name, namelen, iov, iovlen; one iovec is enough
+                    const std::uint64_t iov = get_u64(r.arg[1] + 16);
+                    if (iov && get_u64(r.arg[1] + 24) >= 1)
+                        if (auto o = nl_answer(static_cast<int>(r.arg[0]), uaddr(get_u64(iov)),
+                                               static_cast<std::size_t>(get_u64(iov + 8))))
+                            return std::move(*o);
+                }
+                return fwd();
 
             // -- everything else: FORWARD to the real host kernel. -------
             // Memory (mmap/brk/mprotect) MUST run in the child so it gets
@@ -2787,9 +2811,38 @@ private:
     // Android) made systemd log an error on every run. Everything else is a
     // real host socket.
     [[nodiscard]] Outcome do_socket(const Regs& r) {
-        constexpr std::uint64_t kAfNetlink = 16, kNetlinkAudit = 9;
+        constexpr std::uint64_t kAfNetlink = 16, kNetlinkAudit = 9, kNetlinkGeneric = 16;
         if (r.arg[0] == kAfNetlink && r.arg[2] == kNetlinkAudit)
             return eno(Errno::eprotonosupport);
+        // Generic netlink where the host refuses it (Android's shell): a
+        // local datagram socket the guest binds to a private abstract name,
+        // whose nl80211 requests we answer (see nl_answer).
+        if (r.arg[0] == kAfNetlink && r.arg[2] == kNetlinkGeneric && host_refuses_genl()) {
+            constexpr std::uint64_t kAfUnix = 1, kDgram = 2, kKeepFlags = 0x80800;  // CLOEXEC|NONBLOCK
+            const std::string name = "lx-nl-" + std::to_string(::getpid()) + "-" +
+                                     std::to_string(++nl_seq_);
+            std::string sa(2, '\0');
+            sa[0] = 1;                                 // AF_UNIX, little-endian
+            sa += '\0';                                // abstract
+            sa += name;
+            GuestCalls gc;
+            gc.strings = {sa};
+            // Moved into the fd band the filter traps sendto for (see
+            // kNlFdLo), so sendto on every other socket stays native.
+            const std::uint64_t dupcmd = (r.arg[1] & 0x80000) ? 1030 /*F_DUPFD_CLOEXEC*/ : 0 /*F_DUPFD*/;
+            gc.steps = {{Sysno::socket, {kAfUnix, kDgram | (r.arg[1] & kKeepFlags), 0, 0, 0, 0}},
+                        {Sysno::bind, {GuestCalls::prev_of(0), GuestCalls::str0,
+                                       static_cast<std::uint64_t>(sa.size()), 0, 0, 0}},
+                        {Sysno::fcntl, {GuestCalls::prev_of(0), dupcmd, kNlFdLo, 0, 0, 0}},
+                        {Sysno::close, {GuestCalls::prev_of(0), 0, 0, 0, 0, 0}}};
+            gc.result_of = 2;
+            gc.done = [this, name](std::int64_t fd) {
+                if (fd < 0) return;
+                if (const std::uint64_t ino = socket_inode(static_cast<int>(fd)))
+                    nl_socks_[ino] = name;
+            };
+            return gc;
+        }
         return fwd();
     }
 
@@ -4737,6 +4790,19 @@ private:
         // on every kernel. Answer it here: Android's SELinux says EACCES first.
         if (is_tty_request(request) && host_fd_is_file(static_cast<int>(r.arg[0])))
             return eno(Errno::enotty);
+        // SIOCGIFINDEX (if_nametoindex): Android's SELinux refuses it, but
+        // rtnetlink still names every link. Answer from that where the host
+        // refuses generic netlink, the same sandbox.
+        if (request == 0x8933 /*SIOCGIFINDEX*/ && host_refuses_genl() && r.arg[2]) {
+            char name[16] = {};
+            if (!mem_.copy_in(uaddr(r.arg[2]), std::as_writable_bytes(std::span{name})))
+                return eno(Errno::efault);
+            name[15] = '\0';
+            const std::uint32_t idx = host_ifindex(name);
+            if (!idx) return eno(Errno::enodev);
+            if (!put_u32(r.arg[2] + 16, idx)) return eno(Errno::efault);
+            return val(0);
+        }
         // tcdrain/tcsendbreak: on a pty this is a no-op (writes reach the
         // other end at once, no break op). Android's SELinux refuses it, so
         // answer it there.
@@ -5560,12 +5626,123 @@ public:
         }
     }
 
+    // Does the host refuse the guest a generic netlink socket? Asked once:
+    // the tracer runs in the same sandbox as the guest.
+    [[nodiscard]] static bool host_refuses_genl() {
+#if defined(__linux__)
+        static const bool refuses = [] {
+            if (std::getenv("LINUXITY_EMULATE_NL80211")) return true;
+            const int s = ::socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, 16);
+            if (s >= 0) { ::close(s); return false; }
+            return errno == EACCES || errno == EPERM;
+        }();
+        return refuses;
+#else
+        return false;
+#endif
+    }
+
+    // A request sent on an emulated nl80211 socket: queue the kernel's reply
+    // on it and report the request sent. nullopt = not one of ours.
+    [[nodiscard]] std::optional<Outcome> nl_answer(int fd, UAddr buf, std::size_t len) {
+#if defined(__linux__)
+        if (nl_socks_.empty()) return std::nullopt;
+        const auto it = nl_socks_.find(socket_inode(fd));
+        if (it == nl_socks_.end()) return std::nullopt;
+        std::vector<std::uint8_t> req(std::min<std::size_t>(len, 65536));
+        if (!req.empty() && !mem_.copy_in(buf, std::as_writable_bytes(std::span{req})))
+            return eno(Errno::efault);
+        const std::string ifname = "wlan0";
+        const auto reply = kernel::nl80211::answer(
+            req.data(), req.size(), kernel::nl80211::android_status(), host_ifindex(ifname),
+            ifname, static_cast<std::uint32_t>(ids().pid));
+        if (!reply.empty()) {
+            if (nl_reply_fd_ < 0) nl_reply_fd_ = ::socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+            sockaddr_un to{};
+            to.sun_family = AF_UNIX;
+            std::memcpy(to.sun_path + 1, it->second.data(), it->second.size());
+            const auto tl = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + 1 + it->second.size());
+            (void)::sendto(nl_reply_fd_, reply.data(), reply.size(), MSG_DONTWAIT,
+                           reinterpret_cast<sockaddr*>(&to), tl);
+        }
+        return val(static_cast<std::int64_t>(len));
+#else
+        (void)fd; (void)buf; (void)len;
+        return std::nullopt;
+#endif
+    }
+
+    // An interface's index from rtnetlink, which Android lets the shell use
+    // where it refuses SIOCGIFINDEX. 0 when unknown.
+    [[nodiscard]] static std::uint32_t host_ifindex(const std::string& name) {
+#if defined(__linux__)
+        if (const unsigned i = ::if_nametoindex(name.c_str())) return i;
+        const int s = ::socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, 0 /*NETLINK_ROUTE*/);
+        if (s < 0) return 0;
+        struct { nlmsghdr h; ifinfomsg i; } q{};
+        q.h.nlmsg_len = sizeof q;
+        q.h.nlmsg_type = RTM_GETLINK;
+        q.h.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+        q.h.nlmsg_seq = 1;
+        std::uint32_t found = 0;
+        timeval tv{0, 300000};
+        ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        if (::send(s, &q, sizeof q, 0) == static_cast<ssize_t>(sizeof q)) {
+            std::vector<char> b(65536);
+            for (bool more = true; more && !found;) {
+                const ssize_t n = ::recv(s, b.data(), b.size(), 0);
+                if (n <= 0) break;
+                int left = static_cast<int>(n);
+                for (auto* h = reinterpret_cast<nlmsghdr*>(b.data()); NLMSG_OK(h, left);
+                     h = NLMSG_NEXT(h, left)) {
+                    if (h->nlmsg_type == NLMSG_DONE || h->nlmsg_type == NLMSG_ERROR) { more = false; break; }
+                    if (h->nlmsg_type != RTM_NEWLINK) continue;
+                    const auto* ifi = static_cast<const ifinfomsg*>(NLMSG_DATA(h));
+                    int alen = static_cast<int>(IFLA_PAYLOAD(h));
+                    for (auto* a = IFLA_RTA(ifi); RTA_OK(a, alen); a = RTA_NEXT(a, alen))
+                        if (a->rta_type == IFLA_IFNAME &&
+                            name == static_cast<const char*>(RTA_DATA(a)))
+                            found = static_cast<std::uint32_t>(ifi->ifi_index);
+                }
+            }
+        }
+        ::close(s);
+        return found;
+#else
+        (void)name;
+        return 0;
+#endif
+    }
+
+    // emulated generic netlink sockets: socket inode -> its abstract name.
+    // They live at fds kNlFdLo..kNlFdHi so the filter can trap their sendto
+    // alone (seccomp sees fd numbers, not socket types).
+    static constexpr std::uint64_t kNlFdLo = 1008, kNlFdHi = 1023;
+    std::unordered_map<std::uint64_t, std::string> nl_socks_;
+    std::uint32_t nl_seq_{0};
+    int nl_reply_fd_{-1};
+
     // getsockname(fd, addr, len) / getpeername: an AF_UNIX socket the guest
     // named gets its own spelling back, not the translated host path.
     [[nodiscard]] Outcome do_sockname(const Regs& r, bool peer) {
         if (!r.arg[1] || !r.arg[2]) return fwd();
         const std::uint64_t ino = socket_inode(static_cast<int>(r.arg[0]));
         if (ino == 0) return fwd();
+        // an emulated netlink socket names itself as netlink does
+        if (nl_socks_.count(ino)) {
+            std::uint32_t cap = 0;
+            if (!mem_.copy_in(uaddr(r.arg[2]), std::as_writable_bytes(std::span{&cap, 1})))
+                return eno(Errno::efault);
+            std::array<std::uint8_t, 12> nl{};
+            nl[0] = 16;                                   // AF_NETLINK
+            const auto pid = peer ? 0u : static_cast<std::uint32_t>(ids().pid);
+            std::memcpy(nl.data() + 4, &pid, 4);
+            const std::size_t n = std::min<std::size_t>(cap, nl.size());
+            if (!mem_.copy_out(uaddr(r.arg[1]), std::as_bytes(std::span{nl.data(), n})) ||
+                !put_u32(r.arg[2], 12))
+                return eno(Errno::efault);
+            return val(0);
+        }
         const auto& m = peer ? sock_peers_ : sock_names_;
         auto it = m.find(ino);
         if (it == m.end()) {

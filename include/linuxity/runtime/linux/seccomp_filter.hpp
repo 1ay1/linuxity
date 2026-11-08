@@ -58,14 +58,17 @@
 // Worth revisiting if the answered set ever dominates; today it does not.
 #pragma once
 
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 
 #include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -343,9 +346,21 @@ inline constexpr int kTrappedX86_64[] = {
     // Drop the syscalls this arch doesn't have (aarch64 has no open/stat/
     // fork), so the filter has no dead compares.
     std::vector<std::uint32_t> trapped;
-    trapped.reserve(kTrappedAll.size());
+    trapped.reserve(kTrappedAll.size() + 1);
     for (const std::uint64_t nr : kTrappedAll)
         if (nr != kNoSysno) trapped.push_back(static_cast<std::uint32_t>(nr));
+    // UNTRAPPED(sendto,44): trapped by argument below, only where the host
+    // refuses generic netlink (Android) and only for fds in the band the
+    // emulated nl80211 sockets live in; every other send stays native.
+    bool emulate_genl = std::getenv("LINUXITY_EMULATE_NL80211") != nullptr;
+    if (!emulate_genl) {
+        const int s = ::socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, 16 /*NETLINK_GENERIC*/);
+        if (s >= 0) ::close(s);
+        else emulate_genl = errno == EACCES || errno == EPERM;
+    }
+    constexpr std::uint64_t kSendto = encode(kHostArch, abi::Sysno::sendto);
+    constexpr std::uint32_t kNlFdLo = 1008, kNlFdHi = 1023;   // syscall.hpp's band
+    const std::size_t kSend = emulate_genl ? 4 : 0;           // statements in that check
     const std::size_t nTrapped = trapped.size();
 
     // Program layout (leaves LAST, so every match is a simple forward jump):
@@ -416,7 +431,7 @@ inline constexpr int kTrappedX86_64[] = {
     constexpr std::uint64_t kPread = encode(kHostArch, abi::Sysno::pread64);
     constexpr std::size_t kPre = 5;   // statements in the pread64 check
     const auto to_enosys = [&](std::size_t idx) {
-        return static_cast<std::uint8_t>((firstJeq + nTrapped + kPre + 2) - idx - 1);
+        return static_cast<std::uint8_t>((firstJeq + nTrapped + kSend + kPre + 2) - idx - 1);
     };
     if (emit_x32) {
         f.push_back(BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, kX32Bit,
@@ -432,9 +447,19 @@ inline constexpr int kTrappedX86_64[] = {
                              to_enosys(f.size())));
     }
     for (std::size_t i = 0; i < nTrapped; ++i) {
-        std::uint8_t jt = static_cast<std::uint8_t>((nTrapped - 1 - i) + kPre + 1);
+        std::uint8_t jt = static_cast<std::uint8_t>((nTrapped - 1 - i) + kSend + kPre + 1);
         f.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
                              trapped[i], jt, 0));                // firstJeq + i
+    }
+    // nr == sendto && kNlFdLo <= fd <= kNlFdHi -> TRACE, else ALLOW. A miss
+    // on nr falls through to the pread check with A still holding nr.
+    if (emulate_genl) {
+        constexpr std::uint32_t kArg0 = offsetof(seccomp_data, args);
+        f.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                             static_cast<std::uint32_t>(kSendto), 0, 3));
+        f.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, kArg0));
+        f.push_back(BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, kNlFdLo, 0, 6));   // -> ALLOW
+        f.push_back(BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K, kNlFdHi, 5, 6));   // ALLOW / TRACE
     }
     // nr == pread64 && args[3] == 0 -> TRACE, else ALLOW (little-endian words)
     constexpr std::uint32_t kArg3 = offsetof(seccomp_data, args) + 3 * 8;

@@ -479,6 +479,7 @@ inline std::string Scenario::key() const {
                     .exercising(abi::Sysno::connect)
                     .exercising(abi::Sysno::socket)
                     .exercising(abi::Sysno::getsockname)
+                    .exercising(abi::Sysno::sendmsg)
                     .exercising(abi::Sysno::getpeername)
                     .exercising(abi::Sysno::inotify_add_watch)
                     .exercising(abi::Sysno::fanotify_mark)

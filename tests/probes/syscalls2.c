@@ -222,6 +222,25 @@ int main(void) {
                     LX_CHECK(cc == 0, g == 0 && memcmp(got + 2, SOK, sizeof SOK) == 0),
                     "the client's peer is the bound path");
         }
+        // sendmsg on an ordinary socket is the kernel's: the bytes go through
+        // and the count comes back (the dispatcher only answers emulated
+        // netlink sockets itself)
+        {
+            const long a = (cc == 0) ? LX_SYS3(SYS_accept4, s, 0, 0) : -1;
+            static char msg[] = "ping";
+            static struct { void* base; unsigned long len; } iov = {msg, 4};
+            static struct {
+                void* name; unsigned int namelen; void* iov; unsigned long iovlen;
+                void* control; unsigned long controllen; int flags;
+            } mh = {0, 0, &iov, 1, 0, 0, 0};
+            const long n = (a >= 0) ? LX_SYS3(SYS_sendmsg, c, &mh, 0) : -1;
+            lx_emit("sendmsg", LX_CHECK(a >= 0, n == 4), "sendmsg delivers 4 bytes");
+            static char back[8];
+            const long rn = (n == 4) ? LX_SYS3(SYS_read, a, back, sizeof back) : -1;
+            lx_emit("sendmsg", LX_CHECK(n == 4, rn == 4 && memcmp(back, "ping", 4) == 0),
+                    "the peer reads them");
+            if (a >= 0) LX_SYS1(SYS_close, a);
+        }
         if (c >= 0) LX_SYS1(SYS_close, c);
         if (s >= 0) LX_SYS1(SYS_close, s);
         LX_SYS3(SYS_unlinkat, AT_FDCWD, SOK, 0);

@@ -402,7 +402,8 @@ public:
         // succeeded, answers it. Clause (b) below pairs the two up.
         return c == abi::Sysno::ioctl || c == abi::Sysno::bind ||
                c == abi::Sysno::connect || c == abi::Sysno::getsockname ||
-               c == abi::Sysno::getpeername || c == abi::Sysno::link ||
+               c == abi::Sysno::getpeername || c == abi::Sysno::sendmsg ||
+               c == abi::Sysno::link ||
                c == abi::Sysno::linkat || c == abi::Sysno::newfstatat ||
                c == abi::Sysno::mknod || c == abi::Sysno::mknodat ||
                // dmesg_restrict: the guest is root, the native probe isn't

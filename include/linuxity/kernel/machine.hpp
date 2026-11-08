@@ -24,6 +24,8 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #include "linuxity/conform/arch.hpp"
 #if defined(__APPLE__)

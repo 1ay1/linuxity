@@ -125,7 +125,7 @@ endif()
 
 # Linux-only UNIT tests: they include <linux/*.h> (seccomp, audit) but run no
 # guest, so they belong with the fast tests rather than LX_LIVE_TESTS.
-set(LX_LINUX_UNIT_TESTS seccomp_arch)
+set(LX_LINUX_UNIT_TESTS seccomp_arch nl80211)
 
 set(LX_TESTS ${LX_PORTABLE_TESTS})
 if(NOT WIN32)
