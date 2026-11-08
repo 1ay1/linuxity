@@ -6214,6 +6214,19 @@ public:
                 else                    (void)put_u32(base + L.nlink, n);
             }
         }
+        // statx filled by the host carries the HOST's mount id, which means
+        // nothing against our mount table; restate it as write_statx would.
+        if (is_statx && !s.guest_path.empty()) {
+            const auto mo = k_.files().mount_of(s.guest_path);
+            constexpr std::uint32_t kMntId = 0x1000, kMntIdUnique = 0x4000;
+            constexpr std::uint64_t kMountRoot = 0x2000;
+            constexpr std::uint64_t kMaskOff = 0, kAttrOff = 8, kMnt = 144, kAttrMask = 48;
+            (void)put_u32(base + kMaskOff, get_u32(base + kMaskOff) | kMntId | kMntIdUnique);
+            (void)put_u64(base + kMnt, mo.id);
+            (void)put_u64(base + kAttrMask, get_u64(base + kAttrMask) | kMountRoot);
+            const std::uint64_t a = get_u64(base + kAttrOff);
+            (void)put_u64(base + kAttrOff, mo.root ? (a | kMountRoot) : (a & ~kMountRoot));
+        }
     }
 
     // Small typed guest-memory pokes/peeks for the scrub overlay.
@@ -6533,6 +6546,11 @@ public:
         std::array<std::byte, 2> b{};
         if (!mem_.copy_in(uaddr(addr), b)) return 0;
         std::uint16_t v = 0; std::memcpy(&v, b.data(), 2); return v;
+    }
+    [[nodiscard]] std::uint64_t get_u64(std::uint64_t addr) {
+        std::array<std::byte, 8> b{};
+        if (!mem_.copy_in(uaddr(addr), b)) return 0;
+        std::uint64_t v = 0; std::memcpy(&v, b.data(), 8); return v;
     }
 
     // True iff `path` is a symbolic link (lstat, no follow). Used to skip a
