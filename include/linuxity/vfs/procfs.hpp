@@ -19,6 +19,8 @@
 #include "linuxity/kernel/machine.hpp"
 #include "linuxity/kernel/process_table.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -285,6 +287,37 @@ inline std::pair<int, int> run_counts(const kernel::ProcessTable& procs) {
 // /proc/net/<rest> (rest may be empty): the host's network, which the guest
 // shares. Socket tables are rewritten so the host uid running linuxity
 // reads as the guest's root, like the rest of its identity.
+// Android's /proc/net/wireless has only its header (the vendor driver skips
+// wireless extensions), but `cmd wifi status` gives the shell user the link's
+// RSSI. Build the kernel's line for wlan0 from it, as cfg80211 would: quality
+// is rssi+110 clamped to 0..70. Cached two seconds; empty when not connected.
+inline std::string android_wireless_line() {
+    static std::string cache;
+    static std::chrono::steady_clock::time_point at{};
+    static const bool have = ::access("/system/bin/cmd", X_OK) == 0;
+    if (!have) return {};
+    const auto now = std::chrono::steady_clock::now();
+    if (at.time_since_epoch().count() && now - at < std::chrono::seconds(2)) return cache;
+    at = now;
+    cache.clear();
+    if (std::FILE* p = ::popen("/system/bin/cmd wifi status 2>/dev/null", "re")) {
+        char line[2048];
+        while (std::fgets(line, sizeof line, p))
+            if (const char* r = std::strstr(line, "RSSI: "); r && std::strstr(line, "WifiInfo:")) {
+                const int rssi = std::atoi(r + 6);
+                if (rssi < 0 && rssi > -127) {
+                    const int q = std::clamp(rssi, -110, -40) + 110;
+                    char out[160];
+                    std::snprintf(out, sizeof out, "%6s: %04x  %3d.  %4d.  %4d  %6d %6d %6d %6d %6d   %6d\n",
+                                  "wlan0", 0, q, rssi, -256, 0, 0, 0, 0, 0, 0);
+                    cache = out;
+                }
+            }
+        ::pclose(p);
+    }
+    return cache;
+}
+
 inline std::optional<Result<kernel::VirtualFile>> net_view(std::string_view rest) {
 #if defined(_WIN32)
     (void)rest;
@@ -305,6 +338,13 @@ inline std::optional<Result<kernel::VirtualFile>> net_view(std::string_view rest
     bool table = false;
     for (const auto t : kSockTables) table |= rest == t;
     if (!table) {
+        if (rest == "wireless") {
+            std::string h = host_file(host.c_str());
+            // the header alone: no interface reports; ask Android's service
+            if (std::count(h.begin(), h.end(), '\n') <= 2)
+                if (const std::string l = android_wireless_line(); !l.empty())
+                    return ok(detail::text_file(h + l));
+        }
         if (auto vf = host_redirect(host.c_str())) return ok(std::move(*vf));
         return std::nullopt;
     }
