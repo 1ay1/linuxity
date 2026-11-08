@@ -30,6 +30,7 @@
 
 #include "linuxity/kernel/resources.hpp"
 
+#include <sched.h>
 #include <sys/resource.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -40,6 +41,8 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace lx::runtime {
 
@@ -62,13 +65,25 @@ public:
     // for the launcher to print. Empty when the spec requested nothing.
     [[nodiscard]] std::string describe() const {
         if (!spec_.any()) return {};
-        std::string how = cgroup_active() ? "cgroup v2" : "setrlimit (coarse)";
-        std::string s = "bounded via " + how + ":";
-        if (spec_.cpus)    s += " cpus=" + trim(std::to_string(*spec_.cpus));
-        if (spec_.mem_max) s += " mem=" + human(*spec_.mem_max);
-        if (spec_.pids_max) s += " pids=" + std::to_string(*spec_.pids_max);
-        if (spec_.cpuset)  s += " cpuset=" + *spec_.cpuset;
+        std::string s = "limits:";
+        for (const auto& [what, how] : enforcement()) s += " " + what + " " + how + ";";
+        if (!s.empty() && s.back() == ';') s.pop_back();
         return s;
+    }
+
+    // For each requested limit, how this host actually holds the guest to it.
+    // "cgroup" is exact; "linuxity" is enforced by the runtime itself;
+    // "affinity" pins via sched_setaffinity; "rlimit" caps address space,
+    // which is coarser than RSS; "not enforced" means the host offers no way.
+    [[nodiscard]] std::vector<std::pair<std::string, std::string>> enforcement() const {
+        std::vector<std::pair<std::string, std::string>> out;
+        const bool cg = cgroup_active();
+        if (spec_.cpus) out.emplace_back("cpus=" + trim(std::to_string(*spec_.cpus)), cg ? "cgroup" : "not enforced (no cgroup; guests are only told)");
+        if (spec_.mem_max) out.emplace_back("memory=" + human(*spec_.mem_max), cg ? "cgroup" : "rlimit (address space, per process)");
+        if (spec_.swap_and_mem_max) out.emplace_back("memory-swap=" + human(*spec_.swap_and_mem_max), cg ? "cgroup" : "not enforced (no cgroup)");
+        if (spec_.pids_max) out.emplace_back("pids=" + std::to_string(*spec_.pids_max), cg ? "cgroup" : "linuxity");
+        if (spec_.cpuset) out.emplace_back("cpuset=" + *spec_.cpuset, cg ? "cgroup" : "affinity");
+        return out;
     }
 
     // Called by the CHILD after fork(), before execve(). Adopts the child into
@@ -79,8 +94,35 @@ public:
         if (!cg_path_.empty()) {
             std::string procs = cg_path_ + "/cgroup.procs";
             write_num(procs.c_str(), static_cast<std::uint64_t>(::getpid()));
+        } else if (spec_.cpuset) {
+            pin_cpus();
         }
         install_rlimits();
+    }
+
+    // Parse "0-3,6" into CPU numbers; empty on a malformed list.
+    [[nodiscard]] static std::vector<int> parse_cpu_list(std::string_view s) {
+        std::vector<int> out;
+        while (!s.empty()) {
+            const auto comma = s.find(',');
+            const std::string_view part = s.substr(0, comma);
+            const auto dash = part.find('-');
+            auto num = [](std::string_view v, int& n) {
+                if (v.empty() || v.size() > 4 || v.find_first_not_of("0123456789") != std::string_view::npos) return false;
+                n = 0;
+                for (const char c : v) n = n * 10 + (c - '0');
+                return true;
+            };
+            int a = 0, b = 0;
+            if (!num(part.substr(0, dash), a)) return {};
+            b = a;
+            if (dash != std::string_view::npos && !num(part.substr(dash + 1), b)) return {};
+            if (b < a || b > 1023) return {};
+            for (int c = a; c <= b; ++c) out.push_back(c);
+            if (comma == std::string_view::npos) break;
+            s.remove_prefix(comma + 1);
+        }
+        return out;
     }
 
 private:
@@ -203,6 +245,20 @@ private:
     // ---- setrlimit fallback ----------------------------------------------
 
     void install_rlimits() const {
+        install_rlimits_impl();
+    }
+
+    // cpuset without a cgroup: sched_setaffinity, inherited by every child.
+    void pin_cpus() const {
+#if defined(__linux__)
+        ::cpu_set_t set;
+        CPU_ZERO(&set);
+        for (const int c : parse_cpu_list(*spec_.cpuset)) CPU_SET(static_cast<std::size_t>(c), &set);
+        if (CPU_COUNT(&set) > 0) (void)::sched_setaffinity(0, sizeof set, &set);
+#endif
+    }
+
+    void install_rlimits_impl() const {
         if (spec_.mem_max) {
             // RLIMIT_AS bounds ADDRESS SPACE (a superset of RSS), the closest
             // rlimit to a memory cap. Coarser than memory.max but always works.

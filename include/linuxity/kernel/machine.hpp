@@ -50,6 +50,10 @@ public:
     std::string   root_host{"/"};
     // --bind mounts as (guest path, host dir), for the mount table.
     std::vector<std::pair<std::string, std::string>> binds;
+    // Most tasks (processes + threads) the guest may have; 0 = no limit.
+    // linuxity enforces it itself at fork/clone, so it holds on hosts with no
+    // cgroups to delegate (Android).
+    std::uint64_t task_limit{0};
 
     // -- Memory (bytes; the one canonical unit) ----------------------------
     std::uint64_t mem_total{std::uint64_t{2048} << 20};   // 2 GiB

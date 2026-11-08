@@ -19,6 +19,7 @@
 
 #include "linuxity/env/config.hpp"
 #include "linuxity/env/vibe_edit.hpp"
+#include "linuxity/host/tmpdir.hpp"
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -42,7 +43,7 @@ namespace lx::env {
     if (const char* h = std::getenv("LINUXITY_HOME"); h && *h) return h;
     if (const char* x = std::getenv("XDG_DATA_HOME"); x && *x) return std::string{x} + "/linuxity";
     if (const char* h = std::getenv("HOME"); h && *h) return std::string{h} + "/.local/share/linuxity";
-    return "/tmp/linuxity-home-" + std::to_string(::getuid());
+    return lx::host::tmp_path("linuxity-home-" + std::to_string(::getuid()));
 }
 
 // Env and snapshot names: [A-Za-z0-9._-], not starting with '.' or '-'.
@@ -197,8 +198,8 @@ inline bool write_file_atomic(const std::string& path, std::string_view body) {
     std::uint64_t h = 1469598103934665603ULL;
     for (const char c : run_dir) { h ^= static_cast<unsigned char>(c); h *= 1099511628211ULL; }
     char buf[64];
-    std::snprintf(buf, sizeof buf, "/tmp/linuxity-%llx.sock", static_cast<unsigned long long>(h));
-    return buf;
+    std::snprintf(buf, sizeof buf, "linuxity-%llx.sock", static_cast<unsigned long long>(h));
+    return lx::host::tmp_path(buf);
 }
 
 class Store {

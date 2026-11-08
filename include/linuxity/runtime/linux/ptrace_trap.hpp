@@ -237,6 +237,17 @@ public:
         }
         int st = 0;
         ::waitpid(pid, &st, 0);
+        // A host seccomp policy (Android's app filter) can refuse a call the
+        // child makes before its self-stop. Say which, instead of a bare
+        // "killed by SIGSYS" later.
+        if (WIFSTOPPED(st) && WSTOPSIG(st) == SIGSYS) {
+            siginfo_t si{};
+            if (::ptrace(PTRACE_GETSIGINFO, pid, 0, &si) == 0)
+                std::fprintf(stderr, "linuxity: the host refused syscall %d while starting a task\n",
+                             si.si_syscall);
+        } else if (WIFSIGNALED(st) && WTERMSIG(st) == SIGSYS) {
+            std::fprintf(stderr, "linuxity: the host killed a starting task with SIGSYS (seccomp)\n");
+        }
         // Learn whether the child installed the seccomp filter.
         if (seccomp_pipe[1] >= 0) ::close(seccomp_pipe[1]);
         char ok_byte = 0;
@@ -636,6 +647,7 @@ public:
                     continue;
                 }
             }
+            if (sig == SIGSYS && answer_host_refusal(w)) continue;
             rewrite_siginfo_pid(w);
             trace_fault(w, sig);
             resume_run(w, sig);
@@ -655,6 +667,27 @@ public:
         const long n = ::ptrace(req, w, reinterpret_cast<void*>(sizeof info), &info);
         return n > 0 ? info.op : 0;
     }
+
+    // A SIGSYS from seccomp is a refusal by a filter the HOST installed
+    // (ours never traps): Android's app policy blocks set_robust_list, which
+    // glibc calls at the start of every process. That signal outranks our
+    // trace rule, so the call never reaches the dispatcher. The kernel has
+    // already skipped it; answer ENOSYS, as a kernel without the call would,
+    // and drop the signal. Callers like glibc carry on.
+    bool answer_host_refusal(::pid_t w) {
+        siginfo_t si{};
+        if (::ptrace(PTRACE_GETSIGINFO, w, 0, &si) != 0 || si.si_code != 1 /*SYS_SECCOMP*/) return false;
+        Regs rr{};
+        if (!Regs::fetch(w, rr)) return false;
+        rr.set_ret(-ENOSYS);
+        if (!rr.store(w)) return false;
+        if (refused_.insert(si.si_syscall).second)
+            std::fprintf(stderr, "linuxity: the host refuses syscall %d; guests get ENOSYS for it\n",
+                         si.si_syscall);
+        resume_run(w, 0);
+        return true;
+    }
+    std::set<int> refused_;
 
     // A guest died on a signal. Under LINUXITY_TRACE say so, because the
     // trace otherwise just stops mid-stream and a fatal SIGILL/SIGSEGV looks

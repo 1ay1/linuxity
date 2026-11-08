@@ -11,6 +11,7 @@
 #include "linuxity/env/status.hpp"
 #include "linuxity/env/store.hpp"
 #include "linuxity/host/posix_host.hpp"
+#include "linuxity/host/tmpdir.hpp"
 #include "linuxity/kernel/kernel.hpp"
 #include "linuxity/kernel/resolver.hpp"
 #include "linuxity/kernel/resources.hpp"
@@ -487,6 +488,7 @@ int run_runtime(lx::cli::Options& o, int argc, char** argv) {
         // per CPU" shapes itself to the bound it will actually be held to —
         // belief == enforced reality (kernel/resources.hpp::advertise).
         spec = res.advertise(std::move(spec));
+        if (res.pids_max) spec.task_limit = *res.pids_max;
         k.set_machine(std::move(spec));
     }
 
@@ -498,7 +500,9 @@ int run_runtime(lx::cli::Options& o, int argc, char** argv) {
     const std::string limits_text = governor.describe();
     if (!limits_text.empty())
         st.event("limits", limits_text, [&](env::Json& j) {
-            j.kv("cgroup", governor.cgroup_active());
+            j.kv("cgroup", governor.cgroup_active()).key("enforced").obj();
+            for (const auto& [what, how] : governor.enforcement()) j.kv(what, how);
+            j.end();
         });
 
     // Seed the process table: pid 1 is our init (the traced root). Its
@@ -579,8 +583,8 @@ int run_runtime(lx::cli::Options& o, int argc, char** argv) {
         if (!host_has) {
             // Same convention and location as the private /tmp below: named
             // with the SUPERVISOR's pid, since the guest's is always 1.
-            shm_dir = "/tmp/linuxity-shm-" +
-                      std::to_string(static_cast<long>(::getpid()));
+            shm_dir = host::tmp_path("linuxity-shm-" +
+                      std::to_string(static_cast<long>(::getpid())));
             (void)::mkdir(shm_dir.c_str(), 01777);
             (void)::chmod(shm_dir.c_str(), 01777);
         }
@@ -598,7 +602,7 @@ int run_runtime(lx::cli::Options& o, int argc, char** argv) {
         // (installs/DB/config survive across runs — a real machine); without
         // it, a fresh per-run /tmp dir that's implicitly discarded on exit.
         std::string upper = persist.empty()
-            ? "/tmp/linuxity-upper-" + std::to_string(::getpid())
+            ? host::tmp_path("linuxity-upper-" + std::to_string(::getpid()))
             : persist;
         if (persist.empty()) ephemeral_upper = upper;
         if (!persist.empty()) {
@@ -642,7 +646,7 @@ int run_runtime(lx::cli::Options& o, int argc, char** argv) {
     // guest's own pid cannot, since it is always 1. Same convention as the
     // overlay upper dir above.
     if (private_tmp) {
-        const std::string gt = "/tmp/linuxity-tmp-" + std::to_string(::getpid());
+        const std::string gt = host::tmp_path("linuxity-tmp-" + std::to_string(::getpid()));
         // 1777, like a real /tmp: world-writable with the sticky bit. 0700 is
         // wrong here even though only one guest uses it -- the guest presents
         // as root while the directory is owned by the invoking uid, so a
@@ -750,7 +754,7 @@ int run_runtime(lx::cli::Options& o, int argc, char** argv) {
     // The probe binds a socket in the overlay upper (where a guest's would
     // go) and unlinks it. One syscall pair at startup beats a per-host #ifdef.
     {
-        std::string probe = (persist.empty() ? std::string{"/tmp"} : persist) +
+        std::string probe = (persist.empty() ? host::tmp_base() : persist) +
                             "/.linuxity-sock-probe";
         ::unlink(probe.c_str());
         bool fs_ok = false;
@@ -773,7 +777,7 @@ int run_runtime(lx::cli::Options& o, int argc, char** argv) {
     // Same question for FIFOs. Android refuses mkfifo everywhere a shell can
     // write, so emulate them there (see Syscalls::fifo_*).
     {
-        std::string probe = (persist.empty() ? std::string{"/tmp"} : persist) +
+        std::string probe = (persist.empty() ? host::tmp_base() : persist) +
                             "/.linuxity-fifo-probe";
         ::unlink(probe.c_str());
         int rc = ::mkfifo(probe.c_str(), 0600);
@@ -984,6 +988,7 @@ int run_runtime(lx::cli::Options& o, int argc, char** argv) {
         h.layers = layers;
         h.resolv = resolv;
         h.limits_text = limits_text;
+        h.cgroup = governor.cgroup_active();
         sup = std::make_unique<cli::Supervisor>(k, trap, o, std::move(h));
         std::string why;
         if (!sup->start(why)) {
@@ -1012,7 +1017,7 @@ int run_runtime(lx::cli::Options& o, int argc, char** argv) {
     // upper is NEVER touched, only the per-pid one we created.
     const auto sweep = [](const std::string& d) {
         if (d.empty()) return;
-        if (d.rfind("/tmp/linuxity-", 0) != 0) return;   // ours, or nothing
+        if (d.rfind(host::tmp_path("linuxity-"), 0) != 0) return;   // ours, or nothing
         std::string cmd = "rm -rf -- '" + d + "' 2>/dev/null";
         (void)!std::system(cmd.c_str());
     };

@@ -29,6 +29,7 @@
 
 #include "linuxity/abi/result.hpp"
 #include "linuxity/abi/syscall.hpp"
+#include "linuxity/host/tmpdir.hpp"
 #include "linuxity/host/win_posix.hpp"
 #include "linuxity/runtime/backend.hpp"
 
@@ -866,8 +867,8 @@ private:
     // Write bytes to a fresh host temp file, return its path ("" on failure).
     // Used to back an INJECT (virtual file) with a real, mmappable fd.
     static std::string materialize(const std::vector<std::byte>& bytes) {
-        char tmpl[] = "/tmp/linuxity-vfile-XXXXXX";
-        int fd = ::mkstemp(tmpl);
+        std::string tmpl = host::tmp_path("linuxity-vfile-XXXXXX");
+        int fd = ::mkstemp(tmpl.data());
         if (fd < 0) return {};
         std::size_t off = 0;
         while (off < bytes.size()) {
@@ -876,15 +877,15 @@ private:
             off += static_cast<std::size_t>(n);
         }
         ::close(fd);
-        return std::string{tmpl};
+        return tmpl;
     }
 
     // Create a fresh empty host temp DIRECTORY, return its path. Backs a
     // virtual directory so the child's O_DIRECTORY open succeeds; the actual
     // entries are served by the virtualized getdents64.
     static std::string materialize_dir() {
-        char tmpl[] = "/tmp/linuxity-vdir-XXXXXX";
-        return ::mkdtemp(tmpl) ? std::string{tmpl} : std::string{};
+        std::string tmpl = host::tmp_path("linuxity-vdir-XXXXXX");
+        return ::mkdtemp(tmpl.data()) ? tmpl : std::string{};
     }
 
     // Unlink every INJECT temp created during the run (files and dirs).

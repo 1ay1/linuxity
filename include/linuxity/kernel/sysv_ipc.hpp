@@ -12,6 +12,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+
+#include "linuxity/host/tmpdir.hpp"
 #include <map>
 #include <optional>
 #include <string>
@@ -115,9 +117,7 @@ public:
         return {};
 #else
         if (!dir_.empty()) return dir_;
-        const char* t = std::getenv("TMPDIR");
-        std::string base = t && *t ? t : "/tmp";
-        std::string d = base + "/linuxity-sysvipc-" + std::to_string(::getpid());
+        std::string d = host::tmp_path("linuxity-sysvipc-" + std::to_string(::getpid()));
         if (::mkdir(d.c_str(), 0700) == 0 || errno == EEXIST) dir_ = d;
         return dir_;
 #endif

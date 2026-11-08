@@ -71,6 +71,7 @@ struct RuntimeHooks {
     std::vector<std::string> layers;          // host dirs, top first (for passwd)
     std::shared_ptr<std::string> resolv;      // served /etc/resolv.conf, live
     std::string limits_text;                  // how limits are enforced
+    bool cgroup{false};                       // limits held by a cgroup
 };
 
 class Supervisor {
@@ -757,7 +758,9 @@ private:
         std::string dir{self};
         dir.resize(dir.find_last_of('/'));
         std::string helper;
-        for (const char* cand : {"/linuxity-bridge", "/../libexec/linuxity/linuxity-bridge",
+        // next to us, under its own name, or as packaged in an Android APK
+        for (const char* cand : {"/linuxity-bridge", "/liblinuxity-bridge.so",
+                                 "/../libexec/linuxity/linuxity-bridge",
                                  "/../lib/linuxity/linuxity-bridge"})
             if (::access((dir + cand).c_str(), X_OK) == 0) { helper = dir + cand; break; }
         if (helper.empty()) {

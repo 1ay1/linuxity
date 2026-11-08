@@ -13,6 +13,7 @@
 #include "linuxity/abi/result.hpp"
 #include "linuxity/abi/sysno.hpp"
 #include "linuxity/abi/types.hpp"
+#include "linuxity/host/tmpdir.hpp"
 #include "linuxity/kernel/file_namespace.hpp"
 #include "linuxity/kernel/machine.hpp"
 #include "linuxity/kernel/nl80211.hpp"
@@ -963,6 +964,16 @@ public:
                 }
                 return fwd();
 
+            // -- fork/clone: the task limit (limits.pids). pids.max needs a
+            //    delegated cgroup; this works on every host.
+            case Sysno::clone:
+            case Sysno::clone3:
+            case Sysno::fork:
+            case Sysno::vfork:
+                if (const auto lim = machine().task_limit; lim && task_count() >= lim)
+                    return eno(Errno::eagain);
+                return fwd();
+
             // -- everything else: FORWARD to the real host kernel. -------
             // Memory (mmap/brk/mprotect) MUST run in the child so it gets
             // real pages in its own address space; file I/O, arch_prctl,
@@ -974,6 +985,15 @@ public:
     }
 
 private:
+    // Live guest tasks: every process plus its extra threads.
+    [[nodiscard]] std::uint64_t task_count() const {
+        std::uint64_t n = 0;
+        for (const std::int32_t pid : k_.procs().pids())
+            if (const auto* p = k_.procs().find(pid); p && p->state != 'Z')
+                n += 1 + p->threads.size();
+        return n;
+    }
+
     // Mount points the GUEST asked for. Its mounts are no-ops on our side,
     // but it believes they exist, so the matching umount2 must succeed --
     // a program that mounts and then unmounts its own scratch tree should
@@ -1009,8 +1029,8 @@ private:
         }
         std::string host_dir;
         if (type == "tmpfs" || type == "ramfs") {
-            char tmpl[] = "/tmp/linuxity-tmpfs-XXXXXX";
-            if (!::mkdtemp(tmpl)) return eno(Errno::enospc);
+            std::string tmpl = host::tmp_path("linuxity-tmpfs-XXXXXX");
+            if (!::mkdtemp(tmpl.data())) return eno(Errno::enospc);
             host_dir = tmpl;
             fs.mount_guest(tgt, host_dir, ns, f & kRdonly);
             return val(0);
