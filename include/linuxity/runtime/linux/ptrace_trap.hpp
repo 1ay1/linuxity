@@ -997,7 +997,11 @@ public:
         const long w1 = ::ptrace(PTRACE_PEEKDATA, w, reinterpret_cast<void*>(at + 8), 0);
         if (errno != 0) return;
         const auto host = static_cast<std::int32_t>(static_cast<std::uint32_t>(w0));
-        const std::int32_t g = host > 0 ? known_gpid_of(host) : 0;
+        std::int32_t g = host > 0 ? known_gpid_of(host) : 0;
+        // a child that connected before its fork event was processed (the
+        // slow, no-seccomp path makes this race easy to hit) is still one
+        // we trace: give it its pid now, as the fork event would
+        if (g <= 0 && host > 0 && tasks_.count(host)) g = gpid_of(host);
         if (g <= 0) return;   // not ours: leave the host's answer alone
         const auto ids = guest_ids_of_ ? guest_ids_of_(g) : std::pair<std::uint32_t, std::uint32_t>{0, 0};
         const auto n0 = static_cast<std::uint64_t>(static_cast<std::uint32_t>(g)) |
@@ -2336,7 +2340,17 @@ private:
             fn(static_cast<std::int64_t>(r.ret()));
             // a deferred redirect owns its result; a forwarded call that only
             // borrowed a buffer still gets the usual translations below
-            if (t.action != Action::none || !t.forwarded) { t.forwarded = false; return; }
+            if (t.action != Action::none || !t.forwarded) {
+                t.forwarded = false;
+                // the call is over. Without seccomp in_call is what tells the
+                // next stop's entry from an exit; left set, the guest's next
+                // syscall (a getpid after connect) was taken for this one's
+                // exit and ran unanswered, returning a host pid. on_exit may
+                // already have restarted it (wait_then_retry), which is fine:
+                // the rerun is a fresh entry either way.
+                if (t.in_call) sys_done(w);
+                return;
+            }
         }
         t.forwarded = false;
         if (t.action == Action::set_ret) {
