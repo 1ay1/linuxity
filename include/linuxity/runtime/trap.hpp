@@ -94,6 +94,14 @@ public:
             return (t && *t) ? t : nullptr;
         }();
         LX_TRY(trap_.start(entry, sp));
+        // with host pids, init is the root task's real pid, known only now
+        if constexpr (requires { trap_.init_gpid(); }) {
+            const std::int32_t init = trap_.init_gpid();
+            if (init != kernel_.procs().init_pid()) {
+                kernel_.files().rekey_pid(kernel_.procs().init_pid(), init);
+                kernel_.procs().rekey_init(init);
+            }
+        }
         for (;;) {
             TrapFrame f;
             bool still_running = LX_TRY(trap_.next(f));
@@ -752,7 +760,7 @@ private:
                         kernel_.procs().ipc().process_gone(static_cast<std::int32_t>(e.pid));
                         // pid 1 (our init) is never removed: /proc must always
                         // have a root even as the last guest thread winds down.
-                        if (e.pid != 1) {
+                        if (e.pid != kernel_.procs().init_pid()) {
                             kernel_.procs().drop_ns_pid(static_cast<std::int32_t>(e.pid));
                             kernel_.procs().remove(static_cast<std::int32_t>(e.pid));
                             // Drop the exited pid's cwd record so a later pid

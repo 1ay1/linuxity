@@ -265,6 +265,14 @@ public:
     // chdir/fchdir/getcwd and every relative-path absolutize act on the RIGHT
     // process's cwd. A pid with no record inherits the tree default "/".
     void set_current_pid(std::int32_t pid) const noexcept { cur_pid_ = pid; }
+    // Move pid `from`'s cwd and fd table to `to` (init gets its host pid).
+    void rekey_pid(std::int32_t from, std::int32_t to) {
+        if (from == to) return;
+        if (auto n = cwds_.extract(from)) { n.key() = to; cwds_.insert(std::move(n)); }
+        if (auto n = fd_tables_.extract(from)) { n.key() = to; fd_tables_.insert(std::move(n)); }
+        if (cur_pid_ == from) cur_pid_ = to;
+        if (seeded_pid_ == from) seeded_pid_ = to;
+    }
     // The pid whose syscall is being served right now. A virtual-file producer
     // needs it to answer per-process questions (/dev/tty is "MY controlling
     // terminal"), and the producer signature carries only the path.

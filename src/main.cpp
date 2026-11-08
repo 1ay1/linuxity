@@ -270,6 +270,7 @@ int main(int argc, char** argv) {
     // distro is mounted (the bootstrap rootfs has orphan library files that
     // would otherwise abort installs). --no-pacman-overwrite disables it.
     bool pacman_overwrite = true;
+    bool host_pids = false;
     // A PRIVATE /tmp, on by default.
     //
     // The guest's top process is pid 1, correctly -- it is the guest's init.
@@ -327,6 +328,7 @@ int main(int argc, char** argv) {
         }
         else if (f == "--pids")   { res.pids_max = std::strtoull(need("--pids"), nullptr, 10); }
         else if (f == "--cpuset") { res.cpuset = need("--cpuset"); }
+        else if (f == "--host-pids") { host_pids = true; }
         else if (f == "--bind" || f == "-b") {
             // host[:guest] — split on the LAST ':' so a Windows-free host path
             // with no colon binds to itself; guest defaults to the host path.
@@ -369,6 +371,8 @@ int main(int argc, char** argv) {
             "  --cpuset <LIST>     pin to CPUs (e.g. 0-1, 0,2,4)\n"
             "  --bind host[:guest] expose a host dir in the guest tree\n"
             "                      (guest defaults to the same path)\n"
+            "  --host-pids         share the host's pid space, like docker --pid=host:\n"
+            "                      ps, top and monitors see every host process\n"
             "\n"
             "  The resource bounds are enforced by the HOST kernel (cgroup v2,\n"
             "  or setrlimit where a cgroup can't be created unprivileged) and\n"
@@ -929,6 +933,8 @@ int main(int argc, char** argv) {
     // then loaded host libraries, or failed to load any. conform::host_arch()
     // is the one place that answers this.
     runtime::Cpu cpu{trap, k, trap, conform::host_arch()};
+    trap.set_host_pids(host_pids);
+    k.procs().set_host_pids(host_pids);
     // procfs reads live per-task facts from the guest's real host task
     k.procs().set_host_resolver([&trap](std::int32_t g) { return static_cast<int>(trap.host_tid_of(g)); });
     k.procs().set_guest_resolver([&trap](std::int32_t h) { return static_cast<int>(trap.guest_pid_of_host(h)); });

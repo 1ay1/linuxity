@@ -525,7 +525,22 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
         std::string p{abs};
         // Our "self" is always pid 1 (the traced root / init).
         if (p == "/proc/self" || p.starts_with("/proc/self/"))
-            p = "/proc/1" + p.substr(std::string_view{"/proc/self"}.size());
+            p = "/proc/" + std::to_string(procs.init_pid()) +
+                p.substr(std::string_view{"/proc/self"}.size());
+
+        // ---- --host-pids: a host process that isn't ours is the host's own
+        //      /proc entry, read-only as the kernel lets us read it
+        if (procs.host_pids() && procs.reader_pid_ns() == 0) {
+            const auto [hp, rest] = detail::split_pid(p);
+            if (hp > 0 && !procs.has(static_cast<std::int32_t>(hp)) &&
+                !procs.thread_group_of(static_cast<std::int32_t>(hp))) {
+                const std::string h = "/proc/" + std::to_string(hp);
+                if (::access(h.c_str(), F_OK) != 0) return err<kernel::VirtualFile>(Errno::enoent);
+                kernel::VirtualFile vf;
+                vf.redirect_host = std::string{p};
+                return ok(std::move(vf));
+            }
+        }
 
         // ---- /proc root: enumerate every pid + the well-known files -----
         if (abs == "/proc") {
@@ -533,7 +548,19 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
             // only the pids the reader's pid namespace can see, by its numbers
             for (std::int32_t pid : procs.pids())
                 if (const auto v = procs.view_pid(pid); v > 0)
-                    e.push_back({std::to_string(v), true});
+                    if (!procs.host_pids() || pid == procs.init_pid() ||
+                        ::access(("/proc/" + std::to_string(pid)).c_str(), F_OK) == 0)
+                        e.push_back({std::to_string(v), true});
+            if (procs.host_pids() && procs.reader_pid_ns() == 0)
+                if (DIR* d = ::opendir("/proc")) {
+                    while (const dirent* de = ::readdir(d)) {
+                        char* end = nullptr;
+                        const long v = std::strtol(de->d_name, &end, 10);
+                        if (v > 0 && *end == '\0' && !procs.has(static_cast<std::int32_t>(v)))
+                            e.push_back({de->d_name, true});
+                    }
+                    ::closedir(d);
+                }
             for (const char* f : {"stat","meminfo","vmstat","cpuinfo","uptime","loadavg",
                                   "version","cmdline","filesystems","mounts",
                                   "interrupts","softirqs","swaps","partitions",
@@ -1108,6 +1135,13 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
             if (!pi)
                 if (const auto tg = procs.thread_group_of(self_tid)) pi = procs.find(tg);
             if (!pi) return err<kernel::VirtualFile>(Errno::enoent);
+            // With host pids the guest and host share numbers, and a reaped
+            // task's record can outlive the waitpid that reaped it by a beat.
+            // The host is the truth: no host task, no entry. Kernel threads
+            // and zombies the host still shows are its answer too.
+            if (procs.host_pids() && self_tid != procs.init_pid() &&
+                ::access(("/proc/" + std::to_string(self_tid)).c_str(), F_OK) != 0)
+                return err<kernel::VirtualFile>(Errno::enoent);
             const auto& I = *pi;
 
             if (tail.empty())     // the /proc/<pid> directory itself
@@ -1178,7 +1212,11 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
             if (tail == "task") {
                 std::vector<kernel::VirtualDirent> ents{{std::to_string(procs.view_pid(I.pid)), true}};
                 for (auto t : I.threads)
-                    if (const auto v = procs.view_pid(t); v > 0) ents.push_back({std::to_string(v), true});
+                    if (const auto v = procs.view_pid(t); v > 0)
+                        if (!procs.host_pids() ||
+                            ::access(("/proc/" + std::to_string(I.pid) + "/task/" +
+                                      std::to_string(t)).c_str(), F_OK) == 0)
+                            ents.push_back({std::to_string(v), true});
                 return ok(dir_file(std::move(ents)));
             }
             if (tail.starts_with("task/")) {

@@ -270,9 +270,9 @@ public:
                 if (WIFSIGNALED(st)) trace_killed(w, WTERMSIG(st));
                 if (w == root_pid_) exit_code_ = code;
                 gt_on_exit(w, st);
-                if (auto it = gpid_.find(w); it != gpid_.end()) {
-                    proc_events_.push_back({ProcEvent::reap, it->second, 0, {}, {}});
-                    reparent_orphans_of(it->second);
+                if (const std::int32_t g = exited_gpid(w)) {
+                    proc_events_.push_back({ProcEvent::reap, g, 0, {}, {}});
+                    reparent_orphans_of(g);
                 }
                 // NB: do NOT erase gpid_[w] here. The parent's wait4() has not
                 // run its exit stop yet; when it does, finalize_exit translates
@@ -1600,6 +1600,7 @@ public:
     // and each newly-seen process gets the next number. This keeps /proc in
     // linuxity's own tiny pid space instead of exposing host pids.
     std::int32_t gpid_of(::pid_t tid) {
+        if (host_pids_) return static_cast<std::int32_t>(tid);
         if (tid == root_pid_) return 1;
         auto [it, fresh] = gpid_.try_emplace(tid, 0);
         if (fresh) {
@@ -1607,6 +1608,22 @@ public:
             host_of_gpid_[it->second] = tid;
         }
         return it->second;
+    }
+    // The guest pid of a task that just exited, or 0 if it was never ours
+    // (the root is reported by its own path).
+    [[nodiscard]] std::int32_t exited_gpid(::pid_t w) const {
+        if (host_pids_)
+            return w != root_pid_ && (gppid_.count(static_cast<std::int32_t>(w)))
+                ? static_cast<std::int32_t>(w) : 0;
+        auto it = gpid_.find(w);
+        return it != gpid_.end() ? it->second : 0;
+    }
+
+    // Guest pids are host pids (--host-pids). Set before start().
+    void set_host_pids(bool on) noexcept { host_pids_ = on; }
+    // The guest's init: the root task's pid as the guest names it.
+    [[nodiscard]] std::int32_t init_gpid() const noexcept {
+        return host_pids_ ? static_cast<std::int32_t>(root_pid_) : 1;
     }
 
     [[nodiscard]] bool exited() const noexcept { return exited_; }
@@ -1732,7 +1749,7 @@ public:
         std::int32_t ppid = 0;
         if (auto it = gppid_.find(pid); it != gppid_.end()) {
             ppid = it->second;
-        } else if (pid != 1) {
+        } else if (pid != init_gpid()) {
             // The child's attach stop can win the race with the parent's
             // fork event, so its first syscall arrives with no parent link.
             // The host knows the parent; take it from there.
@@ -1741,6 +1758,10 @@ public:
                 gppid_[pid] = gp;
                 ppid = gp;
             }
+        } else if (host_pids_) {
+            // init's parent is linuxity itself, which the guest can see
+            ppid = static_cast<std::int32_t>(::getpid());
+            gppid_[pid] = ppid;
         }
         return TaskIds{pid, tid, ppid};
     }
@@ -1815,6 +1836,11 @@ public:
             for (const auto& [tid, gp] : gpid_)
                 if (gp == leader || descends_from(gp, leader))
                     targets.push_back(tid);
+            // host pids keep no gpid_ map; the tree is gppid_ itself
+            if (host_pids_)
+                for (const auto& [gp, _] : gppid_)
+                    if ((gp == leader || descends_from(gp, leader)) && tasks_.count(gp))
+                        targets.push_back(static_cast<::pid_t>(gp));
 
             // The implicit forms (0 and -1) always include the caller, which
             // may not be in gpid_ (the root task is tracked separately). An
@@ -1841,6 +1867,9 @@ public:
 
         const ::pid_t tid = host_tid_of(gpid);
         if (tid < 0) return -static_cast<std::int64_t>(Errno::esrch);
+        // a host process outside the guest: the host kernel decides
+        if (host_pids_ && !known_gpid_of(tid))
+            return ::kill(tid, signum) == 0 ? 0 : -static_cast<std::int64_t>(errno);
         return deliver_to_tid(tid, signum);
     }
 
@@ -1848,7 +1877,7 @@ public:
     // depth so a cycle (which should not happen, but a stale entry could
     // create one) cannot spin.
     [[nodiscard]] bool descends_from(std::int32_t p, std::int32_t root) const {
-        for (int hops = 0; hops < 64 && p > 1; ++hops) {
+        for (int hops = 0; hops < 64 && p > 1 && p != init_gpid(); ++hops) {
             const auto it = gppid_.find(p);
             if (it == gppid_.end()) return false;
             p = it->second;
@@ -2089,6 +2118,7 @@ public:
     // the same range guest pids reach, so waitpid(child) sometimes landed on
     // an unrelated tracee and got ECHILD.
     [[nodiscard]] ::pid_t host_tid_of(std::int32_t pid) const {
+        if (host_pids_) return pid > 0 ? static_cast<::pid_t>(pid) : -1;
         if (pid == 1) return root_pid_;
         if (auto it = host_of_gpid_.find(pid); it != host_of_gpid_.end()) return it->second;
         return -1;
@@ -2416,9 +2446,9 @@ private:
                 int code = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
                 if (w == root_pid_) exit_code_ = code;
                 gt_on_exit(w, st);
-                if (auto it = gpid_.find(w); it != gpid_.end()) {
-                    proc_events_.push_back({ProcEvent::reap, it->second, 0, {}, {}});
-                    reparent_orphans_of(it->second);
+                if (const std::int32_t g = exited_gpid(w)) {
+                    proc_events_.push_back({ProcEvent::reap, g, 0, {}, {}});
+                    reparent_orphans_of(g);
                 }
                 // Retained past exit — see the note in next(): the parent's
                 // wait4 still needs to translate this reaped pid.
@@ -2533,7 +2563,18 @@ private:
     // The guest pid for a host id we have ALREADY seen, or 0. Pure lookup, so
     // it cannot perturb the pid allocator the way gpid_of does.
     [[nodiscard]] std::int32_t known_gpid_of(::pid_t host) const {
-        if (host == root_pid_) return 1;
+        if (host == root_pid_) return init_gpid();
+        if (host_pids_) {
+            // ours only if we trace it (or did): a host stranger is not
+            if (tasks_.count(host) || gppid_.count(static_cast<std::int32_t>(host)))
+                return static_cast<std::int32_t>(host);
+            for (const auto& [tid, _] : tasks_) {
+                auto c = tgid_cache_.find(tid);
+                if ((c != tgid_cache_.end() ? c->second : tgid_of(tid)) == host)
+                    return static_cast<std::int32_t>(host);
+            }
+            return 0;
+        }
         if (auto it = gpid_.find(host); it != gpid_.end()) return it->second;
         // si_pid carries the sender's THREAD-GROUP id; our map is keyed by
         // the tid we attached to. They differ only once the group's leader
@@ -2562,7 +2603,9 @@ private:
             const ::pid_t hp = status_field(host, "PPid:");
             if (hp <= 0) continue;   // gone already
             std::int32_t np = known_gpid_of(hp);
-            if (np <= 0 || np == dead) np = 1;
+            // with host pids the new parent is the host's answer as is
+            if (host_pids_) np = static_cast<std::int32_t>(hp);
+            else if (np <= 0 || np == dead) np = 1;
             parent = np;
             proc_events_.push_back({ProcEvent::reparent, child, np, {}, {}});
         }
@@ -2619,6 +2662,7 @@ private:
     // served through the normal dispatch path until drain_deadline_.
     bool draining_{false};
     std::chrono::steady_clock::time_point drain_deadline_{};
+    bool host_pids_{false};        // --host-pids: guest pids are host pids
     bool seccomp_{false};          // trap filter active -> drive with PTRACE_CONT
     int base_opts_{0};             // linuxity's own ptrace options on every task
     std::unordered_map<::pid_t, Task> tasks_;

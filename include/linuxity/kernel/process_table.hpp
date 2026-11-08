@@ -26,6 +26,9 @@
 #include <map>
 #include <string>
 #include <vector>
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 
 namespace lx::kernel {
 
@@ -106,6 +109,35 @@ public:
     }
     // Stands in for the host group/session pid 1 was born into.
     static constexpr std::int32_t kInheritedPgid = 0x7fff0000;
+
+    // The guest's init. 1 in linuxity's own pid space; with host pids it is
+    // the root task's real pid, known only once the trap has started it.
+    [[nodiscard]] std::int32_t init_pid() const { return init_pid_; }
+    // Guest pids are host pids (docker's --pid=host): no translation, and
+    // processes outside the guest are visible and signalable.
+    [[nodiscard]] bool host_pids() const { return host_pids_; }
+    void set_host_pids(bool on) { host_pids_ = on; }
+    // Move init's record (seeded at 1 before the root existed) to its pid.
+    // With host pids nothing needs hiding: init's parent is linuxity, and
+    // the group and session it inherited are the real host ones.
+    void rekey_init(std::int32_t pid) {
+        if (pid <= 0 || pid == init_pid_) return;
+        if (auto n = procs_.extract(init_pid_)) {
+            n.key() = pid;
+            n.mapped().pid = pid;
+#if !defined(_WIN32)
+            if (host_pids_) {
+                n.mapped().ppid = static_cast<std::int32_t>(::getpid());
+                if (n.mapped().pgid == kInheritedPgid) n.mapped().pgid = ::getpgrp();
+                if (n.mapped().sid == kInheritedPgid) n.mapped().sid = ::getsid(0);
+            }
+#endif
+            for (auto& [_, p] : procs_) if (p.ppid == init_pid_) p.ppid = pid;
+            procs_.insert(std::move(n));
+        }
+        init_pid_ = pid;
+        note_pid(pid);
+    }
 
     // Replace a process's identity (comm, argv, exe, ...). Group and session
     // are KEPT unless the new record sets them: they are job-control state,
@@ -216,7 +248,8 @@ public:
             if (p->ppid == 0 || p->ppid == p->pid) break;
             p = find(p->ppid);
         }
-        return pid == 1 ? pid : (find(1) && find(1)->pgid ? find(1)->pgid : 1);
+        const ProcInfo* in = find(init_pid_);
+        return pid == init_pid_ ? pid : (in && in->pgid ? in->pgid : init_pid_);
     }
     [[nodiscard]] std::int32_t sid_of(std::int32_t pid) const {
         if (pid <= 0) return pid;
@@ -227,7 +260,8 @@ public:
             if (p->ppid == 0 || p->ppid == p->pid) break;
             p = find(p->ppid);
         }
-        return pid == 1 ? pid : (find(1) && find(1)->sid ? find(1)->sid : 1);
+        const ProcInfo* in = find(init_pid_);
+        return pid == init_pid_ ? pid : (in && in->sid ? in->sid : init_pid_);
     }
     // setsid(): a new session AND a new group, both led by the caller.
     void set_sid(std::int32_t pid) {
@@ -305,7 +339,7 @@ public:
         if (p.pid == 0) p.pid = pid;          // first mention of this pid
         p.pgid = pgid ? pgid : pid;
     }
-    void remove(std::int32_t pid) { if (pid != 1) procs_.erase(pid); }
+    void remove(std::int32_t pid) { if (pid != init_pid_) procs_.erase(pid); }
 
     [[nodiscard]] bool has(std::int32_t pid) const { return find(pid) != nullptr; }
     // The supplementary groups `pid` holds. fork copies the parent's (see
@@ -556,6 +590,8 @@ private:
     HostOf guest_of_;
     TracerOf tracer_of_;
     std::map<std::int32_t, ProcInfo> procs_;
+    std::int32_t init_pid_{1};
+    bool host_pids_{false};
     std::int32_t last_pid_{1};
     Namespaces ns_;
     SysvIpc ipc_;
