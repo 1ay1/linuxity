@@ -16,6 +16,7 @@
 #pragma once
 
 #include "linuxity/abi/types.hpp"
+#include "linuxity/kernel/landlock.hpp"
 #include "linuxity/kernel/namespaces.hpp"
 #include "linuxity/kernel/sysv_ipc.hpp"
 
@@ -80,6 +81,9 @@ struct ProcInfo {
                   cap_bnd{kAllCaps}, cap_amb{0};
     bool keepcaps{false};
     bool no_new_privs{false};
+    // Landlock layers linuxity enforces itself (hosts with no Landlock);
+    // shared with a fork, replaced by a new restriction
+    landlock::Domain landlock{};
     std::int32_t nice{0};
     // set on a spawn record that carries the parent's credentials
     bool creds_given{false};
@@ -164,6 +168,7 @@ public:
             cur.cap_eff = old.cap_eff; cur.cap_prm = old.cap_prm; cur.cap_inh = old.cap_inh;
             cur.cap_bnd = old.cap_bnd; cur.cap_amb = old.cap_amb;
             cur.keepcaps = old.keepcaps; cur.no_new_privs = old.no_new_privs; cur.nice = old.nice;
+            cur.landlock = old.landlock;
         }
         cur.creds_given = false;
     }

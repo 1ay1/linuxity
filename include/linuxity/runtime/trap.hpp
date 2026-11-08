@@ -726,6 +726,7 @@ private:
                             pi.cap_amb = pp->cap_amb;
                             pi.keepcaps = pp->keepcaps;
                             pi.no_new_privs = pp->no_new_privs;
+                            pi.landlock = pp->landlock;
                             pi.nice = pp->nice;
                             pi.creds_given = true;
                             kernel_.procs().inherit_ns(pi, *pp, kernel_.procs().take_clone_ns(pi.ppid) | ns_flags_of(e));

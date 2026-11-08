@@ -145,6 +145,9 @@ public:
             if constexpr (requires { mem_.host_tid(); })
                 if (!k_.procs().find_mut(id.pid)) (void)me();
         }
+        // a process under a landlock domain linuxity keeps (no host Landlock)
+        if (ll_layers_ > 0)
+            if (const Errno e = ll_gate(sc, r); e != Errno::ok) return eno(e);
         switch (sc) {
             // -- process lifecycle: let the task ACTUALLY exit in the kernel
             //    (forward), so the trap reaps it and attributes the code. In
@@ -848,20 +851,16 @@ public:
             //    it asked for, and a path rule is added for every host layer
             //    behind the guest path (overlay upper and lower).
             //
-            //    Where the host has none (Android's 6.1 GKI) we say ENOSYS,
-            //    the answer a kernel without Landlock gives. These calls used
-            //    to be accepted and do nothing, for pacman's sake -- but a
-            //    sandbox told its walls are up when they are not is worse than
-            //    one told to go without: claybin's audit read `strong` and
-            //    `--require strong` passed with nothing enforced. pacman needs
-            //    DisableSandbox in pacman.conf on such a host, which is what
-            //    it documents for kernels without Landlock.
+            //    Where the host has none (Android's 6.1 GKI) we keep the rule
+            //    sets ourselves (kernel/landlock.hpp) and check every path,
+            //    port and signal call against them. We see all of those calls
+            //    already, so the walls hold just the same.
             case Sysno::landlock_create_ruleset:
                 if (host_has_landlock()) return fwd();
-                return eno(Errno::enosys);
+                return do_ll_create_ruleset(r);
             case Sysno::landlock_add_rule:
                 if (host_has_landlock()) return do_landlock_add_rule(r);
-                return eno(Errno::enosys);
+                return do_ll_add_rule(r);
             case Sysno::landlock_restrict_self:
                 if (host_has_landlock()) {
                     // from now on this process (and what it forks) can't open
@@ -869,7 +868,7 @@ public:
                     landlocked_.insert(ids().pid);
                     return fwd();
                 }
-                return eno(Errno::enosys);
+                return do_ll_restrict_self(r);
 
             // -- AF_UNIX bind/connect: the chroot'd guest resolves an
             //    absolute sun_path correctly on its own, so we forward the
@@ -5491,6 +5490,7 @@ private:
             pi.cap_amb = pp->cap_amb;
             pi.keepcaps = pp->keepcaps;
             pi.no_new_privs = pp->no_new_privs;
+            pi.landlock = pp->landlock;
             pi.nice = pp->nice;
             k_.procs().inherit_ns(pi, *pp, 0);
         }
@@ -6960,6 +6960,260 @@ public:
     // Does the host kernel enforce Landlock? Asked once.
     // guest processes that Landlocked themselves (a fork inherits it)
     std::set<std::int32_t> landlocked_;
+
+    // -- landlock kept by us, for a host whose kernel has none --------------
+    // Rule sets under construction, keyed by the inode of the fd the guest
+    // holds for each (a memfd it made), so dup, fork and close need no help.
+    std::map<std::uint64_t, kernel::landlock::Ruleset> ll_sets_;
+    std::uint64_t ll_next_domain_{1};
+    int ll_layers_{0};   // processes restricted so far; 0 skips the gate
+
+    // The inode behind guest fd `fd`, or 0.
+    [[nodiscard]] std::uint64_t ll_fd_ino(int fd) {
+        if constexpr (!requires { mem_.host_tid(); }) {
+            (void)fd;
+            return 0;
+        } else {
+            char link[64];
+            std::snprintf(link, sizeof link, "/proc/%d/fd/%d", mem_.host_tid(), fd);
+            struct ::stat st{};
+            return ::stat(link, &st) == 0 ? static_cast<std::uint64_t>(st.st_ino) : 0;
+        }
+    }
+    [[nodiscard]] std::uint64_t u64_at(std::uint64_t at) {
+        std::array<std::byte, 8> b{};
+        if (!mem_.copy_in(uaddr(at), b)) return 0;
+        std::uint64_t v = 0;
+        for (std::size_t i = 0; i < 8; ++i)
+            v |= static_cast<std::uint64_t>(std::to_integer<unsigned>(b[i])) << (i * 8);
+        return v;
+    }
+
+    // landlock_create_ruleset(attr, size, flags)
+    [[nodiscard]] Outcome do_ll_create_ruleset(const Regs& r) {
+        namespace ll = kernel::landlock;
+        const std::uint64_t flags = r.arg[2];
+        if (flags == 1 /*VERSION*/) {
+            if (r.arg[0] || r.arg[1]) return eno(Errno::einval);
+            return val(ll::kAbi);
+        }
+        if (flags == 2 /*ERRATA*/) return val(0);
+        if (flags != 0) return eno(Errno::einval);
+        const std::size_t size = static_cast<std::size_t>(r.arg[1]);
+        if (size < 8) return eno(Errno::einval);
+        if (size > 4096) return eno(Errno::e2big);
+        ll::Ruleset rs;
+        rs.handled_fs = u64_at(r.arg[0]);
+        if (size >= 16) rs.handled_net = u64_at(r.arg[0] + 8);
+        if (size >= 24) rs.scoped = u64_at(r.arg[0] + 16);
+        if ((rs.handled_fs & ~ll::kAllFs) || (rs.handled_net & ~ll::kAllNet) ||
+            (rs.scoped & ~ll::kAllScope))
+            return eno(Errno::einval);
+        if (!rs.handled_fs && !rs.handled_net && !rs.scoped) return eno(Errno::enomsg);
+        GuestCalls gc;
+        gc.strings = {"landlock-ruleset"};
+        gc.steps = {{Sysno::memfd_create, {GuestCalls::str0, 1u /*MFD_CLOEXEC*/, 0, 0, 0, 0}}};
+        gc.before_resume = [this, rs = std::move(rs)](std::int64_t fd) mutable {
+            if (fd >= 0)
+                if (const auto ino = ll_fd_ino(static_cast<int>(fd))) ll_sets_[ino] = std::move(rs);
+        };
+        return gc;
+    }
+
+    // landlock_add_rule(ruleset_fd, type, attr, flags)
+    [[nodiscard]] Outcome do_ll_add_rule(const Regs& r) {
+        namespace ll = kernel::landlock;
+        if (r.arg[3] != 0) return eno(Errno::einval);
+        auto it = ll_sets_.find(ll_fd_ino(static_cast<int>(r.arg[0])));
+        if (it == ll_sets_.end()) return eno(Errno::ebadf);
+        ll::Ruleset& rs = it->second;
+        if (r.arg[2] == 0) return eno(Errno::efault);
+        const std::uint64_t access = u64_at(r.arg[2]);
+        if (r.arg[1] == 1 /*PATH_BENEATH*/) {
+            std::array<std::byte, 4> fb{};
+            if (!mem_.copy_in(uaddr(r.arg[2] + 8), fb)) return eno(Errno::efault);
+            std::int32_t pfd = 0;
+            std::memcpy(&pfd, fb.data(), 4);
+            if (access == 0) return eno(Errno::enomsg);
+            if (access & ~rs.handled_fs) return eno(Errno::einval);
+            std::string gp{k_.files().path_of_fd(pfd)};
+            if (gp.empty()) return eno(Errno::ebadf);
+            gp = k_.files().resolve_links(gp);
+            // rights that only a directory can hold, on something else
+            const auto pc = k_.files().classify(gp);
+            bool dir = false;
+            if (pc.realm == kernel::Realm2::host_backed) {
+                struct ::stat st{};
+                dir = ::stat(pc.host_path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+            } else if (pc.realm == kernel::Realm2::virtual_file) {
+                if (auto vf = k_.files().produce(gp)) dir = vf->is_dir;
+            }
+            if (!dir && (access & ll::kDirOnly)) return eno(Errno::einval);
+            rs.paths.push_back({std::move(gp), access});
+            return val(0);
+        }
+        if (r.arg[1] == 2 /*NET_PORT*/) {
+            const std::uint64_t port = u64_at(r.arg[2] + 8);
+            if (access == 0) return eno(Errno::enomsg);
+            if (access & ~rs.handled_net) return eno(Errno::einval);
+            if (port > 65535) return eno(Errno::einval);
+            rs.ports.push_back({port, access});
+            return val(0);
+        }
+        return eno(Errno::einval);
+    }
+
+    // landlock_restrict_self(ruleset_fd, flags)
+    [[nodiscard]] Outcome do_ll_restrict_self(const Regs& r) {
+        namespace ll = kernel::landlock;
+        if (r.arg[1] != 0) return eno(Errno::einval);   // ABI 6 has no flags
+        auto it = ll_sets_.find(ll_fd_ino(static_cast<int>(r.arg[0])));
+        if (it == ll_sets_.end()) return eno(Errno::ebadf);
+        auto& p = me();
+        // the kernel's rule: no_new_privs, or CAP_SYS_ADMIN in the namespace
+        if (!p.no_new_privs && !creds::capable(p, 21)) return eno(Errno::eperm);
+        auto layers = p.landlock ? *p.landlock : std::vector<ll::Layer>{};
+        if (layers.size() >= 16) return eno(Errno::e2big);
+        layers.push_back({it->second, ll_next_domain_++});
+        p.landlock = std::make_shared<const std::vector<ll::Layer>>(std::move(layers));
+        ++ll_layers_;
+        return val(0);
+    }
+
+    // Which access a call needs, checked against the caller's domain: the
+    // same hooks fs/landlock attaches in the kernel. EACCES when refused.
+    [[nodiscard]] Errno ll_gate(Sysno sc, const Regs& r) {
+        namespace ll = kernel::landlock;
+        const auto* self = k_.procs().find(ids().pid);
+        if (!self || !self->landlock) return Errno::ok;
+        const ll::Domain& d = self->landlock;
+        // the object a path names (links followed unless told otherwise)
+        auto obj = [&](int arg, bool at, bool follow = true) {
+            return k_.files().resolve_links(resolve_arg(r, arg, at, follow));
+        };
+        auto parent = [](const std::string& p) {
+            const auto s = p.rfind('/');
+            return s == 0 || s == std::string::npos ? std::string{"/"} : p.substr(0, s);
+        };
+        auto exists = [&](const std::string& p, bool* dir = nullptr) {
+            const auto pc = k_.files().classify(p, false, /*follow=*/false);
+            if (pc.realm == kernel::Realm2::virtual_file) {
+                if (dir) if (auto vf = k_.files().produce(p)) *dir = vf->is_dir;
+                return true;
+            }
+            struct ::stat st{};
+            if (pc.realm != kernel::Realm2::host_backed || ::lstat(pc.host_path.c_str(), &st) != 0) return false;
+            if (dir) *dir = S_ISDIR(st.st_mode);
+            return true;
+        };
+        auto need = [&](const std::string& p, std::uint64_t want) {
+            return ll::allows(d, p, want) ? Errno::ok : Errno::eacces;
+        };
+        // the make-right a new node of mknod `mode` needs on its directory
+        auto make_right = [](std::uint32_t mode) -> std::uint64_t {
+            switch (mode & 0170000u) {
+                case 0020000u: return ll::kMakeChar;
+                case 0060000u: return ll::kMakeBlock;
+                case 0010000u: return ll::kMakeFifo;
+                case 0140000u: return ll::kMakeSock;
+                default:       return ll::kMakeReg;
+            }
+        };
+        auto open_check = [&](int arg, bool at, std::uint64_t flags) {
+            if (wire::has_for(arch_, flags, wire::OpenFlag::path)) return Errno::ok;
+            const bool nofollow = wire::has_for(arch_, flags, wire::OpenFlag::nofollow);
+            const std::string p = obj(arg, at, !nofollow);
+            bool dir = false;
+            if (!exists(p, &dir)) {
+                if (!wire::has(flags, wire::OpenFlag::creat)) return Errno::ok;   // ENOENT is the host's
+                return need(parent(p), ll::kMakeReg);
+            }
+            std::uint64_t want = 0;
+            const std::uint64_t acc = flags & 3u;
+            if (dir) want |= ll::kReadDir;
+            else {
+                if (acc == 0 || acc == 2) want |= ll::kReadFile;
+                if (acc == 1 || acc == 2) want |= ll::kWriteFile;
+                if (wire::has(flags, wire::OpenFlag::trunc)) want |= ll::kTruncate;
+            }
+            return need(p, want);
+        };
+        // rename/link: make-rights where it lands, remove-rights where it
+        // leaves (rename), and REFER when it changes directory
+        auto move_check = [&](int a1, int a2, bool at, bool keep_src) {
+            const std::string src = obj(a1, at, false), dst = obj(a2, at, false);
+            bool dir = false;
+            if (!exists(src, &dir)) return Errno::ok;
+            const std::uint64_t make = dir ? ll::kMakeDir : ll::kMakeReg;
+            if (const Errno e = need(parent(dst), make); e != Errno::ok) return e;
+            if (!keep_src)
+                if (const Errno e = need(parent(src), dir ? ll::kRemoveDir : ll::kRemoveFile); e != Errno::ok)
+                    return e;
+            if (parent(src) != parent(dst)) {
+                if (const Errno e = need(parent(src), ll::kRefer); e != Errno::ok) return Errno::exdev;
+                if (const Errno e = need(parent(dst), ll::kRefer); e != Errno::ok) return Errno::exdev;
+            }
+            return Errno::ok;
+        };
+        switch (sc) {
+            case Sysno::open:    return open_check(0, false, r.arg[1]);
+            case Sysno::openat:  return open_check(1, true, r.arg[2]);
+            case Sysno::creat:   return open_check(0, false, 0101u | 01000u);
+            case Sysno::openat2: return open_check(1, true, u64_at(r.arg[2]));
+            case Sysno::execve:  return need(obj(0, false), ll::kExecute);
+            case Sysno::execveat:return need(obj(1, true), ll::kExecute);
+            case Sysno::truncate:return need(obj(0, false), ll::kTruncate);
+            case Sysno::mkdir:   return need(parent(obj(0, false, false)), ll::kMakeDir);
+            case Sysno::mkdirat: return need(parent(obj(1, true, false)), ll::kMakeDir);
+            case Sysno::mknod:   return need(parent(obj(0, false, false)), make_right(static_cast<std::uint32_t>(r.arg[1])));
+            case Sysno::mknodat: return need(parent(obj(1, true, false)), make_right(static_cast<std::uint32_t>(r.arg[2])));
+            case Sysno::symlink: return need(parent(obj(1, false, false)), ll::kMakeSym);
+            case Sysno::symlinkat: return need(parent(obj(2, true, false)), ll::kMakeSym);
+            case Sysno::unlink:  return need(parent(obj(0, false, false)), ll::kRemoveFile);
+            case Sysno::rmdir:   return need(parent(obj(0, false, false)), ll::kRemoveDir);
+            case Sysno::unlinkat:
+                return need(parent(obj(1, true, false)),
+                            wire::has_at(r.arg[2], wire::AtFlag::removedir) ? ll::kRemoveDir : ll::kRemoveFile);
+            case Sysno::rename:    return move_check(0, 1, false, false);
+            case Sysno::renameat:
+            case Sysno::renameat2: return move_check(1, 3, true, false);
+            case Sysno::link:      return move_check(0, 1, false, true);
+            case Sysno::linkat:    return move_check(1, 3, true, true);
+            case Sysno::kill:
+            case Sysno::tkill:
+            case Sysno::tgkill: {
+                if (!ll::scopes(d, ll::kScopeSignal)) return Errno::ok;
+                const auto target = static_cast<std::int32_t>(r.arg[sc == Sysno::tgkill ? 1 : 0]);
+                if (target <= 0) return Errno::ok;   // groups: each member is checked by the kernel's rule below
+                const auto* t = k_.procs().find(target);
+                if (!t || target == ids().pid) return Errno::ok;
+                return ll::within(t->landlock, d) ? Errno::ok : Errno::eperm;
+            }
+            case Sysno::bind:
+            case Sysno::connect: {
+                // TCP ports, for an inet stream socket
+                std::array<std::byte, 4> sa{};
+                if (r.arg[1] == 0 || !mem_.copy_in(uaddr(r.arg[1]), sa)) return Errno::ok;
+                const unsigned fam = std::to_integer<unsigned>(sa[0]) | (std::to_integer<unsigned>(sa[1]) << 8);
+                if (fam != 2 && fam != 10) return Errno::ok;
+                const std::uint64_t want = sc == Sysno::bind ? ll::kBindTcp : ll::kConnectTcp;
+                if (!std::any_of(d->begin(), d->end(), [&](const ll::Layer& l) { return l.rules.handled_net & want; }))
+                    return Errno::ok;
+                const int hfd = fetch_guest_fd(static_cast<int>(r.arg[0]));
+                if (hfd < 0) return Errno::ok;
+                int type = 0, proto = 0;
+                ::socklen_t tl = sizeof type, pl = sizeof proto;
+                (void)::getsockopt(hfd, SOL_SOCKET, SO_TYPE, &type, &tl);
+                (void)::getsockopt(hfd, SOL_SOCKET, SO_PROTOCOL, &proto, &pl);
+                ::close(hfd);
+                if (type != SOCK_STREAM || (proto != 0 && proto != 6 /*IPPROTO_TCP*/)) return Errno::ok;
+                const std::uint64_t port = (std::to_integer<unsigned>(sa[2]) << 8) | std::to_integer<unsigned>(sa[3]);
+                return ll::allows_port(d, port, want) ? Errno::ok : Errno::eacces;
+            }
+            default:
+                return Errno::ok;
+        }
+    }
     // Is `pid` under a Landlock domain? The domain is inherited, so walk up.
     [[nodiscard]] bool is_landlocked(std::int32_t pid) const {
         if (landlocked_.empty()) return false;
@@ -6973,7 +7227,10 @@ public:
     }
     [[nodiscard]] static bool host_has_landlock() {
 #if defined(__linux__)
-        static const bool yes = ::syscall(444, nullptr, 0, 1 /*VERSION*/) >= 1;
+        // LINUXITY_NO_HOST_LANDLOCK=1 runs our own, to test it on a host
+        // that has one
+        static const bool yes = !std::getenv("LINUXITY_NO_HOST_LANDLOCK") &&
+                                ::syscall(444, nullptr, 0, 1 /*VERSION*/) >= 1;
         return yes;
 #else
         return false;
