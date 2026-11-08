@@ -279,6 +279,10 @@ linuxity's subsystems or **forwarded** to the host kernel acting on the guest.
   every CLI flag and environment variable, a task cookbook, resource limits,
   bind mounts, DNS, fake-root, package managers, troubleshooting, and an FAQ.
   **Start here to *use* linuxity.**
+- **[doc/ENVIRONMENTS.md](doc/ENVIRONMENTS.md)** — named environments:
+  `env.vibe` (hostname, user, shell, DNS, limits, mounts, services), snapshots
+  and reset, the long-running instance (`up`, `shell`, `exec`, `ps`, `svc`),
+  the host bridge, and the JSON control protocol frontends use.
 - **[doc/ARCHITECTURE.md](doc/ARCHITECTURE.md)** — the internals: the trap
   backend, syscall fates, the seccomp fast path, the filesystem namespace and
   copy-on-write overlay, shadow-metadata fake-root, the pid namespace, signals,

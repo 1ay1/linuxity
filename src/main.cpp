@@ -7,6 +7,9 @@
 // This is the whole thesis, made runnable: no VM, no emulation, native code,
 // our kernel.
 #include "linuxity/conform/arch.hpp"
+#include "linuxity/env/passwd.hpp"
+#include "linuxity/env/status.hpp"
+#include "linuxity/env/store.hpp"
 #include "linuxity/host/posix_host.hpp"
 #include "linuxity/kernel/kernel.hpp"
 #include "linuxity/kernel/resolver.hpp"
@@ -19,14 +22,22 @@
 #include "linuxity/vfs/procfs.hpp"
 #include "linuxity/vfs/sysfs.hpp"
 
+#include "options.hpp"
+#include "supervisor.hpp"
+
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <fcntl.h>
+#include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 #include <sys/socket.h>
@@ -251,151 +262,73 @@ void maybe_reexec_delegated(int argc, char** argv, bool want_cgroup) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
+int run_runtime(lx::cli::Options& o, int argc, char** argv) {
     using namespace lx;
+    auto& st = env::status();
 
-    // Parse leading flags: `--root <dir>` mounts a rootfs; the resource flags
-    // (`--cpus N`, `--memory SZ`, `--memory-swap SZ`, `--pids N`, `--cpuset
-    // LIST`) BOUND the guest tree via the host kernel (cgroup v2 / rlimit) and
-    // DERIVE the machine the guest believes it has, so belief == enforced
-    // reality. Flags may appear in any order before the program.
-    std::string root;
-    // --persist <dir>: a DURABLE upper overlay layer. Without it the writable
-    // upper is a fresh /tmp/linuxity-upper-<pid> torn down each run, so a
-    // `pacman -S pkg` install evaporates when the process exits. Point
-    // --persist at a directory and every write (installed packages, the pacman
-    // local DB, config) survives across runs — a real, mutable machine.
-    std::string persist;
-    // Transparent pacman --overwrite "*": ON by default whenever a --root
-    // distro is mounted (the bootstrap rootfs has orphan library files that
-    // would otherwise abort installs). --no-pacman-overwrite disables it.
-    bool pacman_overwrite = true;
-    bool host_pids = false;
-    // A PRIVATE /tmp, on by default.
-    //
-    // The guest's top process is pid 1, correctly -- it is the guest's init.
-    // But a shared /tmp turns that into a collision: anything that derives a
-    // filename from getpid() gets the SAME name every run. GNU make names its
-    // jobserver FIFO /tmp/GMfifo<pid>, so one interrupted `make -j` strands
-    // /tmp/GMfifo1 and every later build fails with
-    //
-    //     make: jobserver mkfifo: /tmp/GMfifo1: File exists
-    //
-    // Natively pids are 7 digits and effectively never recur, which is why
-    // this is invisible outside a pid namespace. A real container gets a
-    // private /tmp for exactly this reason.
-    //
-    // Costs nothing at runtime: it is one more entry in the mount table the
-    // path translator already walks for every syscall, not a namespace or a
-    // mount. --shared-tmp opts out for workflows that hand files to the host
-    // through /tmp.
-    bool private_tmp = true;
+    // Everything below was configured by flags or env.vibe (see Options).
+    std::string root = o.root;
+    // A durable upper (--persist / storage.persist). Without it the writable
+    // upper is a fresh /tmp/linuxity-upper-<pid> torn down each run.
+    std::string persist = o.persist;
+    bool pacman_overwrite = o.pacman_overwrite;
+    bool host_pids = o.host_pids;
+    // A PRIVATE /tmp by default: the guest's top process is always pid 1, so
+    // a shared /tmp makes every pid-derived name (make's /tmp/GMfifo<pid>)
+    // collide across runs.
+    bool private_tmp = o.private_tmp;
     // Where that private /tmp landed, so it can be torn down on exit.
     std::string private_tmp_dir;
     // The EPHEMERAL overlay upper, likewise. Empty with --persist, which must
     // survive the run.
     std::string ephemeral_upper;
-    kernel::ResourceSpec res;
-    // --bind host[:guest] mounts a real host directory into the guest tree at
-    // `guest` (default: same path). Thin wrapper over FileNamespace::mount_host
-    // — exactly proot's -b / bubblewrap's --bind, but riding linuxity's own
-    // path-translation namespace (no privilege, no real mount(2)).
-    std::vector<std::pair<std::string, std::string>> binds;
-    int i = 1;
-    auto need = [&](const char* what) -> const char* {
-        if (i + 1 >= argc) {
-            std::fprintf(stderr, "linuxity: %s needs an argument\n", what);
-            std::exit(2);
-        }
-        return argv[++i];
-    };
-    for (; i < argc; ++i) {
-        std::string f = argv[i];
-        if (f == "--root") { root = need("--root"); }
-        else if (f == "--persist" || f == "--upper") { persist = need("--persist"); }
-        else if (f == "--no-pacman-overwrite") { pacman_overwrite = false; }
-        else if (f == "--pacman-overwrite")    { pacman_overwrite = true; }
-        else if (f == "--shared-tmp")  { private_tmp = false; }
-        else if (f == "--private-tmp") { private_tmp = true; }
-        else if (f == "--cpus")        { res.cpus = std::atof(need("--cpus")); }
-        else if (f == "--memory" || f == "-m") {
-            if (auto b = kernel::parse_bytes(need("--memory"))) res.mem_max = *b;
-            else { std::fprintf(stderr, "linuxity: bad --memory size\n"); return 2; }
-        }
-        else if (f == "--memory-swap") {
-            if (auto b = kernel::parse_bytes(need("--memory-swap"))) res.swap_and_mem_max = *b;
-            else { std::fprintf(stderr, "linuxity: bad --memory-swap size\n"); return 2; }
-        }
-        else if (f == "--pids")   { res.pids_max = std::strtoull(need("--pids"), nullptr, 10); }
-        else if (f == "--cpuset") { res.cpuset = need("--cpuset"); }
-        else if (f == "--host-pids") { host_pids = true; }
-        else if (f == "--bind" || f == "-b") {
-            // host[:guest] — split on the LAST ':' so a Windows-free host path
-            // with no colon binds to itself; guest defaults to the host path.
-            std::string spec = need("--bind");
-            auto colon = spec.rfind(':');
-            std::string host = colon == std::string::npos ? spec
-                                                          : spec.substr(0, colon);
-            std::string guest = colon == std::string::npos ? spec
-                                                           : spec.substr(colon + 1);
-            if (host.empty() || guest.empty() || guest.front() != '/') {
-                std::fprintf(stderr,
-                    "linuxity: bad --bind '%s' (want host[:/guest-abs])\n",
-                    spec.c_str());
-                return 2;
-            }
-            binds.emplace_back(std::move(host), std::move(guest));
-        }
-        else break;   // first non-flag: the program
-    }
+    kernel::ResourceSpec res = o.res;
+    // host dir -> guest path, riding the path-translation namespace
+    std::vector<std::pair<std::string, std::string>> binds = o.binds;
 
-    if (i >= argc) {
-        std::fprintf(stderr,
-            "usage: %s [OPTIONS] <program> [args...]\n"
-            "  Runs a native Linux binary; its syscalls are serviced by the\n"
-            "  linuxity runtime (native speed, no VM, no emulation).\n"
-            "\n"
-            "  --root <dir>        mount an extracted distro rootfs as guest '/'\n"
-            "  --persist <dir>     durable overlay upper: installs/writes survive\n"
-            "                      across runs (default: ephemeral per-run)\n"
-            "  --shared-tmp        share the host's /tmp (default: private, so a\n"
-            "                      pid-derived name like make's GMfifo<pid>\n"
-            "                      cannot collide across runs)\n"
-            "  --no-pacman-overwrite  don't auto-pass pacman --overwrite \"*\"\n"
-            "                      (default: on with --root, so a bootstrap\n"
-            "                      rootfs's orphan lib files never block installs)\n"
-            "  --cpus <N>          bound CPU to N cores' worth (e.g. 1.5)\n"
-            "  --memory <SZ>       hard memory ceiling (e.g. 512M, 2G)\n"
-            "  --memory-swap <SZ>  combined memory+swap ceiling\n"
-            "  --pids <N>          max tasks in the guest tree (fork-bomb guard)\n"
-            "  --cpuset <LIST>     pin to CPUs (e.g. 0-1, 0,2,4)\n"
-            "  --bind host[:guest] expose a host dir in the guest tree\n"
-            "                      (guest defaults to the same path)\n"
-            "  --host-pids         share the host's pid space, like docker --pid=host:\n"
-            "                      ps, top and monitors see every host process\n"
-            "\n"
-            "  The resource bounds are enforced by the HOST kernel (cgroup v2,\n"
-            "  or setrlimit where a cgroup can't be created unprivileged) and\n"
-            "  the guest's /proc, /sys and sysinfo are derived to MATCH them.\n",
-            argv[0]);
-        return 2;
-    }
+    // The compat and debug switches are read by the runtime from the
+    // environment, once, where they take effect.
+    auto flag_env = [](const char* k, bool on) { if (on) ::setenv(k, "1", 1); };
+    flag_env("LINUXITY_NO_SECCOMP", !o.seccomp);
+    flag_env("LINUXITY_EMULATE_FIFOS", o.emulate_fifos);
+    flag_env("LINUXITY_EMULATE_SYSV", o.emulate_sysv);
+    flag_env("LINUXITY_EMULATE_NL80211", o.emulate_nl80211);
+    flag_env("LINUXITY_FORCE_LINK_EMULATION", o.emulate_hardlinks);
+    flag_env("LINUXITY_SYNTH_HW", !o.host_hw);
+    if (!o.trace.empty()) ::setenv("LINUXITY_TRACE", o.trace.c_str(), 1);
 
     // If a hard bound was asked for, try to run under a delegated cgroup scope
     // (via systemd-run) so the enforcement is precise. This re-execs the whole
     // process; on return we are either delegated or proceeding with fallback.
-    maybe_reexec_delegated(argc, argv, res.mem_max.has_value() ||
-                                       res.cpus.has_value() ||
-                                       res.pids_max.has_value());
+    // A detached instance can't re-exec: its launcher waits on a pipe that
+    // the exec would close.
+    if (o.ready_fd < 0)
+        maybe_reexec_delegated(argc, argv, res.mem_max.has_value() ||
+                                           res.cpus.has_value() ||
+                                           res.pids_max.has_value());
 
-    std::string path = argv[i];
-    std::vector<std::string> gargv;
-    for (int j = i; j < argc; ++j) gargv.emplace_back(argv[j]);
+    // The program (pid 1). Empty in instance mode: sessions come later.
+    std::string prog_path = o.argv.empty() ? std::string{} : o.argv[0];
+    std::vector<std::string> prog_argv = o.argv;
 
-    // Inherit the host environment for the guest (PATH etc.), so real
-    // programs behave; identity syscalls are still virtualized.
+    // The guest's environment: the host's, or (login.clean-env) only the
+    // variables named in login.pass-env. Identity syscalls are virtualized
+    // either way.
     std::vector<std::string> genvp;
-    for (char** e = environ; e && *e; ++e) genvp.emplace_back(*e);
+    for (char** e = environ; e && *e; ++e) {
+        const std::string_view kv{*e};
+        if (kv.starts_with("LINUXITY_")) continue;   // ours, not the guest's
+        if (o.clean_env) {
+            const auto eq = kv.find('=');
+            const std::string_view name = kv.substr(0, eq);
+            if (std::find(o.pass_env.begin(), o.pass_env.end(), name) == o.pass_env.end())
+                continue;
+        }
+        genvp.emplace_back(kv);
+    }
+    std::vector<std::string> layers;   // host dirs of the guest tree, top first
+    env::UserInfo login;               // who pid 1 / sessions run as
+    login.name = "root";
 
     // With a rootfs mounted, linuxity presents a ROOT-OWNED world (every guest
     // uid/gid is scrubbed to 0). But the host shell that launched us exported
@@ -414,21 +347,35 @@ int main(int argc, char** argv) {
                 if (kv.rfind(prefix, 0) == 0) { kv = prefix + std::string{val}; return; }
             genvp.emplace_back(prefix + std::string{val});
         };
-        set_env("USER", "root");
-        set_env("LOGNAME", "root");
-        set_env("HOME", "/root");
-        set_env("SHELL", "/bin/bash");
+        if (!persist.empty()) layers.push_back(persist);
+        layers.push_back(root);
+        // The login user's identity, from the guest's own /etc/passwd.
+        const auto who = env::resolve_user(layers, o.user);
+        if (!who) {
+            std::fprintf(stderr, "linuxity: no user '%s' in the guest's /etc/passwd "
+                                 "(add one with `linuxity env adduser`)\n", o.user.c_str());
+            return 2;
+        }
+        login = *who;
+        if (!o.shell.empty()) login.shell = o.shell;
+        set_env("USER", login.name);
+        set_env("LOGNAME", login.name);
+        set_env("HOME", login.home);
+        set_env("SHELL", login.shell);
         // The host's temp dir means nothing in the guest's namespace (adb
         // exports TMPDIR=/data/local/tmp, so make put its jobserver FIFO
         // there). A distro leaves it unset and programs use /tmp.
         std::erase_if(genvp, [](const std::string& kv) { return kv.starts_with("TMPDIR="); });
-        // a locale the rootfs can actually load (top layer first)
-        {
-            std::vector<std::string> layers;
-            if (!persist.empty()) layers.push_back(persist);
-            layers.push_back(root);
-            fix_guest_locale(genvp, layers);
+        // a locale the rootfs can actually load (top layer first); an
+        // explicit system.locale wins, and is still checked
+        if (!o.locale.empty()) {
+            std::erase_if(genvp, [](const std::string& kv) {
+                return kv.starts_with("LANG=") || kv.starts_with("LC_");
+            });
+            genvp.push_back("LANG=" + o.locale);
         }
+        fix_guest_locale(genvp, layers);
+        if (!o.timezone.empty()) set_env("TZ", o.timezone);
         // A DISTRO umask, for the same reason as the environment above: the
         // guest is a Linux distro, not this host's shell session. Every
         // distro ships 022 (via /etc/profile or pam_umask); Android's adb
@@ -444,7 +391,7 @@ int main(int argc, char** argv) {
         //
         // It is only a DEFAULT: umask(2) is not intercepted, so a guest
         // profile or program that sets its own still wins.
-        (void)::umask(022);
+        (void)::umask(static_cast<mode_t>(o.umask));
         // PATH belongs to the ROOTFS, not the host. Inheriting it works by
         // luck on a Linux host (/usr/bin is /usr/bin either way) and fails
         // completely on Android, where the host PATH is /system/bin:/apex/...
@@ -465,8 +412,8 @@ int main(int argc, char** argv) {
                     const std::string_view dir = rest.substr(0, cut);
                     if (!dir.empty() && merged.find(std::string{dir}) ==
                                             std::string::npos) {
-                        struct ::stat st{};
-                        if (::stat((root + std::string{dir}).c_str(), &st) == 0)
+                        struct ::stat pst{};
+                        if (::stat((root + std::string{dir}).c_str(), &pst) == 0)
                             merged += ":" + std::string{dir};
                     }
                     if (cut == std::string_view::npos) break;
@@ -475,7 +422,10 @@ int main(int argc, char** argv) {
             }
             set_env("PATH", merged);
         }
+        // env.vibe's [env] and -e K=V come last, so they win
+        for (const auto& [k, v] : o.env) set_env(k, v);
     }
+    if (root.empty()) for (const auto& kv : o.env) genvp.push_back(kv.first + "=" + kv.second);
 
     // Transparent pacman --overwrite "*": expose the mode to the dispatcher
     // (abi::path_exec reads this via getenv on the linuxity process) so a
@@ -518,8 +468,8 @@ int main(int argc, char** argv) {
         if (const auto s = kernel::MachineSpec::host_meminfo_kb("SwapTotal:"))
             spec.swap_total = *s << 10;
 #endif
-        spec.release = "6.6.0-linuxity";
-        spec.nodename = "linuxity";
+        spec.release = o.release;
+        spec.nodename = o.hostname;
         // the guest runs on the host's hardware, so show it (LINUXITY_SYNTH_HW=1
         // keeps the fixed virtual machine)
         spec.host_hw = !std::getenv("LINUXITY_SYNTH_HW");
@@ -545,21 +495,44 @@ int main(int argc, char** argv) {
     // after the systemd-run re-exec above) or installs rlimit fallbacks; the
     // child adopts it via the pre-exec hook so every descendant inherits it.
     runtime::ResourceGovernor governor{res};
-    if (std::string how = governor.describe(); !how.empty())
-        std::fprintf(stderr, "linuxity: %s\n", how.c_str());
+    const std::string limits_text = governor.describe();
+    if (!limits_text.empty())
+        st.event("limits", limits_text, [&](env::Json& j) {
+            j.kv("cgroup", governor.cgroup_active());
+        });
 
     // Seed the process table: pid 1 is our init (the traced root). Its
     // cmdline is the program we're about to run, so /proc/1/cmdline is real.
+    // An instance has no root program, so its pid 1 is a quiet init that
+    // owns every session.
     {
         kernel::ProcInfo init;
         init.pid = 1; init.ppid = 0;
-        init.comm = path.substr(path.find_last_of('/') + 1);
-        init.cmdline.clear();
-        for (std::size_t j = 0; j < gargv.size(); ++j) {
-            init.cmdline += gargv[j];
-            if (j + 1 < gargv.size()) init.cmdline.push_back('\0');   // ProcInfo: NUL-joined
+        if (o.instance) {
+            init.comm = "init";
+            init.cmdline = "/sbin/init";
+            init.exe = "/sbin/init";
+        } else {
+            init.comm = prog_path.substr(prog_path.find_last_of('/') + 1);
+            init.cmdline.clear();
+            for (std::size_t j = 0; j < prog_argv.size(); ++j) {
+                init.cmdline += prog_argv[j];
+                if (j + 1 < prog_argv.size()) init.cmdline.push_back('\0');   // ProcInfo: NUL-joined
+            }
+            // pid 1 runs as the login user, with root's powers only if it is root
+            init.uids = {login.uid, login.uid, login.uid, login.uid};
+            init.gids = {login.gid, login.gid, login.gid, login.gid};
+            init.groups = login.groups.empty() ? std::vector<std::uint32_t>{login.gid} : login.groups;
+            init.groups_set = login.uid != 0;
+            if (login.uid != 0) init.cap_eff = init.cap_prm = init.cap_inh = init.cap_amb = 0;
+            init.creds_given = true;
         }
         k.procs().upsert(init);
+        // login.cwd / --cwd: where pid 1 starts
+        if (!o.instance && !o.cwd.empty()) {
+            k.files().set_current_pid(1);
+            k.files().set_cwd(o.cwd);
+        }
 
         // An INHERITED terminal is already our controlling one, and the guest
         // will never call TIOCSCTTY for it -- a shell launched from a
@@ -572,7 +545,7 @@ int main(int argc, char** argv) {
         // if fd 2 has none the whole chain is pathless and the ioctl cannot
         // tell it is looking at the terminal. That is what made bash say
         // "cannot set terminal process group (-1)" on Android.
-        for (int fd = 0; fd <= 2; ++fd) {
+        for (int fd = 0; fd <= 2 && !o.instance; ++fd) {
             if (::isatty(fd) == 0) continue;
             const char* n = ::ttyname(fd);
             if (n == nullptr) continue;
@@ -638,8 +611,8 @@ int main(int argc, char** argv) {
                     if (acc != "/") (void)::mkdir(acc.c_str(), 0755);
                 }
             }
-            std::fprintf(stderr, "linuxity: persistent overlay upper at %s\n",
-                         upper.c_str());
+            st.event("storage", "persistent overlay upper at " + upper,
+                     [&](env::Json& j) { j.kv("upper", upper).kv("persist", true); });
         } else {
             (void)::mkdir(upper.c_str(), 0755);
         }
@@ -698,8 +671,8 @@ int main(int argc, char** argv) {
             k.machine().binds.emplace_back(norm, rp);   // for the mount table
             std::free(rp);
         }
-        std::fprintf(stderr, "linuxity: bind %s -> %s\n",
-                     norm.c_str(), host_dir.c_str());
+        st.event("bind", "bind " + norm + " -> " + host_dir,
+                 [&](env::Json& j) { j.kv("at", norm).kv("host", host_dir); });
     }
 
     // Guarantee working DNS in a real rootfs (the proot-distro lesson, done
@@ -716,31 +689,55 @@ int main(int argc, char** argv) {
     // nothing and every guest lookup failed while the host resolved fine.
     // Serving a virtual file is one path for every host and never mutates
     // the image. Opt out with LINUXITY_NO_DNS=1.
-    if (!root.empty() && !std::getenv("LINUXITY_NO_DNS")) {
+    // The served body is shared so `linuxity reload` can change it live.
+    auto resolv = std::make_shared<std::string>();
+    if (!root.empty() && o.manage_dns && !std::getenv("LINUXITY_NO_DNS")) {
         const auto gpc = k.files().classify("/etc/resolv.conf");
         const std::string guest_resolv =
             gpc.realm == kernel::Realm2::host_backed ? gpc.host_path : std::string{};
 
+        // network.dns (or --dns) is the explicit override, like LINUXITY_DNS
+        std::string dns_spec;
+        for (const auto& s : o.dns) dns_spec += (dns_spec.empty() ? "" : ",") + s;
         const auto choice = kernel::choose_nameservers(
-            std::getenv("LINUXITY_DNS"), "/etc/resolv.conf", guest_resolv);
+            dns_spec.empty() ? std::getenv("LINUXITY_DNS") : dns_spec.c_str(),
+            "/etc/resolv.conf", guest_resolv);
 
         // The image's own resolver needs no help: leave the file alone so the
         // guest keeps whatever it shipped (and any options with it).
         if (choice.origin != kernel::ResolverOrigin::guest_file &&
             !choice.empty()) {
-            const std::string body = kernel::render_resolv_conf(choice.servers);
+            *resolv = kernel::render_resolv_conf(choice.servers);
             k.files().mount_virtual(
                 "/etc/resolv.conf",
-                [body](std::string_view) -> Result<kernel::VirtualFile> {
+                [resolv](std::string_view) -> Result<kernel::VirtualFile> {
                     kernel::VirtualFile vf;
+                    const std::string& body = *resolv;
                     vf.bytes.assign(
                         reinterpret_cast<const std::byte*>(body.data()),
                         reinterpret_cast<const std::byte*>(body.data() + body.size()));
                     return vf;
                 });
-            std::fprintf(stderr, "linuxity: dns from %s (%s)\n",
-                         std::string{kernel::origin_name(choice.origin)}.c_str(),
-                         choice.servers.front().c_str());
+        }
+        const std::string origin{kernel::origin_name(choice.origin)};
+        st.event("dns", choice.empty() ? std::string{"no nameservers found"}
+                                       : "dns from " + origin + " (" + choice.servers.front() + ")",
+                 [&](env::Json& j) { j.kv("origin", origin).kv("servers", choice.servers); });
+    }
+
+    // /etc/hostname follows system.hostname (and a live reload). With an env
+    // the config owns the name; a bare --root run keeps the image's file if
+    // it has one. Read from the machine on every open, like uname.
+    if (!root.empty()) {
+        const auto hpc = k.files().classify("/etc/hostname");
+        if (hpc.realm != kernel::Realm2::host_backed || !o.env_name.empty()) {
+            k.files().mount_virtual("/etc/hostname", [&k](std::string_view) -> Result<kernel::VirtualFile> {
+                kernel::VirtualFile vf;
+                const std::string body = k.machine().nodename + "\n";
+                vf.bytes.assign(reinterpret_cast<const std::byte*>(body.data()),
+                                reinterpret_cast<const std::byte*>(body.data() + body.size()));
+                return vf;
+            });
         }
     }
 
@@ -767,9 +764,8 @@ int main(int argc, char** argv) {
         }
         if (!fs_ok) {
             k.files().set_socket_ns(kernel::SocketNs::abstract);
-            std::fprintf(stderr,
-                "linuxity: host forbids filesystem AF_UNIX binds; using the "
-                "abstract namespace\n");
+            st.event("compat", "host forbids filesystem AF_UNIX binds; using the abstract namespace",
+                     [](env::Json& j) { j.kv("feature", "unix-sockets").kv("mode", "abstract"); });
         }
         k.files().set_instance_id(static_cast<std::uint64_t>(::getpid()));
     }
@@ -791,14 +787,21 @@ int main(int argc, char** argv) {
         } else if (rc == 0 || errno == EACCES || errno == EPERM) {
             if (rc == 0) ::unlink(probe.c_str());
             k.files().set_fifos_emulated(true);
-            std::fprintf(stderr, "linuxity: host forbids mkfifo; emulating FIFOs\n");
+            st.event("compat", "host forbids mkfifo; emulating FIFOs",
+                     [](env::Json& j) { j.kv("feature", "fifos").kv("mode", "emulated"); });
         }
     }
 
+    // How to exec a guest program: the HOST path the kernel runs and its argv.
+    // Shared by pid 1 and every session an instance starts.
+    //
     // The rootfs makes the translation unprivileged, so we no longer need to
     // chroot the child. The one path the host kernel resolves itself is the
     // exec target, so translate it up front: the child execs the REAL host
     // path under the rootfs, then every syscall it makes is virtualized.
+    auto prepare = [&k, &root, &pacman_overwrite](const std::string& path,
+                                                  const std::vector<std::string>& gargv) {
+    cli::Launch out;
     std::string exec_path = path;
     {
         std::string abs = k.files().absolutize(path);
@@ -806,36 +809,27 @@ int main(int argc, char** argv) {
         if (pc.realm == kernel::Realm2::host_backed) exec_path = pc.host_path;
     }
 
-    // Fail fast on a foreign-ISA program named on the command line (e.g. an
-    // aarch64 rootfs's /bin/sh on an x86-64 host). linuxity runs guest code
-    // natively on the host CPU — there is no cross-emulator — so a foreign
-    // binary would only die in a cryptic loader crash. Diagnose it up front,
-    // pointing at the ISA mismatch (this is termux's isNonNativeElf, surfaced
-    // as an actionable error rather than routed to qemu).
+    // Fail fast on a foreign-ISA program (e.g. an aarch64 rootfs's /bin/sh on
+    // an x86-64 host). linuxity runs guest code natively on the host CPU and
+    // has no cross-emulator, so it would only die in a cryptic loader crash.
     if (loader::read_elf_machine(exec_path) == loader::ForeignArch::foreign) {
-        std::fprintf(stderr,
-            "linuxity: '%s' is a foreign-architecture binary — linuxity runs "
+        out.error = "'" + path + "' is a foreign-architecture binary — linuxity runs "
             "guest code natively on this host's CPU and has no cross-emulator. "
-            "Use a rootfs built for this machine's ISA.\n", path.c_str());
-        return 1;
+            "Use a rootfs built for this machine's ISA.";
+        return out;
     }
 
     // A dynamically-linked guest names its interpreter (ld-linux / ld-musl) in
     // PT_INTERP. The HOST kernel would resolve that path against the HOST root
-    // at execve time — where a guest rootfs's /lib/ld-musl-x86_64.so.1 does
-    // not exist, so the exec fails silently. Instead, read the interp, map it
-    // through linuxity's namespace to its real host location, and exec the
-    // INTERPRETER directly with the program as argv[1]. The loader then opens
-    // every shared library via ordinary (redirected) openat syscalls, all
-    // inside the rootfs — no chroot, no privilege. argv[0] stays the guest
-    // program name so the process sees itself correctly.
+    // at execve time, where the guest's loader does not exist. So exec the
+    // INTERPRETER directly (its host path) with the program as argv[1], named
+    // in the GUEST namespace: the loader's own opens are then redirected into
+    // the rootfs. argv[0] stays the guest program name.
     std::vector<std::string> child_argv = gargv;
-    // A `#!` script named directly on the command line: the host kernel would
-    // launch its interpreter with the HOST-translated script path, which our
-    // namespace re-translates (double-rooting). Resolve the shebang ourselves
-    // and exec the interpreter with the script as a GUEST path (its own openat
-    // redirects into the rootfs). If the interpreter is dynamic, chain its
-    // ld.so too. This mirrors path_exec's in-guest handling for the FIRST hop.
+    // A `#!` script: resolve the shebang ourselves and exec the interpreter
+    // with the script as a GUEST path (the host kernel would hand it the HOST
+    // path, which our namespace re-translates). A dynamic interpreter chains
+    // its ld.so too. This mirrors path_exec's in-guest handling.
     if (loader::Shebang sh = loader::read_shebang(exec_path); !sh.interp.empty()) {
         std::string si_abs = k.files().absolutize(sh.interp);
         auto sic = k.files().classify(si_abs);
@@ -845,21 +839,20 @@ int main(int argc, char** argv) {
         child_argv.clear();
         std::string si_interp = loader::read_elf_interp(si_host);
         if (!si_interp.empty()) {
-            // Dynamic interpreter: exec its ld.so, then the interpreter (guest
-            // path), then the shebang arg, then the script (guest path).
+            // ld.so, the interpreter (guest path), its arg, the script
             std::string ld_abs = k.files().absolutize(si_interp);
             auto ldc = k.files().classify(ld_abs);
             std::string ld_host = ldc.realm == kernel::Realm2::host_backed
                                       ? ldc.host_path : si_interp;
             child_argv.push_back(ld_host);
-            child_argv.push_back(si_abs);           // interpreter, guest path
+            child_argv.push_back(si_abs);
             exec_path = ld_host;
         } else {
             child_argv.push_back(si_host);          // static interpreter
             exec_path = si_host;
         }
         if (!sh.arg.empty()) child_argv.push_back(sh.arg);
-        child_argv.push_back(script_guest);         // the script, guest path
+        child_argv.push_back(script_guest);
         for (std::size_t j = 1; j < gargv.size(); ++j)
             child_argv.push_back(gargv[j]);
     } else if (std::string interp = loader::read_elf_interp(exec_path); !interp.empty()) {
@@ -867,23 +860,16 @@ int main(int argc, char** argv) {
         auto ipc = k.files().classify(interp_abs);
         std::string interp_host = interp;
         if (ipc.realm == kernel::Realm2::host_backed) interp_host = ipc.host_path;
-        // ld.so <guest-prog> <original-args...>; keep gargv[0] as argv[1] so the
-        // guest program's own argv[0] is preserved by the loader.
         child_argv.clear();
-        child_argv.push_back(interp_host);   // the interpreter to exec (host path)
-        // The program the loader should open is named in the GUEST namespace:
-        // the loader's own openat on it is virtualized/redirected into the
-        // rootfs. Passing the host path would make linuxity re-translate it
-        // (rootfs-under-rootfs) and fail. Use the guest path the user named.
+        child_argv.push_back(interp_host);
         child_argv.push_back(k.files().absolutize(path));
         for (std::size_t j = 1; j < gargv.size(); ++j)
-            child_argv.push_back(gargv[j]);  // the guest program's args
-        exec_path = interp_host;             // exec the interpreter itself
+            child_argv.push_back(gargv[j]);
+        exec_path = interp_host;
     }
 
-    // If the top-level program is pacman and transparent-overwrite is on,
-    // append `--overwrite "*"` to the child argv (same rationale as the
-    // in-guest path_exec handling — bootstrap rootfs orphan lib files).
+    // A top-level pacman transaction gets `--overwrite "*"` (same rationale
+    // as the in-guest path_exec handling: bootstrap rootfs orphan lib files).
     if (!root.empty() && pacman_overwrite) {
         auto slash = path.find_last_of('/');
         std::string base = slash == std::string::npos ? path : path.substr(slash + 1);
@@ -900,29 +886,32 @@ int main(int argc, char** argv) {
             child_argv.push_back("*");
         }
     }
-    runtime::PtraceTrap trap{exec_path, child_argv, genvp, {},
-                             [&governor]() {
-                                 governor.join_child();
-                                 // Occupy a handful of low file descriptors so
-                                 // the guest's dynamic fd allocation starts
-                                 // above them — exactly like a normal process
-                                 // launched from a shell/login session that
-                                 // inherits several open fds. Without this the
-                                 // guest allocates from fd 3, and a program
-                                 // that races a short-lived control fd (e.g.
-                                 // curl_multi's wakeup eventfd in pacman's
-                                 // download workers) against a data file can
-                                 // see BOTH land on the same low number and
-                                 // corrupt the file. Point the reservations at
-                                 // /dev/null so they are harmless and let them
-                                 // survive execve (NOT CLOEXEC) so they still
-                                 // occupy the low slots once the guest program
-                                 // and its forked download workers are running
-                                 // — which is precisely when the collision would
-                                 // otherwise occur. Inheriting a few open fds is
-                                 // exactly what a shell-launched process sees.
-                                 reserve_low_fds();
-                             }};
+    out.exec_path = std::move(exec_path);
+    out.argv = std::move(child_argv);
+    return out;
+    };
+
+    // Occupy a handful of low file descriptors so the guest's dynamic fd
+    // allocation starts above them, like a process launched from a login
+    // session. Without this the guest allocates from fd 3, and a program that
+    // races a short-lived control fd (curl_multi's wakeup eventfd in pacman's
+    // download workers) against a data file can see BOTH land on the same low
+    // number and corrupt the file. /dev/null, and NOT CLOEXEC, so they still
+    // hold the slots once the guest is running.
+    std::function<void()> pre_exec = [&governor]() {
+        governor.join_child();
+        reserve_low_fds();
+    };
+
+    cli::Launch first;
+    if (!o.instance) {
+        first = prepare(prog_path, prog_argv);
+        if (!first.error.empty()) {
+            std::fprintf(stderr, "linuxity: %s\n", first.error.c_str());
+            return 1;
+        }
+    }
+    runtime::PtraceTrap trap{first.exec_path, first.argv, genvp, {}, pre_exec};
 
     // PtraceTrap is BOTH the trap backend and the guest-memory accessor
     // (it shares the child's real pages via process_vm_readv/writev).
@@ -963,7 +952,53 @@ int main(int argc, char** argv) {
             return k.procs().pid_from(ns, pid);
         });
 
+    // Instance mode: no root program; the supervisor serves the control
+    // socket from the trap's idle hook and starts sessions on request.
+    std::unique_ptr<cli::Supervisor> sup;
+    if (o.instance) {
+        cli::RuntimeHooks h;
+        h.prepare = prepare;
+        h.which = [&k](const std::string& name, const std::string& path_var) -> std::string {
+            std::string_view rest = path_var.empty() ? std::string_view{"/usr/local/bin:/usr/bin:/bin"}
+                                                     : std::string_view{path_var};
+            while (!rest.empty()) {
+                const auto c = rest.find(':');
+                const std::string dir{rest.substr(0, c)};
+                if (!dir.empty()) {
+                    const std::string cand = dir + "/" + name;
+                    const auto pc = k.files().classify(cand);
+                    if (pc.realm == kernel::Realm2::host_backed && ::access(pc.host_path.c_str(), X_OK) == 0)
+                        return cand;
+                }
+                if (c == std::string_view::npos) break;
+                rest.remove_prefix(c + 1);
+            }
+            return {};
+        };
+        h.pre_exec = pre_exec;
+        // a session sets its own identity; drop pid 1's
+        for (const auto& kv : genvp)
+            if (!kv.starts_with("USER=") && !kv.starts_with("LOGNAME=") &&
+                !kv.starts_with("HOME=") && !kv.starts_with("SHELL="))
+                h.base_env.push_back(kv);
+        h.layers = layers;
+        h.resolv = resolv;
+        h.limits_text = limits_text;
+        sup = std::make_unique<cli::Supervisor>(k, trap, o, std::move(h));
+        std::string why;
+        if (!sup->start(why)) {
+            std::fprintf(stderr, "linuxity: %s: %s\n", o.env_name.c_str(), why.c_str());
+            return why == "already running" ? 3 : 1;
+        }
+        trap.set_idle([&sup](int chld, bool block) { return sup->idle(chld, block); });
+        trap.set_on_exit([&sup](::pid_t h2, std::int32_t g, int code) { sup->on_exit(h2, g, code); });
+    }
+
     auto rc = cpu.run(uaddr(0), uaddr(0));
+    if (sup) {
+        sup->cleanup();
+        st.event("down", "instance " + o.env_name + " stopped");
+    }
 
     // Remove this run's throwaway dirs under /tmp. The upper-layer comment
     // above has always claimed these are "torn down each run" and nothing
@@ -988,5 +1023,273 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "linuxity: runtime error %d\n", int(rc.error()));
         return 1;
     }
-    return *rc;
+    return o.instance ? 0 : *rc;
+}
+
+// ---------------------------------------------------------------------------
+// Command line
+// ---------------------------------------------------------------------------
+
+namespace {
+
+void usage(const char* argv0) {
+    std::fprintf(stderr,
+        "usage: %s [OPTIONS] <program> [args...]\n"
+        "       %s run <env> [OPTIONS] [-- program args...]\n"
+        "       %s up <env> [--foreground]      start an environment in the background\n"
+        "       %s <command> ...                 see `linuxity help`\n"
+        "\n"
+        "  Runs a native Linux binary; its syscalls are serviced by the\n"
+        "  linuxity runtime (native speed, no VM, no emulation).\n"
+        "\n"
+        "  --env <name>        take every setting from that environment's env.vibe\n"
+        "  --root <dir>        mount an extracted distro rootfs as guest '/'\n"
+        "  --persist <dir>     keep the writable upper layer in <dir>, so writes persist\n"
+        "                      across runs (default: ephemeral per-run)\n"
+        "  --shared-tmp        share the host's /tmp (default: private)\n"
+        "  --no-pacman-overwrite  don't auto-pass pacman --overwrite \"*\"\n"
+        "  --cpus <N>          bound CPU to N cores' worth (e.g. 1.5)\n"
+        "  --memory <SZ>       hard memory ceiling (e.g. 512M, 2G)\n"
+        "  --memory-swap <SZ>  combined memory+swap ceiling\n"
+        "  --pids <N>          max tasks in the guest tree (fork-bomb guard)\n"
+        "  --cpuset <LIST>     pin to CPUs (e.g. 0-1, 0,2,4)\n"
+        "  --bind host[:guest] expose a host dir in the guest tree\n"
+        "  --host-pids         share the host's pid space, like docker --pid=host\n"
+        "  --hostname <name>   hostname the guest sees\n"
+        "  --kernel-release <r> kernel release the guest sees (uname -r)\n"
+        "  --user <name|uid>   run as this guest user (from its /etc/passwd)\n"
+        "  --cwd <dir>         start in this guest directory\n"
+        "  --umask <octal>     file creation mask (default 022)\n"
+        "  --dns <a,b,...>     nameservers for the guest's resolv.conf\n"
+        "  -e, --setenv K=V    set a variable for the guest\n"
+        "  --clean-env         don't inherit the host environment\n"
+        "  --status-fd <fd>    write JSON status events, one per line, to <fd>\n"
+        "  --quiet             no notices on stderr\n"
+        "\n"
+        "  The resource bounds are enforced by the HOST kernel (cgroup v2,\n"
+        "  or setrlimit where a cgroup can't be created unprivileged) and\n"
+        "  the guest's /proc, /sys and sysinfo are derived to MATCH them.\n",
+        argv0, argv0, argv0, argv0);
+}
+
+// Load an environment's config into `o`. Returns false (having printed why).
+bool load_env(const std::string& name, lx::cli::Options& o) {
+    lx::env::Store store;
+    if (!store.has(name)) {
+        std::fprintf(stderr, "linuxity: no environment '%s' (see `linuxity env list`)\n", name.c_str());
+        return false;
+    }
+    auto r = store.load(name);
+    std::vector<lx::env::Diag> diags = r.diags;
+    lx::env::check_runnable(r.config, diags);
+    bool bad = false;
+    for (const auto& d : diags) {
+        std::fprintf(stderr, "linuxity: %s: %s\n", store.config_path(name).c_str(),
+                     lx::env::format_diag(d).c_str());
+        bad = bad || d.error;
+    }
+    if (bad) return false;
+    lx::cli::apply_config(r.config, o);
+    o.env_name = name;
+    o.config_path = store.config_path(name);
+    o.run_dir = store.run_dir(name);
+    o.logs_dir = store.logs_dir(name);
+    o.control_path = store.socket_path(name);
+    o.pid_path = store.pid_path(name);
+    if (!o.persist.empty()) (void)lx::env::mkdirs(o.persist);
+    return true;
+}
+
+// Parse leading flags into `o`. Returns the index of the first non-flag, or
+// -1 on a bad flag (already reported).
+int parse_flags(int argc, char** argv, int i, lx::cli::Options& o) {
+    using namespace lx;
+    auto need = [&](const char* what) -> const char* {
+        if (i + 1 >= argc) {
+            std::fprintf(stderr, "linuxity: %s needs an argument\n", what);
+            std::exit(2);
+        }
+        return argv[++i];
+    };
+    for (; i < argc; ++i) {
+        const std::string f = argv[i];
+        if (f == "--") { ++i; break; }
+        if (f == "--env") { if (!load_env(need("--env"), o)) return -1; }
+        else if (f == "--root") { o.root = need("--root"); }
+        else if (f == "--persist" || f == "--upper") { o.persist = need("--persist"); }
+        else if (f == "--no-pacman-overwrite") { o.pacman_overwrite = false; }
+        else if (f == "--pacman-overwrite")    { o.pacman_overwrite = true; }
+        else if (f == "--shared-tmp")  { o.private_tmp = false; }
+        else if (f == "--private-tmp") { o.private_tmp = true; }
+        else if (f == "--cpus")        { o.res.cpus = std::atof(need("--cpus")); }
+        else if (f == "--memory" || f == "-m") {
+            if (auto b = kernel::parse_bytes(need("--memory"))) o.res.mem_max = *b;
+            else { std::fprintf(stderr, "linuxity: bad --memory size\n"); return -1; }
+        }
+        else if (f == "--memory-swap") {
+            if (auto b = kernel::parse_bytes(need("--memory-swap"))) o.res.swap_and_mem_max = *b;
+            else { std::fprintf(stderr, "linuxity: bad --memory-swap size\n"); return -1; }
+        }
+        else if (f == "--pids")   { o.res.pids_max = std::strtoull(need("--pids"), nullptr, 10); }
+        else if (f == "--cpuset") { o.res.cpuset = need("--cpuset"); }
+        else if (f == "--host-pids") { o.host_pids = true; }
+        else if (f == "--bind" || f == "-b") {
+            std::string spec = need("--bind");
+            auto colon = spec.find(':');
+            std::string host = colon == std::string::npos ? spec : spec.substr(0, colon);
+            std::string guest = colon == std::string::npos ? spec : spec.substr(colon + 1);
+            if (host.empty() || guest.empty() || guest.front() != '/') {
+                std::fprintf(stderr, "linuxity: bad --bind '%s' (want host[:/guest-abs])\n", spec.c_str());
+                return -1;
+            }
+            o.binds.emplace_back(std::move(host), std::move(guest));
+        }
+        else if (f == "--hostname") { o.hostname = need("--hostname"); }
+        else if (f == "--kernel-release") { o.release = need("--kernel-release"); }
+        else if (f == "--user" || f == "-u") { o.user = need("--user"); }
+        else if (f == "--shell") { o.shell = need("--shell"); }
+        else if (f == "--cwd" || f == "-C") { o.cwd = need("--cwd"); }
+        else if (f == "--umask") {
+            const std::string u = need("--umask");
+            if (u.empty() || u.find_first_not_of("01234567") != std::string::npos) {
+                std::fprintf(stderr, "linuxity: bad --umask '%s'\n", u.c_str());
+                return -1;
+            }
+            o.umask = static_cast<unsigned>(std::strtoul(u.c_str(), nullptr, 8)) & 0777u;
+        }
+        else if (f == "--dns") {
+            o.dns = kernel::nameservers_from_env(need("--dns"));
+        }
+        else if (f == "-e" || f == "--setenv") {
+            const std::string kv = need("--setenv");
+            const auto eq = kv.find('=');
+            if (eq == std::string::npos || eq == 0) {
+                std::fprintf(stderr, "linuxity: bad -e '%s' (want NAME=value)\n", kv.c_str());
+                return -1;
+            }
+            o.env.emplace_back(kv.substr(0, eq), kv.substr(eq + 1));
+        }
+        else if (f == "--clean-env") { o.clean_env = true; }
+        else if (f == "--timezone") { o.timezone = need("--timezone"); }
+        else if (f == "--locale") { o.locale = need("--locale"); }
+        else if (f == "--status-fd") { o.status_fd = std::atoi(need("--status-fd")); }
+        else if (f == "--quiet" || f == "-q") { o.quiet = true; }
+        else if (f == "--foreground") { /* handled by `up` */ }
+        else if (f.size() > 1 && f[0] == '-' && f != "-") {
+            std::fprintf(stderr, "linuxity: unknown option '%s'\n", f.c_str());
+            return -1;
+        }
+        else break;   // first non-flag: the program
+    }
+    return i;
+}
+
+void setup_status(const lx::cli::Options& o) {
+    auto& st = lx::env::status();
+    st.set_quiet(o.quiet);
+    if (o.status_fd >= 0 && ::fcntl(o.status_fd, F_GETFD) >= 0) {
+        (void)::fcntl(o.status_fd, F_SETFD, FD_CLOEXEC);   // never leak into guests
+        st.set_fd(o.status_fd);
+    }
+}
+
+// `linuxity up <env>`: run the instance. In the background unless
+// --foreground; the launcher returns once the control socket is live.
+int cmd_up(int argc, char** argv) {
+    if (argc < 3) { std::fprintf(stderr, "usage: linuxity up <env> [--foreground] [--status-fd N]\n"); return 2; }
+    lx::cli::Options o;
+    if (!load_env(argv[2], o)) return 1;
+    const int rest = parse_flags(argc, argv, 3, o);
+    if (rest < 0) return 2;
+    bool fg = false;
+    for (int j = 3; j < argc; ++j) fg = fg || std::string_view{argv[j]} == "--foreground";
+    o.instance = true;
+    o.argv.clear();
+
+    lx::env::Store store;
+    if (const ::pid_t p = store.running_pid(o.env_name); p > 0) {
+        std::fprintf(stderr, "linuxity: %s is already running (pid %d)\n", o.env_name.c_str(), p);
+        return 0;
+    }
+    if (fg) {
+        setup_status(o);
+        return run_runtime(o, argc, argv);
+    }
+
+    // Background: fork, detach, log to the env's log. The child writes a
+    // byte to `ready` once it listens (or closes it on failure), so the
+    // parent waits for exactly that and no longer.
+    int ready[2];
+    if (::pipe2(ready, O_CLOEXEC) != 0) { std::perror("linuxity: pipe"); return 1; }
+    const ::pid_t pid = ::fork();
+    if (pid < 0) { std::perror("linuxity: fork"); return 1; }
+    if (pid == 0) {
+        ::close(ready[0]);
+        (void)::setsid();
+        (void)lx::env::mkdirs(o.logs_dir);
+        const int log = ::open(o.cfg.log.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+        const int nul = ::open("/dev/null", O_RDWR | O_CLOEXEC);
+        if (nul >= 0) ::dup2(nul, 0);
+        if (log >= 0) { ::dup2(log, 1); ::dup2(log, 2); }
+        o.ready_fd = ready[1];
+        setup_status(o);
+        std::_Exit(run_runtime(o, argc, argv));
+    }
+    ::close(ready[1]);
+    char b = 0;
+    ::ssize_t n;
+    do { n = ::read(ready[0], &b, 1); } while (n < 0 && errno == EINTR);
+    ::close(ready[0]);
+    if (n == 1) {
+        if (!o.quiet) std::fprintf(stderr, "linuxity: %s is up (pid %d)\n", o.env_name.c_str(), pid);
+        return 0;
+    }
+    int stc = 0;
+    ::waitpid(pid, &stc, 0);
+    std::fprintf(stderr, "linuxity: %s failed to start; see %s\n", o.env_name.c_str(), o.cfg.log.c_str());
+    return WIFEXITED(stc) && WEXITSTATUS(stc) ? WEXITSTATUS(stc) : 1;
+}
+
+// `linuxity run <env> [flags] [-- program...]`: one program as pid 1 with
+// the environment's settings (the user's login shell if none is given).
+int cmd_run(int argc, char** argv) {
+    if (argc < 3) { std::fprintf(stderr, "usage: linuxity run <env> [OPTIONS] [-- program args...]\n"); return 2; }
+    lx::cli::Options o;
+    if (!load_env(argv[2], o)) return 1;
+    const int i = parse_flags(argc, argv, 3, o);
+    if (i < 0) return 2;
+    for (int j = i; j < argc; ++j) o.argv.emplace_back(argv[j]);
+    if (o.argv.empty()) o.argv = o.cfg.command;
+    std::vector<std::string> layers;
+    if (!o.persist.empty()) layers.push_back(o.persist);
+    layers.push_back(o.root);
+    const auto u = lx::env::resolve_user(layers, o.user);
+    if (o.argv.empty())
+        o.argv = {o.shell.empty() ? (u ? u->shell : std::string{"/bin/sh"}) : o.shell, "-l"};
+    if (o.cwd.empty() && u) o.cwd = u->home;
+    setup_status(o);
+    return run_runtime(o, argc, argv);
+}
+
+}  // namespace
+
+int lx_cli_main(int argc, char** argv);   // cli.cpp: env, shell, ps, ...
+
+int main(int argc, char** argv) {
+    if (argc >= 2) {
+        const std::string_view sub = argv[1];
+        if (sub == "up") return cmd_up(argc, argv);
+        if (sub == "run") return cmd_run(argc, argv);
+        if (sub == "env" || sub == "shell" || sub == "exec" || sub == "down" || sub == "ps" ||
+            sub == "kill" || sub == "status" || sub == "svc" || sub == "logs" || sub == "reload" ||
+            sub == "help" || sub == "--help" || sub == "-h" || sub == "version")
+            return lx_cli_main(argc, argv);
+    }
+    lx::cli::Options o;
+    const int i = parse_flags(argc, argv, 1, o);
+    if (i < 0) return 2;
+    if (i >= argc) { usage(argv[0]); return 2; }
+    for (int j = i; j < argc; ++j) o.argv.emplace_back(argv[j]);
+    setup_status(o);
+    return run_runtime(o, argc, argv);
 }

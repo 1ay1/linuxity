@@ -40,7 +40,7 @@ endif()
 # Win32 CRT has no <sys/mman.h>. Keeping them out of LX_PORTABLE_TESTS is
 # what lets the portable set be a real cross-host contract rather than one
 # that quietly means "POSIX".
-set(LX_POSIX_HOST_TESTS hostfs loader hostcalls cpu_truth)
+set(LX_POSIX_HOST_TESTS hostfs loader hostcalls cpu_truth env_config)
 
 # Live tests: run real guest ELF binaries through a trap backend. Today the
 # only complete backend is ptrace (Linux), so they are Linux-only until the
@@ -50,7 +50,7 @@ set(LX_LIVE_TESTS
     run_open_procfs run_mutate run_dev run_socket run_daemon run_shebang
     run_tty_jobcontrol run_ttyname run_termios2 run_trap_insn run_pid_namespace run_seccomp run_meta run_bind
     run_foreign_exec run_untranslated run_empty_path run_rewinddir run_fd_reuse run_proc_self run_proc_link run_path_escape
-    run_orphan_confined run_link_emulation run_root_access)
+    run_orphan_confined run_link_emulation run_root_access run_instance)
 
 # ---- differential conformance -------------------------------------------
 #
@@ -141,6 +141,10 @@ foreach(t IN LISTS LX_TESTS)
     target_link_libraries(test_${t} PRIVATE linuxity_core)
     add_test(NAME ${t} COMMAND test_${t})
 endforeach()
+# drives the real binary (env, up, exec, down)
+if(TARGET test_run_instance AND TARGET linuxity)
+    add_dependencies(test_run_instance linuxity)
+endif()
 
 # The runtime/ layering invariants (no cross-backend includes, portable
 # headers free of backend deps, shared/ free of platform APIs, every backend
