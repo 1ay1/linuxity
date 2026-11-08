@@ -350,6 +350,11 @@ make_sysfs(const kernel::MachineSpec& mach) {
 
         // Helper: "0-3" style cpu range list for `ncpu`.
         std::string cpu_range = mach.cpu_range();
+        // the host's cpufreq policy layout applies when the guest has every cpu
+        auto host_policies = [&] {
+            return mach.host_hw && ncpu == ::sysconf(_SC_NPROCESSORS_ONLN) &&
+                   host_node_ok("/sys/devices/system/cpu/cpufreq");
+        };
 
         // ================= /sys root =====================================
         if (abs == "/sys")
@@ -407,8 +412,13 @@ make_sysfs(const kernel::MachineSpec& mach) {
         // /sys/devices/system/cpu/cpufreq/policyN/*
         if (abs == "/sys/devices/system/cpu/cpufreq") {
             std::vector<VirtualDirent> e;
-            for (long i = 0; i < ncpu; ++i)
-                e.push_back({"policy" + std::to_string(i), true});
+            // the host's policies (one per cluster on big.LITTLE) when the
+            // guest has every cpu; fastfetch sums related_cpus over them
+            if (host_policies())
+                host_entries("/sys/devices/system/cpu/cpufreq", e);
+            if (e.empty())
+                for (long i = 0; i < ncpu; ++i)
+                    e.push_back({"policy" + std::to_string(i), true});
             return ok(dir(std::move(e)));
         }
         // per-cpu dir: /sys/devices/system/cpu/cpuN and its subtree, plus
@@ -426,6 +436,11 @@ make_sysfs(const kernel::MachineSpec& mach) {
                                         ? rest.substr(head.size() + 1) : std::string_view{};
                 long cpu = index_after(head, "cpu");
                 long pol = index_after(head, "policy");
+                // a policy the host doesn't have doesn't exist
+                if (pol >= 0 && host_policies() &&
+                    ::access(("/sys/devices/system/cpu/cpufreq/" + std::string{head}).c_str(),
+                             F_OK) != 0)
+                    return err<kernel::VirtualFile>(Errno::enoent);
 
                 if (cpu >= 0 && cpu < ncpu) {
                     // Kernel cpumask format: comma-separated 32-bit hex words,

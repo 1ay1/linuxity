@@ -905,8 +905,23 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
             if (abs == "/proc/driver" || abs.starts_with("/proc/driver/"))
                 if (auto vf = host_redirect(std::string{abs}.c_str())) return ok(std::move(*vf));
         }
-        if (abs == "/proc/swaps")
-            return ok(text_file("Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n"));
+        if (abs == "/proc/swaps") {
+            // The host hid its table (Android) but meminfo says swap exists:
+            // one zram line that agrees with meminfo, which is what Android
+            // swaps to, so tools reading this file don't call swap disabled.
+            std::string s = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n";
+            const auto total = kernel::MachineSpec::host_meminfo_kb("SwapTotal:");
+            const auto freek = kernel::MachineSpec::host_meminfo_kb("SwapFree:");
+            if (mach.host_hw && total && *total) {
+                const auto used = *total - std::min(*total, freek.value_or(*total));
+                char line[160];
+                std::snprintf(line, sizeof line, "%-40s%-16s%-16llu%-16llu%d\n", "/dev/block/zram0",
+                              "partition", static_cast<unsigned long long>(*total),
+                              static_cast<unsigned long long>(used), -2);
+                s += line;
+            }
+            return ok(text_file(std::move(s)));
+        }
         // No block devices: the guest's root is a directory, not a disk.
         if (abs == "/proc/partitions")
             return ok(text_file("major minor  #blocks  name\n\n"));
