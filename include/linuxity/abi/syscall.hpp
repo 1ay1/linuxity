@@ -2852,6 +2852,30 @@ private:
                 extra = {"--overwrite", "*"};
         }
         if (pc.realm == kernel::Realm2::host_backed) {
+            // A set-user/group-ID program raises the caller's effective id, and
+            // the guest's ids are ours to keep, so note the owner here for
+            // creds::on_exec to apply once the image is in. Without this a
+            // guest that dropped to a normal user could never get back:
+            // `sudo` saw euid != 0 and blamed a nosuid mount.
+            //
+            // The mode the GUEST sees is what counts (the overlay records it,
+            // so a host that cannot keep the s-bit still shows it), and the
+            // owner comes from the same view -- a rootfs unpacked by an
+            // ordinary user still has a root-owned sudo.
+            {
+                struct ::stat st{};
+                if (::stat(pc.host_path.c_str(), &st) == 0) {
+                    std::uint32_t mode = st.st_mode, uid = 0, gid = 0;
+                    if (auto rec = k_.files().meta().lookup(k_.files().resolve_links(abs))) {
+                        mode = kernel::MetaStore::effective_mode(mode, *rec);
+                        if (rec->have & kernel::MetaRecord::kUid) uid = rec->uid;
+                        if (rec->have & kernel::MetaRecord::kGid) gid = rec->gid;
+                    }
+                    auto& p = me();
+                    p.exec_setuid = (mode & 04000u) ? uid : creds::kKeep;
+                    p.exec_setgid = (mode & 02000u) ? gid : creds::kKeep;
+                }
+            }
             // termux-exec's inspectFileHeader lesson: a FOREIGN-arch ELF (an
             // aarch64 binary on an x86-64 host, say) cannot run natively —
             // linuxity executes guest code directly on the host CPU, there is
