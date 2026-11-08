@@ -27,8 +27,10 @@ else()
     add_compile_options(
         -Wall -Wextra -Wpedantic
         -Wshadow -Wconversion -Wsign-conversion
-        -Wnon-virtual-dtor -Wold-style-cast -Woverloaded-virtual
-        -fno-rtti)
+        $<$<COMPILE_LANGUAGE:CXX>:-Wnon-virtual-dtor>
+        $<$<COMPILE_LANGUAGE:CXX>:-Wold-style-cast>
+        $<$<COMPILE_LANGUAGE:CXX>:-Woverloaded-virtual>
+        $<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>)
 endif()
 
 # ---- Sanitizers (opt-in: -DLX_SANITIZE=address,undefined) ----------------
@@ -56,6 +58,15 @@ add_library(linuxity_core INTERFACE)
 target_include_directories(linuxity_core INTERFACE ${CMAKE_SOURCE_DIR}/include)
 target_compile_features(linuxity_core INTERFACE cxx_std_23)
 
+# ---- libvibe: the parser for env.vibe (vendored single header, MIT) -------
+enable_language(C)
+add_library(linuxity_vibe STATIC third_party/vibe/vibe_impl.c)
+target_include_directories(linuxity_vibe PUBLIC ${CMAKE_SOURCE_DIR}/third_party/vibe)
+set_target_properties(linuxity_vibe PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+# third-party code: our C++ warning set doesn't apply to it
+target_compile_options(linuxity_vibe PRIVATE -w)
+target_link_libraries(linuxity_core INTERFACE linuxity_vibe)
+
 # ---- Host backends -------------------------------------------------------
 # The core above is header-only and host-agnostic. The executable needs a
 # trap backend; today those are ptrace (Linux), Hypervisor.framework
@@ -73,8 +84,14 @@ target_compile_features(linuxity_core INTERFACE cxx_std_23)
 set(LX_PTRACE_HOSTS Linux Android)
 if(CMAKE_SYSTEM_NAME IN_LIST LX_PTRACE_HOSTS)
     add_subdirectory(src/host)
-    add_executable(linuxity src/main.cpp)
+    add_executable(linuxity src/main.cpp src/cli.cpp)
     target_link_libraries(linuxity PRIVATE linuxity_core linuxity_host)
+    # The guest side of the host bridge: static, so it runs in any distro.
+    # Instances put it on the guest's PATH as xdg-open, wl-copy, notify-send.
+    add_executable(linuxity-bridge src/guest/linuxity-bridge.c)
+    target_link_options(linuxity-bridge PRIVATE -static)
+    target_compile_options(linuxity-bridge PRIVATE -O2 -w)
+    add_dependencies(linuxity linuxity-bridge)
 elseif(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
     # macOS: the Hypervisor.framework backend. hv_vm_create is entitlement-
     # gated, so sign ad-hoc with com.apple.security.hypervisor after linking.
