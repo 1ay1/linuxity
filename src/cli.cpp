@@ -525,17 +525,23 @@ std::optional<std::string> render_value(const std::string& key, const std::vecto
     if (words.empty()) { why = "no value"; return std::nullopt; }
     std::string text;
     if (t == Type::strings) {
-        // one word with spaces is split, several words are the list
+        // one word with spaces is split like a shell would (quotes group),
+        // several words are the list
         std::vector<std::string> items = words;
-        if (items.size() == 1 && items[0].find(' ') != std::string::npos) {
+        if (items.size() == 1 && items[0].find_first_of(" \t") != std::string::npos) {
             items.clear();
-            std::string_view s = words[0];
-            while (!s.empty()) {
-                const auto sp = s.find(' ');
-                if (sp != 0) items.emplace_back(s.substr(0, sp));
-                if (sp == std::string_view::npos) break;
-                s.remove_prefix(sp + 1);
+            std::string cur;
+            bool have = false;
+            char q = 0;
+            for (const char c : words[0]) {
+                if (q) { if (c == q) q = 0; else cur.push_back(c); continue; }
+                if (c == '\'' || c == '"') { q = c; have = true; continue; }
+                if (c == ' ' || c == '\t') { if (have) items.push_back(cur); cur.clear(); have = false; continue; }
+                cur.push_back(c);
+                have = true;
             }
+            if (q) { why = "unclosed quote in " + key; return std::nullopt; }
+            if (have) items.push_back(cur);
         }
         text = "[";
         for (const auto& w : items) text += " " + vibe_edit::string_text(w);
@@ -1522,8 +1528,7 @@ std::vector<std::string> lx_with_default_env(int argc, char** argv) {
                      find_dyn_field(std::string{next});
         else if (verb == "snapshot" || verb == "adduser" || verb == "export" || verb == "kill" ||
                  verb == "logs" || verb == "svc")
-            insert = argc == 3 || (verb == "svc" && (next == "list" || next == "start" || next == "stop" || next == "restart")) ||
-                     (verb == "kill" && next.find_first_not_of("0123456789") == std::string_view::npos);
+            insert = true;   // their first word is a user, file, pid or service, never an env
     }
     if (insert) a.insert(a.begin() + 2, d);
     return a;

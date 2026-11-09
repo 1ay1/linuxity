@@ -279,6 +279,9 @@ linuxity's subsystems or **forwarded** to the host kernel acting on the guest.
   every CLI flag and environment variable, a task cookbook, resource limits,
   bind mounts, DNS, fake-root, package managers, troubleshooting, and an FAQ.
   **Start here to *use* linuxity.**
+- **[doc/USER_GUIDE.md](doc/USER_GUIDE.md)** — **start here.** `linuxity new
+  ubuntu`, shells, users and sudo, settings, services, snapshots, limits,
+  Android, and every command.
 - **[doc/ENVIRONMENTS.md](doc/ENVIRONMENTS.md)** — named environments:
   `env.vibe` (hostname, user, shell, DNS, limits, mounts, services), snapshots
   and reset, the long-running instance (`up`, `shell`, `exec`, `ps`, `svc`),
