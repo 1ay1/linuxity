@@ -544,15 +544,34 @@ public:
             // parent dirs: the last component is the caller's business
             // (O_NOFOLLOW, unlink, rename all differ).
             if (depth < 8) {
+                // Directories rarely become symlinks, so each answer is kept
+                // until the guest writes anything or a mount changes (a write
+                // is where a dir could be replaced by a link). Without the
+                // cache this was a readlink per path component on every
+                // stat and open.
+                if (for_write) dirlink_cache_.clear();
                 std::size_t end = 0;
                 while ((end = rel.find('/', end)) != std::string_view::npos) {
                     const std::string_view sub = rel.substr(0, end);
                     const std::string guest = (m->prefix == "/" ? std::string{} : m->prefix) + "/" + std::string{sub};
                     std::string target;
-                    Probe p = probe_link(join_host(m->upper, sub).c_str(), target);
-                    if (p == Probe::absent) {
-                        if (!whiteouts_.empty() && is_whiteout(guest)) break;
-                        p = probe_link(join_host(m->host_base, sub).c_str(), target);
+                    Probe p;
+                    std::string key = guest;
+                    key.push_back('\0');
+                    key += m->upper;
+                    key.push_back('\0');
+                    key += m->host_base;
+                    if (auto it = dirlink_cache_.find(key); it != dirlink_cache_.end()) {
+                        p = it->second.first;
+                        target = it->second.second;
+                    } else {
+                        p = probe_link(join_host(m->upper, sub).c_str(), target);
+                        if (p == Probe::absent) {
+                            if (!whiteouts_.empty() && is_whiteout(guest)) p = Probe::notdir;   // stop here
+                            else p = probe_link(join_host(m->host_base, sub).c_str(), target);
+                        }
+                        if (dirlink_cache_.size() > 65536) dirlink_cache_.clear();
+                        dirlink_cache_.emplace(std::move(key), std::pair{p, target});
                     }
                     if (p == Probe::absent || p == Probe::notdir) break;
                     if (p == Probe::symlink) {
@@ -1869,6 +1888,9 @@ private:
     }
 
     std::vector<Mount> mounts_;
+    // directory -> symlink answers for classify_impl's parent walk (keyed by
+    // guest path + the mount's dirs); cleared on any write
+    mutable std::unordered_map<std::string, std::pair<Probe, std::string>> dirlink_cache_;
     // Per-process current directory (see set_current_pid/inherit_cwd). cur_pid_
     // is mutable so a const cwd()/absolutize path can select the active pid.
     mutable std::unordered_map<std::int32_t, std::string> cwds_{};

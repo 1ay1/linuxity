@@ -42,6 +42,8 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <ctime>
+#include <algorithm>
 #include <unordered_map>
 #include <vector>
 #if !defined(_WIN32)
@@ -114,9 +116,12 @@ public:
             trap_.set_flush_events([&] { locked([&] { apply_proc_events(); }); });
         for (;;) {
             TrapFrame f;
+            const auto t_wait = prof_.on ? prof_clock() : 0;
             bool still_running = LX_TRY(trap_.next(f));
+            const auto t_got = prof_.on ? prof_clock() : 0;
+            if (prof_.on) prof_.wait_ns += t_got - t_wait;
             locked([&] { apply_proc_events(); });
-            if (!still_running) { cleanup_temps(); return ok(trap_.exit_code()); }
+            if (!still_running) { cleanup_temps(); prof_.report(); return ok(trap_.exit_code()); }
 
             // The dispatcher classifies the trapped syscall: service it from
             // our subsystems, forward it to the host kernel, or exit.
@@ -127,6 +132,8 @@ public:
                 if (trap_.refused_call() && !o.template get_if<abi::Virtualize>())
                     o = abi::Outcome::error(Errno::enosys);
             if (const char* t = trace_env) trace_fate(t, f.regs, o);
+            const int o_kind = prof_.on ? static_cast<int>(o.fate().index()) : 0;
+            const auto t_disp = prof_.on ? prof_clock() : 0;
 
             // Act on the fate. Exactly one arm runs, chosen by the type, and
             // the compiler rejects this match if a fate is left unhandled --
@@ -491,12 +498,13 @@ public:
                 });
 
             switch (step) {
-                case Step::done:  cleanup_temps(); return ok(exit_status);
+                case Step::done:  cleanup_temps(); prof_.report(); return ok(exit_status);
                 case Step::fail:  cleanup_temps();
                                   return std::unexpected(Errno::eio);
                 case Step::again: continue;
                 case Step::next:  break;
             }
+            if (prof_.on) prof_.add(f.regs.nr, o_kind, prof_clock() - t_got, t_disp - t_got);
             // The trap continues the task asynchronously; whole-tree exit is
             // reported by next() returning false, so we just loop.
         }
@@ -908,6 +916,51 @@ private:
         if (fd >= 0) ::close(fd);
         return seen[p] = fd >= 0;
     }
+
+    // LINUXITY_PROFILE=1: where the time goes. Per syscall and fate, how
+    // often it was trapped and how long linuxity spent on it (dispatch plus
+    // acting on it, which includes the extra stops a redirect needs), and how
+    // long the loop waited for the next trap. Printed at exit.
+    static std::uint64_t prof_clock() {
+        ::timespec ts{};
+        ::clock_gettime(CLOCK_MONOTONIC, &ts);
+        return static_cast<std::uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<std::uint64_t>(ts.tv_nsec);
+    }
+    struct Profile {
+        bool on = [] { const char* p = std::getenv("LINUXITY_PROFILE"); return p && *p && *p != '0'; }();
+        struct Cell { std::uint64_t n{0}, ns{0}, disp{0}; };
+        std::unordered_map<std::uint64_t, Cell> cells;   // (nr << 8) | fate
+        std::uint64_t wait_ns{0};
+        void add(std::uint64_t nr, int fate, std::uint64_t ns, std::uint64_t disp) {
+            auto& c = cells[(nr << 8) | static_cast<std::uint64_t>(fate)];
+            ++c.n;
+            c.ns += ns;
+            c.disp += disp;
+        }
+        void report() {
+            if (!on || cells.empty()) return;
+            static constexpr const char* kFate[] = {"virt", "forward", "redirect", "inject", "raise",
+                                                    "exec", "sock", "argrw", "guestcall", "exit"};
+            std::vector<std::pair<std::uint64_t, Cell>> v(cells.begin(), cells.end());
+            std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second.ns > b.second.ns; });
+            std::uint64_t total = 0, calls = 0;
+            for (auto& [k, c] : v) { total += c.ns; calls += c.n; }
+            std::fprintf(stderr, "\nlinuxity profile: %llu trapped calls, %.1f ms handling them, %.1f ms waiting for the next\n"
+                                 "  %-6s %-9s %9s %10s %9s %9s\n",
+                         static_cast<unsigned long long>(calls), static_cast<double>(total) / 1e6,
+                         static_cast<double>(wait_ns) / 1e6, "nr", "fate", "calls", "total ms", "us/call", "decide us");
+            for (std::size_t i = 0; i < v.size() && i < 20; ++i) {
+                const auto& [k, c] = v[i];
+                const auto fate = static_cast<std::size_t>(k & 0xff);
+                std::fprintf(stderr, "  %-6llu %-9s %9llu %10.2f %9.2f %9.2f\n", static_cast<unsigned long long>(k >> 8),
+                             fate < std::size(kFate) ? kFate[fate] : "?", static_cast<unsigned long long>(c.n),
+                             static_cast<double>(c.ns) / 1e6, static_cast<double>(c.ns) / 1e3 / static_cast<double>(c.n),
+                             static_cast<double>(c.disp) / 1e3 / static_cast<double>(c.n));
+            }
+            on = false;
+        }
+    };
+    Profile prof_;
 
     // Unlink every INJECT temp created during the run (files and dirs).
     void cleanup_temps() {

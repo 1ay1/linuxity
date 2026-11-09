@@ -539,10 +539,14 @@ int run_runtime(lx::cli::Options& o, int argc, char** argv) {
             init.creds_given = true;
         }
         k.procs().upsert(init);
-        // login.cwd / --cwd: where pid 1 starts
-        if (!o.instance && !o.cwd.empty()) {
+        // login.cwd / --cwd: where pid 1 starts. Without a rootfs the guest
+        // sees the host's tree, so it starts where you ran linuxity.
+        std::string start_dir = o.cwd;
+        if (start_dir.empty() && root.empty())
+            if (char cwd[4096]; ::getcwd(cwd, sizeof cwd) != nullptr) start_dir = cwd;
+        if (!o.instance && !start_dir.empty()) {
             k.files().set_current_pid(1);
-            k.files().set_cwd(o.cwd);
+            k.files().set_cwd(start_dir);
         }
 
         // An INHERITED terminal is already our controlling one, and the guest
@@ -946,9 +950,11 @@ int run_runtime(lx::cli::Options& o, int argc, char** argv) {
     cli::Launch first;
     if (!o.instance) {
         first = prepare(prog_path, prog_argv);
+        if (first.error.empty() && ::access(first.exec_path.c_str(), X_OK) != 0)
+            first.error = prog_path + ": " + std::strerror(errno);
         if (!first.error.empty()) {
             std::fprintf(stderr, "linuxity: %s\n", first.error.c_str());
-            return 1;
+            return errno == ENOENT || errno == EACCES ? 127 : 1;
         }
     }
     runtime::PtraceTrap trap{first.exec_path, first.argv, genvp, {}, pre_exec};

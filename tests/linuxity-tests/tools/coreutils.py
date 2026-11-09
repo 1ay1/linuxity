@@ -21,7 +21,7 @@ def text_pipeline():
 @test
 def hashing_and_bytes():
     """sha256sum/md5sum/base64/od over 5 MB match Python."""
-    need_cmd("yes", "head", "sha256sum", "md5sum", "base64", "od")
+    need_cmd("yes", "head", "sha256sum", "md5sum", "base64", "od", "cmp")
     data = (b"crazy\n" * 1000000)[:5000000]
     eq(sh("yes crazy | head -c 5000000 | sha256sum").stdout.split()[0], hashlib.sha256(data).hexdigest(), "sha256sum")
     with open("blob", "wb") as f:

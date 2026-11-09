@@ -349,7 +349,7 @@ inline constexpr int kTrappedX86_64[] = {
     std::vector<std::uint32_t> trapped;
     trapped.reserve(kTrappedAll.size() + 1);
     for (const std::uint64_t nr : kTrappedAll)
-        if (nr != kNoSysno) trapped.push_back(static_cast<std::uint32_t>(nr));
+        if (nr != kNoSysno && nr != encode(kHostArch, abi::Sysno::fcntl)) trapped.push_back(static_cast<std::uint32_t>(nr));
     // UNTRAPPED(sendto,44): trapped by argument below. A send with a
     // destination address is trapped, since landlock's abstract-socket scope
     // has to see where it goes. The filter can't read the address, and its
@@ -435,8 +435,15 @@ inline constexpr int kTrappedX86_64[] = {
     // UNTRAPPED(pread64,17): trapped below by argument, offset 0 only
     constexpr std::uint64_t kPread = encode(kHostArch, abi::Sysno::pread64);
     constexpr std::size_t kPre = 5;   // statements in the pread64 check
+    // UNTRAPPED(fcntl,72): trapped below by argument. Only F_DUPFD and
+    // F_DUPFD_CLOEXEC (the new fd inherits the old one's path) and F_GETLK
+    // (l_pid is a host pid) need linuxity; F_GETFD/F_SETFD/F_GETFL and the
+    // rest are what `find` and every libc make thousands of, and they run
+    // natively now.
+    constexpr std::uint64_t kFcntl = encode(kHostArch, abi::Sysno::fcntl);
+    constexpr std::size_t kFc = 6;    // statements in the fcntl check
     const auto to_enosys = [&](std::size_t idx) {
-        return static_cast<std::uint8_t>((firstJeq + nTrapped + kSend + kPre + 2) - idx - 1);
+        return static_cast<std::uint8_t>((firstJeq + nTrapped + kSend + kFc + kPre + 2) - idx - 1);
     };
     if (emit_x32) {
         f.push_back(BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, kX32Bit,
@@ -452,7 +459,7 @@ inline constexpr int kTrappedX86_64[] = {
                              to_enosys(f.size())));
     }
     for (std::size_t i = 0; i < nTrapped; ++i) {
-        std::uint8_t jt = static_cast<std::uint8_t>((nTrapped - 1 - i) + kSend + kPre + 1);
+        std::uint8_t jt = static_cast<std::uint8_t>((nTrapped - 1 - i) + kSend + kFc + kPre + 1);
         f.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
                              trapped[i], jt, 0));                // firstJeq + i
     }
@@ -464,8 +471,8 @@ inline constexpr int kTrappedX86_64[] = {
     {
         constexpr std::uint32_t kArg0 = offsetof(seccomp_data, args);
         constexpr std::uint32_t kArg4 = offsetof(seccomp_data, args) + 4 * 8;
-        const auto to_trace = [&](std::size_t k) { return static_cast<std::uint8_t>(kSend + 6 - k - 1); };
-        const auto to_allow = [&](std::size_t k) { return static_cast<std::uint8_t>(kSend + 5 - k - 1); };
+        const auto to_trace = [&](std::size_t k) { return static_cast<std::uint8_t>(kSend + kFc + 6 - k - 1); };
+        const auto to_allow = [&](std::size_t k) { return static_cast<std::uint8_t>(kSend + kFc + 5 - k - 1); };
         f.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
                              static_cast<std::uint32_t>(kSendto), 0,
                              static_cast<std::uint8_t>(kSend - 1)));              // s0 -> pread check
@@ -480,6 +487,19 @@ inline constexpr int kTrappedX86_64[] = {
         } else {
             f.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));           // s5
         }
+    }
+    // nr == fcntl: TRACE for F_DUPFD(0), F_GETLK(5), F_DUPFD_CLOEXEC(1030),
+    // else ALLOW. A miss on nr falls through to the pread check.
+    {
+        constexpr std::uint32_t kArg1 = offsetof(seccomp_data, args) + 1 * 8;
+        const auto to_trace = [&](std::size_t k) { return static_cast<std::uint8_t>((kFc - 1 - k) + kPre + 1); };
+        f.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, static_cast<std::uint32_t>(kFcntl), 0,
+                             static_cast<std::uint8_t>(kFc - 1)));                 // f0 -> pread check
+        f.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, kArg1));                   // f1 (cmd is an int)
+        f.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, to_trace(2), 0));      // f2 F_DUPFD
+        f.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 5, to_trace(3), 0));      // f3 F_GETLK
+        f.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 1030, to_trace(4), 0));   // f4 F_DUPFD_CLOEXEC
+        f.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));                // f5
     }
     // nr == pread64 && args[3] == 0 -> TRACE, else ALLOW (little-endian words)
     constexpr std::uint32_t kArg3 = offsetof(seccomp_data, args) + 3 * 8;

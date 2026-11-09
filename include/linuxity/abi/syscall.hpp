@@ -55,6 +55,7 @@
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <sys/syscall.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 #endif
 #include <ctime>
@@ -131,6 +132,8 @@ public:
 
     [[nodiscard]] Outcome dispatch(const Regs& r) {
         const Sysno sc = decode(arch_, r.nr);
+        cstr_valid_ = false;
+        struct DropCstr { bool& v; ~DropCstr() { v = false; } } drop_cstr{cstr_valid_};
         // Select the trapped task's per-process cwd for this syscall, so
         // chdir/fchdir/getcwd and every relative-path absolutize act on THIS
         // process's directory rather than a single shared one (a forked
@@ -1180,7 +1183,21 @@ private:
     // EISDIR ("cannot read file data"). To avoid that, on a chunk fault we
     // fall back to reading up to the next page boundary, then byte-by-byte,
     // so we always recover the maximal valid prefix up to the NUL.
+    // Handlers read the same path arg several times per syscall; keep the
+    // last one until the next dispatch.
     [[nodiscard]] std::string read_cstr(UAddr a) {
+        if (cstr_valid_ && cstr_addr_ == value(a)) return cstr_;
+        std::string s = read_cstr_uncached(a);
+        cstr_valid_ = true;
+        cstr_addr_ = value(a);
+        cstr_ = s;
+        return s;
+    }
+    bool cstr_valid_ = false;
+    std::uint64_t cstr_addr_ = 0;
+    std::string cstr_;
+
+    [[nodiscard]] std::string read_cstr_uncached(UAddr a) {
         std::string s;
         const std::uint64_t base = value(a);
         std::uint64_t off = 0;
@@ -1190,16 +1207,17 @@ private:
             // never read across it in one process_vm_readv (that's the read
             // that can spuriously fault on a valid string).
             std::uint64_t to_page = kPage - ((base + off) & (kPage - 1));
-            std::size_t want = static_cast<std::size_t>(to_page < 64 ? to_page : 64);
-            std::array<std::byte, 64> chunk{};
-            std::span<std::byte> dst{chunk.data(), want};
+            // 256 bytes covers nearly every path in one read.
+            constexpr std::size_t kChunk = 256;
+            std::size_t want = static_cast<std::size_t>(to_page < kChunk ? to_page : kChunk);
+            std::array<char, kChunk> chunk;
+            std::span<std::byte> dst{reinterpret_cast<std::byte*>(chunk.data()), want};
             if (mem_.copy_in(uaddr(base + off), dst)) {
-                for (std::size_t i = 0; i < want; ++i) {
-                    char c = static_cast<char>(chunk[i]);
-                    if (c == '\0') return s;
-                    s.push_back(c);
-                    if (s.size() > 4096) return s;
-                }
+                const void* nul = std::memchr(chunk.data(), '\0', want);
+                const std::size_t n = nul ? static_cast<std::size_t>(static_cast<const char*>(nul) - chunk.data()) : want;
+                s.append(chunk.data(), n);
+                if (nul) return s;
+                if (s.size() > 4096) { s.resize(4097); return s; }
                 off += want;
                 continue;
             }
@@ -2669,7 +2687,23 @@ private:
 
         auto pc = k_.files().classify(abs, /*for_write=*/false, /*follow=*/false);
         if (pc.realm == kernel::Realm2::host_backed) {
+#if defined(__linux__)
+            // Most links read the same from any process, so read them here:
+            // one stop instead of a redirect's two. /proc and /dev links
+            // depend on who reads them (/proc/self), so the guest still does.
+            const std::string_view hp = pc.host_path;
+            if (hp.starts_with("/proc/") || hp.starts_with("/dev/"))
+                return Redirect{PathArg{path_arg, std::move(pc.host_path)}};
+            char tgt[4096];
+            const ::ssize_t n = ::readlink(pc.host_path.c_str(), tgt, sizeof tgt);
+            if (n < 0) return eno(wire::errno_from_host(errno));
+            const std::size_t len = std::min(static_cast<std::size_t>(n), cap);
+            if (len && !mem_.copy_out(buf, {reinterpret_cast<const std::byte*>(tgt), len}))
+                return eno(Errno::efault);
+            return val(static_cast<std::int64_t>(len));
+#else
             return Redirect{PathArg{path_arg, std::move(pc.host_path)}};
+#endif
         }
         if (pc.realm == kernel::Realm2::virtual_file) {
             // A synthesized symlink (e.g. /dev/stdin -> /proc/self/fd/0)
@@ -3232,10 +3266,47 @@ private:
             : k_.files().classify(abs, /*for_write=*/false, follow);
         if (pc.realm == kernel::Realm2::virtual_file) return eno(Errno::enotsup);
         if (pc.host_path.empty()) return eno(pc.error);
+        // A read needs nothing from the guest's own context, so answer it
+        // here: one stop, where a redirect is two plus poking the path into
+        // its memory word by word. `ls -l` makes one of these per file.
+#if defined(__linux__)
+        if (!for_write && !at && !pc.host_path.starts_with("/proc/") &&
+            !pc.host_path.starts_with("/dev/")) {
+            if (const auto sc = decode(arch_, r.nr);
+                sc == Sysno::listxattr || sc == Sysno::llistxattr ||
+                sc == Sysno::getxattr || sc == Sysno::lgetxattr)
+                return host_xattr_read(r, sc, pc.host_path);
+        }
+#endif
         // Hand the guest path along so PathArg can see this is an identity
         // translation and the trap loop can forward instead of rewriting.
         return Redirect{PathArg{path_arg, std::move(pc.host_path), abs}};
     }
+
+#if defined(__linux__)
+    // getxattr/lgetxattr/listxattr/llistxattr on a host path, done by us and
+    // copied out. Same errors the kernel would give the guest: we run as the
+    // same host user it does.
+    [[nodiscard]] Outcome host_xattr_read(const Regs& r, Sysno sc, const std::string& host) {
+        const bool list = sc == Sysno::listxattr || sc == Sysno::llistxattr;
+        const bool nofollow = sc == Sysno::llistxattr || sc == Sysno::lgetxattr;
+        // list(path, buf, size); get(path, name, buf, size)
+        const UAddr buf = uaddr(r.arg[list ? 1 : 2]);
+        const auto cap = static_cast<std::size_t>(std::min<std::uint64_t>(r.arg[list ? 2 : 3], 1u << 16));
+        std::string name;
+        if (!list) name = read_cstr(uaddr(r.arg[1]));
+        std::vector<std::byte> out(cap);
+        void* p = cap ? out.data() : nullptr;
+        const ::ssize_t n = list ? (nofollow ? ::llistxattr(host.c_str(), static_cast<char*>(p), cap)
+                                             : ::listxattr(host.c_str(), static_cast<char*>(p), cap))
+                                 : (nofollow ? ::lgetxattr(host.c_str(), name.c_str(), p, cap)
+                                             : ::getxattr(host.c_str(), name.c_str(), p, cap));
+        if (n < 0) return eno(wire::errno_from_host(errno));
+        if (cap && n > 0 && !mem_.copy_out(buf, {out.data(), static_cast<std::size_t>(n)}))
+            return eno(Errno::efault);
+        return val(n);
+    }
+#endif
 
     [[nodiscard]] Outcome do_getcwd(const Regs& r) {
         std::string_view cwd = k_.files().cwd();
