@@ -190,7 +190,8 @@ at 100ms. Five exits within two seconds of starting each mark it
 
 Inside an instance, guest programs can reach the host. `xdg-open`,
 `wl-copy`, `wl-paste` and `notify-send` are on every session's `PATH` (from
-`/run/linuxity/bin`, a small static helper), so ordinary tools just work:
+`/run/linuxity/bin`; a small static helper embedded in `linuxity` and written
+out when the instance starts), so ordinary tools just work:
 
 ```sh
 xdg-open https://example.com       # opens in the phone's browser

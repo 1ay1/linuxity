@@ -51,6 +51,10 @@
 
 extern char** environ;
 
+// the static guest helper, embedded at build time (bridge_blob.S)
+extern "C" const unsigned char lx_bridge_blob[];
+extern "C" const unsigned char lx_bridge_blob_end[];
+
 namespace lx::cli {
 
 using Kern = kernel::Kernel<host::PosixHost>;
@@ -751,29 +755,19 @@ private:
     // linuxity-bridge (found next to our own binary), mounted read-only at
     // /run/linuxity/bin and put first on every session's PATH.
     void install_helpers() {
-        char self[4096];
-        const ::ssize_t n = ::readlink("/proc/self/exe", self, sizeof self - 1);
-        if (n <= 0) return;
-        self[n] = '\0';
-        std::string dir{self};
-        dir.resize(dir.find_last_of('/'));
-        std::string helper;
-        // next to us, under its own name, or as packaged in an Android APK
-        for (const char* cand : {"/linuxity-bridge", "/liblinuxity-bridge.so",
-                                 "/../libexec/linuxity/linuxity-bridge",
-                                 "/../lib/linuxity/linuxity-bridge"})
-            if (::access((dir + cand).c_str(), X_OK) == 0) { helper = dir + cand; break; }
-        if (helper.empty()) {
-            env::status().event("bridge", "bridge helper linuxity-bridge not found next to linuxity; "
-                                          "guest xdg-open/wl-copy won't reach the host");
-            return;
-        }
         const std::string bin = o_.run_dir + "/bin";
         (void)env::remove_tree(bin);
         if (!env::mkdirs(bin)) return;
-        // one real copy; the other names link to it by a RELATIVE symlink,
-        // which resolves inside the guest's view of the mount
-        if (!env::copy_tree(helper, bin + "/linuxity-bridge")) return;
+        // the helper is embedded in this binary (see CMakeLists.txt)
+        const std::string_view blob{reinterpret_cast<const char*>(lx_bridge_blob),
+                                    static_cast<std::size_t>(lx_bridge_blob_end - lx_bridge_blob)};
+        const std::string helper = bin + "/linuxity-bridge";
+        if (!env::write_file_atomic(helper, blob) || ::chmod(helper.c_str(), 0755) != 0) {
+            env::status().event("bridge", "cannot write the bridge helper to " + bin);
+            return;
+        }
+        // the other names link to it by a RELATIVE symlink, which resolves
+        // inside the guest's view of the mount
         for (const char* name : {"xdg-open", "wl-copy", "wl-paste", "notify-send",
                                  "linuxity-open", "linuxity-copy", "linuxity-paste", "linuxity-notify"})
             (void)::symlink("linuxity-bridge", (bin + "/" + name).c_str());

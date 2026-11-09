@@ -84,13 +84,23 @@ target_link_libraries(linuxity_core INTERFACE linuxity_vibe)
 set(LX_PTRACE_HOSTS Linux Android)
 if(CMAKE_SYSTEM_NAME IN_LIST LX_PTRACE_HOSTS)
     add_subdirectory(src/host)
-    add_executable(linuxity src/main.cpp src/cli.cpp)
-    target_link_libraries(linuxity PRIVATE linuxity_core linuxity_host)
     # The guest side of the host bridge: static, so it runs in any distro.
-    # Instances put it on the guest's PATH as xdg-open, wl-copy, notify-send.
+    # It's embedded in linuxity (one file to ship); an instance writes it out
+    # and puts it on the guest's PATH as xdg-open, wl-copy, notify-send.
     add_executable(linuxity-bridge src/guest/linuxity-bridge.c)
     target_link_options(linuxity-bridge PRIVATE -static)
     target_compile_options(linuxity-bridge PRIVATE -O2 -w)
+    set_target_properties(linuxity-bridge PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+    enable_language(ASM)
+    set(LX_BRIDGE_BIN ${CMAKE_BINARY_DIR}/linuxity-bridge)
+    file(WRITE ${CMAKE_BINARY_DIR}/bridge_blob.S
+        ".section .rodata\n.balign 16\n.global lx_bridge_blob\nlx_bridge_blob:\n"
+        ".incbin \"${LX_BRIDGE_BIN}\"\n.global lx_bridge_blob_end\nlx_bridge_blob_end:\n"
+        ".section .note.GNU-stack,\"\",%progbits\n")
+    set_source_files_properties(${CMAKE_BINARY_DIR}/bridge_blob.S PROPERTIES OBJECT_DEPENDS ${LX_BRIDGE_BIN})
+
+    add_executable(linuxity src/main.cpp src/cli.cpp ${CMAKE_BINARY_DIR}/bridge_blob.S)
+    target_link_libraries(linuxity PRIVATE linuxity_core linuxity_host)
     add_dependencies(linuxity linuxity-bridge)
 elseif(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
     # macOS: the Hypervisor.framework backend. hv_vm_create is entitlement-
