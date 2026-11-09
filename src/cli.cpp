@@ -12,6 +12,7 @@
 #include "linuxity/env/control.hpp"
 #include "linuxity/env/json.hpp"
 #include "linuxity/env/json_read.hpp"
+#include "linuxity/env/passwd.hpp"
 #include "linuxity/env/store.hpp"
 #include "linuxity/env/vibe_edit.hpp"
 
@@ -29,7 +30,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -75,7 +78,9 @@ void help() {
         "  env snapshot <name> <snap>    env restore <name> <snap>\n"
         "  env snapshots <name>          env drop-snapshot <name> <snap>\n"
         "  env rename <old> <new>        env rm <name>\n"
-        "  env adduser <name> <user> [--sudo]   create a guest user\n"
+        "  env adduser <name> <user> [--password] [--no-sudo] [--shell PATH]\n"
+        "                                a login user with sudo; new shells log in as it\n"
+        "  env users <name> [--json]     login users\n"
         "\n"
         "running\n"
         "  run <env> [-- cmd ...]        one program in the foreground (pid 1)\n"
@@ -620,6 +625,249 @@ std::string value_text(const JValue& v) {
     return "";
 }
 
+// ---- users ---------------------------------------------------------------------------
+
+// Runs as root inside the instance. POSIX sh, so it works on bash, dash and
+// busybox images alike. Inputs come in the environment, never spliced into
+// the script text.
+constexpr const char* kAddUserScript = R"SH(
+set -e
+say() { printf 'linuxity: %s\n' "$*" >&2; }
+U=$LX_USER
+[ -x "$LX_SHELL" ] || { say "$LX_SHELL is not in this image, using /bin/sh"; LX_SHELL=/bin/sh; }
+
+created=0
+if id -u "$U" >/dev/null 2>&1; then
+  say "$U already exists, updating it"
+  if command -v usermod >/dev/null 2>&1; then usermod -s "$LX_SHELL" "$U"; fi
+elif command -v useradd >/dev/null 2>&1; then
+  useradd -m -U -s "$LX_SHELL" "$U" 2>/dev/null || useradd -m -g "$U" -s "$LX_SHELL" "$U"
+  created=1
+elif command -v adduser >/dev/null 2>&1; then
+  adduser -D -s "$LX_SHELL" "$U"
+  created=1
+else
+  say "the image has neither useradd nor adduser"; exit 1
+fi
+
+H=$(awk -F: -v u="$U" '$1==u{print $6}' /etc/passwd)
+if [ -n "$H" ] && [ ! -d "$H" ]; then mkdir -p "$H"; fi
+[ -n "$H" ] && chown "$U" "$H" && chmod 0700 "$H"
+
+if [ -n "$LX_PASSWORD" ]; then
+  printf '%s:%s\n' "$U" "$LX_PASSWORD" | chpasswd
+elif [ "$created" = 1 ]; then
+  passwd -d "$U" >/dev/null 2>&1 || true
+fi
+
+if [ "$LX_SUDO" = 1 ]; then
+  if ! command -v sudo >/dev/null 2>&1; then
+    say "installing sudo"
+    if command -v pacman >/dev/null 2>&1; then
+      # a fresh image has no keyring and no package database yet
+      if [ ! -s /etc/pacman.d/gnupg/pubring.gpg ] && [ ! -s /etc/pacman.d/gnupg/pubring.kbx ]; then
+        pacman-key --init >/dev/null && pacman-key --populate >/dev/null
+      fi
+      pacman -S --noconfirm --needed sudo 2>/dev/null || pacman -Sy --noconfirm --needed sudo
+    elif command -v apk >/dev/null 2>&1; then apk add --no-cache sudo
+    elif command -v apt-get >/dev/null 2>&1; then
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get install -y sudo || { apt-get update && apt-get install -y sudo; }
+    elif command -v dnf >/dev/null 2>&1; then dnf install -y sudo
+    elif command -v zypper >/dev/null 2>&1; then zypper -n install sudo
+    fi
+  fi
+  command -v sudo >/dev/null 2>&1 || { say "sudo is not installed and could not be installed"; exit 1; }
+
+  for g in wheel sudo; do
+    if grep -q "^$g:" /etc/group; then
+      if command -v usermod >/dev/null 2>&1; then usermod -aG "$g" "$U"; else addgroup "$U" "$g"; fi
+      break
+    fi
+  done
+
+  mkdir -p /etc/sudoers.d
+  chmod 0750 /etc/sudoers.d
+  f=/etc/sudoers.d/90-linuxity-$U
+  # "last matching rule wins" in sudo, so a later %wheel rule in the image's
+  # sudoers would bring the password prompt back. A per-user Defaults line
+  # applies whatever the rule order is.
+  if [ -n "$LX_PASSWORD" ]; then rule="$U ALL=(ALL:ALL) ALL"
+  elif [ "$created" = 1 ] || [ ! -f "$f" ] || grep -q NOPASSWD "$f"; then
+    rule="Defaults:$U !authenticate
+$U ALL=(ALL:ALL) ALL"
+  else rule=$(cat "$f"); fi
+  # sudo skips names with a dot, so the temp file is ignored until the move
+  printf '%s\n' "$rule" > "$f.new"
+  chown root:root "$f.new"
+  chmod 0440 "$f.new"
+  if command -v visudo >/dev/null 2>&1 && ! visudo -cqf "$f.new"; then
+    rm -f "$f.new"; say "visudo rejected the rule"; exit 1
+  fi
+  mv -f "$f.new" "$f"
+  [ -f /etc/sudoers ] || { printf 'root ALL=(ALL:ALL) ALL\n' > /etc/sudoers; chmod 0440 /etc/sudoers; }
+  grep -Eq '^[@#]includedir[[:space:]]+/etc/sudoers.d' /etc/sudoers ||
+    { chmod u+w /etc/sudoers; printf '@includedir /etc/sudoers.d\n' >> /etc/sudoers; chmod 0440 /etc/sudoers; }
+  # prove it, as the user, without asking for anything
+  if [ -z "$LX_PASSWORD" ]; then
+    su -s /bin/sh -c 'sudo -n true' "$U" || { say "sudo does not work for $U"; exit 1; }
+  fi
+fi
+)SH";
+
+[[nodiscard]] bool valid_user_name(std::string_view n) {
+    if (n.empty() || n.size() > 32 || n == "root") return false;
+    if (!((n[0] >= 'a' && n[0] <= 'z') || n[0] == '_')) return false;
+    for (const char c : n)
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-')) return false;
+    return true;
+}
+
+// Read a password from the terminal, without echo.
+std::optional<std::string> prompt_password(const char* what) {
+    const int fd = ::open("/dev/tty", O_RDWR | O_CLOEXEC);
+    if (fd < 0) return std::nullopt;
+    ::termios old{};
+    const bool tty = ::tcgetattr(fd, &old) == 0;
+    if (tty) {
+        ::termios t = old;
+        t.c_lflag &= ~static_cast<tcflag_t>(ECHO);
+        ::tcsetattr(fd, TCSAFLUSH, &t);
+    }
+    (void)!::write(fd, what, std::strlen(what));
+    std::string pw;
+    char c;
+    while (::read(fd, &c, 1) == 1 && c != '\n' && c != '\r') pw.push_back(c);
+    (void)!::write(fd, "\n", 1);
+    if (tty) ::tcsetattr(fd, TCSAFLUSH, &old);
+    ::close(fd);
+    return pw;
+}
+
+// linuxity env adduser <env> <user> [--no-sudo] [--password | --password-stdin]
+//                                   [--shell PATH] [--no-default]
+int cmd_adduser(const Store& s, const std::string& name, int argc, char** argv) {
+    if (argc < 5)
+        return fail("usage: linuxity env adduser <env> <user> [--no-sudo] [--password | --password-stdin] "
+                    "[--shell PATH] [--no-default]");
+    const std::string user = argv[4];
+    if (!valid_user_name(user))
+        return fail("bad user name '" + user + "' (lowercase letters, digits, _ and -, starting with a letter)");
+    std::string shell, password;
+    bool sudo = true, make_default = true, ask = false, from_stdin = false;
+    for (int i = 5; i < argc; ++i) {
+        const std::string_view f = argv[i];
+        if (f == "--shell" && i + 1 < argc) shell = argv[++i];
+        else if (f == "--no-sudo") sudo = false;
+        else if (f == "--sudo") sudo = true;
+        else if (f == "--no-default") make_default = false;
+        else if (f == "--password") ask = true;
+        else if (f == "--password-stdin") from_stdin = true;
+        else return fail("unknown option '" + std::string{f} + "'");
+    }
+    if (ask) {
+        const auto a = prompt_password("password: ");
+        const auto b = a ? prompt_password("again: ") : std::nullopt;
+        if (!a || !b) return fail("no terminal to ask for a password on (use --password-stdin)");
+        if (*a != *b) return fail("the passwords don't match");
+        password = *a;
+    } else if (from_stdin) {
+        std::getline(std::cin, password);
+        if (!password.empty() && password.back() == '\r') password.pop_back();
+    }
+    if (password.find_first_of(":\n") != std::string::npos) return fail("a password can't contain ':' or a newline");
+    if (shell.empty()) {
+        const auto r = s.load(name);
+        shell = r.config.shell.empty() ? "/bin/bash" : r.config.shell;
+    }
+
+    // inside the running instance, so there is one kernel and one view of
+    // the files, never two writing the same upper
+    Conn c;
+    if (!ensure_up(name, c)) return fail("cannot start " + name);
+    const int rc = run_session(c, {"/bin/sh", "-c", kAddUserScript}, "root", "/",
+                               {{"LX_USER", user}, {"LX_SHELL", shell}, {"LX_PASSWORD", password},
+                                {"LX_SUDO", sudo ? "1" : "0"}, {"PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}},
+                               false);
+    if (rc != 0) return fail("setting up " + user + " failed");
+
+    if (make_default) {
+        const auto cur = slurp(s.config_path(name)).value_or("");
+        const auto next = vibe_edit::set(cur, "login.user", vibe_edit::string_text(user));
+        if (!next || save_config(s, name, *next) != 0) return fail("created " + user + " but couldn't make it the default");
+    }
+    std::printf("%s is ready in %s%s%s\n", user.c_str(), name.c_str(),
+                sudo ? (password.empty() ? ", with passwordless sudo" : ", with sudo") : "",
+                make_default ? ", and new shells log in as it" : "");
+    return 0;
+}
+
+// linuxity env users <env> [--json]: login users (root and uid >= 1000)
+int cmd_users(const Store& s, const std::string& name, bool json) {
+    const auto r = s.load(name);
+    std::vector<std::string> layers;
+    if (!r.config.upper.empty()) layers.push_back(r.config.upper);
+    layers.push_back(r.config.rootfs);
+    const std::string passwd = read_layered(layers, "/etc/passwd");
+    const std::string groups = read_layered(layers, "/etc/group");
+    // groups sudoers actually grants (Arch ships %wheel commented out)
+    std::vector<std::string> granted;
+    {
+        std::istringstream si{read_layered(layers, "/etc/sudoers")};
+        std::string sl;
+        while (std::getline(si, sl))
+            for (const char* g : {"wheel", "sudo", "admin"})
+                if (sl.starts_with(std::string{"%"} + g + " ") || sl.starts_with(std::string{"%"} + g + "\t"))
+                    granted.emplace_back(g);
+    }
+    struct Row { std::string name, home, shell; std::uint32_t uid; bool sudo; };
+    std::vector<Row> rows;
+    std::istringstream in{passwd};
+    std::string line;
+    while (std::getline(in, line)) {
+        std::vector<std::string> f;
+        std::size_t a = 0;
+        for (;;) {
+            const auto b = line.find(':', a);
+            f.push_back(line.substr(a, b == std::string::npos ? std::string::npos : b - a));
+            if (b == std::string::npos) break;
+            a = b + 1;
+        }
+        if (f.size() < 7) continue;
+        const auto uid = static_cast<std::uint32_t>(std::strtoul(f[2].c_str(), nullptr, 10));
+        if (uid != 0 && (uid < 1000 || uid >= 60000)) continue;
+        bool sudo = uid == 0;
+        if (!sudo) {
+            const std::string rule = "/etc/sudoers.d/90-linuxity-" + f[0];
+            for (const auto& l : layers) sudo = sudo || exists(l + rule);
+            const auto gs = groups_of(groups, f[0], static_cast<std::uint32_t>(std::strtoul(f[3].c_str(), nullptr, 10)));
+            for (const auto& g : granted) {
+                std::istringstream gi{groups};
+                std::string gl;
+                while (std::getline(gi, gl))
+                    if (gl.starts_with(g + ":")) {
+                        const auto gid = std::strtoul(gl.substr(gl.find(':', gl.find(':') + 1) + 1).c_str(), nullptr, 10);
+                        for (const auto x : gs) sudo = sudo || x == gid;
+                    }
+            }
+        }
+        rows.push_back({f[0], f[5], f[6], uid, sudo});
+    }
+    if (json) {
+        Json j;
+        j.obj().kv("default", r.config.user).key("users").arr();
+        for (const auto& u : rows)
+            j.obj().kv("name", u.name).kv("uid", static_cast<std::int64_t>(u.uid)).kv("home", u.home)
+                .kv("shell", u.shell).kv("sudo", u.sudo).kv("default", u.name == r.config.user).end();
+        std::puts(j.end().end().take().c_str());
+        return 0;
+    }
+    for (const auto& u : rows)
+        std::printf("%-14s uid %-6u %-16s %s%s\n", u.name.c_str(), u.uid, u.shell.c_str(),
+                    u.sudo ? "sudo" : "", u.name == r.config.user ? "  (default)" : "");
+    return 0;
+}
+
 int cmd_env(int argc, char** argv) {
     if (argc < 3) { help(); return 2; }
     Store s;
@@ -880,45 +1128,9 @@ int cmd_env(int argc, char** argv) {
         return 0;
     }
 
-    if (sub == "adduser") {
-        if (argc < 5) return fail("usage: linuxity env adduser <name> <user> [--sudo] [--shell PATH]");
-        const std::string user = argv[4];
-        std::string shell = "/bin/bash";
-        for (int i = 5; i + 1 < argc; ++i) if (std::string_view{argv[i]} == "--shell") shell = argv[i + 1];
-        const bool sudo = has_flag(argc, argv, "--sudo");
-        // run the guest's own useradd as root, as a one-shot pid 1
-        const auto r = s.load(name);
-        auto exists_in = [&](const char* p) {
-            return exists(r.config.upper + p) || exists(r.config.rootfs + p);
-        };
-        std::string script;
-        if (exists_in("/usr/bin/useradd") || exists_in("/usr/sbin/useradd") || exists_in("/sbin/useradd")) {
-            script = "useradd -m -U -s '" + shell + "' '" + user + "'";
-            if (sudo) script += " && (getent group wheel >/dev/null && usermod -aG wheel '" + user +
-                                "' || usermod -aG sudo '" + user + "')";
-        } else if (exists_in("/usr/sbin/adduser") || exists_in("/bin/busybox")) {
-            script = "adduser -D -s '" + shell + "' '" + user + "'";
-            if (sudo) script += " && addgroup '" + user + "' wheel";
-        } else {
-            return fail("the image has no useradd or adduser");
-        }
-        if (sudo)
-            script += " && mkdir -p /etc/sudoers.d && echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/10-wheel"
-                      " && chmod 440 /etc/sudoers.d/10-wheel";
-        const std::string exe = self_exe();
-        const ::pid_t pid = ::fork();
-        if (pid == 0) {
-            ::execl(exe.c_str(), exe.c_str(), "run", name.c_str(), "--user", "root", "--quiet", "--",
-                    "/bin/sh", "-c", script.c_str(), static_cast<char*>(nullptr));
-            ::_exit(127);
-        }
-        int st = 0;
-        ::waitpid(pid, &st, 0);
-        if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) return fail("adding " + user + " failed");
-        std::printf("added %s to %s. Make it the default: linuxity env set %s login.user %s\n",
-                    user.c_str(), name.c_str(), name.c_str(), user.c_str());
-        return 0;
-    }
+    if (sub == "users") return cmd_users(s, name, json);
+
+    if (sub == "adduser") return cmd_adduser(s, name, argc, argv);
 
     return fail("unknown env command '" + std::string{sub} + "' (see `linuxity help`)");
 }

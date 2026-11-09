@@ -702,11 +702,20 @@ private:
             if (!it->second.pid) it = services_.erase(it);
             else ++it;
         }
+        // login settings only matter to sessions started from now on
+        if (next.user != o_.cfg.user) { o_.user = next.user; applied.emplace_back("login.user"); }
+        if (next.shell != o_.cfg.shell) { o_.shell = next.shell; applied.emplace_back("login.shell"); }
+        if (next.cwd != o_.cfg.cwd) { o_.cwd = next.cwd; applied.emplace_back("login.cwd"); }
+        if (next.command != o_.cfg.command) applied.emplace_back("login.command");
         // anything else needs a restart of the instance
         env::EnvConfig a = o_.cfg, b = next;
         a.hostname = b.hostname;
         a.dns = b.dns;
         a.services = b.services;
+        a.user = b.user;
+        a.shell = b.shell;
+        a.cwd = b.cwd;
+        a.command = b.command;
         const bool restart = env::config_json(a) != env::config_json(b);
         o_.cfg = next;
         o_.cfg.hostname = next.hostname;

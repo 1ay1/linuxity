@@ -8,7 +8,7 @@ UI) edit the same file through `linuxity env set` or the JSON schema.
 
 ```sh
 linuxity env create arch ~/arch/root.x86_64
-linuxity env adduser arch ayush --sudo
+linuxity env adduser arch ayush
 linuxity env set arch login.user ayush
 linuxity env set arch system.hostname pixel
 linuxity shell arch            # starts it if needed, opens a login shell
@@ -274,9 +274,29 @@ stderr. Each has `event` and a human `text`:
 
 ## Users
 
-`login.user` must exist in the guest. `linuxity env adduser <env> <user>
-[--sudo]` runs the image's own `useradd` (or busybox `adduser`) as root, and
-with `--sudo` adds the user to `wheel` and allows that group in
-`/etc/sudoers.d`. A non-root session gets that user's uid, gid, groups and
-home, and no capabilities, and file permissions are checked against it
-like a real kernel would.
+```sh
+linuxity env adduser arch ayush              # sudo without a password
+linuxity env adduser arch ayush --password   # asks; sudo asks for it too
+linuxity env users arch
+```
+
+`adduser` does the whole job in one step, inside the running instance:
+
+- creates the user with the image's own `useradd` (or busybox `adduser`),
+  with a home dir and their own group. Running it again for an existing user
+  updates it instead of failing.
+- installs `sudo` if the image doesn't have it (pacman, apt, apk, dnf or
+  zypper; a fresh Arch image gets its keyring set up first).
+- adds the user to `wheel` (or `sudo`) and writes
+  `/etc/sudoers.d/90-linuxity-<user>`, checked with `visudo` and enabled
+  with `@includedir` if the image's sudoers lacks it. Without a password the
+  rule is `Defaults:<user> !authenticate`, which still holds if the image
+  has a `%wheel ... ALL` rule after it.
+- checks that `sudo -n true` works as the user before reporting success.
+- makes it `login.user`, so new shells log in as it right away (no
+  restart). `--no-default` skips that, `--no-sudo` skips sudo, and
+  `--password-stdin` reads the password from a pipe (the app uses this).
+
+A non-root session gets that user's uid, gid, groups and home, and no
+capabilities, and file permissions are checked against it like a real
+kernel would.

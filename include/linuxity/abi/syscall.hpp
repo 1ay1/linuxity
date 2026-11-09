@@ -6778,7 +6778,9 @@ public:
             const auto mo = k_.files().mount_of(s.guest_path);
             constexpr std::uint32_t kMntId = 0x1000, kMntIdUnique = 0x4000;
             constexpr std::uint64_t kMountRoot = 0x2000;
-            constexpr std::uint64_t kMaskOff = 0, kAttrOff = 8, kMnt = 144, kAttrMask = 48;
+            // offsets: stx_mask 0, stx_attributes 8, stx_blocks 48,
+            // stx_attributes_mask 56, stx_mnt_id 144
+            constexpr std::uint64_t kMaskOff = 0, kAttrOff = 8, kMnt = 144, kAttrMask = 56;
             (void)put_u32(base + kMaskOff, get_u32(base + kMaskOff) | kMntId | kMntIdUnique);
             (void)put_u64(base + kMnt, mo.id);
             (void)put_u64(base + kAttrMask, get_u64(base + kAttrMask) | kMountRoot);
