@@ -745,6 +745,35 @@ int run_runtime(lx::cli::Options& o, int argc, char** argv) {
         }
     }
 
+    // /etc/hosts: the image's own, plus the hostname when it lacks it, so
+    // sudo and friends can resolve it (WSL and Docker do the same). Live, so
+    // a hostname change shows up at once. network.manage-hosts=false turns
+    // it off and leaves the file editable.
+    if (!root.empty() && o.manage_hosts) {
+        const auto hpc = k.files().classify("/etc/hosts");
+        const std::string image_hosts = hpc.realm == kernel::Realm2::host_backed ? hpc.host_path : std::string{};
+        k.files().mount_virtual("/etc/hosts", [&k, image_hosts](std::string_view) -> Result<kernel::VirtualFile> {
+            std::string body = image_hosts.empty() ? std::string{} : env::slurp(image_hosts).value_or("");
+            if (body.empty()) body = "127.0.0.1\tlocalhost\n::1\t\tlocalhost ip6-localhost ip6-loopback\n";
+            if (!body.empty() && body.back() != '\n') body.push_back('\n');
+            const std::string& h = k.machine().nodename;
+            bool named = false;
+            std::size_t at = 0;
+            while (!named && (at = body.find(h, at)) != std::string::npos) {
+                const bool left = at == 0 || body[at - 1] == ' ' || body[at - 1] == '\t';
+                const std::size_t e = at + h.size();
+                const bool right = e == body.size() || body[e] == ' ' || body[e] == '\t' || body[e] == '\n' || body[e] == '.';
+                named = left && right;
+                at = e;
+            }
+            if (!named) body += "127.0.1.1\t" + h + "\n";
+            kernel::VirtualFile vf;
+            vf.bytes.assign(reinterpret_cast<const std::byte*>(body.data()),
+                            reinterpret_cast<const std::byte*>(body.data() + body.size()));
+            return vf;
+        });
+    }
+
     // Which AF_UNIX namespace this host actually permits. Probed, not
     // assumed: Android's SELinux denies a filesystem bind in every directory
     // an app can write, so a guest gpg-agent/ssh-agent/dirmngr would fail
@@ -1138,7 +1167,7 @@ int parse_flags(int argc, char** argv, int i, lx::cli::Options& o) {
         else if (f == "--pids")   { o.res.pids_max = std::strtoull(need("--pids"), nullptr, 10); }
         else if (f == "--cpuset") { o.res.cpuset = need("--cpuset"); }
         else if (f == "--host-pids") { o.host_pids = true; }
-        else if (f == "--bind" || f == "-b") {
+        else if (f == "--bind" || f == "-b" || f == "-v" || f == "--volume") {
             std::string spec = need("--bind");
             auto colon = spec.find(':');
             std::string host = colon == std::string::npos ? spec : spec.substr(0, colon);
@@ -1258,9 +1287,32 @@ int cmd_up(int argc, char** argv) {
 // `linuxity run <env> [flags] [-- program...]`: one program as pid 1 with
 // the environment's settings (the user's login shell if none is given).
 int cmd_run(int argc, char** argv) {
-    if (argc < 3) { std::fprintf(stderr, "usage: linuxity run <env> [OPTIONS] [-- program args...]\n"); return 2; }
+    if (argc < 3) { std::fprintf(stderr, "usage: linuxity run [env] [--fresh] [-v host:guest] [-e K=V] [-- program args...]\n"); return 2; }
     lx::cli::Options o;
     if (!load_env(argv[2], o)) return 1;
+    // --fresh: like docker run --rm, changes go to a throwaway layer
+    bool fresh = false;
+    const int orig_argc = argc;
+    char** const orig_argv = argv;   // a re-exec under systemd-run must keep --fresh
+    std::vector<char*> rest(argv, argv + argc);
+    std::erase_if(rest, [&](char* a) { return std::string_view{a} == "--fresh" && (fresh = true); });
+    argc = static_cast<int>(rest.size());
+    argv = rest.data();
+    std::string scratch;
+    if (fresh) {
+        lx::env::Store store;
+        // a re-exec under systemd-run (for exact limits) reuses the same dir
+        if (const char* d = std::getenv("LINUXITY_FRESH_DIR"); d && *d) scratch = d;
+        else {
+            scratch = lx::host::tmp_path("linuxity-fresh-" + std::to_string(::getpid()));
+            (void)lx::env::mkdirs(scratch);
+            // the image's own owners and modes still apply
+            if (const auto m = lx::env::slurp(store.dir(o.env_name) + "/image.meta"))
+                (void)lx::env::write_file_atomic(scratch + "/.linuxity-meta", *m);
+            ::setenv("LINUXITY_FRESH_DIR", scratch.c_str(), 1);
+        }
+        o.persist = scratch;
+    }
     const int i = parse_flags(argc, argv, 3, o);
     if (i < 0) return 2;
     for (int j = i; j < argc; ++j) o.argv.emplace_back(argv[j]);
@@ -1268,28 +1320,83 @@ int cmd_run(int argc, char** argv) {
     std::vector<std::string> layers;
     if (!o.persist.empty()) layers.push_back(o.persist);
     layers.push_back(o.root);
-    const auto u = lx::env::resolve_user(layers, o.user);
+    auto u = lx::env::resolve_user(layers, o.user);
+    if (!u && fresh) {
+        // --fresh starts from the clean image, which predates users added later
+        if (!std::getenv("LINUXITY_DELEGATED"))
+            std::fprintf(stderr, "linuxity: %s isn't in the clean image; running as root\n", o.user.c_str());
+        o.user = "root";
+        o.shell.clear();
+        u = lx::env::resolve_user(layers, o.user);
+    }
+    // a bare command name is looked up on the guest's PATH
+    if (!o.argv.empty() && o.argv[0].find('/') == std::string::npos) {
+        for (const char* dir : {"/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"}) {
+            const std::string cand = std::string{dir} + "/" + o.argv[0];
+            bool found = false;
+            for (const auto& l : layers) {
+                struct ::stat sst{};
+                if (::lstat((l + cand).c_str(), &sst) == 0 && (S_ISREG(sst.st_mode) || S_ISLNK(sst.st_mode))) { found = true; break; }
+            }
+            if (found) { o.argv[0] = cand; break; }
+        }
+        if (o.argv[0].find('/') == std::string::npos) {
+            std::fprintf(stderr, "linuxity: %s: command not found\n", o.argv[0].c_str());
+            if (!scratch.empty()) (void)lx::env::remove_tree(scratch);
+            return 127;
+        }
+    }
     if (o.argv.empty())
         o.argv = {o.shell.empty() ? (u ? u->shell : std::string{"/bin/sh"}) : o.shell, "-l"};
     if (o.cwd.empty() && u) o.cwd = u->home;
     setup_status(o);
-    return run_runtime(o, argc, argv);
+    const int rc = run_runtime(o, orig_argc, orig_argv);
+    if (!scratch.empty()) (void)lx::env::remove_tree(scratch);
+    return rc;
 }
 
 }  // namespace
 
-int lx_cli_main(int argc, char** argv);   // cli.cpp: env, shell, ps, ...
+int lx_cli_main(int argc, char** argv);   // cli.cpp: new, list, shell, set, ...
+std::vector<std::string> lx_with_default_env(int argc, char** argv);
+
+namespace {
+
+int with_args(int (*fn)(int, char**), std::vector<std::string> a) {
+    std::vector<char*> av;
+    for (auto& x : a) av.push_back(x.data());
+    av.push_back(nullptr);
+    return fn(static_cast<int>(a.size()), av.data());
+}
+
+// Words that are commands, not programs to run.
+bool is_verb(std::string_view s) {
+    static constexpr std::string_view kVerbs[] = {
+        "new", "import", "export", "images", "list", "ls", "default", "shell", "exec", "ps",
+        "kill", "status", "svc", "logs", "reload", "stop", "down", "set", "get", "unset",
+        "edit", "info", "check", "path", "users", "adduser", "snapshot", "snapshots",
+        "restore", "drop-snapshot", "reset", "rm", "remove", "rename", "schema", "env",
+        "help", "--help", "-h", "version", "--version"};
+    for (const auto v : kVerbs) if (s == v) return true;
+    return false;
+}
+
+}  // namespace
 
 int main(int argc, char** argv) {
-    if (argc >= 2) {
-        const std::string_view sub = argv[1];
-        if (sub == "up") return cmd_up(argc, argv);
-        if (sub == "run") return cmd_run(argc, argv);
-        if (sub == "env" || sub == "shell" || sub == "exec" || sub == "down" || sub == "ps" ||
-            sub == "kill" || sub == "status" || sub == "svc" || sub == "logs" || sub == "reload" ||
-            sub == "help" || sub == "--help" || sub == "-h" || sub == "version")
-            return lx_cli_main(argc, argv);
+    // `linuxity` alone opens the default environment
+    if (argc < 2) return lx_cli_main(argc, argv);
+    const std::string_view sub = argv[1];
+    if (sub == "help" && argc > 2 && std::string_view{argv[2]} == "--all") { usage(argv[0]); return 0; }
+    // the server side: an environment running in the background
+    if (sub == "up" || sub == "start") {
+        auto a = lx_with_default_env(argc, argv);
+        a[1] = "up";
+        return with_args(cmd_up, a);
     }
+    if (sub == "run") return with_args(cmd_run, lx_with_default_env(argc, argv));
+    if (is_verb(sub)) return lx_cli_main(argc, argv);
+    // anything else: run one program, as linuxity always has
     lx::cli::Options o;
     const int i = parse_flags(argc, argv, 1, o);
     if (i < 0) return 2;

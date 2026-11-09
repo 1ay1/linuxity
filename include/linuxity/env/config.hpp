@@ -77,6 +77,7 @@ struct EnvConfig {
     // network
     std::vector<std::string> dns;
     bool manage_dns{true};
+    bool manage_hosts{true};
 
     // login
     std::string user{"root"};
@@ -160,6 +161,8 @@ inline constexpr Field kFields[] = {
         [](EnvConfig& c, const Val& v) { c.dns = v.list; }},
     {"network.manage-dns", Type::boolean, "true", "Serve a resolv.conf when the image has none. Off: leave DNS to the image.", "", false,
         [](EnvConfig& c, const Val& v) { c.manage_dns = v.b; }},
+    {"network.manage-hosts", Type::boolean, "true", "Add the hostname to /etc/hosts, like WSL and Docker do. Off: /etc/hosts is the image's, editable.", "", false,
+        [](EnvConfig& c, const Val& v) { c.manage_hosts = v.b; }},
 
     {"login.user", Type::string, "root", "User that shells and commands run as. Must exist in the guest's /etc/passwd (add one with `env adduser`).", "", true,
         [](EnvConfig& c, const Val& v) { c.user = v.s; }},
@@ -624,7 +627,7 @@ inline void check_runnable(const EnvConfig& c, std::vector<Diag>& diags) {
             .kv("host-hardware", c.host_hardware).kv("host-pids", c.host_pids)
             .kv("timezone", c.timezone).kv("locale", c.locale)
         .end()
-        .key("network").obj().kv("dns", c.dns).kv("manage-dns", c.manage_dns).end()
+        .key("network").obj().kv("dns", c.dns).kv("manage-dns", c.manage_dns).kv("manage-hosts", c.manage_hosts).end()
         .key("login").obj()
             .kv("user", c.user).kv("shell", c.shell).kv("cwd", c.cwd)
             .kv("command", c.command).kv("umask", c.umask)

@@ -8,13 +8,17 @@
 // shell/exec start the instance if it isn't running. Everything here talks
 // to the instance through its control socket (env/control.hpp); no kernel
 // headers, so this file builds fast.
+#include "linuxity/env/archive.hpp"
+#include "linuxity/env/catalog.hpp"
 #include "linuxity/env/config.hpp"
 #include "linuxity/env/control.hpp"
+#include "linuxity/env/digest.hpp"
 #include "linuxity/env/json.hpp"
 #include "linuxity/env/json_read.hpp"
 #include "linuxity/env/passwd.hpp"
 #include "linuxity/env/store.hpp"
 #include "linuxity/env/vibe_edit.hpp"
+#include "linuxity/kernel/meta_store.hpp"
 
 #include <fcntl.h>
 #include <poll.h>
@@ -63,39 +67,37 @@ std::string self_exe() {
 
 void help() {
     std::puts(
-        "linuxity: a Linux userland without a VM.\n"
+        "linuxity: Linux, without a VM.\n"
         "\n"
-        "environments\n"
-        "  env create <name> <rootfs> [--set key=value ...]   new environment\n"
-        "  env list [--json]                                 every environment\n"
-        "  env info <name> [--json]                          config, disk use, state\n"
-        "  env get <name> <key>          env set <name> <key> <value>\n"
-        "  env unset <name> <key>        env edit <name>      ($EDITOR on env.vibe)\n"
-        "  env check <name> [--json]     validate env.vibe\n"
-        "  env schema                    every key, as JSON (for frontends)\n"
-        "  env path <name>               where it lives on disk\n"
-        "  env reset <name>              drop every change, back to the clean image\n"
-        "  env snapshot <name> <snap>    env restore <name> <snap>\n"
-        "  env snapshots <name>          env drop-snapshot <name> <snap>\n"
-        "  env rename <old> <new>        env rm <name>\n"
-        "  env adduser <name> <user> [--password] [--no-sudo] [--shell PATH]\n"
-        "                                a login user with sudo; new shells log in as it\n"
-        "  env users <name> [--json]     login users\n"
+        "  linuxity                      a shell in your default environment\n"
+        "  linuxity new ubuntu [name]    download and set up a distro (see `linuxity images`)\n"
+        "  linuxity import NAME FILE     bring your own rootfs (tar.gz/xz/zst, or a directory)\n"
+        "  linuxity export [ENV] FILE    the whole environment as a tarball\n"
+        "  linuxity list                 your environments\n"
+        "  linuxity default ENV          which one `linuxity` opens\n"
         "\n"
-        "running\n"
-        "  run <env> [-- cmd ...]        one program in the foreground (pid 1)\n"
-        "  up <env> [--foreground]       start the environment (services, sessions)\n"
-        "  shell <env> [--user U]        a login shell in it (starts it if needed)\n"
-        "  exec <env> [--user U] [--cwd D] [-e K=V] [-t|-T] -- cmd ...\n"
-        "  ps <env> [--json]             kill <env> <pid> [signal]\n"
-        "  status <env> [--json]         reload <env>   (apply env.vibe changes)\n"
-        "  svc <env> [list|start|stop|restart] [name]\n"
-        "  logs <env> [service] [-f]     down <env>\n"
+        "  linuxity shell [ENV]          a login shell\n"
+        "  linuxity exec [ENV] -- CMD    run a command (-u USER, -C DIR, -e K=V, -t/-T)\n"
+        "  linuxity run ENV [-- CMD]     one program as pid 1, in the foreground\n"
+        "  linuxity start|stop [ENV]     keep it running in the background, or stop it\n"
+        "  linuxity status|ps [ENV]      what's running\n"
         "\n"
-        "Without a subcommand: linuxity [OPTIONS] <program> [args...]  (see --help).\n"
+        "  linuxity set [ENV] KEY=VALUE  change a setting: hostname, user, memory, cpus,\n"
+        "                                dns, timezone, env.NAME, ... (`linuxity get` lists them)\n"
+        "  linuxity get [ENV] [KEY]      show settings\n"
+        "  linuxity edit [ENV]           edit env.vibe in $EDITOR\n"
+        "  linuxity adduser [ENV] USER   a user with sudo; new shells log in as it\n"
+        "  linuxity users [ENV]          who can log in\n"
+        "\n"
+        "  linuxity snapshot [ENV] NAME  save the current state;  restore [ENV] NAME\n"
+        "  linuxity reset [ENV]          back to the clean image\n"
+        "  linuxity rename OLD NEW       linuxity rm ENV\n"
+        "  linuxity svc [ENV] [start|stop|restart NAME]   linuxity logs [ENV] [SVC] [-f]\n"
+        "\n"
+        "ENV can be left out when you have a default (the first env you make is).\n"
+        "Run one program without an environment: linuxity --root DIR PROGRAM  (linuxity help --all).\n"
         "Environments live in $LINUXITY_HOME (default ~/.local/share/linuxity).");
 }
-
 // ---- talking to an instance ------------------------------------------------
 
 struct Conn {
@@ -182,7 +184,7 @@ bool write_all(int fd, const char* p, std::size_t n) {
 // hand over our own 0/1/2 and just wait. Returns the session's exit code.
 int run_session(Conn& c, std::vector<std::string> argv, const std::string& user,
                 const std::string& cwd, const std::vector<std::pair<std::string, std::string>>& env,
-                bool tty) {
+                bool tty, int in_fd = 0, int out_fd = 1) {
     Json j;
     j.obj().kv("op", "spawn").kv("argv", argv).kv("user", user).kv("cwd", cwd).kv("wait", true);
     j.key("env").obj();
@@ -210,7 +212,7 @@ int run_session(Conn& c, std::vector<std::string> argv, const std::string& user,
         ::close(slave);
         if (print_reply(r)) { ::close(master); return 1; }
     } else {
-        fds = {0, 1, 2};
+        fds = {in_fd, out_fd, 2};
         j.kv("fds", 3);
         if (print_reply(request(c, j.end().take(), fds))) return 1;
     }
@@ -493,6 +495,21 @@ int cmd_logs(int argc, char** argv) {
 }
 
 // ---- env management ---------------------------------------------------------------
+
+// A key as the user typed it: the full path, or its last part when that's
+// unique ("hostname" -> system.hostname, "memory" -> limits.memory).
+[[nodiscard]] std::string resolve_key(const std::string& key) {
+    if (find_field(key) || find_dyn_field(key) || key.find('.') != std::string::npos) return key;
+    std::string hit;
+    for (const auto& f : kFields) {
+        const auto dot = f.path.rfind('.');
+        if (dot != std::string_view::npos && f.path.substr(dot + 1) == key) {
+            if (!hit.empty()) return key;   // ambiguous: let the caller complain
+            hit = std::string{f.path};
+        }
+    }
+    return hit.empty() ? key : hit;
+}
 
 // Render a CLI value for `key` as VIBE text, checked against the schema.
 std::optional<std::string> render_value(const std::string& key, const std::vector<std::string>& words,
@@ -868,6 +885,298 @@ int cmd_users(const Store& s, const std::string& name, bool json) {
     return 0;
 }
 
+// ---- images: new, import, export -------------------------------------------------------
+
+// Run a host command and capture stdout (for curl/wget). -1 if it couldn't run.
+int capture(const std::vector<std::string>& argv, std::string& out) {
+    int p[2];
+    if (::pipe2(p, O_CLOEXEC) != 0) return -1;
+    const ::pid_t pid = ::fork();
+    if (pid == 0) {
+        ::dup2(p[1], 1);
+        std::vector<char*> a;
+        for (const auto& s : argv) a.push_back(const_cast<char*>(s.c_str()));
+        a.push_back(nullptr);
+        ::execvp(a[0], a.data());
+        ::_exit(127);
+    }
+    ::close(p[1]);
+    char buf[4096];
+    ::ssize_t n;
+    while ((n = ::read(p[0], buf, sizeof buf)) > 0) out.append(buf, static_cast<std::size_t>(n));
+    ::close(p[0]);
+    int st = 0;
+    ::waitpid(pid, &st, 0);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+[[nodiscard]] bool have_fetcher() { return archive::have_tool("curl") || archive::have_tool("wget"); }
+
+// Download with the host's curl or wget, showing their progress bar.
+bool download(const std::string& url, const std::string& to) {
+    const std::string part = to + ".part";
+    std::vector<std::string> argv;
+    if (archive::have_tool("curl")) argv = {"curl", "-fL", "--retry", "3", "-C", "-", "-o", part, url};
+    else if (archive::have_tool("wget")) argv = {"wget", "-c", "-O", part, url};
+    else return false;
+    if (!::isatty(2) && argv[0] == "curl") argv.insert(argv.begin() + 1, "-sS");
+    else if (argv[0] == "curl") argv.insert(argv.begin() + 1, "--progress-bar");
+    const ::pid_t pid = ::fork();
+    if (pid == 0) {
+        std::vector<char*> a;
+        for (const auto& s : argv) a.push_back(const_cast<char*>(s.c_str()));
+        a.push_back(nullptr);
+        ::dup2(2, 1);
+        ::execvp(a[0], a.data());
+        ::_exit(127);
+    }
+    int st = 0;
+    ::waitpid(pid, &st, 0);
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0 && ::rename(part.c_str(), to.c_str()) == 0;
+}
+
+void say(const std::string& s) { std::fprintf(stderr, "%s\n", s.c_str()); }
+
+// Unpack an image into a new environment `name`: the rootfs lives inside the
+// env (so `rm` takes it too) and the image's owners and modes go into the
+// metadata journal, kept as image.meta so `reset` restores them.
+std::string unpack_into_env(const Store& s, const std::string& name, const std::string& file,
+                            const std::string& strip, bool auto_strip) {
+    const std::string tmp = s.envs_dir() + "/." + name + ".unpacking";
+    (void)remove_tree(tmp);
+    if (!mkdirs(s.envs_dir())) return "cannot create " + s.envs_dir();
+    const bool tty = ::isatty(2);
+    auto r = archive::extract(file, tmp, strip, [tty](std::uint64_t n) {
+        if (tty) std::fprintf(stderr, "\runpacking... %llu files", static_cast<unsigned long long>(n));
+    });
+    if (tty) std::fprintf(stderr, "\r\x1b[K");
+    if (!r.error.empty()) { (void)remove_tree(tmp); return r.error; }
+    // an imported tarball may wrap everything in one directory
+    if (auto_strip && !exists(tmp + "/etc")) {
+        const auto top = list_dir(tmp);
+        if (top.size() == 1 && exists(tmp + "/" + top[0] + "/etc")) {
+            const std::string inner = tmp + ".inner";
+            if (::rename((tmp + "/" + top[0]).c_str(), inner.c_str()) == 0) {
+                (void)remove_tree(tmp);
+                (void)::rename(inner.c_str(), tmp.c_str());
+                const std::string pre = "/" + top[0];
+                for (auto& m : r.meta)
+                    if (m.path.starts_with(pre)) m.path = m.path.substr(pre.size());
+            }
+        }
+    }
+    if (!exists(tmp + "/etc") || !(exists(tmp + "/bin") || exists(tmp + "/usr/bin"))) {
+        (void)remove_tree(tmp);
+        return "that doesn't look like a Linux root filesystem (no /etc or /bin)";
+    }
+    if (const auto e = s.create(name, tmp); !e.empty()) { (void)remove_tree(tmp); return e; }
+    const std::string rootfs = s.dir(name) + "/rootfs";
+    if (::rename(tmp.c_str(), rootfs.c_str()) != 0) return std::string{"cannot move the rootfs: "} + std::strerror(errno);
+    const auto cur = slurp(s.config_path(name)).value_or("");
+    if (const auto next = vibe_edit::set(cur, "rootfs", "rootfs")) (void)write_file_atomic(s.config_path(name), *next);
+
+    lx::kernel::MetaStore meta;
+    meta.attach(s.default_upper(name));
+    for (const auto& m : r.meta) {
+        if (m.uid || m.gid) meta.set_owner(m.path, m.uid, m.gid);
+        struct ::stat st{};
+        const bool have = ::lstat((rootfs + m.path).c_str(), &st) == 0;
+        meta.set_mode(m.path, m.mode, have ? static_cast<std::uint32_t>(st.st_mode) : 0xffffffffu);
+    }
+    if (const auto j = slurp(s.default_upper(name) + "/.linuxity-meta"))
+        (void)write_file_atomic(s.dir(name) + "/image.meta", *j);
+    if (r.skipped)
+        say("note: " + std::to_string(r.skipped) + " entries (devices, FIFOs) were skipped; linuxity provides /dev itself");
+    return {};
+}
+
+// After unpacking: the distro's own setup, a user, and the default env.
+int finish_env(const Store& s, const std::string& name, std::string_view setup,
+               const std::string& user, bool ask_user, bool password) {
+    Conn c;
+    if (!setup.empty()) {
+        say("setting up...");
+        if (!ensure_up(name, c)) return fail("cannot start " + name);
+        if (run_session(c, {"/bin/sh", "-c", std::string{setup}}, "root", "/", {}, false) != 0)
+            say("note: the setup step failed; you may need to run it yourself");
+    }
+    std::string who = user;
+    if (who.empty() && ask_user && ::isatty(0)) {
+        const char* host_user = std::getenv("USER");
+        const std::string suggest = host_user && valid_user_name(host_user) ? host_user : "";
+        std::fprintf(stderr, "Your user name in %s%s (empty to stay root): ", name.c_str(),
+                     suggest.empty() ? "" : (" [" + suggest + "]").c_str());
+        std::string line;
+        std::getline(std::cin, line);
+        while (!line.empty() && (line.back() == ' ' || line.back() == '\r')) line.pop_back();
+        who = line.empty() ? suggest : line;
+        if (who == "root" || who == "-") who.clear();
+    }
+    if (!who.empty()) {
+        std::vector<std::string> a = {"linuxity", "env", "adduser", name, who};
+        if (password) a.emplace_back("--password");
+        std::vector<char*> av;
+        for (auto& x : a) av.push_back(x.data());
+        if (cmd_adduser(s, name, static_cast<int>(av.size()), av.data()) != 0) return 1;
+    }
+    const bool first = !exists(s.home() + "/default") || s.default_env().empty();
+    if (first) (void)s.set_default(name);
+    std::printf("\n%s is ready. Open it with:  linuxity%s\n", name.c_str(),
+                s.default_env() == name ? "" : (" shell " + name).c_str());
+    return 0;
+}
+
+// linuxity new <distro>[:version] [name] [--user U | --root] [--password]
+//                                        [--file F] [--checksum algo:hex]
+int cmd_new(int argc, char** argv) {
+    Store s;
+    std::string ref, name, file, user, checksum;
+    bool root_only = false, password = false, no_verify = false;
+    for (int i = 2; i < argc; ++i) {
+        const std::string_view a = argv[i];
+        auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
+        if (a == "--file") file = next();
+        else if (a == "--user" || a == "-u") user = next();
+        else if (a == "--root") root_only = true;
+        else if (a == "--password") password = true;
+        else if (a == "--checksum") checksum = next();
+        else if (a == "--no-verify") no_verify = true;
+        else if (!a.empty() && a[0] == '-') return fail("unknown option '" + std::string{a} + "'");
+        else if (ref.empty()) ref = a;
+        else if (name.empty()) name = a;
+        else return fail("too many arguments");
+    }
+    if (ref.empty()) {
+        std::puts("usage: linuxity new <distro> [name]\n");
+        std::string list;
+        for (const auto& i : kImages)
+            if (i.arch == kHostArch) std::printf("  %-8s %-24s %s\n", std::string{i.distro}.c_str(), std::string{i.title}.c_str(), std::string{i.note}.c_str());
+        std::puts("\nOr bring your own: linuxity import <name> <rootfs.tar.gz>");
+        return 2;
+    }
+    const Image* img = find_image(ref);
+    if (!img) {
+        std::string avail;
+        for (const auto& i : kImages) if (i.arch == kHostArch) avail += " " + std::string{i.distro};
+        return fail("no image '" + ref + "' for " + std::string{kHostArch} + ". Available:" + avail +
+                    ". Or: linuxity import <name> <rootfs.tar.gz>");
+    }
+    if (name.empty()) name = std::string{img->distro};
+    if (!valid_name(name)) return fail("bad name '" + name + "' (letters, digits, . _ -)");
+    if (exists(s.dir(name))) return fail(name + " already exists. Pick another name: linuxity new " + ref + " <name>");
+
+    // the image, from --file, the cache, or the network
+    if (file.empty()) {
+        (void)mkdirs(s.cache_dir());
+        file = s.cache_dir() + "/" + image_file_name(*img);
+    }
+    std::string expect = std::string{img->checksum};
+    std::string algo = std::string{img->algo};
+    if (!checksum.empty()) {
+        const auto colon = checksum.find(':');
+        if (colon != std::string::npos) { algo = checksum.substr(0, colon); expect = checksum.substr(colon + 1); }
+        else expect = checksum;
+    }
+    auto verify = [&](bool quiet) {
+        if (no_verify) return true;
+        if (expect.empty() && !img->checksum_url.empty() && have_fetcher()) {
+            std::string body;
+            const int rc = archive::have_tool("curl") ? capture({"curl", "-fsSL", std::string{img->checksum_url}}, body)
+                                                      : capture({"wget", "-qO-", std::string{img->checksum_url}}, body);
+            if (rc == 0) expect = body.substr(0, body.find_first_of(" \t\n"));
+        }
+        if (expect.empty()) {
+            if (!quiet) say("note: no checksum to check this image against");
+            return true;
+        }
+        if (!quiet) say("verifying...");
+        std::string got = file_digest(file, algo);
+        for (auto& ch : expect) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        return got == expect;
+    };
+    if (!exists(file) || !verify(true)) {
+        if (exists(file) && checksum.empty() && file.starts_with(s.cache_dir())) (void)::unlink(file.c_str());
+        if (!exists(file)) {
+            if (!have_fetcher())
+                return fail("this system has no curl or wget. Download\n  " + std::string{img->url} +
+                            "\nand run: linuxity new " + ref + " " + name + " --file <the file>");
+            say("downloading " + std::string{img->title} + " (about " + std::to_string(img->size_mb) + " MB)...");
+            if (!download(std::string{img->url}, file)) return fail("the download failed");
+        }
+        if (!verify(false)) {
+            if (file.starts_with(s.cache_dir())) (void)::unlink(file.c_str());
+            return fail("the image doesn't match its checksum (a broken or tampered download); try again");
+        }
+    }
+
+    say("unpacking " + std::string{img->title} + "...");
+    if (const auto e = unpack_into_env(s, name, file, std::string{img->strip}, false); !e.empty())
+        return fail(e);
+    return finish_env(s, name, img->setup, user, !root_only, password);
+}
+
+// linuxity import <name> <rootfs.tar[.gz|.xz|.zst] | directory> [--user U | --root]
+int cmd_import(int argc, char** argv) {
+    if (argc < 4) return fail("usage: linuxity import <name> <rootfs tarball or directory> [--user U]");
+    Store s;
+    const std::string name = argv[2], src = argv[3];
+    std::string user;
+    bool root_only = false;
+    for (int i = 4; i < argc; ++i) {
+        const std::string_view a = argv[i];
+        if ((a == "--user" || a == "-u") && i + 1 < argc) user = argv[++i];
+        else if (a == "--root") root_only = true;
+        else return fail("unknown option '" + std::string{a} + "'");
+    }
+    if (!valid_name(name)) return fail("bad name '" + name + "'");
+    if (exists(s.dir(name))) return fail(name + " already exists");
+    if (is_dir(src)) {
+        // a directory is used in place, never copied or written to
+        if (const auto e = s.create(name, src); !e.empty()) return fail(e);
+    } else {
+        say("unpacking " + src + "...");
+        if (const auto e = unpack_into_env(s, name, src, {}, true); !e.empty()) return fail(e);
+    }
+    return finish_env(s, name, {}, user, !root_only, false);
+}
+
+// linuxity export <env> <file.tar[.gz]>: the whole environment as you see it
+// inside, with owners and modes, ready for `linuxity import` anywhere.
+int cmd_export(int argc, char** argv) {
+    if (argc < 4) return fail("usage: linuxity export <env> <file.tar.gz>");
+    const std::string name = argv[2], to = argv[3];
+    Conn c;
+    if (!ensure_up(name, c)) return fail("cannot start " + name);
+    const std::string part = to + ".part";
+    const int out = ::open(part.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (out < 0) return fail("cannot write " + to + ": " + std::strerror(errno));
+    const bool gz = to.ends_with(".gz") || to.ends_with(".tgz");
+    const std::string script =
+        "cd / && x='--exclude=./proc --exclude=./sys --exclude=./dev --exclude=./run --exclude=./tmp'; "
+        "if tar --version 2>/dev/null | grep -q GNU; then tar --numeric-owner -cpf - $x .; else tar -cf - $x .; fi" +
+        std::string{gz ? " | gzip -6" : ""};
+    say("exporting " + name + "...");
+    const int rc = run_session(c, {"/bin/sh", "-c", script}, "root", "/", {}, false, ::open("/dev/null", O_RDONLY | O_CLOEXEC), out);
+    ::close(out);
+    if (rc != 0 || ::rename(part.c_str(), to.c_str()) != 0) { ::unlink(part.c_str()); return fail("export failed"); }
+    struct ::stat st{};
+    (void)::stat(to.c_str(), &st);
+    std::printf("wrote %s (%s). Bring it back with: linuxity import <name> %s\n", to.c_str(),
+                human_bytes(static_cast<std::uint64_t>(st.st_size)).c_str(), to.c_str());
+    return 0;
+}
+
+int cmd_images(bool json) {
+    if (json) { std::puts(images_json().c_str()); return 0; }
+    for (const auto& i : kImages) {
+        if (i.arch != kHostArch) continue;
+        std::printf("%-8s %-22s ~%4d MB  %s\n", std::string{i.distro}.c_str(), std::string{i.title}.c_str(),
+                    i.size_mb, std::string{i.note}.c_str());
+    }
+    std::puts("\nlinuxity new <distro> [name]      or bring your own: linuxity import <name> <tarball>");
+    return 0;
+}
+
 int cmd_env(int argc, char** argv) {
     if (argc < 3) { help(); return 2; }
     Store s;
@@ -999,39 +1308,80 @@ int cmd_env(int argc, char** argv) {
     }
 
     if (sub == "get") {
-        if (argc < 5) return fail("usage: linuxity env get <name> <key>");
         auto r = s.load(name);
         const auto cj = parse_json(config_json(r.config));
-        const JValue* v = cj ? &*cj : nullptr;
-        std::string_view k = argv[4];
-        while (v && !k.empty()) {
-            const auto d = k.find('.');
-            v = v->get(k.substr(0, d));
-            if (d == std::string_view::npos) break;
-            k.remove_prefix(d + 1);
+        auto lookup = [&](std::string_view k) -> const JValue* {
+            const JValue* v = cj ? &*cj : nullptr;
+            while (v && !k.empty()) {
+                const auto d = k.find('.');
+                v = v->get(k.substr(0, d));
+                if (d == std::string_view::npos) break;
+                k.remove_prefix(d + 1);
+            }
+            return v;
+        };
+        if (argc < 5) {
+            // every setting and its value, defaults included
+            for (const auto& f : kFields) {
+                const JValue* v = lookup(f.path);
+                std::string val = !v ? ""
+                    : f.type == Type::size && v->kind == JValue::Kind::number ? human_bytes(static_cast<std::uint64_t>(v->n))
+                    : value_text(*v);
+                std::printf("%-24s %s\n", std::string{f.path}.c_str(),
+                            val.empty() ? (f.def.empty() ? "-" : (std::string{f.def} + " (default)").c_str()) : val.c_str());
+            }
+            for (const auto& [k, v] : r.config.env) std::printf("env.%-20s %s\n", k.c_str(), v.c_str());
+            for (const auto& m : r.config.mounts) std::printf("mount.%-18s %s -> %s\n", m.name.c_str(), m.host.c_str(), m.at.c_str());
+            for (const auto& sv : r.config.services) std::printf("service.%-16s %s\n", sv.name.c_str(), sv.command.empty() ? "" : sv.command[0].c_str());
+            return 0;
         }
+        const std::string key = resolve_key(argv[4]);
+        const JValue* v = lookup(key);
         if (!v) return fail("no key '" + std::string{argv[4]} + "'");
-        std::puts(value_text(*v).c_str());
+        const Field* f = find_field(key);
+        if (f && f->type == Type::size && v->kind == JValue::Kind::number)
+            std::puts(human_bytes(static_cast<std::uint64_t>(v->n)).c_str());
+        else std::puts(value_text(*v).c_str());
         return 0;
     }
 
     if (sub == "set") {
-        if (argc < 6) return fail("usage: linuxity env set <name> <key> <value...>");
-        std::vector<std::string> words;
-        for (int i = 5; i < argc; ++i) words.emplace_back(argv[i]);
-        std::string why;
-        const auto text = render_value(argv[4], words, why);
-        if (!text) return fail(why);
-        const auto cur = slurp(s.config_path(name)).value_or("");
-        const auto next = vibe_edit::set(cur, argv[4], *text);
-        if (!next) return fail("cannot edit " + s.config_path(name) + " automatically; use `linuxity env edit`");
-        return save_config(s, name, *next);
+        // `set ENV key value...` or `set ENV key=value key=value ...`
+        if (argc < 5) return fail("usage: linuxity set [env] key=value ...   (or: set [env] key value)");
+        std::vector<std::pair<std::string, std::vector<std::string>>> edits;
+        if (std::string_view{argv[4]}.find('=') != std::string_view::npos) {
+            for (int i = 4; i < argc; ++i) {
+                const std::string kv = argv[i];
+                const auto eq = kv.find('=');
+                if (eq == std::string::npos || eq == 0) return fail("'" + kv + "' is not key=value");
+                edits.push_back({resolve_key(kv.substr(0, eq)), {kv.substr(eq + 1)}});
+            }
+        } else {
+            if (argc < 6) return fail("usage: linuxity set [env] key value");
+            std::vector<std::string> words;
+            for (int i = 5; i < argc; ++i) words.emplace_back(argv[i]);
+            edits.push_back({resolve_key(argv[4]), words});
+        }
+        auto text = slurp(s.config_path(name)).value_or("");
+        for (const auto& [key, words] : edits) {
+            std::optional<std::string> next;
+            if (words.size() == 1 && words[0].empty()) next = vibe_edit::unset(text, key);   // key= unsets
+            else {
+                std::string why;
+                const auto v = render_value(key, words, why);
+                if (!v) return fail(why);
+                next = vibe_edit::set(text, key, *v);
+            }
+            if (!next) return fail("cannot edit " + s.config_path(name) + " automatically; use `linuxity edit`");
+            text = *next;
+        }
+        return save_config(s, name, text);
     }
 
     if (sub == "unset") {
         if (argc < 5) return fail("usage: linuxity env unset <name> <key>");
         const auto cur = slurp(s.config_path(name)).value_or("");
-        const auto next = vibe_edit::unset(cur, argv[4]);
+        const auto next = vibe_edit::unset(cur, resolve_key(argv[4]));
         if (!next) return fail("cannot edit " + s.config_path(name) + " automatically; use `linuxity env edit`");
         return save_config(s, name, *next);
     }
@@ -1111,20 +1461,31 @@ int cmd_env(int argc, char** argv) {
     }
 
     if (sub == "rm" || sub == "remove") {
-        if (s.running_pid(name) > 0) return fail(name + " is running; stop it first");
+        const auto r = s.load(name);
+        const bool owns_rootfs = r.config.rootfs.starts_with(s.dir(name) + "/");
         if (!has_flag(argc, argv, "--yes") && ::isatty(0)) {
-            std::fprintf(stderr, "remove %s and all its changes? (the rootfs is kept) [y/N] ", name.c_str());
+            std::fprintf(stderr, "remove %s and everything in it%s? [y/N] ", name.c_str(),
+                         owns_rootfs ? "" : (" (" + r.config.rootfs + " itself is kept)").c_str());
             char a[8] = {0};
             if (!std::fgets(a, sizeof a, stdin) || (a[0] != 'y' && a[0] != 'Y')) return 1;
         }
+        if (s.running_pid(name) > 0) {
+            Conn c;
+            if (connect_env(name, c)) { (void)request(c, R"({"op":"down"})"); std::string l; while (c.in.read_line(l)) {} }
+        }
+        const bool was_default = s.default_env() == name;
         if (const auto e = s.remove(name); !e.empty()) return fail(e);
+        if (was_default) ::unlink((s.home() + "/default").c_str());
+        std::printf("removed %s\n", name.c_str());
         return 0;
     }
 
     if (sub == "rename") {
-        if (argc < 5) return fail("usage: linuxity env rename <old> <new>");
-        if (s.running_pid(name) > 0) return fail(name + " is running; stop it first");
+        if (argc < 5) return fail("usage: linuxity rename <old> <new>");
+        if (s.running_pid(name) > 0) return fail(name + " is running; stop it first (linuxity stop " + name + ")");
+        const bool was_default = s.default_env() == name;
         if (const auto e = s.rename(name, argv[4]); !e.empty()) return fail(e);
+        if (was_default) (void)s.set_default(argv[4]);
         return 0;
     }
 
@@ -1137,20 +1498,122 @@ int cmd_env(int argc, char** argv) {
 
 }  // namespace
 
+// Commands that act on one environment take its name first; leave it out and
+// the default is used (`linuxity set memory=2G`, `linuxity exec -- ls`).
+// Only when that's unambiguous: a word that isn't an environment is an error,
+// never a reason to act on a different one, and commands that destroy data
+// always need the name spelled out.
+std::vector<std::string> lx_with_default_env(int argc, char** argv) {
+    std::vector<std::string> a(argv, argv + argc);
+    if (argc < 2) return a;
+    Store s;
+    if (argc >= 3 && s.has(argv[2])) return a;
+    const std::string_view verb = argv[1];
+    for (const char* v : {"rm", "remove", "reset", "restore", "rename", "drop-snapshot", "import"})
+        if (verb == v) return a;
+    const std::string d = s.default_env();
+    if (d.empty()) return a;
+    bool insert = argc < 3;
+    if (!insert) {
+        const std::string_view next = argv[2];
+        if (next.starts_with("-")) insert = true;                       // flags or `--`
+        else if (verb == "set" || verb == "get" || verb == "unset")
+            insert = next.find('=') != std::string_view::npos || find_field(resolve_key(std::string{next})) ||
+                     find_dyn_field(std::string{next});
+        else if (verb == "snapshot" || verb == "adduser" || verb == "export" || verb == "kill" ||
+                 verb == "logs" || verb == "svc")
+            insert = argc == 3 || (verb == "svc" && (next == "list" || next == "start" || next == "stop" || next == "restart")) ||
+                     (verb == "kill" && next.find_first_not_of("0123456789") == std::string_view::npos);
+    }
+    if (insert) a.insert(a.begin() + 2, d);
+    return a;
+}
+
+namespace {
+
+int no_env_yet() {
+    std::puts("No Linux environments yet. Make one:\n");
+    for (const auto& i : kImages)
+        if (i.arch == kHostArch)
+            std::printf("  linuxity new %-8s %s\n", std::string{i.distro}.c_str(), std::string{i.title}.c_str());
+    std::puts("\nor bring your own:  linuxity import <name> <rootfs.tar.gz>");
+    return 1;
+}
+
+int run_argv(int (*fn)(int, char**), std::vector<std::string> a) {
+    std::vector<char*> av;
+    for (auto& x : a) av.push_back(x.data());
+    av.push_back(nullptr);
+    return fn(static_cast<int>(a.size()), av.data());
+}
+
+}  // namespace
+
 int lx_cli_main(int argc, char** argv) {
-    const std::string_view sub = argv[1];
+    Store s;
+    // `linuxity` alone: a shell in the default environment
+    if (argc < 2) {
+        const std::string d = s.default_env();
+        if (d.empty()) {
+            if (s.names().empty()) return no_env_yet();
+            std::puts("Which one? Pick a default with: linuxity default <name>\n");
+            return run_argv(cmd_env, {argv[0], "env", "list"});
+        }
+        return run_argv([](int c, char** v) { return cmd_shell(c, v, false); }, {argv[0], "shell", d});
+    }
+    const std::string sub = argv[1];
     if (sub == "help" || sub == "--help" || sub == "-h") { help(); return 0; }
-    if (sub == "version") { std::puts("linuxity 0.1.0"); return 0; }
+    if (sub == "version" || sub == "--version") { std::puts("linuxity 0.1.0"); return 0; }
     if (sub == "env") return cmd_env(argc, argv);
-    if (sub == "shell") return cmd_shell(argc, argv, false);
-    if (sub == "exec") return cmd_shell(argc, argv, true);
-    if (sub == "ps") return cmd_ps(argc, argv);
-    if (sub == "kill") return cmd_kill(argc, argv);
-    if (sub == "status") return cmd_status(argc, argv);
-    if (sub == "svc") return cmd_svc(argc, argv);
-    if (sub == "down") return cmd_down(argc, argv);
-    if (sub == "reload") return cmd_reload(argc, argv);
-    if (sub == "logs") return cmd_logs(argc, argv);
+    if (sub == "new") return cmd_new(argc, argv);
+    if (sub == "import") return cmd_import(argc, argv);
+    if (sub == "images") return cmd_images(has_flag(argc, argv, "--json"));
+    if (sub == "schema") { std::puts(schema_json().c_str()); return 0; }
+    if (sub == "list" || sub == "ls") {
+        if (s.names().empty() && !has_flag(argc, argv, "--json")) return no_env_yet();
+        std::vector<std::string> a = {argv[0], "env", "list"};
+        for (int i = 2; i < argc; ++i) a.emplace_back(argv[i]);
+        return run_argv(cmd_env, a);
+    }
+    if (sub == "default") {
+        if (argc < 3) {
+            const auto d = s.default_env();
+            if (d.empty()) return fail("no default environment; set one with: linuxity default <name>");
+            std::puts(d.c_str());
+            return 0;
+        }
+        if (!s.has(argv[2])) return fail("no environment '" + std::string{argv[2]} + "'");
+        if (!s.set_default(argv[2])) return fail("cannot write the default");
+        std::printf("`linuxity` now opens %s\n", argv[2]);
+        return 0;
+    }
+
+    // everything below acts on one environment, the default if not named
+    auto a = lx_with_default_env(argc, argv);
+    if (a.size() < 3 || !s.has(a[2])) {
+        if (s.names().empty()) return no_env_yet();
+        if (a.size() >= 3 && !a[2].starts_with("-"))
+            return fail("no environment '" + a[2] + "' (see `linuxity list`)");
+        return fail("which environment? (see `linuxity list`, or set one with `linuxity default <name>`)");
+    }
+    static constexpr std::string_view kEnvVerbs[] = {
+        "set", "get", "unset", "edit", "info", "check", "path", "users", "adduser", "snapshot",
+        "snapshots", "restore", "drop-snapshot", "reset", "rm", "remove", "rename"};
+    for (const auto v : kEnvVerbs)
+        if (sub == v) {
+            a.insert(a.begin() + 1, "env");
+            return run_argv(cmd_env, a);
+        }
+    if (sub == "export") return run_argv(cmd_export, a);
+    if (sub == "shell") return run_argv([](int c, char** v) { return cmd_shell(c, v, false); }, a);
+    if (sub == "exec") return run_argv([](int c, char** v) { return cmd_shell(c, v, true); }, a);
+    if (sub == "ps") return run_argv(cmd_ps, a);
+    if (sub == "kill") return run_argv(cmd_kill, a);
+    if (sub == "status") return run_argv(cmd_status, a);
+    if (sub == "svc") return run_argv(cmd_svc, a);
+    if (sub == "down" || sub == "stop") return run_argv(cmd_down, a);
+    if (sub == "reload") return run_argv(cmd_reload, a);
+    if (sub == "logs") return run_argv(cmd_logs, a);
     help();
     return 2;
 }

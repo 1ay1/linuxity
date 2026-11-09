@@ -218,6 +218,24 @@ public:
     [[nodiscard]] std::string pid_path(std::string_view n) const { return run_dir(n) + "/pid"; }
 
     [[nodiscard]] bool has(std::string_view n) const { return valid_name(n) && exists(config_path(n)); }
+
+    // Downloaded images, kept so a second `new` of the same image is instant.
+    [[nodiscard]] std::string cache_dir() const { return home_ + "/cache"; }
+
+    // The environment `linuxity` alone opens: the one named in <home>/default,
+    // else the only one there is. "" when there's no clear choice.
+    [[nodiscard]] std::string default_env() const {
+        if (auto t = slurp(home_ + "/default")) {
+            std::string n = *t;
+            while (!n.empty() && (n.back() == '\n' || n.back() == ' ')) n.pop_back();
+            if (has(n)) return n;
+        }
+        const auto all = names();
+        return all.size() == 1 ? all[0] : std::string{};
+    }
+    bool set_default(std::string_view n) const {
+        return mkdirs(home_) && write_file_atomic(home_ + "/default", std::string{n} + "\n");
+    }
     [[nodiscard]] std::vector<std::string> names() const {
         std::vector<std::string> out;
         for (auto& n : list_dir(envs_dir()))
@@ -300,6 +318,9 @@ public:
         if (!r.ok()) return "cannot load " + std::string{n};
         if (!remove_tree(r.config.upper)) return "cannot clear " + r.config.upper + ": " + std::strerror(errno);
         if (!mkdirs(r.config.upper)) return "cannot recreate " + r.config.upper;
+        // owners and modes of the image itself (see `linuxity new`) outlive a reset
+        if (const auto m = slurp(dir(n) + "/image.meta"))
+            (void)write_file_atomic(r.config.upper + "/.linuxity-meta", *m);
         return {};
     }
 

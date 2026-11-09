@@ -39,6 +39,7 @@ struct Options {
     // network
     std::vector<std::string> dns;
     bool manage_dns{true};
+    bool manage_hosts{false};
 
     // compat / debug (become the LINUXITY_* variables the runtime reads)
     bool seccomp{true};
@@ -86,6 +87,7 @@ inline void apply_config(const env::EnvConfig& c, Options& o) {
     o.env = c.env;
     o.dns = c.dns;
     o.manage_dns = c.manage_dns;
+    o.manage_hosts = c.manage_hosts;
     o.seccomp = c.seccomp;
     o.emulate_fifos = c.emulate_fifos;
     o.emulate_sysv = c.emulate_sysv;

@@ -100,7 +100,7 @@ if(CMAKE_SYSTEM_NAME IN_LIST LX_PTRACE_HOSTS)
     set_source_files_properties(${CMAKE_BINARY_DIR}/bridge_blob.S PROPERTIES OBJECT_DEPENDS ${LX_BRIDGE_BIN})
 
     add_executable(linuxity src/main.cpp src/cli.cpp ${CMAKE_BINARY_DIR}/bridge_blob.S)
-    target_link_libraries(linuxity PRIVATE linuxity_core linuxity_host)
+    target_link_libraries(linuxity PRIVATE linuxity_core linuxity_host z)
     add_dependencies(linuxity linuxity-bridge)
 elseif(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
     # macOS: the Hypervisor.framework backend. hv_vm_create is entitlement-
