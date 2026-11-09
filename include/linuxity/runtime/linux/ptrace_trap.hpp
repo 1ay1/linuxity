@@ -2420,19 +2420,16 @@ public:
         return ok();
     }
 
-    // Write a path string into the current task, preferring PTRACE_POKEDATA
-    // (ordered against the tracee's own copy_from_user — see redirect()) and
-    // falling back to process_vm_writev when the poke is refused. The poke can
-    // fail with EIO on a task we can observe but not ptrace-poke (a daemonized
-    // child whose stop we reached indirectly); the vm write uses a different
-    // kernel access path and often still succeeds. Returns false only if BOTH
-    // paths fail, which the caller degrades to a forward-unmodified.
+    // Write a path string into the current task. One process_vm_writev (it
+    // has landed before it returns, and the task is stopped) instead of a
+    // ptrace call per 8 bytes. copy_out falls back to pokes when the vm
+    // write is refused (non-dumpable task, read-only page).
     [[nodiscard]] bool poke_path(std::uint64_t at, const std::string& s,
                                  bool dead_scratch = false) const {
-        if (dead_scratch ? poke_scratch(at, s) : poke_bytes(at, s)) return true;
-        std::vector<std::byte> b(s.size() + 1);
-        std::memcpy(b.data(), s.c_str(), s.size() + 1);
-        return static_cast<bool>(copy_out(uaddr(at), std::span<const std::byte>{b}));
+        if (copy_out(uaddr(at), std::span<const std::byte>{
+                reinterpret_cast<const std::byte*>(s.c_str()), s.size() + 1}))
+            return true;
+        return dead_scratch ? poke_scratch(at, s) : poke_bytes(at, s);
     }
 
     // Write a NUL-terminated string into DEAD stack scratch below rsp. Nothing

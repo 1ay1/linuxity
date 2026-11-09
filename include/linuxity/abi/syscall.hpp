@@ -2375,8 +2375,9 @@ private:
             h.ctime_ns = static_cast<std::uint64_t>(st.st_ctim.tv_sec) * 1'000'000'000ull +
                          static_cast<std::uint64_t>(st.st_ctim.tv_nsec);
             // the same inode by path: fill in what a path stat would (emulated
-            // link counts, socket placeholders), only if it IS that inode
-            if (!gp.empty()) {
+            // link counts, socket placeholders), only if it IS that inode.
+            // Without either, the path stat could only repeat the fd's.
+            if (!gp.empty() && (!k_.files().links().empty() || !sock_placeholders_.empty())) {
                 auto pc = k_.files().classify(gp);
                 if (pc.realm == kernel::Realm2::host_backed)
                     if (auto f = fast_stat(pc.host_path, gp); f && f->ino == h.ino && f->dev == h.dev) {
@@ -6197,6 +6198,9 @@ public:
     // 1 x), judged on the mode and owner the guest sees? Absent files pass;
     // the host call that follows reports ENOENT itself.
     [[nodiscard]] bool guest_may(const std::string& guest, int want) {
+        // CAP_DAC_OVERRIDE passes every check except exec of a file with no
+        // x bit, so skip the lookup for plain read/write.
+        if (!(want & 1) && privileged()) return true;
         const auto pc = k_.files().classify(guest);
         if (pc.realm != kernel::Realm2::host_backed || pc.host_path.empty()) return true;
         struct ::stat st{};
