@@ -534,6 +534,36 @@ public:
         // resolve to upper; reads of not-yet-copied files fall through to the
         // read-only lower.
         if (!m->upper.empty()) {
+            // A path goes where the merged view says its directory is. When a
+            // directory on the way is a symlink (merged-/usr: /lib -> usr/lib),
+            // resolve it first and start over from the target, as a kernel
+            // would. Otherwise a write's copy-up makes a real upper/lib that
+            // hides the image's symlink (dpkg then says the system isn't
+            // merged-/usr), and a read through /lib looks only in the image
+            // and misses what was installed into /usr/lib since. Only the
+            // parent dirs: the last component is the caller's business
+            // (O_NOFOLLOW, unlink, rename all differ).
+            if (depth < 8) {
+                std::size_t end = 0;
+                while ((end = rel.find('/', end)) != std::string_view::npos) {
+                    const std::string_view sub = rel.substr(0, end);
+                    const std::string guest = (m->prefix == "/" ? std::string{} : m->prefix) + "/" + std::string{sub};
+                    std::string target;
+                    Probe p = probe_link(join_host(m->upper, sub).c_str(), target);
+                    if (p == Probe::absent) {
+                        if (!whiteouts_.empty() && is_whiteout(guest)) break;
+                        p = probe_link(join_host(m->host_base, sub).c_str(), target);
+                    }
+                    if (p == Probe::absent || p == Probe::notdir) break;
+                    if (p == Probe::symlink) {
+                        const std::string rest{rel.substr(end + 1)};
+                        const std::string base = target.starts_with('/')
+                            ? target : guest.substr(0, guest.rfind('/') + 1) + target;
+                        return classify_impl(normalize(base + "/" + rest), for_write, follow, wi, depth + 1);
+                    }
+                    ++end;
+                }
+            }
             std::string up = join_host(m->upper, rel);
             std::string lo = join_host(m->host_base, rel);
             if (for_write) {
