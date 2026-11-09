@@ -351,10 +351,17 @@ int run_runtime(lx::cli::Options& o, int argc, char** argv) {
         if (!persist.empty()) layers.push_back(persist);
         layers.push_back(root);
         // The login user's identity, from the guest's own /etc/passwd.
-        const auto who = env::resolve_user(layers, o.user);
+        auto who = env::resolve_user(layers, o.user);
+        if (!who && o.instance && o.user != "root") {
+            // the instance itself runs fine without it; sessions say why
+            st.event("login", "login user " + o.user + " isn't in this environment; "
+                     "add it back with `linuxity adduser " + o.user + "`");
+            who = env::resolve_user(layers, "root");
+        }
         if (!who) {
-            std::fprintf(stderr, "linuxity: no user '%s' in the guest's /etc/passwd "
-                                 "(add one with `linuxity env adduser`)\n", o.user.c_str());
+            std::fprintf(stderr, "linuxity: there's no user '%s' in this environment (a reset removes users). "
+                                 "Add it back with `linuxity adduser %s`, or use `--user root`\n",
+                         o.user.c_str(), o.user.c_str());
             return 2;
         }
         login = *who;
@@ -1110,7 +1117,7 @@ void usage(const char* argv0) {
 bool load_env(const std::string& name, lx::cli::Options& o) {
     lx::env::Store store;
     if (!store.has(name)) {
-        std::fprintf(stderr, "linuxity: no environment '%s' (see `linuxity env list`)\n", name.c_str());
+        std::fprintf(stderr, "linuxity: no environment '%s' (see `linuxity list`)\n", name.c_str());
         return false;
     }
     auto r = store.load(name);

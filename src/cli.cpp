@@ -446,7 +446,7 @@ int cmd_svc(int argc, char** argv) {
 }
 
 int cmd_down(int argc, char** argv) {
-    if (argc < 3) return fail("usage: linuxity down <env>");
+    if (argc < 3) return fail("usage: linuxity stop <env>");
     Conn c;
     if (!connect_env(argv[2], c)) { std::printf("%s is not running\n", argv[2]); return 0; }
     if (print_reply(request(c, R"({"op":"down"})"))) return 1;
@@ -466,7 +466,7 @@ int cmd_reload(int argc, char** argv) {
     if (applied.empty()) std::puts("nothing changed that applies live");
     for (const auto& a : applied) std::printf("applied %s\n", a.c_str());
     if (r->flag("restart_needed"))
-        std::printf("other changes need a restart: linuxity down %s && linuxity up %s\n", argv[2], argv[2]);
+        std::printf("other changes need a restart: linuxity stop %s, then use it again\n", argv[2]);
     return 0;
 }
 
@@ -623,7 +623,7 @@ int save_config(const Store& s, const std::string& name, const std::string& text
     if (connect_env(name, c)) {
         const auto rr = request(c, R"({"op":"reload"})");
         if (rr && rr->flag("ok") && rr->flag("restart_needed"))
-            std::fprintf(stderr, "linuxity: %s is running; restart it for this to take effect\n", name.c_str());
+            std::fprintf(stderr, "linuxity: saved; it applies the next time %s starts (linuxity stop %s)\n", name.c_str(), name.c_str());
     }
     return 0;
 }
@@ -771,7 +771,7 @@ std::optional<std::string> prompt_password(const char* what) {
 //                                   [--shell PATH] [--no-default]
 int cmd_adduser(const Store& s, const std::string& name, int argc, char** argv) {
     if (argc < 5)
-        return fail("usage: linuxity env adduser <env> <user> [--no-sudo] [--password | --password-stdin] "
+        return fail("usage: linuxity adduser <env> <user> [--no-sudo] [--password | --password-stdin] "
                     "[--shell PATH] [--no-default]");
     const std::string user = argv[4];
     if (!valid_user_name(user))
@@ -1213,7 +1213,7 @@ int cmd_env(int argc, char** argv) {
             std::puts(j.end().end().take().c_str());
             return 0;
         }
-        if (names.empty()) { std::puts("no environments yet: linuxity env create <name> <rootfs>"); return 0; }
+        if (names.empty()) { std::puts("no environments yet: linuxity new ubuntu"); return 0; }
         std::printf("%-16s %-9s %-10s %s\n", "NAME", "STATE", "USER", "ROOTFS");
         for (const auto& n : names) {
             const auto r = s.load(n);
@@ -1388,7 +1388,7 @@ int cmd_env(int argc, char** argv) {
         if (argc < 5) return fail("usage: linuxity env unset <name> <key>");
         const auto cur = slurp(s.config_path(name)).value_or("");
         const auto next = vibe_edit::unset(cur, resolve_key(argv[4]));
-        if (!next) return fail("cannot edit " + s.config_path(name) + " automatically; use `linuxity env edit`");
+        if (!next) return fail("cannot edit " + s.config_path(name) + " automatically; use `linuxity edit`");
         return save_config(s, name, *next);
     }
 
@@ -1418,15 +1418,36 @@ int cmd_env(int argc, char** argv) {
         return 0;
     }
 
+    // stop a running environment (reset/restore/rename need it down)
+    auto stop_env = [&] {
+        if (s.running_pid(name) <= 0) return;
+        Conn c;
+        if (connect_env(name, c)) { (void)request(c, R"({"op":"down"})"); std::string l; while (c.in.read_line(l)) {} }
+    };
+
     if (sub == "reset") {
-        if (s.running_pid(name) > 0) return fail(name + " is running; stop it first (linuxity down " + name + ")");
         if (!has_flag(argc, argv, "--yes") && ::isatty(0)) {
-            std::fprintf(stderr, "drop every change made in %s? [y/N] ", name.c_str());
+            std::fprintf(stderr, "drop every change made in %s%s? [y/N] ", name.c_str(),
+                         s.running_pid(name) > 0 ? " (it's running and will be stopped)" : "");
             char a[8] = {0};
             if (!std::fgets(a, sizeof a, stdin) || (a[0] != 'y' && a[0] != 'Y')) return 1;
         }
+        stop_env();
         if (const auto e = s.reset(name); !e.empty()) return fail(e);
         std::printf("%s is back to the clean image\n", name.c_str());
+        // the login user was one of the changes; make it again so `linuxity`
+        // keeps working (its password, if it had one, isn't kept)
+        const auto r = s.load(name);
+        std::vector<std::string> layers{r.config.upper, r.config.rootfs};
+        if (r.config.user != "root" && !resolve_user(layers, r.config.user) && !has_flag(argc, argv, "--no-user")) {
+            std::printf("setting up %s again...\n", r.config.user.c_str());
+            std::vector<std::string> a = {"linuxity", "env", "adduser", name, r.config.user};
+            if (!r.config.shell.empty()) { a.emplace_back("--shell"); a.push_back(r.config.shell); }
+            std::vector<char*> av;
+            for (auto& x : a) av.push_back(x.data());
+            if (cmd_adduser(s, name, static_cast<int>(av.size()), av.data()) != 0)
+                return fail("couldn't set up " + r.config.user + " again; log in as root: linuxity shell " + name + " -u root");
+        }
         return 0;
     }
 
@@ -1440,8 +1461,8 @@ int cmd_env(int argc, char** argv) {
     }
 
     if (sub == "restore") {
-        if (argc < 5) return fail("usage: linuxity env restore <name> <snapshot>");
-        if (s.running_pid(name) > 0) return fail(name + " is running; stop it first");
+        if (argc < 5) return fail("usage: linuxity restore <env> <snapshot>");
+        stop_env();
         if (const auto e = s.restore(name, argv[4]); !e.empty()) return fail(e);
         std::printf("%s restored to %s\n", name.c_str(), argv[4]);
         return 0;
@@ -1488,7 +1509,7 @@ int cmd_env(int argc, char** argv) {
 
     if (sub == "rename") {
         if (argc < 5) return fail("usage: linuxity rename <old> <new>");
-        if (s.running_pid(name) > 0) return fail(name + " is running; stop it first (linuxity stop " + name + ")");
+        stop_env();
         const bool was_default = s.default_env() == name;
         if (const auto e = s.rename(name, argv[4]); !e.empty()) return fail(e);
         if (was_default) (void)s.set_default(argv[4]);

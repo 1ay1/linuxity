@@ -375,7 +375,12 @@ private:
         auto close_fds = [&spec] { for (const int f : spec.fds) ::close(f); spec.fds.clear(); };
         const std::string who = spec.user.empty() ? o_.user : spec.user;
         auto u = env::resolve_user(h_.layers, who);
-        if (!u) { close_fds(); why = "no such user in the guest: " + who; return 0; }
+        if (!u) {
+            close_fds();
+            why = "there's no user '" + who + "' in " + o_.env_name + " (a reset removes users). Add it back with `linuxity adduser " +
+                  o_.env_name + " " + who + "`, or log in as root with `-u root`";
+            return 0;
+        }
         const std::string shell = !o_.shell.empty() && spec.user.empty() ? o_.shell : u->shell;
         std::vector<std::string> argv = spec.argv;
         if (argv.empty()) argv = o_.cfg.command;
