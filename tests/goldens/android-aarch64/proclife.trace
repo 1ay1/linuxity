@@ -3,6 +3,8 @@
 # arch: aarch64
 # recorded-by: live Linux kernel on this host
 # kernel: Linux 6.1.162-android14-11-g9dd05ae3a1de-ab16261587
+clone = 1 | a new process runs, exits 7, and is reaped
+clone3 = 1 | a new process runs, exits 7, and is reaped
 clone = 1 | fork a child
 wait4 = 1 | wait4 reaps the child we forked
 exit_group = 1 | the child's exit status arrives intact

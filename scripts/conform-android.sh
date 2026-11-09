@@ -106,16 +106,16 @@ if [ "$record" -eq 1 ]; then
     say "recording goldens from the device kernel"
     adb shell "cd $REMOTE && LX_PROBE_DIR=$REMOTE/probes timeout -s KILL $DEADLINE ./record_goldens" ||
         die "recording failed"
-    rm -rf "$REPO/tests/goldens/aarch64"
+    rm -rf "$REPO/tests/goldens/android-aarch64"
     mkdir -p "$REPO/tests/goldens"
-    adb pull "$REMOTE/tests/goldens/aarch64" "$REPO/tests/goldens/" >/dev/null ||
+    adb pull "$REMOTE/tests/goldens/android-aarch64" "$REPO/tests/goldens/" >/dev/null ||
         die "could not pull goldens"
-    say "wrote $(ls "$REPO/tests/goldens/aarch64"/*.trace | wc -l) goldens to tests/goldens/aarch64"
+    say "wrote $(ls "$REPO/tests/goldens/android-aarch64"/*.trace | wc -l) goldens to tests/goldens/android-aarch64"
 fi
 
 # Ship the committed goldens so the replay path has a reference too.
 adb shell "mkdir -p $REMOTE/goldens" >/dev/null
-adb push "$REPO/tests/goldens/aarch64" "$REMOTE/goldens/" >/dev/null 2>&1 || true
+adb push "$REPO/tests/goldens/android-aarch64" "$REMOTE/goldens/" >/dev/null 2>&1 || true
 
 # -- line coverage, measured ON THE DEVICE --------------------------------
 # conform_diff proves the ANSWERS agree. This measures how much of the

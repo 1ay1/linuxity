@@ -440,6 +440,10 @@ inline std::string Scenario::key() const {
     // No raw pid is ever emitted, only relationships: the reaped pid IS the
     // one we forked, the status IS what the child passed to exit_group.
     v.push_back(Scenario{"proclife", "proclife"}
+                    .exercising(abi::Sysno::fork)
+                    .exercising(abi::Sysno::vfork)
+                    .exercising(abi::Sysno::clone)
+                    .exercising(abi::Sysno::clone3)
                     .exercising(abi::Sysno::execve)
                     .exercising(abi::Sysno::execveat)
                     .exercising(abi::Sysno::exit_group)

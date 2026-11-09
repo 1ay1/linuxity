@@ -3,6 +3,10 @@
 # arch: x86_64
 # recorded-by: live Linux kernel on this host
 # kernel: Linux 7.2.14-zen1-1-zen
+fork = 1 | a new process runs, exits 7, and is reaped
+vfork = 1 | a new process runs, exits 7, and is reaped
+clone = 1 | a new process runs, exits 7, and is reaped
+clone3 = 1 | a new process runs, exits 7, and is reaped
 clone = 1 | fork a child
 wait4 = 1 | wait4 reaps the child we forked
 exit_group = 1 | the child's exit status arrives intact

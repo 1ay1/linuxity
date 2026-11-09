@@ -75,7 +75,66 @@ static int exited_with(int st) { return ((st & 0x7f) == 0) ? ((st >> 8) & 0xff) 
 static int killed_by(int st)   { return ((st & 0x7f) != 0 && (st & 0x7f) != 0x7f)
                                         ? (st & 0x7f) : -1; }
 
+// vfork's child runs on OUR stack until it exits, so it must not call
+// anything: issue both syscalls inline. The child exits 7.
+static long raw_vfork_exit7(void) {
+#if defined(__x86_64__) && defined(SYS_vfork)
+    long r;
+    __asm__ volatile("syscall\n\t"
+                     "test %%rax, %%rax\n\t"
+                     "jnz 1f\n\t"
+                     "mov %2, %%eax\n\t"
+                     "mov $7, %%edi\n\t"
+                     "syscall\n"
+                     "1:"
+                     : "=a"(r) : "a"((long)SYS_vfork), "i"(SYS_exit_group) : "rcx", "r11", "rdi", "memory");
+    return r;
+#elif defined(__aarch64__) && defined(SYS_vfork)
+    register long x0 __asm__("x0");
+    register long x8 __asm__("x8") = SYS_vfork;
+    __asm__ volatile("svc 0\n\tcbnz x0, 1f\n\tmov x8, %2\n\tmov x0, #7\n\tsvc 0\n1:"
+                     : "=r"(x0), "+r"(x8) : "i"(SYS_exit_group) : "memory");
+    return x0;
+#else
+    return -38;
+#endif
+}
+
 int main(void) {
+    // -- every way to make a process: each child exits 7 and is reaped ----
+    // (vfork's child shares our memory until it exits, so it only exits)
+    {
+        struct { const char* name; long nr; int kind; } forms[] = {
+#ifdef SYS_fork
+            {"fork", SYS_fork, 0},
+#endif
+#ifdef SYS_vfork
+            {"vfork", SYS_vfork, 3},
+#endif
+            {"clone", SYS_clone, 1},
+#ifdef SYS_clone3
+            {"clone3", SYS_clone3, 2},
+#endif
+        };
+        for (unsigned i = 0; i < sizeof forms / sizeof forms[0]; ++i) {
+            fflush(stdout);
+            long c;
+            if (forms[i].kind == 3) c = raw_vfork_exit7();
+            else if (forms[i].kind == 0) c = LX_SYS0(forms[i].nr);
+            else if (forms[i].kind == 1) c = LX_SYS5(SYS_clone, SIGCHLD, 0, 0, 0, 0);
+            else {
+                unsigned long args[11] = {0};   // struct clone_args
+                args[4] = SIGCHLD;              // exit_signal
+                c = LX_SYS2(SYS_clone3, args, sizeof args);
+            }
+            if (c == 0) LX_SYS1(SYS_exit_group, 7);
+            int st = 0;
+            const long w = c > 0 ? reap(c, &st) : c;
+            lx_emit(forms[i].name, c > 0 ? LX_CHECK(w == c, exited_with(st) == 7) : c,
+                    "a new process runs, exits 7, and is reaped");
+        }
+    }
+
     // -- exit: a child's status must come back exactly ---------------------
     {
         const long c = do_fork();
