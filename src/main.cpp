@@ -946,6 +946,7 @@ int run_runtime(lx::cli::Options& o, int argc, char** argv) {
         governor.join_child();
         reserve_low_fds();
     };
+    governor.pin_supervisor();
 
     cli::Launch first;
     if (!o.instance) {

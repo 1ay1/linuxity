@@ -158,7 +158,7 @@ the program.
 | `--memory`, `-m` | `<SZ>` | Hard memory ceiling, e.g. `512M`, `2G`. |
 | `--memory-swap` | `<SZ>` | Combined memory+swap ceiling. |
 | `--pids` | `<N>` | Max number of tasks in the guest tree (a fork-bomb guard). |
-| `--cpuset` | `<LIST>` | Pin the guest to specific CPUs, e.g. `0-1` or `0,2,4`. |
+| `--cpuset` | `<LIST>` | Pin the guest (and linuxity itself) to specific CPUs, e.g. `0-1` or `0,2,4`. On Android the default is the faster cores, since traps cost about 2x on the little ones; pass `--cpuset 0-7` for all of them. |
 
 Size suffixes for `--memory`/`--memory-swap`: `K`, `M`, `G` (powers of 1024).
 
