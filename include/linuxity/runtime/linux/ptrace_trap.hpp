@@ -93,6 +93,9 @@ public:
         // the call is being forwarded as the guest issued it (so the normal
         // exit translations apply even with an on_exit hook)
         bool forwarded{false};
+        // this call was refused by a host seccomp filter and is being
+        // answered by the dispatcher (see next())
+        bool refused{false};
     };
 
     [[nodiscard]] Status start(UAddr, UAddr) {
@@ -647,7 +650,36 @@ public:
                     continue;
                 }
             }
-            if (sig == SIGSYS && answer_host_refusal(w)) continue;
+            if (sig == SIGSYS) {
+                siginfo_t si{};
+                if (::ptrace(PTRACE_GETSIGINFO, w, 0, &si) == 0 && si.si_code == 1 /*SYS_SECCOMP*/) {
+                    // A refused call with an allowed equivalent runs again as
+                    // that: Android's app filter has accept4 but not accept,
+                    // which glibc's accept() uses (gpg-agent spun on ENOSYS).
+                    if (rerun_as_allowed(w, si.si_syscall)) continue;
+                    // A filter the HOST installed refused this call (Android's
+                    // app policy: setfsuid, set_robust_list, rseq, ...). Its
+                    // SIGSYS outranks our trace rule, so the dispatcher never
+                    // saw it. Hand it over now; the kernel already skipped
+                    // the call, so resume() only has to write the answer.
+                    Regs rr{};
+                    if (Regs::fetch(w, rr)) {
+                        if (refused_.insert(si.si_syscall).second)
+                            std::fprintf(stderr, "linuxity: the host refuses syscall %d; linuxity answers it\n",
+                                         si.si_syscall);
+                        Task& t = tasks_[w];
+                        cur_ = w;
+                        t.regs = rr;
+                        t.guest_regs = rr;
+                        t.in_call = true;
+                        t.refused = true;
+                        translate_entry_args(w, rr, t);
+                        fill_frame(f, rr);
+                        f.regs.nr = static_cast<std::uint64_t>(si.si_syscall);
+                        return ok(true);
+                    }
+                }
+            }
             rewrite_siginfo_pid(w);
             trace_fault(w, sig);
             resume_run(w, sig);
@@ -668,26 +700,23 @@ public:
         return n > 0 ? info.op : 0;
     }
 
-    // A SIGSYS from seccomp is a refusal by a filter the HOST installed
-    // (ours never traps): Android's app policy blocks set_robust_list, which
-    // glibc calls at the start of every process. That signal outranks our
-    // trace rule, so the call never reaches the dispatcher. The kernel has
-    // already skipped it; answer ENOSYS, as a kernel without the call would,
-    // and drop the signal. Callers like glibc carry on.
-    bool answer_host_refusal(::pid_t w) {
-        siginfo_t si{};
-        if (::ptrace(PTRACE_GETSIGINFO, w, 0, &si) != 0 || si.si_code != 1 /*SYS_SECCOMP*/) return false;
+    // Syscalls a host seccomp policy refused, reported once each.
+    std::set<int> refused_;
+
+    // The kernel skipped the call and left pc just past the syscall
+    // instruction with the original arguments, so rewrite the number and
+    // step back: the guest reissues it as the allowed form.
+    bool rerun_as_allowed(::pid_t w, int nr) {
+        const abi::Sysno sc = abi::decode(kTraceeArch, static_cast<std::uint64_t>(nr));
         Regs rr{};
-        if (!Regs::fetch(w, rr)) return false;
-        rr.set_ret(-ENOSYS);
+        if (sc != abi::Sysno::accept || !Regs::fetch(w, rr)) return false;
+        rr.set_nr(encode(kTraceeArch, abi::Sysno::accept4));
+        rr.set_arg(3, 0);   // accept4 flags: none, i.e. plain accept
+        rr.rewind_to_syscall();
         if (!rr.store(w)) return false;
-        if (refused_.insert(si.si_syscall).second)
-            std::fprintf(stderr, "linuxity: the host refuses syscall %d; guests get ENOSYS for it\n",
-                         si.si_syscall);
         resume_run(w, 0);
         return true;
     }
-    std::set<int> refused_;
 
     // A guest died on a signal. Under LINUXITY_TRACE say so, because the
     // trace otherwise just stops mid-stream and a fatal SIGILL/SIGSEGV looks
@@ -929,6 +958,17 @@ public:
     // VIRTUALIZE: neutralize the syscall now; write `ret` into RAX at exit.
     [[nodiscard]] Status resume(std::int64_t ret) {
         Task& t = tasks_[cur_];
+        if (t.refused) {
+            // the host refused it: nothing ran, nothing to skip, no exit stop
+            Regs r = t.regs;
+            r.set_ret(ret);
+            if (!r.store(cur_)) return err(Errno::eio);
+            t.refused = false;
+            t.in_call = false;
+            t.action = Action::none;
+            resume_run(cur_, 0);
+            return ok();
+        }
         Regs r = t.regs;
         r.skip_call();
         if (seccomp_) {
@@ -2922,6 +2962,12 @@ public:
     void set_on_exit(std::function<void(::pid_t, std::int32_t, int)> f) { on_exit_ = std::move(f); }
     void set_flush_events(std::function<void()> f) { flush_events_ = std::move(f); }
     void request_stop() { stop_requested_ = true; }
+    // The current call was refused by the host: only a virtualized answer
+    // can complete it.
+    [[nodiscard]] bool refused_call() const {
+        auto it = tasks_.find(cur_);
+        return it != tasks_.end() && it->second.refused;
+    }
     // Graceful stop: SIGTERM everything, SIGKILL what's left after the grace.
     void shutdown() { if (!draining_) begin_drain(); }
     [[nodiscard]] bool instance() const noexcept { return instance_; }

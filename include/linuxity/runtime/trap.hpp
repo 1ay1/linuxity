@@ -120,6 +120,11 @@ public:
             // The dispatcher classifies the trapped syscall: service it from
             // our subsystems, forward it to the host kernel, or exit.
             abi::Outcome o = locked([&] { return sys.dispatch(f.regs); });
+            // the host already refused this call, so it can't be forwarded or
+            // redirected; anything but a virtualized answer is ENOSYS
+            if constexpr (requires { trap_.refused_call(); })
+                if (trap_.refused_call() && !o.template get_if<abi::Virtualize>())
+                    o = abi::Outcome::error(Errno::enosys);
             if (const char* t = trace_env) trace_fate(t, f.regs, o);
 
             // Act on the fate. Exactly one arm runs, chosen by the type, and
