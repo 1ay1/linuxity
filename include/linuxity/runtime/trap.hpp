@@ -42,6 +42,7 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #if !defined(_WIN32)
 #include <fcntl.h>
@@ -196,10 +197,13 @@ public:
                     // it. The open runs ASYNCHRONOUSLY in the child, so we must
                     // NOT unlink here -- the child hasn't opened it yet; temps
                     // are cleaned up at the end of the run.
-                    std::string tmp = in.is_dir ? (in.dir_host.empty() ? materialize_dir() : std::string{})
+                    // A virtual directory opens the host's twin (/proc, /sys, ...)
+                    // when we may: it exists and is nothing of ours to clean.
+                    // Android refuses apps most of /sys, so there it gets an
+                    // empty temp dir; its entries come from getdents either way.
+                    const bool twin = in.is_dir && !in.dir_host.empty() && dir_openable(in.dir_host);
+                    std::string tmp = in.is_dir ? (twin ? std::string{} : materialize_dir())
                                                 : materialize(in.content);
-                    // a virtual directory opens the host's twin (/proc, ...):
-                    // it exists everywhere and is nothing of ours to clean
                     const std::string& backing = tmp.empty() && in.is_dir ? in.dir_host : tmp;
                     arm_blob();
                     auto fdr = trap_.redirect(in.path_arg, backing);
@@ -891,6 +895,18 @@ private:
     static std::string materialize_dir() {
         std::string tmpl = host::tmp_path("linuxity-vdir-XXXXXX");
         return ::mkdtemp(tmpl.data()) ? tmpl : std::string{};
+    }
+
+    // Can a guest open this host directory? Same domain as us, so ask once
+    // per path and remember.
+    static bool dir_openable(const std::string& p) {
+        static std::mutex mu;
+        static std::unordered_map<std::string, bool> seen;
+        std::lock_guard g{mu};
+        if (auto it = seen.find(p); it != seen.end()) return it->second;
+        const int fd = ::open(p.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (fd >= 0) ::close(fd);
+        return seen[p] = fd >= 0;
     }
 
     // Unlink every INJECT temp created during the run (files and dirs).

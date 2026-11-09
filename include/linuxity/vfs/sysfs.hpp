@@ -206,10 +206,14 @@ inline bool host_node_ok(const std::string& p) {
     struct ::stat st{};
     if (::stat(p.c_str(), &st) != 0) return false;
     if (S_ISDIR(st.st_mode)) {
+        // opening isn't enough: Android lets an app open /sys/class/net but
+        // not list it, so read an entry to be sure the guest can too
         DIR* d = ::opendir(p.c_str());
         if (!d) return false;
+        errno = 0;
+        const bool listed = ::readdir(d) != nullptr || errno == 0;
         ::closedir(d);
-        return true;
+        return listed && ::access(p.c_str(), R_OK | X_OK) == 0;
     }
     return ::access(p.c_str(), R_OK) == 0 || ::access(p.c_str(), W_OK) == 0;
 }
