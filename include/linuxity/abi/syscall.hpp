@@ -985,6 +985,15 @@ public:
     }
 
 private:
+    // Does process group `pg` still have a live member (in session `sid`,
+    // when given)? The sentinel group is always alive.
+    [[nodiscard]] bool fg_group_alive(std::int32_t pg, std::int32_t sid) {
+        if (pg <= 0 || pg == flat_pgrp()) return true;
+        for (const std::int32_t p : k_.procs().members_of(pg))
+            if (sid <= 0 || k_.procs().sid_of(p) == sid) return true;
+        return false;
+    }
+
     // Live guest tasks: every process plus its extra threads.
     [[nodiscard]] std::uint64_t task_count() const {
         std::uint64_t n = 0;
@@ -5257,7 +5266,8 @@ private:
                 // On a pty MASTER this asks about the slave's session, which
                 // need not be ours.
                 if (const std::int32_t m = pty_master_slave(static_cast<int>(r.arg[0])); m >= 0) {
-                    const auto it = fg_pgrp_.find(m);
+                    auto it = fg_pgrp_.find(m);
+                    if (it != fg_pgrp_.end() && !fg_group_alive(it->second, 0)) { fg_pgrp_.erase(it); it = fg_pgrp_.end(); }
                     std::int32_t fg = 0;
                     if (it != fg_pgrp_.end()) {
                         fg = it->second;
@@ -5289,12 +5299,20 @@ private:
                 // prints "no job control in background". bash then makes
                 // itself a leader and hands the terminal to that group.
                 const std::int32_t tty = k_.procs().ctty_of(ids().pid);
-                const auto it = fg_pgrp_.find(tty);
+                auto it = fg_pgrp_.find(tty);
                 // No tcsetpgrp yet: the terminal's foreground is the group
                 // of the session that claimed it (its leader's), not the
                 // caller's. Answering the caller's own group made a job
                 // think it owned the tty before its shell handed it over.
                 std::int32_t fg;
+                if (it != fg_pgrp_.end() && !fg_group_alive(it->second, k_.procs().sid_of(ids().pid))) {
+                    // the terminal's last foreground group is gone: a pts
+                    // number reused by a new session (every tab, every exec
+                    // in a long-running instance). bash would wait on it and
+                    // give up with "no job control in background".
+                    fg_pgrp_.erase(it);
+                    it = fg_pgrp_.end();
+                }
                 if (it != fg_pgrp_.end()) fg = it->second;
                 else if (tty >= 0)        fg = k_.procs().pgid_of(k_.procs().sid_of(ids().pid));
                 else                      fg = flat_pgrp();
