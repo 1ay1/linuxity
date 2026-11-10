@@ -200,6 +200,12 @@ if(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
         COMMENT "Signing test_hvf_run with the hypervisor entitlement"
         VERBATIM)
     add_test(NAME hvf_run COMMAND test_hvf_run)
+
+    # The tree-wide Hypervisor.framework VM budget: pure shared-memory
+    # arithmetic, no VM needed.
+    add_executable(test_vm_budget test_vm_budget.cpp)
+    target_link_libraries(test_vm_budget PRIVATE linuxity_core)
+    add_test(NAME vm_budget COMMAND test_vm_budget)
 endif()
 
 # The Windows hypervisor backend (WHP). The test is split internally: the

@@ -225,11 +225,8 @@ struct HandoffRecvFds {
     return true;
 }
 
-[[nodiscard]] inline bool receive(mach_port_t port, Received& out) {
-    HandoffRecv r{};
-    if (::mach_msg(&r.msg.header, MACH_RCV_MSG, 0, sizeof r, port,
-                   MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL) != MACH_MSG_SUCCESS)
-        return false;
+// A received handoff, unpacked.
+[[nodiscard]] inline bool unpack(HandoffRecv& r, Received& out) {
     out.memory = r.msg.memory.name;
     out.mem_size = r.msg.mem_size;
     auto* p = static_cast<std::byte*>(r.msg.blob.address);
@@ -238,6 +235,46 @@ struct HandoffRecvFds {
                          reinterpret_cast<mach_vm_address_t>(r.msg.blob.address),
                          r.msg.blob.size);
     return true;
+}
+
+// Receive the fork handoff on `port`. `peer` is the parent's port we said
+// hello on: if the parent gives up on this fork (its hello wait timed out,
+// it was killed), that port dies, and so does the wait -- a child must never
+// park forever on a handoff that is not coming. The zygote path has no peer
+// (its creator watch ends it instead) and passes MACH_PORT_NULL.
+//
+// The peer dying is ALSO what follows every successful handoff: the parent
+// sends, then drops the port. So "dead" never means "give up" on its own --
+// only "dead and nothing queued" does. Both orders are handled: dead before
+// we could ask (the request fails), and the notification dequeued before
+// the handoff.
+[[nodiscard]] inline bool receive(mach_port_t port, Received& out, mach_port_t peer = MACH_PORT_NULL) {
+    HandoffRecv r{};
+    auto take = [&](mach_port_t from, bool wait) {
+        r = HandoffRecv{};
+        return ::mach_msg(&r.msg.header, MACH_RCV_MSG | (wait ? 0 : MACH_RCV_TIMEOUT), 0,
+                          sizeof r, from, wait ? MACH_MSG_TIMEOUT_NONE : 0,
+                          MACH_PORT_NULL) == MACH_MSG_SUCCESS;
+    };
+    if (peer == MACH_PORT_NULL) return take(port, true) && unpack(r, out);
+
+    mach_port_t notify = MACH_PORT_NULL, prev = MACH_PORT_NULL;
+    ::mach_port_allocate(::mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &notify);
+    if (::mach_port_request_notification(::mach_task_self(), peer, MACH_NOTIFY_DEAD_NAME, 0,
+                                         notify, MACH_MSG_TYPE_MAKE_SEND_ONCE, &prev)
+        != KERN_SUCCESS) {
+        // already dead: the handoff is queued, or it never will be
+        ::mach_port_mod_refs(::mach_task_self(), notify, MACH_PORT_RIGHT_RECEIVE, -1);
+        return take(port, false) && unpack(r, out);
+    }
+    // one wait on {port, notify}; a port in a set is received through the set
+    mach_port_t set = MACH_PORT_NULL;
+    ::mach_port_allocate(::mach_task_self(), MACH_PORT_RIGHT_PORT_SET, &set);
+    ::mach_port_move_member(::mach_task_self(), port, set);
+    ::mach_port_move_member(::mach_task_self(), notify, set);
+    if (!take(set, true)) return false;
+    if (r.msg.header.msgh_local_port == port) return unpack(r, out);
+    return take(set, false) && r.msg.header.msgh_local_port == port && unpack(r, out);   // died: queued?
 }
 
 } // namespace lx::runtime::fork_ipc

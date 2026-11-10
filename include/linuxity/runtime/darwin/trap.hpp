@@ -2148,10 +2148,7 @@ private:
                 // parent's wait sees this status. Waiting for siblings
                 // instead hung pacman's download child -- see run() in
                 // src/run_darwin.cpp for the whole story.
-                proc_.request_group_exit(static_cast<int>(a0 & 0xff));
-                sync_all_shared();
-                std::fflush(nullptr);
-                ::_exit(static_cast<int>(a0 & 0xff));
+                end_process(static_cast<int>(a0 & 0xff));
 
             // Thread/signal state libc installs at startup. There is no host
             // task to carry it and nothing reads it back on this backend.
@@ -3039,6 +3036,21 @@ public:
     // Write back and forget EVERY shared file mapping: the address space is
     // going away (exec, exit) and the guest's stores must not go with it.
     void sync_all_shared() { sync_shared(0, ~std::uint64_t{0} >> 1, /*drop=*/true); }
+
+    // The ONE way this process ends, from exit_group or the end of the
+    // main loop: every thread stops (Linux does not wait for them, and one
+    // blocked in a host call can't be kicked), shared mappings reach their
+    // files, the embedder's exit hooks run (zygote VM budget), stdio
+    // flushes, and _exit. Never returns.
+    using ExitHook = std::function<void()>;
+    void on_exit(ExitHook h) { exit_hooks_.push_back(std::move(h)); }
+    [[noreturn]] void end_process(int status) {
+        proc_.request_group_exit(status);
+        sync_all_shared();
+        for (auto& h : exit_hooks_) h();
+        std::fflush(nullptr);
+        ::_exit(status);
+    }
 private:
 
     // Write the shared file mappings overlapping [at, at+len) back to their
@@ -4512,6 +4524,7 @@ private:
     struct Child { std::int32_t guest; pid_t host; };
     std::vector<Child> children_;
     std::vector<ProcEvent> proc_events_;
+    std::vector<ExitHook> exit_hooks_;
     Resolver resolve_;
     Resolver unresolve_;
     std::string fd_path_storage_;

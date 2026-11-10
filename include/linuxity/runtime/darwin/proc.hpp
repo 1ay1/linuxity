@@ -63,6 +63,40 @@ public:
 
     [[nodiscard]] bool valid() const noexcept { return shared_ != nullptr; }
 
+    // -- The VM budget --------------------------------------------------------
+    // Every guest process is a host process holding a Hypervisor.framework
+    // VM, and a Mac allows kMaxVms of those at once (measured: 128, the
+    // framework's limit). Warm zygotes hold one each while parked, so they
+    // are budgeted across the WHOLE tree: a deep process tree must not
+    // spend its VMs on idle spares and then fail the fork that needed one.
+    // Spares may use what is left above kKeepFree; a real fork never waits
+    // on this -- it falls back to a fresh process (its own VM) when no
+    // spare is parked.
+    static constexpr int kMaxVms = 128;
+    static constexpr int kKeepFree = 32;   // never parked: real processes' headroom
+    // Processes holding (or about to hold) a VM: every bound or reserved
+    // slot -- a fork in flight (kReserved) needs one as much as a live one.
+    [[nodiscard]] int live_processes() const noexcept {
+        int n = 0;
+        for (int g = 1; g < kMax; ++g)
+            if (shared_->host[g].load(std::memory_order_relaxed) != 0) ++n;
+        return n;
+    }
+    // Reserve a VM for one more parked zygote, if the tree can spare it.
+    [[nodiscard]] bool reserve_warm_vm() noexcept {
+        if (!shared_) return false;
+        const int busy = live_processes();
+        int w = shared_->warm_vms.load(std::memory_order_relaxed);
+        do {
+            if (busy + w + 1 > kMaxVms - kKeepFree) return false;
+        } while (!shared_->warm_vms.compare_exchange_weak(w, w + 1));
+        return true;
+    }
+    // A parked zygote was claimed (it becomes a live process) or exited.
+    void release_warm_vm() noexcept {
+        if (shared_) shared_->warm_vms.fetch_sub(1, std::memory_order_relaxed);
+    }
+
     // Allocate a guest pid. `host` may be 0 to RESERVE the slot before the
     // host process exists (fork assigns the child's pid up front); bind()
     // fills it in once the host pid is known.
@@ -206,6 +240,8 @@ private:
         // buffer is always NUL-terminated at kExe-1).
         char exe[kMax][kExe]{};
         std::atomic<std::int32_t> ppid[kMax]{};
+        // Hypervisor.framework VMs held by PARKED zygotes, tree-wide.
+        std::atomic<int> warm_vms{0};
     };
     Shared* shared_{nullptr};
     int fd_{-1};

@@ -278,6 +278,18 @@ public:
     Forker(const Options& o, Machine& m, runtime::HvfMachine& machine, runtime::PidSpace& pids)
         : opts_{o}, machine_wrap_{m}, machine_{machine}, pids_{pids} {}
 
+    // Every spare still parked when this process ends dies with it (it
+    // watches us); its reserved VM goes back to the tree. Run from the one
+    // process-exit hook (runtime::on_process_exit), whichever _exit ends us.
+    void release_unclaimed() {
+        auto& s = slot();
+        std::lock_guard l{s.mu};
+        for (std::size_t k = 0; k < s.ready.size() + static_cast<std::size_t>(s.pending); ++k)
+            pids_.release_warm_vm();
+        s.ready.clear();
+        s.pending = 0;
+    }
+
     [[nodiscard]] pid_t operator()(runtime::HvfTrap::ForkImage& img) {
         static const bool profile = std::getenv("LINUXITY_PROFILE_FORK") != nullptr;
         const auto t0 = std::chrono::steady_clock::now();
@@ -406,18 +418,28 @@ public:
         // then ship RAM + state. The child cannot run guest code until this
         // arrives, so the snapshot is exactly the guest at the fork point.
         //
-        // BOUNDED: if the child dies before saying hello (bad exec path,
-        // signing problem), an unbounded receive would hang this guest
-        // process -- and the user's whole shell -- forever.
+        // BOUNDED: if the child dies before saying hello (no VM left, bad
+        // exec path, signing problem), an unbounded receive would hang this
+        // guest process -- and the user's whole shell -- forever. So wait in
+        // short slices and check the child between them: its death ends the
+        // wait at once, a wedged child after kHelloTimeoutMs.
         struct { mach_msg_header_t h; mach_msg_trailer_t t; } hello{};
-        constexpr mach_msg_timeout_t kHelloTimeoutMs = 10'000;
-        const auto got = ::mach_msg(&hello.h, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0,
-                                    sizeof hello, svc, kHelloTimeoutMs, MACH_PORT_NULL);
+        constexpr int kHelloTimeoutMs = 10'000, kSliceMs = 20;
+        mach_msg_return_t got = MACH_RCV_TIMED_OUT;
+        for (int waited = 0; waited < kHelloTimeoutMs; waited += kSliceMs) {
+            got = ::mach_msg(&hello.h, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0,
+                             sizeof hello, svc, kSliceMs, MACH_PORT_NULL);
+            if (got != MACH_RCV_TIMED_OUT) break;
+            int st = 0;
+            if (::waitpid(pid, &st, WNOHANG) == pid) { pid = -1; break; }   // died first
+        }
         if (got != MACH_MSG_SUCCESS) {
             ::mach_port_mod_refs(::mach_task_self(), svc, MACH_PORT_RIGHT_RECEIVE, -1);
-            ::kill(pid, SIGKILL);
-            int st = 0;
-            ::waitpid(pid, &st, 0);
+            if (pid > 0) {
+                ::kill(pid, SIGKILL);
+                int st = 0;
+                ::waitpid(pid, &st, 0);
+            }
             return -1;
         }
         mark("hello");
@@ -466,6 +488,7 @@ private:
         if (s.ready.empty()) return {};
         Zygote z = s.ready.back();
         s.ready.pop_back();
+        pids_.release_warm_vm();      // it becomes a live process: counted there
         return z;
     }
     void spawn_zygote_async() {
@@ -474,6 +497,11 @@ private:
         {
             std::lock_guard l{s.mu};
             want = kPool - static_cast<int>(s.ready.size()) - s.pending;
+            if (want <= 0) return;
+            // only as many spares as the tree's VM budget allows
+            int got = 0;
+            while (got < want && pids_.reserve_warm_vm()) ++got;
+            want = got;
             if (want <= 0) return;
             s.pending += want;
         }
@@ -484,6 +512,7 @@ private:
                 std::lock_guard l{sl.mu};
                 --sl.pending;
                 if (z.pid > 0) sl.ready.push_back(z);
+                else pids_.release_warm_vm();
                 sl.cv.notify_all();
             }).detach();
     }
@@ -555,6 +584,11 @@ struct ChildArgs {
 
 [[nodiscard]] bool receive_fork(const ChildArgs& ca, runtime::HvfMachine& vm,
                                 runtime::HvfTrap::ForkImage& img) {
+    // A VM first: Hypervisor.framework allows a fixed number at once (see
+    // PidSpace::kMaxVms). If none is left, exit WITHOUT the hello, and the
+    // parent's fork fails EAGAIN -- what a kernel out of process slots
+    // says -- instead of reporting a child that then dies.
+    if (!vm.prewarm()) ::_exit(127);
     mach_port_t parent = MACH_PORT_NULL;
     static const bool prof = std::getenv("LINUXITY_PROFILE_FORK") != nullptr;
     const auto r0 = std::chrono::steady_clock::now();
@@ -583,10 +617,16 @@ struct ChildArgs {
 
     runtime::fork_ipc::Received in;
     rmark("hello-sent");
-    if (!runtime::fork_ipc::receive(reply, in)) return false;
+    if (!runtime::fork_ipc::receive(reply, in, parent)) ::_exit(127);   // parent gave up: so do we
     rmark("received");
     void* ram = runtime::fork_ipc::map_snapshot(in.memory, in.mem_size);
-    if (!ram || !vm.init_from(ram, in.mem_size)) return false;
+    if (!ram) { std::fputs("linuxity: fork: cannot map the parent's memory\n", stderr); return false; }
+    if (auto st = vm.init_from(ram, in.mem_size); !st) {
+        std::fprintf(stderr, "linuxity: fork: %s\n", st.error() == Errno::enodev
+            ? "the hypervisor refused another VM (too many guest processes at once?)"
+            : "cannot map guest memory into the VM");
+        return false;
+    }
     return runtime::wire::decode(in.blob, img);
 }
 
@@ -666,12 +706,14 @@ void run_guest_thread(ThreadContext& ctx, runtime::HvfTrap::ThreadStart start) {
 }
 
 // -- Run a guest to completion (shared by root and fork children) ---------------
-[[nodiscard]] int run(const Options& o, Machine& m, runtime::HvfMachine& machine,
+// Never returns: the process ends in HvfTrap::end_process.
+[[noreturn]] void run(const Options& o, Machine& m, runtime::HvfMachine& machine,
                       runtime::HvfCpu& cpu, runtime::ProcessState& proc,
                       runtime::TaskState& task, runtime::PidSpace& pids,
                       runtime::HvfTrap& trap) {
     runtime::HvfMem mem{machine, &trap};
     Forker forker{o, m, machine, pids};
+    trap.on_exit([&forker] { forker.release_unclaimed(); });
     std::vector<std::thread> threads;
     std::mutex threads_mu;
     ThreadContext ctx{o, m, machine, proc, pids, forker, threads, threads_mu};
@@ -700,14 +742,8 @@ void run_guest_thread(ThreadContext& ctx, runtime::HvfTrap::ThreadStart start) {
     // _exit() is exactly the Linux semantics: every thread stops, every fd
     // closes, the parent's wait sees our status. Guest RAM is a mapping the
     // kernel reclaims; nothing in it needs unwinding.
-    proc.request_group_exit(rc ? *rc : 1);
-    trap.sync_all_shared();      // MAP_SHARED stores reach their files
-    std::fflush(nullptr);
-    if (!rc) {
-        std::fprintf(stderr, "linuxity: runtime error %d\n", static_cast<int>(rc.error()));
-        ::_exit(1);
-    }
-    ::_exit(*rc);
+    if (!rc) std::fprintf(stderr, "linuxity: runtime error %d\n", static_cast<int>(rc.error()));
+    trap.end_process(rc ? *rc : 1);
 }
 
 }  // namespace
@@ -830,7 +866,7 @@ int cli::host_internal(const Options& o, int argc, char** argv, int i) {
         runtime::HvfTrap trap{machine, cpu, proc, task, pids};
         attach_live_procs(m, pids);
         trap.resume_fork_child(img, ca.group_fds);
-        return run(o, m, machine, cpu, proc, task, pids, trap);
+        run(o, m, machine, cpu, proc, task, pids, trap);
     }
 
     // -- Zygote: `--zygote SERVICE`. A fork child spawned AHEAD of the fork.
@@ -934,7 +970,7 @@ int cli::host_internal(const Options& o, int argc, char** argv, int i) {
         attach_live_procs(m, pids);
         trap.resume_fork_child(img, groups);
         zmark("resumed");
-        return run(o, m, machine, cpu, proc, task, pids, trap);
+        run(o, m, machine, cpu, proc, task, pids, trap);
     }
 
     return -1;
@@ -1053,5 +1089,5 @@ int cli::host_run(Options& o, int, char**) {
         trap.adopt(sg.begin, sg.end, runtime::prot_from_elf(sg.flags));
     trap.adopt_stack(ex->sp, machine.mem_size());
     cpu.set_entry(ex->entry, ex->sp);
-    return run(o, m, machine, cpu, proc, task, pids, trap);
+    run(o, m, machine, cpu, proc, task, pids, trap);
 }
