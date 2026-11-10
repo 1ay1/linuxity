@@ -172,6 +172,8 @@ struct Redirect {
     bool                   created_dir{false};
     // on success, guest path `moved->first` is now `moved->second` (rename)
     std::optional<std::pair<std::string, std::string>> moved{};
+    // on success, `linked->second` is a new hard link to `linked->first`
+    std::optional<std::pair<std::string, std::string>> linked{};
     std::optional<Scrub>   scrub{};
     std::optional<ArgBlob> blob{};
 

@@ -4293,6 +4293,7 @@ private:
             if (fd < 0) return eno(static_cast<Errno>(errno));
             ::close(fd);
             k_.files().links().add(pd.host_path, ps.host_path);
+            note_linked(src, dst);
             return val(0);
         }
         // A rename that moves, replaces or carries a name the link table
@@ -4308,6 +4309,7 @@ private:
         rd.second = PathArg{a2, std::move(pd.host_path)};
         // a rename (not a link): tell note_moved what moved where
         if (link_flags_arg < 0) rd.moved = std::pair{src, dst};
+        else rd.linked = std::pair{src, dst};
         return rd;
     }
 
@@ -4709,6 +4711,8 @@ private:
             // Reached only when the link name RESOLVED, so the name is taken.
             return eno(virtual_mut_errno(link, VMut::exists));
         if (pc.host_path.empty()) return eno(pc.error);
+        if (!privileged())
+            if (Errno e = dir_entry_allowed(link, false); e != Errno::ok) return eno(e);
         // Rewrite ONLY the linkpath; `target` stays guest-literal.
         //
         // NO .parents(): creating the chain is for mirroring a directory that
@@ -4717,7 +4721,11 @@ private:
         // where the kernel says ENOENT -- and with a FILE in that position it
         // said EEXIST instead of ENOTDIR. Same rule mkdir/mknod opt into with
         // strict_parent; let the host kernel judge the translated path.
-        return Redirect{PathArg{link_arg, std::move(pc.host_path)}};
+        // created: the link is its creator's, or a sticky /tmp won't let
+        // them remove it (emacs lock files).
+        Redirect o{PathArg{link_arg, std::move(pc.host_path)}};
+        o.created = link;
+        return o;
     }
 
     // Resolve the SECOND path of an *at two-operand syscall. Its dirfd is the
@@ -6623,6 +6631,17 @@ public:
         // only an existing FIFO is deferred, so O_CREAT made nothing
         pending_flags_ = p.flags & ~static_cast<std::uint64_t>(wire::OpenFlag::creat);
         note_opened_fd(fd);
+    }
+
+    // A hard link is the same inode, so the new name gets the source's
+    // owner and mode. They're kept per path, so copy them over.
+    void note_linked(const std::string& src, const std::string& dst) {
+        auto& m = k_.files().meta();
+        const auto rec = m.lookup(src);
+        if (!rec) return;
+        const bool hu = rec->have & kernel::MetaRecord::kUid, hg = rec->have & kernel::MetaRecord::kGid;
+        if (hu || hg) m.set_owner(dst, hu ? rec->uid : 0xffffffffu, hg ? rec->gid : 0xffffffffu);
+        if (rec->have & kernel::MetaRecord::kMode) m.set_mode(dst, rec->mode);
     }
 
     // A rename went through: guest path `from` is now `to`. The kernel ties a
