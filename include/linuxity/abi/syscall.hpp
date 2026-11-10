@@ -4827,6 +4827,8 @@ private:
             // is right by construction. Cheap to give up: these are rare.
             if (host_path == "/proc" || host_path.starts_with("/proc/"))
                 return std::nullopt;
+            // a pty slave's owner is ours to report (scrub_ids), not root
+            if (pts_owner(guest_path)) return std::nullopt;
             auto fields = mem_.stat_host_path(host_path);
             // An inode with emulated extra names: the host counts only the
             // backing, so report every name, as the scrub does on the slow
@@ -6214,6 +6216,9 @@ public:
         // CAP_DAC_OVERRIDE passes every check except exec of a file with no
         // x bit, so skip the lookup for plain read/write.
         if (!(want & 1) && privileged()) return true;
+        // /dev/tty is 0666; whether there's a terminal behind it is the
+        // ctty check's call, not the slave's mode.
+        if (guest == "/dev/tty") return !(want & 1);
         const auto pc = k_.files().classify(guest);
         if (pc.realm != kernel::Realm2::host_backed || pc.host_path.empty()) return true;
         struct ::stat st{};
@@ -6221,10 +6226,28 @@ public:
         std::uint32_t mode = st.st_mode & 07777u;
         if (auto rec = k_.files().meta().lookup(guest); rec && (rec->have & kernel::MetaRecord::kMode))
             mode = rec->mode & 07777u;
-        const auto [uid, gid] = owner_of(guest);
+        auto [uid, gid] = owner_of(guest);
         auto p = me();
+        if (const auto o = pts_owner(guest)) {
+            // a pty we never saw handed out: the host says it's ours
+            uid = o->first < 0 ? p.uids[3] : static_cast<std::uint32_t>(o->first);
+            gid = o->second;
+        }
         p.groups = k_.procs().groups_of(p.pid);
         return creds::permitted(p, mode, uid, gid, want, S_ISDIR(st.st_mode));
+    }
+
+    // The guest owner of /dev/pts/N: {uid, tty group}, uid -1 when nobody
+    // told us. nullopt for any other path. The host's devpts says every pty
+    // is linuxity's, which reads as root to the guest.
+    [[nodiscard]] std::optional<std::pair<std::int64_t, std::uint32_t>> pts_owner(std::string_view guest) const {
+        constexpr std::string_view kPre = "/dev/pts/";
+        if (!guest.starts_with(kPre)) return std::nullopt;
+        const std::string_view n = guest.substr(kPre.size());
+        if (n.empty() || n.find_first_not_of("0123456789") != std::string_view::npos) return std::nullopt;
+        constexpr std::uint32_t kTtyGid = 5;
+        const auto uid = k_.procs().pty_owner(std::atoi(std::string{n}.c_str()));
+        return std::pair<std::int64_t, std::uint32_t>{uid ? std::int64_t{*uid} : -1, kTtyGid};
     }
     [[nodiscard]] bool privileged() { return creds::capable(me(), creds::kCapDacOverride); }
 
@@ -6817,6 +6840,9 @@ public:
         if (rec) {
             if (rec->have & kernel::MetaRecord::kUid) uid = rec->uid;
             if (rec->have & kernel::MetaRecord::kGid) gid = rec->gid;
+        } else if (const auto o = pts_owner(s.guest_path)) {
+            uid = o->first < 0 ? me().uids[3] : static_cast<std::uint32_t>(o->first);
+            gid = o->second;
         }
         // uid and gid are ADJACENT u32s on every layout we serve (x86-64
         // stat @28/@32, aarch64 stat @24/@28, statx @20/@24), so write them as

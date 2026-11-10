@@ -451,6 +451,7 @@ private:
         if (!pts.empty()) {
             for (int fd = 0; fd <= 2; ++fd) k_.files().bind_fd(fd, pts);
             k_.procs().set_ctty(gpid, std::atoi(pts.c_str() + 9));
+            k_.procs().set_pty_owner(std::atoi(pts.c_str() + 9), u->uid);
         }
 
         Session s;

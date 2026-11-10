@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 #if !defined(_WIN32)
@@ -338,6 +339,16 @@ public:
         p.ctty = n;
     }
 
+    // Who owns pty slave n: whoever opened ptmx for it, or the user a
+    // session logged in on it. Every host pty is ours, so the guest's view
+    // has to be kept here.
+    void set_pty_owner(std::int32_t n, std::uint32_t uid) { if (n >= 0) pty_owner_[n] = uid; }
+    [[nodiscard]] std::optional<std::uint32_t> pty_owner(std::int32_t n) const {
+        auto it = pty_owner_.find(n);
+        if (it == pty_owner_.end()) return std::nullopt;
+        return it->second;
+    }
+
     // TIOCNOTTY: drop the ctty for the whole session.
     void clear_ctty(std::int32_t pid) {
         const std::int32_t leader = sid_of(pid);
@@ -608,6 +619,7 @@ private:
     HostOf guest_of_;
     TracerOf tracer_of_;
     std::map<std::int32_t, ProcInfo> procs_;
+    std::map<std::int32_t, std::uint32_t> pty_owner_;
     std::int32_t init_pid_{1};
     bool host_pids_{false};
     std::int32_t last_pid_{1};

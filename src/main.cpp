@@ -577,6 +577,7 @@ int run_runtime(lx::cli::Options& o, int argc, char** argv) {
             if (!std::string_view{n}.starts_with(kPre)) continue;
             k.files().bind_fd(fd, n);
             k.procs().set_ctty(1, std::atoi(n + kPre.size()));
+            k.procs().set_pty_owner(std::atoi(n + kPre.size()), login.uid);
         }
     }
 
