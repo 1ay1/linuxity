@@ -94,6 +94,8 @@
 #include <span>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace lx::runtime {
@@ -460,7 +462,7 @@ public:
     // socket to '/etc/pacman.d/gnupg/S.gpg-agent': No such file or
     // directory" -- the host has no /etc/pacman.d -- and `pacman -S` then
     // died with "keyring is not writable".
-    [[nodiscard]] Result<std::int64_t> rewrite_sockaddr(UAddr, const std::string& host_path,
+    [[nodiscard]] Result<std::int64_t> rewrite_sockaddr(UAddr path_addr, const std::string& host_path,
                                                         int, unsigned long long) {
         const auto sc = abi::decode(abi::Arch::aarch64, regs_.nr());
         const int h = host_fd(static_cast<int>(regs_.arg(0)));
@@ -474,7 +476,31 @@ public:
         const int rc = sc == abi::Sysno::bind
             ? ::bind(h, reinterpret_cast<::sockaddr*>(&sun), sun.sun_len)
             : ::connect(h, reinterpret_cast<::sockaddr*>(&sun), sun.sun_len);
-        return complete(rc < 0 ? darwin::fail() : 0);
+        if (rc < 0) return complete(darwin::fail());
+        // getsockname/getpeername give the guest back ITS spelling (a
+        // relative "rel.sock" stays relative), not the translated host path.
+        if (sc == abi::Sysno::bind)
+            if (auto win = machine_.ram().clamp(value(path_addr), 108); !win.empty()) {
+                const char* p = reinterpret_cast<const char*>(win.data());
+                std::string name{p, ::strnlen(p, win.size())};
+                if (!name.empty()) bound_paths_[host_path] = std::move(name);
+            }
+        return complete(0);
+    }
+    // The guest's spelling of an AF_UNIX path the host reports: what this
+    // process bound it as, else the guest path the host path lies at.
+    [[nodiscard]] std::optional<std::string> guest_unix_name(const ::sockaddr_storage& ss) const {
+        if (ss.ss_family != AF_UNIX) return std::nullopt;
+        const auto* sun = reinterpret_cast<const ::sockaddr_un*>(&ss);
+        const std::string host{sun->sun_path, ::strnlen(sun->sun_path, sizeof sun->sun_path)};
+        if (host.empty() || net::abstract_name_of(host)) return std::nullopt;
+        if (auto it = bound_paths_.find(host); it != bound_paths_.end()) return it->second;
+        if (unresolve_) return unresolve_(host);
+        return std::nullopt;
+    }
+    [[nodiscard]] static std::uint64_t sock_ino(int h) noexcept {
+        struct ::stat st{};
+        return ::fstat(h, &st) == 0 ? static_cast<std::uint64_t>(st.st_ino) : 0;
     }
 
     [[nodiscard]] Result<std::int64_t> forward() {
@@ -736,11 +762,19 @@ private:
             case S::socketpair: {
                 const auto af = net::af_to_darwin(static_cast<std::uint16_t>(regs_.arg(0)));
                 if (!af) return -97;
-                const int type = static_cast<int>(a1 & ~(net::kSockNonblock | net::kSockCloexec));
+                int type = static_cast<int>(a1 & ~(net::kSockNonblock | net::kSockCloexec));
+                // Darwin has no SOCK_SEQPACKET for AF_UNIX. A socketpair is
+                // connected from birth, so a DATAGRAM pair gives the same
+                // contract: reliable, ordered, message edges kept (local
+                // datagrams are never dropped). SO_TYPE still answers 5.
+                const bool seqpacket = *af == AF_UNIX && type == 5;
+                if (seqpacket) type = SOCK_DGRAM;
                 int hp[2];
                 if (::socketpair(*af, type, static_cast<int>(a2), hp) < 0)
                     return darwin::fail();
                 for (int e : hp) finish_socket(e, a1);
+                if (seqpacket)
+                    for (int e : hp) seqpacket_.insert(sock_ino(e));
                 const bool cx = (a1 & net::kSockCloexec) != 0;
                 const auto g = proc_.with_fds([&](FdTable& t) {
                     return std::pair{t.install(hp[0], cx), t.install(hp[1], cx)};
@@ -807,6 +841,17 @@ private:
                 if (h < 0) return -9;
                 auto buf = ram.clamp(a1, a2);
                 if (buf.empty() && a2) return -14;
+                // MSG_TRUNC (0x20) on a datagram socket: return the
+                // datagram's REAL length, however much fit. Darwin ignores
+                // the flag, but SO_NREAD says the size of the first datagram.
+                int real = -1;
+                if (a3 & 0x20) {
+                    int typ = 0; socklen_t tl = sizeof typ;
+                    socklen_t nl = sizeof real;
+                    if (::getsockopt(h, SOL_SOCKET, SO_TYPE, &typ, &tl) < 0 || typ != SOCK_DGRAM ||
+                        ::getsockopt(h, SOL_SOCKET, SO_NREAD, &real, &nl) < 0)
+                        real = -1;
+                }
                 ::sockaddr_storage ss{};
                 socklen_t slen = sizeof ss;
                 const auto n = ::recvfrom(h, buf.data(), buf.size(),
@@ -815,13 +860,22 @@ private:
                                           a4 ? &slen : nullptr);
                 if (n < 0) return darwin::fail();
                 if (a4 && !write_sockaddr(ss, a4, regs_.arg(5))) return -14;
-                return n;
+                return real > n ? real : n;
             }
             case S::setsockopt: {
                 const int h = host_fd(gfd);
                 if (h < 0) return -9;
                 const auto opt = net::opt_to_darwin(static_cast<int>(a1),
                                                     static_cast<int>(a2));
+                // SO_PASSCRED (SOL_SOCKET, 16): recvmsg on this socket
+                // reports the sender's SCM_CREDENTIALS. Darwin has no such
+                // thing; remember it and synthesize them (see do_msg).
+                if (a1 == 1 && a2 == 16) {
+                    std::int32_t on = 0;
+                    if (a4 < sizeof on || !ram.get(a3, on)) return -14;
+                    if (on) passcred_.insert(sock_ino(h)); else passcred_.erase(sock_ino(h));
+                    return 0;
+                }
                 // An unknown option is accepted silently rather than failed:
                 // libcurl and openssl set a long tail of tuning options and
                 // treat EINVAL as fatal, though none of them is required for
@@ -836,6 +890,18 @@ private:
             case S::getsockopt: {
                 const int h = host_fd(gfd);
                 if (h < 0) return -9;
+                // SO_TYPE of an emulated SEQPACKET pair, and SO_PASSCRED.
+                if (a1 == 1 && (a2 == 3 || a2 == 16)) {
+                    const auto ino = sock_ino(h);
+                    const bool ours = a2 == 3 ? seqpacket_.count(ino) != 0 : true;
+                    if (ours) {
+                        const std::int32_t v = a2 == 3 ? 5 : (passcred_.count(ino) ? 1 : 0);
+                        std::uint32_t want = 0;
+                        if (!ram.get(a4, want)) return -14;
+                        if (want < sizeof v) return -22;
+                        return ram.put(a3, v) && ram.put(a4, std::uint32_t{sizeof v}) ? 0 : -14;
+                    }
+                }
                 // SO_PEERCRED (SOL_SOCKET=1, 17): struct ucred {pid,uid,gid}.
                 // Darwin has no such option, so the generic path said
                 // ENOPROTOOPT and libassuan's get_peercred failed -- the
@@ -965,7 +1031,18 @@ private:
         std::uint32_t cap = 0;
         if (len_at && !ram.get(len_at, cap)) return false;
         auto out = ram.clamp(addr_at, cap);
-        const std::size_t full = net::to_linux(ss, out);
+        std::size_t full = 0;
+        if (const auto name = guest_unix_name(ss)) {
+            // the guest's own spelling, NUL-terminated like Linux reports it
+            std::array<std::byte, 2 + 108> la{};
+            la[0] = std::byte{1};                          // AF_UNIX, little-endian
+            const std::size_t n = std::min<std::size_t>(name->size(), 107);
+            std::memcpy(la.data() + 2, name->data(), n);
+            full = 2 + n + 1;
+            std::memcpy(out.data(), la.data(), std::min(full, out.size()));
+        } else {
+            full = net::to_linux(ss, out);
+        }
         return !len_at || ram.put(len_at, static_cast<std::uint32_t>(full));
     }
 
@@ -1059,7 +1136,11 @@ private:
                 hm.msg_controllen = static_cast<socklen_t>(hctl.size());
             }
         } else if (!sending && m.control && m.controllen >= kLHdr) {
-            hctl.resize(CMSG_SPACE(64 * sizeof(int)));
+            // Room for as many fds as the guest's buffer could take (Linux
+            // caps one message at SCM_MAX_FD = 253); a fixed 64 truncated a
+            // 200-fd message.
+            const std::size_t room = std::max<std::size_t>(m.controllen / 4, 253);
+            hctl.resize(CMSG_SPACE(room * sizeof(int)));
             hm.msg_control = hctl.data();
             hm.msg_controllen = static_cast<socklen_t>(hctl.size());
         }
@@ -1094,6 +1175,24 @@ private:
                     std::memcpy(lctl.data() + at, &c, kLHdr);
                     std::memcpy(lctl.data() + at + kLHdr, g.data(), cnt * 4);
                 }
+            }
+            // SO_PASSCRED: every message carries the sender's ucred. Darwin
+            // has no SCM_CREDENTIALS, so build it from the peer's pid (the
+            // guest's single identity owns every process: uid/gid are ours).
+            if (passcred_.count(sock_ino(h))) {
+                pid_t hpid = 0;
+                socklen_t pl = sizeof hpid;
+                if (::getsockopt(h, SOL_LOCAL, LOCAL_PEERPID, &hpid, &pl) < 0) hpid = ::getpid();
+                const auto ids = proc_.ids();
+                const std::int32_t g = hpid == ::getpid() ? tgid_ : pids_.guest_of(hpid);
+                const std::int32_t cred[3] = {g > 0 ? g : 1,
+                                              static_cast<std::int32_t>(ids ? ids->uid : 0),
+                                              static_cast<std::int32_t>(ids ? ids->gid : 0)};
+                const std::size_t at = lctl.size();
+                lctl.resize(at + lalign(kLHdr + sizeof cred));
+                LinuxCmsg c{kLHdr + sizeof cred, 1, 2};          // SOL_SOCKET, SCM_CREDENTIALS
+                std::memcpy(lctl.data() + at, &c, kLHdr);
+                std::memcpy(lctl.data() + at + kLHdr, cred, sizeof cred);
             }
             std::int32_t mflags = 0;
             if (lctl.size() > m.controllen) { lctl.resize(m.controllen); mflags |= 0x8; }  // MSG_CTRUNC
@@ -2044,6 +2143,16 @@ private:
                 continue;
             }
             if (loader::read_elf_machine(host) == loader::ForeignArch::foreign) return -8;
+            {
+                // Neither #! nor ELF: ENOEXEC before the old image is gone
+                // (execvp then runs it with /bin/sh, as POSIX says).
+                unsigned char mag[4]{};
+                std::FILE* f = std::fopen(host.c_str(), "rb");
+                const std::size_t got = f ? std::fread(mag, 1, 4, f) : 0;
+                if (f) std::fclose(f);
+                if (got < 4 || mag[0] != 0x7f || mag[1] != 'E' || mag[2] != 'L' || mag[3] != 'F')
+                    return -8;                                       // ENOEXEC
+            }
             if (auto in = loader::read_elf_interp(host); !in.empty()) {
                 if (resolve(in).empty()) return -2;
             }
@@ -2062,18 +2171,30 @@ private:
     // what POSIX says does: the pid, the fd table minus FD_CLOEXEC, and cwd.
     [[nodiscard]] std::int64_t do_execve(const std::string& host_path) {
         const GuestRam ram = machine_.ram();
+        // argv and envp in full: Linux bounds them by size (a quarter of
+        // RLIMIT_STACK, 2 MiB here), not by count -- a 4096-entry cap cut
+        // `xargs`-sized command lines short. Past the limit is E2BIG, and so
+        // is one string over MAX_ARG_STRLEN (32 pages).
+        constexpr std::uint64_t kArgMax = ExecArena::stack_reserve / 4;
+        constexpr std::size_t kStrMax = 32 * 4096;
+        std::uint64_t total = 0;
+        bool too_big = false;
         auto read_vec = [&](std::uint64_t at) {
             std::vector<std::string> v;
-            for (std::size_t i = 0; at && i < 4096; ++i) {
+            for (std::size_t i = 0; at && !too_big; ++i) {
                 std::uint64_t p = 0;
                 if (!ram.get(at + i * 8, p) || p == 0) break;
-                v.push_back(ram.cstr(p, 128 * 1024));
+                std::string s = ram.cstr(p, kStrMax + 1);
+                total += s.size() + 1 + 8;
+                if (s.size() > kStrMax || total > kArgMax) { too_big = true; break; }
+                v.push_back(std::move(s));
             }
             return v;
         };
         std::string guest_path = ram.cstr(regs_.arg(0));
         std::vector<std::string> argv = read_vec(regs_.arg(1));
         std::vector<std::string> envp = read_vec(regs_.arg(2));
+        if (too_big) return -7;                                      // E2BIG
         if (argv.empty()) argv.push_back(guest_path);
         if (!resolve_) return -38;
 
@@ -2775,8 +2896,16 @@ private:
                     id = static_cast<::id_t>(*h);
                 }
                 siginfo_t si{};
-                const int opts = static_cast<int>(a3) & (WEXITED | WSTOPPED
-                                                        | WCONTINUED | WNOHANG | WNOWAIT);
+                // The option BITS differ: Linux WSTOPPED=2, WCONTINUED=8,
+                // WNOWAIT=0x01000000; Darwin 0x08, 0x10, 0x20 (WEXITED=4 and
+                // WNOHANG=1 agree). Passing Linux's straight through dropped
+                // WNOWAIT -- the "peek" reaped the zombie -- and turned
+                // WSTOPPED into WUNTRACED.
+                const std::uint64_t lo = a3;
+                const int opts = ((lo & 1) ? WNOHANG : 0) | ((lo & 2) ? WSTOPPED : 0)
+                               | ((lo & 4) ? WEXITED : 0) | ((lo & 8) ? WCONTINUED : 0)
+                               | ((lo & 0x01000000) ? WNOWAIT : 0);
+                const bool nowait = (lo & 0x01000000) != 0;
                 if (::waitid(idt, id, &si, opts) < 0) return darwin::fail();
                 if (a2) {
                     // The guest's siginfo_t: signo/errno/code then the
@@ -2796,7 +2925,7 @@ private:
                 if (si.si_pid && (si.si_code == CLD_EXITED || si.si_code == CLD_KILLED
                                   || si.si_code == CLD_DUMPED)) {
                     const auto g = pids_.guest_of(si.si_pid);
-                    if (g > 0 && !(static_cast<int>(a3) & WNOWAIT)) {
+                    if (g > 0 && !nowait) {
                         int st = 0;
                         ::waitpid(si.si_pid, &st, 0);        // actually reap
                         pids_.release(g);
@@ -4662,9 +4791,40 @@ private:
                 } else {
                     auto addr = ram.at(regs_.arg(1), regs_.arg(2));
                     if (addr.empty()) return -14;
+                    // bind(fd, {AF_UNIX}, 2): Linux AUTOBINDS an abstract name
+                    // of five hex digits.
+                    std::array<std::byte, 8> autoname{};
+                    if (sc == S::bind && addr.size() == 2 &&
+                        std::to_integer<int>(addr[0]) == 1 && std::to_integer<int>(addr[1]) == 0) {
+                        char nm[8];
+                        std::snprintf(nm, sizeof nm, "%05x",
+                                      static_cast<unsigned>((::getpid() * 2654435761u + sock_ino(h)) & 0xfffff));
+                        autoname[0] = std::byte{1};
+                        std::memcpy(autoname.data() + 3, nm, 5);
+                        addr = {autoname.data(), autoname.size()};
+                    }
                     auto n = net::to_darwin(addr, ss);
                     if (!n) return -97;
                     slen = *n;
+                    // An abstract name lives only as long as its socket. Ours
+                    // are nodes in a shared directory, which outlive a dead
+                    // owner: a bind that finds one nobody answers on takes it.
+                    const auto* sun = reinterpret_cast<const ::sockaddr_un*>(&ss);
+                    if (sc == S::bind && ss.ss_family == AF_UNIX &&
+                        std::string_view(sun->sun_path).starts_with(net::abstract_dir())) {
+                        // Probe with the OTHER socket type: a live socket says
+                        // EPROTOTYPE, a dead node ECONNREFUSED, and nothing
+                        // lands in a live listener's backlog.
+                        int typ = SOCK_STREAM; socklen_t tl = sizeof typ;
+                        (void)::getsockopt(h, SOL_SOCKET, SO_TYPE, &typ, &tl);
+                        const int probe = ::socket(AF_UNIX, typ == SOCK_DGRAM ? SOCK_STREAM : SOCK_DGRAM, 0);
+                        if (probe >= 0) {
+                            const bool dead = ::connect(probe, reinterpret_cast<const ::sockaddr*>(&ss), slen) < 0 &&
+                                              errno == ECONNREFUSED;
+                            ::close(probe);
+                            if (dead) ::unlink(sun->sun_path);
+                        }
+                    }
                 }
                 const int rc = sc == S::bind
                     ? ::bind(h, reinterpret_cast<::sockaddr*>(&ss), slen)
@@ -4690,6 +4850,12 @@ private:
     std::vector<Child> children_;
     std::vector<ProcEvent> proc_events_;
     std::vector<ExitHook> exit_hooks_;
+    // AF_UNIX: the guest's spelling of each path it bound, by translated
+    // host path (so the listener, its accepted sockets and a datagram's
+    // sender all read back the same), and the sockets that asked for
+    // SO_PASSCRED / are emulated SEQPACKET, by host socket inode.
+    std::unordered_map<std::string, std::string> bound_paths_;
+    std::unordered_set<std::uint64_t> passcred_, seqpacket_;
     bool ready_announced_{false};   // PidSpace::ready: the kick handler is in
     Resolver resolve_;
     Resolver unresolve_;

@@ -27,6 +27,7 @@
 #if defined(__APPLE__)
 
 #include <sys/event.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -56,13 +57,16 @@ inline constexpr std::uint32_t et        = 1u << 31;
 // EPOLL_CTL_*
 inline constexpr int kEpollCtlAdd = 1, kEpollCtlDel = 2, kEpollCtlMod = 3;
 
-// struct epoll_event is PACKED on every Linux ABI: a u32 followed by a u64
-// with no padding between them. Getting this wrong shifts the user token.
-struct __attribute__((packed)) LinuxEpollEvent {
+// struct epoll_event is PACKED only on x86-64 (__EPOLL_PACKED); on aarch64,
+// the only guest this backend runs, it is naturally aligned: a u32, four
+// bytes of padding, a u64 -- 16 bytes. Packing it here shifted every event
+// after the first by 4 bytes, so the guest read tokens out of the padding.
+struct LinuxEpollEvent {
     std::uint32_t events;
+    std::uint32_t pad_{};
     std::uint64_t data;
 };
-static_assert(sizeof(LinuxEpollEvent) == 12);
+static_assert(sizeof(LinuxEpollEvent) == 16);
 
 // One epoll set: a kqueue plus the registrations we own.
 class EpollSet {
@@ -96,8 +100,18 @@ public:
                 return -22;                              // EINVAL
         }
         const std::uint32_t old = known ? regs_[guest_fd].mask : 0;
+        if (!known) {
+            // epoll refuses what can never block: regular files and
+            // directories (EPERM). kqueue would take them.
+            struct ::stat st{};
+            if (::fstat(host_fd, &st) == 0 && (S_ISREG(st.st_mode) || S_ISDIR(st.st_mode)))
+                return -1;                               // EPERM
+        }
+        // EPOLLEXCLUSIVE may only be ADDed; MOD of (or to) it is EINVAL.
+        if (op == kEpollCtlMod &&
+            ((mask | regs_[guest_fd].armed) & epoll_bit::exclusive)) return -22;
         if (const std::int64_t rc = apply(guest_fd, host_fd, mask, old); rc < 0) return rc;
-        regs_[guest_fd] = {host_fd, mask, token};
+        regs_[guest_fd] = {host_fd, mask, token, mask};
         return 0;
     }
 
@@ -119,6 +133,7 @@ public:
         // Collapse the (fd, filter) pairs back into one entry per fd, which
         // is the shape epoll_wait promises.
         out.clear();
+        std::vector<int> out_fd;     // which guest fd each `out` entry is
         for (int i = 0; i < n; ++i) {
             const auto& ev = evs[static_cast<std::size_t>(i)];
             const int gfd = static_cast<int>(ev.udata ? reinterpret_cast<std::intptr_t>(ev.udata) : -1);
@@ -136,23 +151,31 @@ public:
             }
             if (ev.flags & EV_ERROR) bits |= epoll_bit::err;
             bits &= it->second.mask | epoll_bit::err | epoll_bit::hup
-                  | epoll_bit::rdhup;    // err/hup are always reportable
+                  ;    // err/hup are always reportable; RDHUP only if asked
             if (!bits) continue;
-            // Merge with an entry already emitted for this fd.
-            auto same = std::find_if(out.begin(), out.end(),
-                [&](const LinuxEpollEvent& e) { return e.data == it->second.token; });
-            if (same != out.end()) same->events |= bits;
-            else out.push_back({bits, it->second.token});
+            // Merge with an entry already emitted for this fd (by fd: two
+            // registrations may well carry the same token).
+            auto same = std::find(out_fd.begin(), out_fd.end(), gfd);
+            if (same != out_fd.end()) {
+                out[static_cast<std::size_t>(same - out_fd.begin())].events |= bits;
+                continue;
+            }
+            out.push_back({bits, 0, it->second.token});
+            out_fd.push_back(gfd);
             if (it->second.mask & epoll_bit::oneshot) {
-                (void)apply(gfd, it->second.host_fd, 0, it->second.mask);   // best-effort, as DEL
-                regs_.erase(it);
+                // Fired once: DISARMED, not forgotten -- the registration
+                // stays (a second ADD is EEXIST) until EPOLL_CTL_MOD re-arms it.
+                (void)apply(gfd, it->second.host_fd, 0, it->second.mask);
+                it->second.mask = 0;
             }
         }
         return static_cast<std::int64_t>(out.size());
     }
 
 private:
-    struct Reg { int host_fd; std::uint32_t mask; std::uint64_t token; };
+    // mask: what is armed in the kqueue now (0 once a ONESHOT fired);
+    // armed: what the guest last asked for.
+    struct Reg { int host_fd; std::uint32_t mask; std::uint64_t token; std::uint32_t armed; };
 
     // Add/remove the kevent pair for one fd so the kqueue matches `want`.
     // The GUEST fd rides in each kevent's udata, which is how wait() maps a
@@ -172,8 +195,9 @@ private:
         const bool want_w = (want & epoll_bit::out) != 0;
         const bool had_r = (had & (epoll_bit::in | epoll_bit::pri | epoll_bit::rdnorm)) != 0;
         const bool had_w = (had & epoll_bit::out) != 0;
-        if (want_r != had_r) change(EVFILT_READ, want_r, edge);
-        if (want_w != had_w) change(EVFILT_WRITE, want_w, edge);
+        const bool flip = ((want ^ had) & epoll_bit::et) != 0;   // EV_CLEAR changes
+        if (want_r != had_r || (want_r && flip)) change(EVFILT_READ, want_r, edge);
+        if (want_w != had_w || (want_w && flip)) change(EVFILT_WRITE, want_w, edge);
         if (n == 0) return 0;
         if (::kevent(kq_, ch, n, nullptr, 0, nullptr) < 0) {
             // A regular file can't be registered with kqueue's read filter,

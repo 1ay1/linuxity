@@ -613,10 +613,21 @@ struct ChildArgs {
 [[nodiscard]] bool receive_fork(const ChildArgs& ca, runtime::HvfMachine& vm,
                                 runtime::HvfTrap::ForkImage& img) {
     // A VM first: Hypervisor.framework allows a fixed number at once (see
-    // PidSpace::kMaxVms). If none is left, exit WITHOUT the hello, and the
-    // parent's fork fails EAGAIN -- what a kernel out of process slots
-    // says -- instead of reporting a child that then dies.
-    if (!vm.prewarm()) ::_exit(127);
+    // PidSpace::kMaxVms). A big tree hits that while most of it is about to
+    // exit (341 short-lived processes four levels deep), and Linux would
+    // simply have forked -- so wait for one to free up, for a while. Only if
+    // none does, exit WITHOUT the hello: the parent's fork fails EAGAIN --
+    // what a kernel out of process slots says -- instead of reporting a
+    // child that then dies.
+    if (!vm.prewarm()) {
+        const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        useconds_t nap = 1000;
+        do {
+            ::usleep(nap);
+            nap = std::min<useconds_t>(nap * 2, 20000);
+            if (std::chrono::steady_clock::now() > give_up) ::_exit(127);
+        } while (!vm.prewarm());
+    }
     mach_port_t parent = MACH_PORT_NULL;
     static const bool prof = std::getenv("LINUXITY_PROFILE_FORK") != nullptr;
     const auto r0 = std::chrono::steady_clock::now();

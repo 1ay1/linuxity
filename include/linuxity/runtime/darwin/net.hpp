@@ -27,9 +27,12 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
+#include <unistd.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <optional>
 #include <span>
@@ -64,6 +67,59 @@ enum class LinuxAf : std::uint16_t {
 // -- socket(2) type flags --------------------------------------------------
 inline constexpr std::uint64_t kSockNonblock = 0x800;
 inline constexpr std::uint64_t kSockCloexec  = 0x80000;
+
+// -- The abstract AF_UNIX namespace ----------------------------------------
+// Linux names a socket by a leading NUL and the bytes after it (its LENGTH
+// delimits it); Darwin has no such namespace, so bind("\0x") fell through as
+// an empty path and failed ENOENT. Every guest process is its own host
+// process, so the namespace has to be somewhere they all see: a private
+// directory of socket nodes, one per name. Short names are hex-encoded so the
+// name can be read back (getsockname, recvfrom's sender); a name too long for
+// sun_path is hashed, and only this process's own bound map can say it.
+[[nodiscard]] inline const std::string& abstract_dir() {
+    static const std::string dir = [] {
+        std::string d = "/tmp/linuxity-abstract-" + std::to_string(::getuid());
+        ::mkdir(d.c_str(), 0700);
+        return d + "/";
+    }();
+    return dir;
+}
+// `name` excludes the leading NUL.
+[[nodiscard]] inline std::string abstract_host_path(std::string_view name) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string p = abstract_dir();
+    if (p.size() + 2 * name.size() + 1 < sizeof(::sockaddr_un{}.sun_path)) {
+        for (unsigned char c : name) { p += kHex[c >> 4]; p += kHex[c & 15]; }
+        if (name.empty()) p += "-";
+        return p;
+    }
+    std::uint64_t h = 1469598103934665603ull;                 // FNV-1a
+    for (unsigned char c : name) { h ^= c; h *= 1099511628211ull; }
+    char b[24];
+    std::snprintf(b, sizeof b, "h%016llx", static_cast<unsigned long long>(h));
+    return p + b;
+}
+// The guest's spelling ("\0" + name) of a node in the abstract directory,
+// if it's a reversible one.
+[[nodiscard]] inline std::optional<std::string> abstract_name_of(std::string_view host) {
+    const std::string& d = abstract_dir();
+    if (!host.starts_with(d)) return std::nullopt;
+    host.remove_prefix(d.size());
+    std::string out(1, '\0');
+    if (host == "-") return out;
+    if (host.size() % 2) return std::nullopt;
+    auto nib = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        return -1;
+    };
+    for (std::size_t i = 0; i < host.size(); i += 2) {
+        const int hi = nib(host[i]), lo = nib(host[i + 1]);
+        if (hi < 0 || lo < 0) return std::nullopt;
+        out += static_cast<char>(hi << 4 | lo);
+    }
+    return out;
+}
 
 // -- sockaddr --------------------------------------------------------------
 // Linux's wire form, as the guest lays it out.
@@ -110,8 +166,14 @@ struct LinuxSockaddr {
             sun->sun_family = AF_UNIX;
             const char* p = reinterpret_cast<const char*>(guest.data()) + 2;
             const std::size_t cap = guest.size() - 2;
-            const std::size_t n = ::strnlen(p, std::min(cap, sizeof sun->sun_path - 1));
-            std::memcpy(sun->sun_path, p, n);
+            std::string path;
+            if (cap > 0 && p[0] == '\0')
+                path = abstract_host_path({p + 1, std::min<std::size_t>(cap, 108) - 1});
+            else
+                path.assign(p, ::strnlen(p, std::min(cap, sizeof sun->sun_path - 1)));
+            if (path.size() >= sizeof sun->sun_path) return std::nullopt;
+            const std::size_t n = path.size();
+            std::memcpy(sun->sun_path, path.data(), n);
             sun->sun_path[n] = '\0';
             sun->sun_len = static_cast<std::uint8_t>(offsetof(::sockaddr_un, sun_path) + n + 1);
             return static_cast<socklen_t>(sun->sun_len);
@@ -153,8 +215,14 @@ struct LinuxSockaddr {
             const auto* sun = reinterpret_cast<const ::sockaddr_un*>(&in);
             la.sa_family = static_cast<std::uint16_t>(LinuxAf::unix_);
             const std::size_t n = ::strnlen(sun->sun_path, sizeof sun->sun_path);
+            if (auto a = abstract_name_of({sun->sun_path, n})) {
+                // an abstract name: NUL + bytes, its length the delimiter
+                std::memcpy(la.sa_data, a->data(), a->size());
+                len = 2 + a->size();
+                break;
+            }
             std::memcpy(la.sa_data, sun->sun_path, n);
-            len = 2 + n + 1;
+            len = n ? 2 + n + 1 : 2;      // unnamed: the family alone, as Linux
             break;
         }
         default:
