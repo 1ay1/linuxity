@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <unistd.h>
 
 using namespace lx;
 using kernel::Realm2;
@@ -114,8 +115,13 @@ int main() {
     }
 
     // -- Mount table + longest-prefix classification. ---------------------
+    // classify() resolves through the real host directories (a missing
+    // parent is ENOENT, as in a kernel walk), so the rootfs must exist: a
+    // private one, not whatever a previous run left in /tmp/lxroot.
+    const std::string root = "/tmp/lx-fn-root-" + std::to_string(::getpid());
+    (void)std::system(("mkdir -p " + root + "/etc " + root + "/procX").c_str());
     FN f;
-    f.mount_host("/", "/tmp/lxroot");
+    f.mount_host("/", root);
     kernel::ProcessTable procs;
     static const kernel::MachineSpec mach;
     f.mount_virtual("/proc", vfs::make_procfs(procs, mach));
@@ -124,7 +130,7 @@ int main() {
     {
         auto pc = f.classify(f.absolutize("/etc/os-release"));
         assert(pc.realm == Realm2::host_backed);
-        assert(pc.host_path == "/tmp/lxroot/etc/os-release");
+        assert(pc.host_path == root + "/etc/os-release");
     }
     // A /proc path is virtual (longest-prefix beats the "/" host mount).
     {
@@ -136,7 +142,7 @@ int main() {
     {
         auto pc = f.classify(f.absolutize("/procX/y"));
         assert(pc.realm == Realm2::host_backed);
-        assert(pc.host_path == "/tmp/lxroot/procX/y");
+        assert(pc.host_path == root + "/procX/y");
     }
 
     // -- cwd + relative resolution. ---------------------------------------
@@ -434,5 +440,6 @@ int main() {
               "classification, synthesized /proc, cross-mount symlinks, "
               "root-mount host paths, relative mount paths, and copy-up "
               "overlay correct");
+    (void)std::system(("rm -rf " + root).c_str());
     return 0;
 }

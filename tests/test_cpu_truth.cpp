@@ -39,6 +39,7 @@ using namespace lx;
 
 namespace {
 
+#if defined(__linux__)   // the helpers serve the Linux-host oracle only
 std::string bytes_to_string(const std::vector<std::byte>& b) {
     std::string s;
     s.reserve(b.size());
@@ -69,6 +70,7 @@ std::string slurp(const char* path) {
     ss << in.rdbuf();
     return ss.str();
 }
+#endif
 
 } // namespace
 

@@ -1,6 +1,17 @@
 # Portable tests: exercise the host-agnostic core (abi/kernel/vfs/loader)
 # against mocks. These must build and pass on EVERY host (Linux, macOS,
 # Windows) — they are the contract that keeps the core portable.
+#
+# The tests ARE assert()s, and the default build is RelWithDebInfo, whose
+# -DNDEBUG compiled every one of them away: a test that checks nothing exits
+# 0, so the suite stayed green while asserting nothing (the only symptom was
+# a wall of unused-variable warnings). Everything in this directory keeps
+# its asserts, whatever the build type; the runtime itself keeps NDEBUG.
+if(MSVC)
+    add_compile_options(/UNDEBUG)
+else()
+    add_compile_options(-UNDEBUG)
+endif()
 set(LX_PORTABLE_TESTS
     core authority vfs interp file_namespace sysfs_proctree
     resources address_space sysno conformance outcome wire fd_slots

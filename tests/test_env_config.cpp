@@ -188,7 +188,11 @@ void test_store() {
     check(!s.create("box", rootfs).empty(), "create twice fails");
     check(!s.create("../x", rootfs).empty(), "bad name rejected");
     auto r = s.load("box");
-    check(r.ok() && r.config.rootfs == rootfs && r.config.hostname == "box", "template loads");
+    // create() stores the rootfs canonicalized (on macOS /tmp is a symlink
+    // to /private/tmp), so compare against what realpath says
+    std::string canon = rootfs;
+    if (char* rp = ::realpath(rootfs.c_str(), nullptr)) { canon = rp; std::free(rp); }
+    check(r.ok() && r.config.rootfs == canon && r.config.hostname == "box", "template loads");
     check(r.config.upper == s.default_upper("box"), "upper defaults into the env dir");
 
     // reset / snapshot / restore only ever touch upper/

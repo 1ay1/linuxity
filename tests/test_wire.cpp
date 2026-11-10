@@ -107,7 +107,7 @@ int main() {
                                DType::fifo, DType::sock, DType::unknown};
         for (DType t : types) {
             Dirent e{1, 1, t, "x"};
-            encode_dirent64(buf, e);
+            (void)encode_dirent64(buf, e);
             check(decode(buf.data()).type == static_cast<std::uint8_t>(t),
                   "d_type passes through unchanged");
         }
