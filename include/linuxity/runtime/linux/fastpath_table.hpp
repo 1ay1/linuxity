@@ -38,7 +38,9 @@ static_assert(LX_FP_PROC_OFF + LX_FP_PROC_SIZE + 0x1000 <= LX_FP_FDMAP_OFF, "pro
 static_assert(sizeof(lx_fp_stats) <= 0x1000, "stats page is one page");
 static_assert(sizeof(lx_fp_fd) == 256, "fd map entry");
 static_assert(LX_FP_FDMAP_OFF + LX_FP_FDS * sizeof(lx_fp_fd) + 0x1000 <= LX_FP_STACKS_OFF, "fd map overlaps the stacks");
-static_assert(LX_FP_STACKS_OFF + LX_FP_STACKS * LX_FP_STACK_SIZE <= LX_FP_TABLE_OFF, "stacks overlap the table");
+static_assert(LX_FP_STACKS_OFF + LX_FP_STACKS * LX_FP_STACK_SIZE <= LX_FP_UNION_OFF, "stacks overlap the union slots");
+static_assert(LX_FP_UNION_OFF + LX_FP_UNIONS * sizeof(lx_fp_union) <= LX_FP_VDIR_OFF, "union slots overlap the dir cache");
+static_assert(LX_FP_VDIR_OFF + LX_FP_VDIRS * sizeof(lx_fp_dir) <= LX_FP_TABLE_OFF, "dir cache overlaps the table");
 
 // The 128-bit key the fast path's own syscalls carry (see seccomp_filter.hpp).
 // Made once, before the first guest is forked, so the filter and the table
@@ -122,6 +124,13 @@ public:
     [[nodiscard]] std::uint64_t hits() const {
         return stats_ ? __atomic_load_n(&stats_->hits, __ATOMIC_RELAXED) : 0;
     }
+    void report_gate() const {
+        if (!stats_ || !(t_->off_ops >> 31)) return;
+        std::fprintf(stderr, "  blob host calls:");
+        for (int nr = 0; nr < 512; ++nr)
+            if (stats_->gate[nr]) std::fprintf(stderr, " %d:%u", nr, stats_->gate[nr]);
+        std::fprintf(stderr, "\n");
+    }
     // Bumped by the blob each time any process logs an fd event, and per
     // process (by tgid slot).
     [[nodiscard]] std::uint32_t evsum() const {
@@ -132,7 +141,7 @@ public:
                                          __ATOMIC_ACQUIRE) : 0;
     }
 
-    void set_enabled(bool on) { store(&t_->enabled, on ? 1u : 0u); }
+    void set_enabled(bool on) { store(&t_->enabled, on && !dead_ ? 1u : 0u); }
     [[nodiscard]] bool enabled() const { return t_ && t_->enabled != 0; }
 
     void set_mounts(const std::vector<Mount>& ms) {
@@ -177,6 +186,7 @@ public:
     void clear_exc_begin() {
         begin();
         std::memset(t_->exc, 0, sizeof t_->exc);
+        std::memset(t_->exc_bloom, 0, sizeof t_->exc_bloom);
         exc_count_ = 0;
     }
     void clear_exc_end() { end(); }
@@ -236,6 +246,7 @@ public:
 
 private:
     lx_fp_table* t_{nullptr};
+    bool dead_{false};
     lx_fp_stats* stats_{nullptr};
     std::string path_;
     std::size_t exc_count_{0};
@@ -267,14 +278,27 @@ private:
     void end() { __atomic_thread_fence(__ATOMIC_SEQ_CST); store(&t_->seq, t_->seq + 1); }
     void bump_dirs_locked() {
         std::uint32_t g = t_->dir_gen + 1;
-        if (g == 0) {   // wrapped: old entries could match again
+        // wrapped (2^31 writes): old entries could match again. The shared
+        // cache is cleared; processes' own caches can't be, so the fast path
+        // goes off rather than risk a stale answer.
+        if (g >= 0x7fffffffu) {
             std::memset(t_->dirs, 0, sizeof t_->dirs);
+            dead_ = true;
+            store(&t_->enabled, 0u);
             g = 1;
         }
         store(&t_->dir_gen, g);
     }
+    void bloom_set(std::uint64_t h) {
+        constexpr std::uint32_t kBits = LX_FP_EXC_BLOOM_WORDS * 64;
+        for (const std::uint32_t b : {static_cast<std::uint32_t>(h) & (kBits - 1),
+                                      static_cast<std::uint32_t>(h >> 32) & (kBits - 1)})
+            __atomic_fetch_or(&t_->exc_bloom[b / 64], std::uint64_t{1} << (b % 64), __ATOMIC_RELEASE);
+    }
     void add_exc(std::uint64_t h) {
         if (!t_) return;
+        // the bloom first: a reader that finds h in exc[] has seen its bits
+        bloom_set(h);
         const std::uint32_t i = static_cast<std::uint32_t>(h) & (LX_FP_EXC_SLOTS - 1);
         for (std::uint32_t k = 0; k < LX_FP_PROBES; ++k) {
             std::uint64_t& slot = t_->exc[(i + k) & (LX_FP_EXC_SLOTS - 1)];
@@ -288,7 +312,10 @@ private:
             }
         }
         // a full run: readers can't find a free slot either, so they treat
-        // the whole run as excepted -- including h
+        // the whole run as excepted -- including h. Bump seq so a call
+        // already past the check doesn't use its answer.
+        begin();
+        end();
         ++exc_count_;
     }
 };

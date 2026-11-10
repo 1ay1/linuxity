@@ -23,6 +23,7 @@
 #pragma once
 
 #include "linuxity/abi/wire/path.hpp"
+#include "linuxity/abi/wire/dirent64.hpp"
 #include "linuxity/abi/result.hpp"
 #include "linuxity/abi/types.hpp"
 #include "linuxity/kernel/link_table.hpp"
@@ -729,7 +730,7 @@ public:
         for (std::string_view hide : {MetaStore::journal_leaf(),
                                       LinkTable::journal_leaf(),
                                       std::string_view{".linuxity-whiteout"}})
-            if (auto it = seen.find(hide); it != seen.end()) seen.erase(it);
+            if (auto it = seen.find(hide); it != seen.end()) it->second.hidden = true;
         // Drop names whited-out from the lower layer (removed in the overlay
         // view but still present on the pristine rootfs) unless the upper has
         // re-created them (merge_dir(up) already recorded those, so a name
@@ -747,20 +748,17 @@ public:
             std::string up_child = up;
             up_child += '/';
             const std::size_t up_base = up_child.size();
-            for (auto it = seen.begin(); it != seen.end();) {
+            for (auto it = seen.begin(); it != seen.end(); ++it) {
                 child.resize(child_base);
                 child += it->first;
                 // is_whiteout is an in-memory set probe; exists() is a host
                 // syscall. Test the cheap one first and let && skip the stat
                 // for the overwhelming majority of entries, which are not
                 // whited out at all.
-                if (!is_whiteout(child)) { ++it; continue; }
+                if (!is_whiteout(child)) continue;
                 up_child.resize(up_base);
                 up_child += it->first;
-                if (!exists(up_child.c_str()))
-                    it = seen.erase(it);
-                else
-                    ++it;
+                if (!exists(up_child.c_str())) it->second.hidden = true;
             }
         }
         // A directory listing MUST begin with "." and ".." (both directories):
@@ -772,7 +770,7 @@ public:
         out.push_back({".",  DType::dir});
         out.push_back({"..", DType::dir});
         for (const std::string_view name : order)
-            if (auto it = seen.find(name); it != seen.end())
+            if (auto it = seen.find(name); it != seen.end() && !it->second.hidden)
                 out.push_back({it->first, it->second.type, it->second.ino});
         return out;
     }
@@ -873,6 +871,36 @@ public:
         auto it = t->second.dirs.find(fd);
         if (it == t->second.dirs.end()) return 0;
         return it->second.lazy.empty() ? 2 : 1;
+    }
+    // The in-guest fast path was serving fd's merged listing and stopped at
+    // byte cookie `cookie`: build the union here and stand at the same spot
+    // (the first entry starting at or after it, as lseek does).
+    void seek_dir_in(std::int32_t pid, int fd, std::uint64_t cookie) {
+        auto t = fd_tables_.find(pid);
+        if (t == fd_tables_.end()) return;
+        auto it = t->second.dirs.find(fd);
+        if (it == t->second.dirs.end()) return;
+        DirStream& ds = it->second;
+        if (!ds.lazy.empty()) {
+            std::string abs = std::move(ds.lazy);
+            ds.lazy.clear();
+            ds.entries = overlay_dir_union(abs);
+        }
+        std::uint64_t cur = 0;
+        std::size_t idx = 0;
+        for (; idx < ds.entries.size() && cur < cookie; ++idx)
+            cur += abi::wire::dirent_reclen(ds.entries[idx].name.size());
+        ds.pos = idx;
+        ds.byte_off = cur;
+    }
+    // The upper-layer host path of `abs` (empty if its mount has no upper).
+    [[nodiscard]] std::string upper_path_of(std::string_view abs) const {
+        const Mount* m = deepest(abs);
+        if (!m || m->upper.empty()) return {};
+        std::string_view rel = abs;
+        rel.remove_prefix(m->prefix == "/" ? 0 : m->prefix.size());
+        while (!rel.empty() && rel.front() == '/') rel.remove_prefix(1);
+        return join_host(m->upper, rel);
     }
     // Is `abs` in a mount with an upper layer (or a virtual one)? Its listing
     // may be a merge, not one host dir's.
@@ -1708,6 +1736,7 @@ private:
     struct DirEntryInfo {
         DType         type{DType::regular};
         std::uint64_t ino{0};
+        bool          hidden{false};   // dropped from the union (kept so views into keys stay valid)
     };
     using NameMap = std::unordered_map<std::string, DirEntryInfo, SvHash, SvEq>;
 

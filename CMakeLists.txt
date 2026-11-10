@@ -111,7 +111,7 @@ if(CMAKE_SYSTEM_NAME IN_LIST LX_PTRACE_HOSTS)
     add_library(linuxity_fp_objs OBJECT src/fastpath/handler.c ${LX_FP_ENTRY})
     target_include_directories(linuxity_fp_objs PRIVATE ${CMAKE_SOURCE_DIR}/include)
     target_compile_options(linuxity_fp_objs PRIVATE
-        $<$<COMPILE_LANGUAGE:C>:-Os -fPIC -ffreestanding -fno-builtin -fno-stack-protector
+        $<$<COMPILE_LANGUAGE:C>:-O2 -fPIC -ffreestanding -fno-builtin -fno-stack-protector
             -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-jump-tables
             -mgeneral-regs-only -fno-sanitize=all -U_FORTIFY_SOURCE ${LX_FP_ARCH_FLAGS} -w>)
     set(LX_FP_ELF ${CMAKE_BINARY_DIR}/linuxity-fastpath.elf)

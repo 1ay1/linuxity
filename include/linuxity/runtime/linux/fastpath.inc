@@ -105,6 +105,34 @@ public:
         else fp_note_privileged(it->second, sys.caller_privileged());
     }
 
+    // Before the dispatcher acts on an fd whose merged listing the blob was
+    // serving (a getdents or lseek the blob gave up on, a dup, an exec that
+    // keeps it open): take the listing over at the cookie the blob reached,
+    // so the guest reads on from the same entry.
+    template <class K>
+    void fp_before_call(const abi::Regs& ar, K& k) {
+        if (fp_regions_.empty()) return;
+        using S2 = abi::Sysno;
+        const abi::Sysno sc = abi::decode(kTraceeArch, ar.nr);
+        const bool exec = sc == S2::execve || sc == S2::execveat;
+        if (!exec && sc != S2::getdents64 && sc != S2::lseek && sc != S2::dup &&
+            sc != S2::dup2 && sc != S2::dup3 && sc != S2::fcntl)
+            return;
+        const ::pid_t tg = host_tgid_of(cur_);
+        auto it = fp_regions_.find(tg);
+        if (it == fp_regions_.end() || !it->second.base || !it->second.owner) return;
+        const std::uint64_t base = it->second.base;
+        if (!exec) {
+            fp_take_union(k, tg, base, static_cast<int>(ar.arg[0]));
+            return;
+        }
+        for (std::uint32_t i = 0; i < LX_FP_UNIONS; ++i) {
+            std::int32_t fd1 = 0;
+            if (fp_get(cur_, base + LX_FP_UNION_OFF + i * sizeof(lx_fp_union) + offsetof(lx_fp_union, fd), fd1) && fd1 > 0)
+                fp_take_union(k, tg, base, fd1 - 1);
+        }
+    }
+
     // A trapped open or dup just made fd `fd` for guest path `gp`: write what
     // it is into the process's fd map. Called with the task still stopped,
     // so its next call sees the entry.
@@ -123,6 +151,7 @@ public:
         std::fprintf(stderr, "linuxity fast path: %llu calls answered in the guest, %llu sites patched\n",
                      static_cast<unsigned long long>(fp_hits()),
                      static_cast<unsigned long long>(fp_patch_count_));
+        fp_own_.report_gate();
     }
 
     [[nodiscard]] bool fp_on() const noexcept {
@@ -309,6 +338,12 @@ private:
         if (::stat(link, &st) != 0 || !(S_ISDIR(st.st_mode) || S_ISREG(st.st_mode))) return e;
         e.kind = LX_FP_FD_HOST;
         e.len = static_cast<std::uint16_t>(gp.size());
+        // opened in the upper layer: the host path the classify picked
+        if (const auto up = fs.upper_path_of(gp); !up.empty()) {
+            struct ::stat us{};
+            if (::lstat(up.c_str(), &us) == 0 && us.st_dev == st.st_dev && us.st_ino == st.st_ino)
+                e.flags |= LX_FP_FD_UPPER;
+        }
         if (S_ISDIR(st.st_mode)) {
             e.flags |= LX_FP_FD_DIR;
             // A listing the dispatcher serves (a union being read, a virtual
@@ -354,6 +389,36 @@ private:
     static bool fp_older(const fastpath::Region& reg, int fd, std::uint32_t idx) {
         auto it = reg.fd_mark.find(fd);
         return it != reg.fd_mark.end() && static_cast<std::int32_t>(idx - it->second) < 0;
+    }
+
+    // Take fd's merged listing from the blob (see fp_before_call). Close the
+    // slot to new users first, let a call already inside finish, then read
+    // where it got to.
+    template <class K>
+    void fp_take_union(K& k, ::pid_t tg, std::uint64_t base, int fd) {
+        if (fd < 0 || fd >= static_cast<int>(LX_FP_FDS)) return;
+        const std::uint64_t fat = base + LX_FP_FDMAP_OFF + static_cast<std::uint64_t>(fd) * sizeof(lx_fp_fd);
+        lx_fp_fd e{};
+        if (!fp_get(cur_, fat, e) || (e.seq & 1) || !(e.flags & LX_FP_FD_UNION)) return;
+        if (!e.ref || e.ref > LX_FP_UNIONS) return;
+        const std::uint64_t ua = base + LX_FP_UNION_OFF + (e.ref - 1) * sizeof(lx_fp_union);
+        std::int32_t fd1 = 0;
+        if (!fp_get(cur_, ua + offsetof(lx_fp_union, fd), fd1)) return;
+        std::uint64_t cum = 0;
+        if (fd1 == fd + 1) {
+            (void)fp_put(cur_, ua + offsetof(lx_fp_union, fd), std::int32_t{0});
+            // a thread mid-call releases the lock within microseconds; a
+            // stopped one never will, so don't wait for long
+            for (int i = 0; i < 20000; ++i) {
+                std::uint32_t lock = 0;
+                if (!fp_get(cur_, ua + offsetof(lx_fp_union, lock), lock) || lock == 0) break;
+            }
+            (void)fp_get(cur_, ua + offsetof(lx_fp_union, cum), cum);
+        }
+        k.files().seek_dir_in(gpid_of(tg), fd, cum);
+        e.flags = static_cast<std::uint8_t>((e.flags | LX_FP_FD_STREAM) & ~LX_FP_FD_UNION);
+        e.ref = 0;
+        fp_write_fd(base, fd, e);
     }
 
     // Apply process tg's logged fd events to the dispatcher's table. An

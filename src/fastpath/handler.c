@@ -133,10 +133,17 @@ static inline int seq_same(const uint32_t* p, uint32_t s1) {
 }
 
 static void zero(void* p, unsigned long n) {
-    volatile char* c = (volatile char*)p;
+    char* c = (char*)p;
+    while (n >= 8) { uint64_t z = 0; __builtin_memcpy(c, &z, 8); c += 8; n -= 8; }
     while (n--) *c++ = 0;
 }
 static void move(char* d, const char* s, unsigned long n) {
+    while (n >= 8) {
+        uint64_t w;
+        __builtin_memcpy(&w, s, 8);
+        __builtin_memcpy(d, &w, 8);
+        d += 8; s += 8; n -= 8;
+    }
     while (n--) *d++ = *s++;
 }
 /* The compiler may turn struct copies into these calls. */
@@ -163,12 +170,20 @@ struct env {
     const struct lx_fp_table* t;
     struct lx_fp_proc* p;
     struct lx_fp_fd* fds;
+    struct lx_fp_union* u;
+    struct lx_fp_dir* vd;
     struct lx_fp_stats* s;
     const uint64_t* key;
     uint32_t seq;   /* table seq at the start of the call */
 };
 
 static int exc_has(const struct env* e, uint64_t h) {
+    /* most paths have no exception at all: two bits in 4 KB say so */
+    const uint32_t bits = LX_FP_EXC_BLOOM_WORDS * 64;
+    const uint32_t b1 = (uint32_t)h & (bits - 1), b2 = (uint32_t)(h >> 32) & (bits - 1);
+    if (!(load_acq64(&e->t->exc_bloom[b1 / 64]) & (1ULL << (b1 % 64))) ||
+        !(load_acq64(&e->t->exc_bloom[b2 / 64]) & (1ULL << (b2 % 64))))
+        return 0;
     const uint64_t* x = e->t->exc;
     const uint32_t i = (uint32_t)h & (LX_FP_EXC_SLOTS - 1);
     for (uint32_t k = 0; k < LX_FP_PROBES; ++k) {
@@ -259,6 +274,8 @@ static int host_special(const char* p, int n) {
 }
 
 static long sys(const struct env* e, long nr, long a0, long a1, long a2, long a3) {
+    if (__builtin_expect(e->t->off_ops >> 31, 0) && nr >= 0 && nr < 512)
+        __atomic_fetch_add(&e->s->gate[nr], 1, __ATOMIC_RELAXED);
     return lx_fp_gate(nr, a0, a1, a2, a3, e->key);
 }
 
@@ -274,6 +291,7 @@ static int fd_read(const struct env* e, long fd, struct lx_fp_fd* out) {
     out->flags = ent->flags;
     out->len = ent->len;
     out->gen = ent->gen;
+    out->ref = ent->ref;
     out->dev = ent->dev;
     out->ino = ent->ino;
     const uint32_t len = out->len;
@@ -305,7 +323,7 @@ static int fd_write(const struct env* e, long fd, const struct lx_fp_fd* src) {
     ent->flags = src->flags;
     ent->len = src->len;
     ent->gen = src->gen;
-    ent->pad = 0;
+    ent->ref = src->ref;
     ent->dev = src->dev;
     ent->ino = src->ino;
     if (src->len < LX_FP_FD_PATH) {
@@ -376,6 +394,7 @@ struct res {
     uint32_t gn;
     int upn, lon, hn;
     int dir_check;      /* g's parent must be fst's inode */
+    int fd_upper;       /* the dirfd is the upper copy of its directory */
     int no_upper;       /* the leaf's parent is not in the upper layer */
     const struct lx_fp_mount* m;
     const char* hp;     /* the layer that holds the leaf */
@@ -392,6 +411,7 @@ static int guest_path(const struct env* e, long dirfd, uint64_t path_ptr, int by
     char* g = r->g;
     long n = 0;
     r->dir_check = 0;
+    r->fd_upper = 0;
     if (path_ptr) {
         n = lx_fp_strcpy(g, (const char*)path_ptr, LX_FP_PATH_MAX - 1);
         if (n < 0 || n >= (long)LX_FP_PATH_MAX - 1) return -1;
@@ -413,6 +433,7 @@ static int guest_path(const struct env* e, long dirfd, uint64_t path_ptr, int by
            directory it has open (checked after the layers are known) */
         if (fd_host(e, dirfd, &ent, &r->fst) != 0 || !(ent.flags & LX_FP_FD_DIR)) return -1;
         if (ent.gen != load_acq(&e->t->dir_gen)) return -1;
+        r->fd_upper = (ent.flags & LX_FP_FD_UPPER) != 0;
         const uint32_t dl = ent.len;
         const uint32_t lead = dl == 1 ? 1 : dl + 1;
         if (lead + (uint32_t)n >= LX_FP_PATH_MAX) return -1;
@@ -448,6 +469,29 @@ static int guest_path(const struct env* e, long dirfd, uint64_t path_ptr, int by
     }
     r->gn = (uint32_t)n;
     return 0;
+}
+
+/* This process's own cache of dirs dir_verify found clean (a direct-mapped
+   table in its private memory). Valid while dir_gen hasn't moved: a write
+   anywhere bumps it, as for the shared cache. */
+static int vdir_get(const struct env* e, uint64_t h, uint32_t len) {
+    struct lx_fp_dir* d = &e->vd[(uint32_t)h & (LX_FP_VDIRS - 1)];
+    const uint32_t g1 = load_acq(&d->gen);
+    if (g1 == 0 || g1 != load_acq(&e->t->dir_gen)) return 0;
+    const uint64_t dh = load_acq64(&d->hash);
+    const uint32_t dl = d->len, nu = d->no_upper;
+    if (!seq_same(&d->gen, g1) || dh != h || dl != len) return 0;
+    return nu ? 2 : 1;
+}
+static void vdir_put(const struct env* e, uint64_t h, uint32_t len, uint32_t gen, int no_upper) {
+    struct lx_fp_dir* d = &e->vd[(uint32_t)h & (LX_FP_VDIRS - 1)];
+    uint32_t g = load_acq(&d->gen);
+    if (g == 0xffffffffu) return;   /* another thread is writing it */
+    if (!__atomic_compare_exchange_n(&d->gen, &g, 0xffffffffu, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+    __atomic_store_n(&d->hash, h, __ATOMIC_RELAXED);
+    d->len = (uint16_t)len;
+    d->no_upper = (uint16_t)(no_upper ? 1 : 0);
+    __atomic_store_n(&d->gen, gen, __ATOMIC_RELEASE);
 }
 
 /* Is guest dir g[0..dn) (in mount m, whose prefix is g[0..skip)) a real
@@ -498,24 +542,77 @@ static int dir_verify(const struct env* e, const struct lx_fp_mount* m, const ch
     return no_up;
 }
 
+/* Paths the supervisor answers differently: a removed path or one under it,
+   a chmod/chown record, a socket placeholder. Also hands back the leaf's
+   parent (position of the last slash, and its hash) for the dir cache.
+   0 ok, -1 excepted. */
+static int exc_walk(const struct env* e, const char* g, uint32_t gn, uint32_t* last, uint64_t* last_h) {
+    uint64_t h = FNV_INIT;
+    *last = 0;
+    *last_h = 0;
+    for (uint32_t i = 0; i < gn; ++i) {
+        if (g[i] == '/' && i > 0) {
+            const uint64_t ph = fnv_finish(h, i);
+            if (exc_has(e, ph)) return -1;
+            *last = i;
+            *last_h = ph;
+        }
+        h = fnv_step(h, (unsigned char)g[i]);
+    }
+    const uint64_t full = fnv_finish(h, gn);
+    if (exc_has(e, full) || exc_has(e, full ^ LX_FP_LEAF_SALT)) return -1;
+    return 0;
+}
+
+/* layers() for the dirfd fast route: the same exception and mount checks,
+   and the leaf's parent known (cached) to be a clean dir; the name is then
+   looked up relative to the fd, the directory it really has open. 0 ok. */
+static int layers_quick(const struct env* e, struct res* r) {
+    const char* g = r->g;
+    const uint32_t gn = r->gn;
+    if (!canonical(g, gn)) return -1;
+    uint32_t last;
+    uint64_t last_h;
+    if (exc_walk(e, g, gn, &last, &last_h) != 0) return -1;
+    const struct lx_fp_mount* m = deepest(e, g, gn);
+    if (!m || m->kind == LX_FP_MNT_VIRTUAL) return -1;
+    r->m = m;
+    const uint32_t skip = m->prefix_len == 1 ? 0 : m->prefix_len;
+    if (last <= skip) return -1;
+    int dc = dir_clean(e, last_h, last);
+    if (dc == 0) dc = vdir_get(e, last_h, last);
+    if (dc == 0) return -1;
+    const char* rel = g + skip;
+    uint32_t rl = gn - skip;
+    while (rl && rel[0] == '/') { ++rel; --rl; }
+    r->upn = -1;
+    r->lon = join(r->lo, m->base, m->base_len, rel, rl);
+    if (r->lon < 0 || host_special(r->lo, r->lon)) return -1;
+    r->hp = r->lo;
+    r->hn = r->lon;
+    r->no_upper = 1;
+    if (m->kind == LX_FP_MNT_OVERLAY && dc != 2) {
+        /* the dir is in the upper: the fd must be that copy, and a name
+           missing from it may still be in the lower (asked by path) */
+        if (!r->fd_upper) return -1;
+        r->upn = join(r->up, m->upper, m->upper_len, rel, rl);
+        if (r->upn < 0 || host_special(r->up, r->upn)) return -1;
+        r->hp = r->up;
+        r->hn = r->upn;
+        r->no_upper = 0;
+    }
+    return 0;
+}
+
 /* Which host paths r->g maps to (r->up for an overlay's upper, r->lo),
    after every check that the supervisor would answer it the plain way. */
 static int layers(const struct env* e, struct res* r) {
     const char* g = r->g;
     const uint32_t gn = r->gn;
     if (!canonical(g, gn)) return -1;
-
-    /* paths the supervisor answers differently: a removed path or one
-       under it, a chmod/chown record, a socket placeholder */
-    {
-        uint64_t h = FNV_INIT;
-        for (uint32_t i = 0; i < gn; ++i) {
-            if (g[i] == '/' && i > 0 && exc_has(e, fnv_finish(h, i))) return -1;
-            h = fnv_step(h, (unsigned char)g[i]);
-        }
-        const uint64_t full = fnv_finish(h, gn);
-        if (exc_has(e, full) || exc_has(e, full ^ LX_FP_LEAF_SALT)) return -1;
-    }
+    uint32_t last;
+    uint64_t last_h;
+    if (exc_walk(e, g, gn, &last, &last_h) != 0) return -1;
 
     const struct lx_fp_mount* m = deepest(e, g, gn);
     if (!m || m->kind == LX_FP_MNT_VIRTUAL) return -1;
@@ -533,12 +630,15 @@ static int layers(const struct env* e, struct res* r) {
        layer the supervisor's probe would pick (upper, else lower). */
     int no_upper = 0;
     {
-        uint32_t last = 0;
-        for (uint32_t i = 0; i < gn; ++i) if (g[i] == '/') last = i;
         if (last > skip) {
-            const int dc = dir_clean(e, lx_fp_hash(g, last), last);
+            int dc = dir_clean(e, last_h, last);
+            if (!dc) dc = vdir_get(e, last_h, last);
             if (dc) no_upper = dc == 2;
-            else if ((no_upper = dir_verify(e, m, g, last, skip)) < 0) return -1;
+            else {
+                const uint32_t gen = load_acq(&e->t->dir_gen);
+                if ((no_upper = dir_verify(e, m, g, last, skip)) < 0) return -1;
+                vdir_put(e, last_h, last, gen, no_upper);
+            }
         }
     }
 
@@ -629,8 +729,35 @@ static long do_stat(const struct env* e, uint64_t* f, long nr) {
     }
     struct res r;
     const int gp = guest_path(e, dirfd, path_ptr, by_fd, &r);
-    if (gp < 0 || layers(e, &r) != 0) return FALLBACK;
-    if (gp == 2) {
+    if (gp < 0) return FALLBACK;
+    /* relative to a dirfd whose directory is the only layer the name can be
+       in (a bind mount, or an overlay dir with no upper copy): stat it
+       relative to the fd itself, the directory it really has open. Same
+       checks on the guest path as layers(), no parent walk. */
+    const int quick = r.dir_check && layers_quick(e, &r) == 0;
+    if (!quick && layers(e, &r) != 0) return FALLBACK;
+    if (quick) {
+        const char* name = (const char*)path_ptr;
+        char nm[256];
+        const long nl = lx_fp_strcpy(nm, name, sizeof nm - 1);
+        if (nl <= 0 || nl >= (long)sizeof nm - 1) return FALLBACK;
+        nm[nl] = 0;
+        for (long i = 0; i < nl; ++i) if (nm[i] == '/') return FALLBACK;
+        const long rc = sys(e, NR_newfstatat, dirfd, (long)nm, (long)&r.st, AT_SYMLINK_NOFOLLOW_);
+        if (rc == -ENOENT_ && r.upn >= 0) {
+            /* not in the upper copy: the lower decides (the supervisor's order) */
+            r.hp = r.lo; r.hn = r.lon;
+            const long r2 = sys(e, NR_newfstatat, AT_FDCWD_, (long)r.lo, (long)&r.st, AT_SYMLINK_NOFOLLOW_);
+            if (r2 == -ENOENT_) return table_unchanged(e) ? -ENOENT_ : FALLBACK;
+            if (r2 != 0) return FALLBACK;
+        } else if (rc == -ENOENT_) {
+            return table_unchanged(e) ? -ENOENT_ : FALLBACK;
+        } else if (rc != 0) {
+            return FALLBACK;
+        }
+        if (follow && (r.st.mode & S_IFMT_) == S_IFLNK_) return FALLBACK;
+        if (exc_has(e, lx_fp_hash(r.hp, (uint32_t)r.hn) ^ LX_FP_LEAF_SALT)) return FALLBACK;
+    } else if (gp == 2) {
         /* the fd's own inode, whichever layer it was opened in */
         r.st = r.fst;
         r.hp = r.lo; r.hn = r.lon;
@@ -783,7 +910,9 @@ static long do_open(const struct env* e, uint64_t* f, long nr) {
     }
     struct lx_fp_fd ent;
     ent.kind = LX_FP_FD_HOST;
+    ent.ref = 0;
     ent.flags = type == S_IFDIR_ ? LX_FP_FD_DIR : 0;
+    if (r.hp == r.up) ent.flags |= LX_FP_FD_UPPER;
     /* a directory on a plain bind mount lists natively from the start */
     if (type == S_IFDIR_ && r.m->kind == LX_FP_MNT_BIND) ent.flags |= LX_FP_FD_NATIVE;
     ent.len = (uint16_t)r.gn;
@@ -809,6 +938,8 @@ static long do_close(const struct env* e, uint64_t* f) {
     /* clear first: once the kernel frees the number, another thread's open
        may get it and its entry must not be wiped by ours */
     fd_clear(e, fd);
+    if ((ent.flags & LX_FP_FD_UNION) && ent.ref && ent.ref <= LX_FP_UNIONS)
+        __atomic_store_n(&e->u[ent.ref - 1].fd, 0, __ATOMIC_RELEASE);
     const long rc = sys(e, NR_close, fd, 0, 0, 0);
     ev_commit(e, &ev, tg, LX_FP_EV_CLOSE, fd, 0);
     return rc;
@@ -827,8 +958,9 @@ static long do_dup(const struct env* e, uint64_t* f, long nr) {
     }
     struct lx_fp_fd ent;
     if (fd_read(e, src, &ent) != 0 || ent.kind != LX_FP_FD_HOST) return FALLBACK;
-    /* the supervisor's merged listing restarts on a dup; leave it the call */
-    if (ent.flags & LX_FP_FD_STREAM) return FALLBACK;
+    /* the supervisor's merged listing restarts on a dup, and the blob's is
+       handed to the supervisor first: leave it the call */
+    if (ent.flags & (LX_FP_FD_STREAM | LX_FP_FD_UNION)) return FALLBACK;
     const long tg = owner(e);
     if (!tg) return FALLBACK;
     struct kstat st;
@@ -854,30 +986,309 @@ static long do_dup(const struct env* e, uint64_t* f, long nr) {
 /* Decide how a host directory fd is listed: natively when the guest dir is
    exactly one host dir (one layer, nothing removed in it), else by the
    supervisor's merged listing. 1 native, 0 merged, -1 can't tell. */
-static int list_natively(const struct env* e, const struct lx_fp_fd* ent, const struct kstat* fst) {
-    struct res r;
+/* Decide how a host directory fd is listed: natively when the guest dir is
+   exactly one host dir (one layer, nothing removed in it); by the blob's
+   own merge when it is an upper and a lower dir and the fd is the upper;
+   else by the supervisor. 1 native, 2 blob merge (lower in r->lo, its
+   stat in *lst), 0 supervisor, -1 can't tell. */
+static int list_natively(const struct env* e, const struct lx_fp_fd* ent, const struct kstat* fst,
+                         struct res* r, struct kstat* lst) {
     if (ent->gen != load_acq(&e->t->dir_gen)) return -1;
-    move(r.g, ent->path, ent->len);
-    r.g[ent->len] = 0;
-    r.gn = ent->len;
-    r.dir_check = 0;
-    if (layers(e, &r) != 0) return -1;
-    if (r.m->kind == LX_FP_MNT_BIND) return 1;
+    move(r->g, ent->path, ent->len);
+    r->g[ent->len] = 0;
+    r->gn = ent->len;
+    r->dir_check = 0;
+    if (layers(e, r) != 0) return -1;
+    if (r->m->kind == LX_FP_MNT_BIND) return 1;
     /* the mount's root holds our journals in its upper; a dir with a
        removed name in it needs the names filtered */
-    if (r.gn == r.m->prefix_len) return 0;
-    if (exc_has(e, lx_fp_hash(r.g, r.gn) ^ LX_FP_WO_DIR_SALT)) return 0;
-    struct kstat us, ls;
-    const long ru = sys(e, NR_newfstatat, AT_FDCWD_, (long)r.up, (long)&us, AT_SYMLINK_NOFOLLOW_);
-    const long rl = sys(e, NR_newfstatat, AT_FDCWD_, (long)r.lo, (long)&ls, AT_SYMLINK_NOFOLLOW_);
+    if (r->gn == r->m->prefix_len) return 0;
+    if (exc_has(e, lx_fp_hash(r->g, r->gn) ^ LX_FP_WO_DIR_SALT)) return 0;
+    struct kstat us;
+    const long ru = sys(e, NR_newfstatat, AT_FDCWD_, (long)r->up, (long)&us, AT_SYMLINK_NOFOLLOW_);
+    const long rl = sys(e, NR_newfstatat, AT_FDCWD_, (long)r->lo, (long)lst, AT_SYMLINK_NOFOLLOW_);
     if ((ru != 0 && ru != -ENOENT_) || (rl != 0 && rl != -ENOENT_)) return -1;
     const int up_dir = ru == 0 && (us.mode & S_IFMT_) == S_IFDIR_;
-    const int lo_dir = rl == 0 && (ls.mode & S_IFMT_) == S_IFDIR_;
-    if (up_dir && lo_dir) return 0;
-    const struct kstat* one = up_dir ? &us : lo_dir ? &ls : 0;
-    if (!one || one->dev != fst->dev || one->ino != fst->ino) return -1;
-    if (!table_unchanged(e)) return -1;
+    const int lo_dir = rl == 0 && (lst->mode & S_IFMT_) == S_IFDIR_;
+    /* the supervisor lists every overlay dir through its union (its own
+       ".", ".." and cookies), so the blob does too; the fd is the upper
+       copy if there is one, else the lower and there is no second layer */
+    if (up_dir) {
+        if (us.dev != fst->dev || us.ino != fst->ino || r->lon >= (int)LX_FP_HOST_MAX) return 0;
+        if (!lo_dir) lst->ino = 0;
+        return table_unchanged(e) ? 2 : -1;
+    }
+    if (lo_dir) {
+        if (lst->dev != fst->dev || lst->ino != fst->ino) return -1;
+        lst->ino = 0;
+        return table_unchanged(e) ? 2 : -1;
+    }
+    return -1;
+}
+
+/* -- merged listings ---------------------------------------------------------
+   The same entries, order, d_ino, d_type and d_off cookies as the
+   supervisor's overlay_dir_union + getdents64: "." and ".." (inodes 1 and
+   2), the upper dir's names in its own order, then the lower's that the
+   upper doesn't have; our journals hidden; types folded to dir, symlink
+   or regular. A cookie is the byte count up to and including the entry,
+   so the supervisor can take over at any of them. */
+
+struct kdirent {   /* struct linux_dirent64 */
+    uint64_t ino;
+    int64_t  off;
+    uint16_t reclen;
+    uint8_t  type;
+    char     name[];
+};
+#define DT_DIR_ 4
+#define DT_REG_ 8
+#define DT_LNK_ 10
+
+static uint32_t reclen_of(uint32_t namelen) { return (19u + namelen + 1u + 7u) & ~7u; }
+
+static int hidden_name(const char* n) {
+    static const char a[] = ".linuxity-meta", b[] = ".linuxity-links", c[] = ".linuxity-whiteout";
+    const char* s[3] = {a, b, c};
+    for (int k = 0; k < 3; ++k) {
+        const char* x = s[k];
+        const char* y = n;
+        while (*x && *x == *y) { ++x; ++y; }
+        if (!*x && !*y) return 1;
+    }
+    return 0;
+}
+static int dot_or_dotdot(const char* n) { return n[0] == '.' && (!n[1] || (n[1] == '.' && !n[2])); }
+
+static void bloom_bits(const char* n, uint32_t* a, uint32_t* b) {
+    uint32_t len = 0;
+    while (n[len]) ++len;
+    const uint64_t h = lx_fp_hash(n, len);
+    *a = (uint32_t)h & (LX_FP_BLOOM_BYTES * 8 - 1);
+    *b = (uint32_t)(h >> 32) & (LX_FP_BLOOM_BYTES * 8 - 1);
+}
+static void bloom_add(struct lx_fp_union* u, const char* n) {
+    uint32_t a, b;
+    bloom_bits(n, &a, &b);
+    u->bloom[a >> 3] |= (uint8_t)(1u << (a & 7));
+    u->bloom[b >> 3] |= (uint8_t)(1u << (b & 7));
+}
+static int bloom_may(const struct lx_fp_union* u, const char* n) {
+    uint32_t a, b;
+    bloom_bits(n, &a, &b);
+    return (u->bloom[a >> 3] & (1u << (a & 7))) && (u->bloom[b >> 3] & (1u << (b & 7)));
+}
+
+/* merge_dir's type rule: a host d_type of dir, symlink or regular stands;
+   anything else is lstat'ed (and its inode taken from that), and folded. */
+static uint8_t fold_type(const struct env* e, long dirfd, const struct kdirent* d, uint64_t* ino) {
+    if (d->type == DT_DIR_ || d->type == DT_LNK_ || d->type == DT_REG_) return d->type;
+    struct kstat st;
+    if (sys(e, NR_newfstatat, dirfd, (long)d->name, (long)&st, AT_SYMLINK_NOFOLLOW_) != 0) return DT_REG_;
+    *ino = st.ino;
+    const uint32_t t = st.mode & S_IFMT_;
+    return t == S_IFLNK_ ? DT_LNK_ : t == S_IFDIR_ ? DT_DIR_ : DT_REG_;
+}
+
+/* One call's worth of state, copied in from the slot and back out only if
+   the whole call worked (so a failed call leaves the slot where it was). */
+struct ucur {
+    uint32_t phase;
+    uint64_t pos, cum;
+    int64_t ukoff, lkoff;
+    uint64_t out;       /* bytes written to the caller this call */
+    uint64_t cap;       /* 0: count only (lseek), else the buffer size */
+    uint64_t target;    /* count only: stop at the first entry starting here */
+    uint64_t buf;
+    int full;
+};
+
+/* Hand out one entry. 1 emitted (or counted), 0 stop (buffer full or the
+   target reached), -1 fault. */
+static int emit(struct ucur* c, const char* name, uint64_t ino, uint8_t type) {
+    uint32_t nl = 0;
+    while (name[nl]) ++nl;
+    const uint32_t rl = reclen_of(nl);
+    if (!c->cap) {
+        if (c->cum >= c->target) return 0;
+    } else if (c->out + rl > c->cap) {
+        c->full = 1;
+        return 0;
+    }
+    if (c->cap) {
+        struct { struct kdirent d; char n[264]; } rec;
+        zero(&rec, rl);
+        rec.d.ino = ino ? ino : c->pos + 1;
+        rec.d.off = (int64_t)(c->cum + rl);
+        rec.d.reclen = (uint16_t)rl;
+        rec.d.type = type;
+        move(rec.d.name, name, nl);
+        if (lx_fp_copy((void*)(c->buf + c->out), &rec, rl) != 0) return -1;
+        c->out += rl;
+    }
+    c->cum += rl;
+    c->pos += 1;
     return 1;
+}
+
+/* Walk the merged listing from where c stands until the buffer is full,
+   the target is reached, or the end. 0 ok, -1 fault, -2 can't (fall back). */
+static int union_walk(const struct env* e, struct lx_fp_union* u, long fd, struct ucur* c) {
+    char scratch[4096] __attribute__((aligned(8)));
+    int stop = 0;
+    while (!stop && c->phase < 4) {
+        if (c->phase < 2) {
+            const int k = emit(c, c->phase == 0 ? "." : "..", 0, DT_DIR_);
+            if (k < 0) return -1;
+            if (k == 0) break;
+            c->phase++;
+            continue;
+        }
+        /* a layer: the guest's own fd for the first, a short-lived one for
+           the lower (the guest never sees it outside this call); a dir in
+           one layer only has no second phase */
+        if (c->phase == 3 && u->lino == 0) { c->phase = 4; break; }
+        long dfd = fd;
+        int64_t* koff = c->phase == 2 ? &c->ukoff : &c->lkoff;
+        if (c->phase == 3) {
+            dfd = sys(e, NR_openat, AT_FDCWD_, (long)u->lower, O_DIRECTORY_ | O_CLOEXEC_ | O_NOFOLLOW_, 0);
+            if (dfd < 0) return -2;
+            struct kstat ls;
+            if (sys(e, NR_fstat, dfd, (long)&ls, 0, 0) != 0 || ls.dev != u->ldev || ls.ino != u->lino) {
+                sys(e, NR_close, dfd, 0, 0, 0);
+                return -2;
+            }
+        }
+        int rc = 0;
+        for (;;) {
+            if (sys(e, NR_lseek, dfd, *koff, 0 /*SET*/, 0) < 0) { rc = -2; break; }
+            const long n = sys(e, NR_getdents64, dfd, (long)scratch, sizeof scratch, 0);
+            if (n < 0) { rc = -2; break; }
+            if (n == 0) { c->phase++; break; }
+            long at = 0;
+            while (at < n) {
+                const struct kdirent* d = (const struct kdirent*)(scratch + at);
+                at += d->reclen;
+                if (dot_or_dotdot(d->name) || hidden_name(d->name)) { *koff = d->off; continue; }
+                if (c->phase == 3 && bloom_may(u, d->name)) {
+                    struct kstat st;
+                    const long r2 = sys(e, NR_newfstatat, fd, (long)d->name, (long)&st, AT_SYMLINK_NOFOLLOW_);
+                    if (r2 == 0) { *koff = d->off; continue; }   /* the upper has it */
+                    if (r2 != -ENOENT_) { rc = -2; goto layer_done; }
+                }
+                uint64_t ino = d->ino;
+                const uint8_t t = fold_type(e, dfd, d, &ino);
+                const int k = emit(c, d->name, ino, t);
+                if (k < 0) { rc = -1; goto layer_done; }
+                if (k == 0) { stop = 1; goto layer_done; }
+                if (c->phase == 2) bloom_add(u, d->name);
+                *koff = d->off;
+            }
+        }
+    layer_done:
+        if (dfd != fd) {
+            /* close ours, unless another thread dup2'd over the number */
+            struct kstat ls;
+            if (dfd != fd && sys(e, NR_fstat, dfd, (long)&ls, 0, 0) == 0 && ls.dev == u->ldev && ls.ino == u->lino)
+                sys(e, NR_close, dfd, 0, 0, 0);
+        }
+        if (rc) return rc;
+    }
+    return 0;
+}
+
+/* The slot serving fd, locked; or 0. */
+static struct lx_fp_union* union_lock(const struct env* e, long fd, const struct lx_fp_fd* ent) {
+    if (!ent->ref || ent->ref > LX_FP_UNIONS) return 0;
+    struct lx_fp_union* u = &e->u[ent->ref - 1];
+    for (long spin = 0; spin < 1000000; ++spin) {
+        uint32_t z = 0;
+        if (__atomic_compare_exchange_n(&u->lock, &z, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+            if (__atomic_load_n(&u->fd, __ATOMIC_RELAXED) == (int32_t)fd + 1) return u;
+            __atomic_store_n(&u->lock, 0, __ATOMIC_RELEASE);
+            return 0;
+        }
+    }
+    return 0;
+}
+static void union_unlock(struct lx_fp_union* u) { __atomic_store_n(&u->lock, 0, __ATOMIC_RELEASE); }
+
+/* A free slot (or one no fd map entry refers to any more), locked. */
+static struct lx_fp_union* union_alloc(const struct env* e, long fd) {
+    for (uint32_t i = 0; i < LX_FP_UNIONS; ++i) {
+        struct lx_fp_union* u = &e->u[i];
+        uint32_t z = 0;
+        if (!__atomic_compare_exchange_n(&u->lock, &z, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) continue;
+        const int32_t owner_fd = u->fd;
+        int stale = owner_fd == 0;
+        if (!stale) {
+            struct lx_fp_fd o;
+            stale = fd_read(e, owner_fd - 1, &o) == 0 &&
+                    (!(o.flags & LX_FP_FD_UNION) || o.ref != i + 1);
+        }
+        if (stale) {
+            u->fd = (int32_t)fd + 1;
+            return u;
+        }
+        union_unlock(u);
+    }
+    return 0;
+}
+
+static void ucur_load(struct ucur* c, const struct lx_fp_union* u) {
+    c->phase = u->phase; c->pos = u->pos; c->cum = u->cum;
+    c->ukoff = u->ukoff; c->lkoff = u->lkoff;
+    c->out = 0; c->full = 0;
+}
+static void ucur_store(struct lx_fp_union* u, const struct ucur* c) {
+    u->phase = c->phase; u->pos = c->pos; u->cum = c->cum;
+    u->ukoff = c->ukoff; u->lkoff = c->lkoff;
+}
+static void ucur_rewind(struct ucur* c, struct lx_fp_union* u) {
+    c->phase = 0; c->pos = 0; c->cum = 0; c->ukoff = 0; c->lkoff = 0;
+    zero(u->bloom, sizeof u->bloom);
+}
+
+static long union_getdents(const struct env* e, long fd, const struct lx_fp_fd* ent, uint64_t buf, uint64_t cap) {
+    struct lx_fp_union* u = union_lock(e, fd, ent);
+    if (!u) return FALLBACK;
+    struct ucur c;
+    ucur_load(&c, u);
+    c.cap = cap; c.buf = buf; c.target = 0;
+    const int rc = union_walk(e, u, fd, &c);
+    long r;
+    if (rc == -2) r = FALLBACK;                       /* the supervisor takes over at u->cum */
+    else if (rc == -1) r = -14;                       /* EFAULT, nothing consumed */
+    else if (c.out == 0 && c.full) r = -EINVAL_;      /* not even one entry fits */
+    else { ucur_store(u, &c); r = (long)c.out; }
+    union_unlock(u);
+    return r;
+}
+
+/* lseek on a merged listing: the supervisor's rule (SET or CUR, the first
+   entry starting at or after the target). */
+static long union_lseek(const struct env* e, long fd, const struct lx_fp_fd* ent, int64_t off, long whence) {
+    struct lx_fp_union* u = union_lock(e, fd, ent);
+    if (!u) return FALLBACK;
+    const int64_t target = whence == 0 ? off : whence == 1 ? (int64_t)u->cum + off : -1;
+    long r;
+    if (target < 0) {
+        r = -EINVAL_;
+    } else if ((uint64_t)target == u->cum) {
+        r = (long)u->cum;
+    } else {
+        struct ucur c;
+        ucur_load(&c, u);
+        /* rewinddir reads the directory afresh, as the supervisor does */
+        if ((uint64_t)target < u->cum || target == 0) ucur_rewind(&c, u);
+        c.cap = 0; c.target = (uint64_t)target; c.buf = 0;
+        /* counting past upper names still has to record them for the dedup */
+        const int rc = union_walk(e, u, fd, &c);
+        if (rc == 0) { ucur_store(u, &c); r = (long)c.cum; }
+        else r = FALLBACK;
+    }
+    union_unlock(u);
+    return r;
 }
 
 static long do_getdents(const struct env* e, uint64_t* f) {
@@ -888,12 +1299,32 @@ static long do_getdents(const struct env* e, uint64_t* f) {
     if (ent.flags & LX_FP_FD_STREAM) return FALLBACK;
     if (!(ent.flags & LX_FP_FD_DIR) || (ent.flags & LX_FP_FD_NATIVE))
         return sys(e, NR_getdents64, fd, (long)ARG(f, 1), (long)ARG(f, 2), 0);
-    /* first read: decide, and tell the supervisor if it is native */
     const long tg = owner(e);
     if (!tg) return FALLBACK;
-    const int native = list_natively(e, &ent, &st);
-    if (native < 0) return FALLBACK;
-    if (!native) {
+    if (ent.flags & LX_FP_FD_UNION) return union_getdents(e, fd, &ent, ARG(f, 1), ARG(f, 2));
+    /* first read: decide, and tell the supervisor if it is native */
+    struct res r;
+    struct kstat lst;
+    const int how = list_natively(e, &ent, &st, &r, &lst);
+    if (how < 0) return FALLBACK;
+    if (how == 2) {
+        struct lx_fp_union* u = union_alloc(e, fd);
+        if (u) {
+            struct ucur c;
+            ucur_rewind(&c, u);
+            ucur_store(u, &c);
+            move(u->lower, r.lo, (unsigned long)r.lon + 1);
+            u->lolen = (uint32_t)r.lon;
+            u->ldev = lst.dev;
+            u->lino = lst.ino;
+            ent.flags = (uint8_t)((ent.flags | LX_FP_FD_UNION) & ~LX_FP_FD_BYSUP);
+            ent.ref = (uint32_t)(u - e->u) + 1;
+            (void)fd_write(e, fd, &ent);
+            union_unlock(u);
+            return union_getdents(e, fd, &ent, ARG(f, 1), ARG(f, 2));
+        }
+    }
+    if (how != 1) {
         ent.flags |= LX_FP_FD_STREAM;
         (void)fd_write(e, fd, &ent);
         return FALLBACK;
@@ -905,12 +1336,15 @@ static long do_getdents(const struct env* e, uint64_t* f) {
     ev_commit(e, &ev, tg, LX_FP_EV_OPEN, fd, &ent);
     return sys(e, NR_getdents64, fd, (long)ARG(f, 1), (long)ARG(f, 2), 0);
 }
-
 static long do_lseek(const struct env* e, uint64_t* f) {
     const long fd = (long)(int)ARG(f, 0);
     struct lx_fp_fd ent;
     struct kstat st;
     if (fd_host(e, fd, &ent, &st) != 0) return FALLBACK;
+    if (ent.flags & LX_FP_FD_UNION) {
+        if (!owner(e)) return FALLBACK;
+        return union_lseek(e, fd, &ent, (int64_t)ARG(f, 1), (long)(int)ARG(f, 2));
+    }
     /* a directory's cursor is the supervisor's unless it lists natively */
     if ((ent.flags & LX_FP_FD_DIR) && !(ent.flags & LX_FP_FD_NATIVE)) return FALLBACK;
     return sys(e, NR_lseek, fd, (long)ARG(f, 1), (long)ARG(f, 2), 0);
@@ -973,6 +1407,8 @@ long lx_fp_handle(uint64_t* frame, unsigned nr) {
     e.t = (const struct lx_fp_table*)(base + LX_FP_TABLE_OFF);
     e.p = (struct lx_fp_proc*)(base + LX_FP_PROC_OFF);
     e.fds = (struct lx_fp_fd*)(base + LX_FP_FDMAP_OFF);
+    e.u = (struct lx_fp_union*)(base + LX_FP_UNION_OFF);
+    e.vd = (struct lx_fp_dir*)(base + LX_FP_VDIR_OFF);
     e.s = (struct lx_fp_stats*)(base + LX_FP_STATS_OFF);
     e.key = e.t->key;
     if (e.t->magic != LX_FP_MAGIC || !load_acq(&e.t->enabled) || e.p->disabled) return FALLBACK;

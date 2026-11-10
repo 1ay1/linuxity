@@ -135,6 +135,8 @@ public:
             // First, apply any fd changes the guest made on its own.
             if constexpr (requires { trap_.fp_before_dispatch(kernel_); })
                 locked([&] { trap_.fp_before_dispatch(kernel_); });
+            if constexpr (requires { trap_.fp_before_call(f.regs, kernel_); })
+                locked([&] { trap_.fp_before_call(f.regs, kernel_); });
             if constexpr (requires { trap_.fp_maybe_patch(f.regs, f.pc, kernel_, sys); }) {
                 if (locked([&] { return trap_.fp_maybe_patch(f.regs, f.pc, kernel_, sys); })) continue;
             }

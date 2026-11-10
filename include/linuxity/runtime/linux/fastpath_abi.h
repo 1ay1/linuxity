@@ -34,7 +34,12 @@
 #define LX_FP_STACKS_OFF  0x51000ULL   /* rw; the page before it is a guard */
 #define LX_FP_STACKS      4u
 #define LX_FP_STACK_SIZE  0x8000ULL
-#define LX_FP_TABLE_OFF   0x71000ULL   /* r--, MAP_SHARED */
+#define LX_FP_UNION_OFF   0x71000ULL   /* rw: merged-directory listings in progress */
+#define LX_FP_UNIONS      16u
+#define LX_FP_BLOOM_BYTES 2048u
+#define LX_FP_VDIR_OFF    0x80000ULL   /* rw: dirs this process verified itself */
+#define LX_FP_VDIRS       1024u
+#define LX_FP_TABLE_OFF   0x91000ULL   /* r--, MAP_SHARED */
 #define LX_FP_TABLE_SIZE  0x120000ULL
 #define LX_FP_STATS_OFF   (LX_FP_TABLE_OFF + LX_FP_TABLE_SIZE)   /* rw-, MAP_SHARED, one page */
 #define LX_FP_REGION_SIZE (LX_FP_STATS_OFF + 0x1000ULL)
@@ -50,6 +55,7 @@
 #define LX_FP_DIR_SLOTS  32768u
 #define LX_FP_EXC_SLOTS  65536u
 #define LX_FP_PROBES     32u
+#define LX_FP_EXC_BLOOM_WORDS 512u   /* 4 KB */
 #define LX_FP_CWD_SLOTS  256u    /* processes whose cwd the blob knows */
 #define LX_FP_CWD_MAX    256u    /* longer cwds: relative paths fall back */
 #define LX_FP_EVENTS     64u     /* fd events a process can hold unapplied */
@@ -102,6 +108,9 @@ struct lx_fp_table {
     uint32_t n_mounts;
     uint32_t off_ops;  /* debug: ops the blob must leave to the trap (bit per op) */
     uint64_t key[2];   /* goes in the blob's syscalls' args 4 and 5 */
+    /* every exc hash sets bit (h & mask) and (h >> 32 & mask): a path no
+       exception can match is ruled out without touching exc[] */
+    uint64_t exc_bloom[LX_FP_EXC_BLOOM_WORDS];
     struct lx_fp_mount mounts[LX_FP_MAX_MOUNTS];
     struct lx_fp_cwd cwds[LX_FP_CWD_SLOTS];
     struct lx_fp_dir dirs[LX_FP_DIR_SLOTS];
@@ -150,6 +159,8 @@ enum { LX_FP_FD_NONE = 0, LX_FP_FD_HOST = 1 };
 #define LX_FP_FD_STREAM  4u   /* the supervisor serves its listing and seeks */
 #define LX_FP_FD_BYSUP   8u   /* written by the supervisor: its table agrees */
 #define LX_FP_FD_CLOSED 16u   /* closed in the guest: drop it from the table */
+#define LX_FP_FD_UNION  32u   /* the blob serves its merged listing (ref = slot + 1) */
+#define LX_FP_FD_UPPER  64u   /* opened in the upper layer (else the lower, or a bind mount) */
 struct lx_fp_fd {
     uint32_t seq;       /* seqlock */
     uint8_t  kind;      /* HOST: a host file or dir at path. NONE: something
@@ -157,9 +168,26 @@ struct lx_fp_fd {
     uint8_t  flags;
     uint16_t len;
     uint32_t gen;       /* table.dir_gen when the path was last known right */
-    uint32_t pad;
+    uint32_t ref;       /* UNION: which listing slot, + 1 */
     uint64_t dev, ino;
     char path[LX_FP_FD_PATH];
+};
+
+/* A merged (upper + lower) directory listing the blob is serving, at
+   base + LX_FP_UNION_OFF. It produces exactly the entries, order, inodes
+   and d_off cookies the supervisor's own union would, so either side can
+   take over at any cookie. */
+struct lx_fp_union {
+    uint32_t lock;      /* 1 while a blob call is using it */
+    int32_t  fd;        /* the guest fd (its host fd is the upper dir) */
+    uint32_t phase;     /* 0 ".", 1 "..", 2 upper, 3 lower, 4 done */
+    uint32_t lolen;
+    uint64_t pos;       /* entries handed out */
+    uint64_t cum;       /* bytes handed out: the d_off cookie and lseek position */
+    int64_t  ukoff, lkoff;  /* where to resume in each layer (host cookies) */
+    uint64_t ldev, lino;    /* the lower dir, checked each time it is opened */
+    uint8_t  bloom[LX_FP_BLOOM_BYTES];   /* upper names, for the lower dedup */
+    char     lower[LX_FP_HOST_MAX];      /* the lower layer's dir */
 };
 
 /* Shared by every process, at base + LX_FP_STATS_OFF (the page after the
@@ -169,6 +197,7 @@ struct lx_fp_stats {
     uint32_t evsum;     /* bumped with any ev[] */
     uint32_t pad;
     uint32_t ev[LX_FP_CWD_SLOTS];   /* bumped when a process (by tgid) logs an fd event */
+    uint32_t gate[512];  /* debug (table.off_ops bit 31): host calls the blob made, by nr */
 };
 
 /* At offset 0 of the blob; offsets are from the blob start. */
