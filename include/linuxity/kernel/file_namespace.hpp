@@ -729,7 +729,8 @@ public:
         // find() plus erase(iterator) is C++20 and allocates nothing either.
         for (std::string_view hide : {MetaStore::journal_leaf(),
                                       LinkTable::journal_leaf(),
-                                      std::string_view{".linuxity-whiteout"}})
+                                      std::string_view{".linuxity-whiteout"},
+                                      std::string_view{".linuxity-meta.ok"}})
             if (auto it = seen.find(hide); it != seen.end()) it->second.hidden = true;
         // Drop names whited-out from the lower layer (removed in the overlay
         // view but still present on the pristine rootfs) unless the upper has
@@ -1815,8 +1816,12 @@ private:
     // partial iff it has no `desc` file; removing it makes pacman re-create a
     // clean entry on the next install.
     static void repair_pacman_db(const std::string& upper) {
+        // pacman holds db.lck for a whole transaction, so a half-written
+        // entry always comes with a lock left behind. No lock: nothing to
+        // repair, and no stat of every installed package on every start.
         std::string lck = upper + "/var/lib/pacman/db.lck";
-        if (exists(lck.c_str())) ::unlink(lck.c_str());
+        if (!exists(lck.c_str())) return;
+        ::unlink(lck.c_str());
 
         std::string localdir = upper + "/var/lib/pacman/local";
         DIR* d = ::opendir(localdir.c_str());

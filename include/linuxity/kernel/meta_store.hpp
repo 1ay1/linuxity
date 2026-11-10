@@ -83,8 +83,10 @@ public:
         // Root-only: drop records the host inode already satisfies (written
         // by older versions before set_mode checked the landed mode), and a
         // mode on a symlink (always 0777, never consulted). One lstat per
-        // record, once per session, keeps every later fork's replay tiny.
+        // record -- so only when the journal changed since the last pass
+        // left it clean (its size then is in <upper>/.linuxity-meta.ok).
         std::size_t pruned = 0;
+        if (compact && journal_size() == clean_size()) compact = false;
         if (compact) {
             for (auto it = table_.begin(); it != table_.end();) {
                 MetaRecord& r = it->second;
@@ -108,6 +110,29 @@ public:
         // rewrites it to the live set (atomically: temp + rename) when it
         // is mostly dead weight.
         if (compact && (pruned || (lines > 1024 && lines > table_.size() * 4))) rewrite();
+        if (compact) note_clean();
+    }
+    // The journal's size, or -1.
+    [[nodiscard]] long long journal_size() const {
+        struct ::stat st{};
+        return ::stat(journal_path_.c_str(), &st) == 0 ? static_cast<long long>(st.st_size) : -1;
+    }
+    // The size the journal had when a compaction pass last found it clean.
+    [[nodiscard]] long long clean_size() const {
+        long long v = -2;
+        if (std::FILE* f = std::fopen((journal_path_ + ".ok").c_str(), "r")) {
+            if (std::fscanf(f, "%lld", &v) != 1) v = -2;
+            std::fclose(f);
+        }
+        return v;
+    }
+    void note_clean() const {
+        const std::string tmp = journal_path_ + ".ok.tmp";
+        if (std::FILE* f = std::fopen(tmp.c_str(), "w")) {
+            std::fprintf(f, "%lld\n", journal_size());
+            std::fclose(f);
+            (void)std::rename(tmp.c_str(), (journal_path_ + ".ok").c_str());
+        }
     }
     // Host directories a guest path may live in (upper first, then lower),
     // for compaction's "does the inode already carry this mode" check.

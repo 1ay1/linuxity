@@ -1048,9 +1048,10 @@ struct kdirent {   /* struct linux_dirent64 */
 static uint32_t reclen_of(uint32_t namelen) { return (19u + namelen + 1u + 7u) & ~7u; }
 
 static int hidden_name(const char* n) {
-    static const char a[] = ".linuxity-meta", b[] = ".linuxity-links", c[] = ".linuxity-whiteout";
-    const char* s[3] = {a, b, c};
-    for (int k = 0; k < 3; ++k) {
+    static const char a[] = ".linuxity-meta", b[] = ".linuxity-links", c[] = ".linuxity-whiteout",
+                      d[] = ".linuxity-meta.ok";
+    const char* s[4] = {a, b, c, d};
+    for (int k = 0; k < 4; ++k) {
         const char* x = s[k];
         const char* y = n;
         while (*x && *x == *y) { ++x; ++y; }

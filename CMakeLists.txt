@@ -136,6 +136,12 @@ if(CMAKE_SYSTEM_NAME IN_LIST LX_PTRACE_HOSTS)
     add_executable(linuxity src/main.cpp src/cli.cpp ${CMAKE_BINARY_DIR}/bridge_blob.S
                             ${CMAKE_BINARY_DIR}/fastpath_blob.S)
     target_link_libraries(linuxity PRIVATE linuxity_core linuxity_host z)
+    # Every guest exec re-runs nothing of ours, but every linuxity run does:
+    # resolving symbols against a shared libstdc++ was 0.7ms of a 0.9ms
+    # start. Linked in, it is a few hundred relative relocations.
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND NOT ANDROID)
+        target_link_options(linuxity PRIVATE -static-libstdc++ -static-libgcc)
+    endif()
     add_dependencies(linuxity linuxity-bridge linuxity-fastpath)
 elseif(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
     # macOS: the Hypervisor.framework backend. hv_vm_create is entitlement-

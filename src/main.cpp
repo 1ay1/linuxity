@@ -36,6 +36,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <memory>
@@ -105,12 +106,20 @@ bool is_utf8_name(std::string_view v) {
 // ASCII: tmux then draws box and block characters as '_'.
 void fix_guest_locale(std::vector<std::string>& env, const std::vector<std::string>& layers) {
     bool chosen = false;   // LANG, LC_ALL or LC_CTYPE picks the character set
+    // a shell usually sets ten LC_* to the same value: check each name once
+    std::vector<std::pair<std::string, bool>> known;
+    const auto has = [&](std::string_view v) {
+        for (const auto& [n, ok] : known) if (n == v) return ok;
+        const bool ok = guest_has_locale(layers, v);
+        known.emplace_back(std::string{v}, ok);
+        return ok;
+    };
     for (auto& kv : env) {
         if (!kv.starts_with("LANG=") && !kv.starts_with("LC_")) continue;
         const auto eq = kv.find('=');
         const std::string_view v = std::string_view{kv}.substr(eq + 1);
         if (v.empty()) continue;
-        if (!guest_has_locale(layers, v)) kv = kv.substr(0, eq + 1) + "C.UTF-8";
+        if (!has(v)) kv = kv.substr(0, eq + 1) + "C.UTF-8";
         if (kv.starts_with("LANG=") || kv.starts_with("LC_ALL=") || kv.starts_with("LC_CTYPE="))
             chosen = true;
     }
@@ -127,7 +136,7 @@ void fix_guest_locale(std::vector<std::string>& env, const std::vector<std::stri
                 s.remove_prefix(5);
                 while (!s.empty() && (s.back() == '\n' || s.back() == '"' || s.back() == '\'')) s.remove_suffix(1);
                 while (!s.empty() && (s.front() == '"' || s.front() == '\'')) s.remove_prefix(1);
-                if (is_utf8_name(s) && guest_has_locale(layers, s)) pick = std::string{s};
+                if (is_utf8_name(s) && has(s)) pick = std::string{s};
             }
             std::fclose(f);
             break;   // the top layer's file wins
@@ -1053,16 +1062,13 @@ int run_runtime(lx::cli::Options& o, int argc, char** argv) {
     // actually did it -- this host had 119 /tmp/linuxity-upper-* left over.
     // Adding a private /tmp would have made that worse, so both get cleaned
     // here, on every exit path.
-    //
-    // Shelling out to rm -rf rather than walking the tree: these are our own
-    // paths (we built the names), the guest is gone by now, and a hand-rolled
-    // recursive unlink is a lot of code to get a temp dir removed. A --persist
-    // upper is NEVER touched, only the per-pid one we created.
+    // A --persist upper is never touched, only the per-pid dirs we made.
+    // remove_all doesn't follow symlinks; forking rm -rf here cost 1.2ms a run.
     const auto sweep = [](const std::string& d) {
         if (d.empty()) return;
         if (d.rfind(host::tmp_path("linuxity-"), 0) != 0) return;   // ours, or nothing
-        std::string cmd = "rm -rf -- '" + d + "' 2>/dev/null";
-        (void)!std::system(cmd.c_str());
+        std::error_code ec;
+        std::filesystem::remove_all(d, ec);
     };
     sweep(private_tmp_dir);
     sweep(ephemeral_upper);
