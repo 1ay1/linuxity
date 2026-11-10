@@ -103,12 +103,12 @@ inline constexpr std::uint64_t kSockCloexec  = 0x80000;
     static constexpr char kHex[] = "0123456789abcdef";
     std::string p = abstract_dir();
     if (p.size() + 2 * name.size() + 1 < sizeof(::sockaddr_un{}.sun_path)) {
-        for (unsigned char c : name) { p += kHex[c >> 4]; p += kHex[c & 15]; }
+        for (const char ch : name) { const auto c = static_cast<unsigned char>(ch); p += kHex[c >> 4]; p += kHex[c & 15]; }
         if (name.empty()) p += "-";
         return p;
     }
     std::uint64_t h = 1469598103934665603ull;                 // FNV-1a
-    for (unsigned char c : name) { h ^= c; h *= 1099511628211ull; }
+    for (const char ch : name) { h ^= static_cast<unsigned char>(ch); h *= 1099511628211ull; }
     char b[24];
     std::snprintf(b, sizeof b, "h%016llx", static_cast<unsigned long long>(h));
     return p + b;

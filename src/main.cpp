@@ -11,6 +11,7 @@
 // and that is host_run() in src/run_<host>.cpp (see host_run.hpp).
 #include "host_run.hpp"
 #include "options.hpp"
+#include "verbs.hpp"
 
 #include "linuxity/kernel/resolver.hpp"
 #include "linuxity/kernel/resources.hpp"
@@ -382,18 +383,8 @@ int with_args(int (*fn)(int, char**), std::vector<std::string> a) {
     return fn(static_cast<int>(a.size()), av.data());
 }
 
-// Words that are commands, not programs to run.
-constexpr std::string_view kVerbs[] = {
-    "new", "import", "export", "images", "list", "ls", "default", "shell", "exec", "ps",
-    "kill", "status", "svc", "logs", "reload", "stop", "down", "set", "get", "unset",
-    "edit", "info", "check", "path", "users", "adduser", "snapshot", "snapshots",
-    "restore", "drop-snapshot", "reset", "rm", "remove", "rename", "schema", "env",
-    "help", "--help", "-h", "version", "--version", "up", "start", "run"};
-
-bool is_verb(std::string_view s) {
-    for (const auto v : kVerbs) if (s == v) return true;
-    return false;
-}
+// Words that are commands, not programs to run (src/verbs.hpp).
+bool is_verb(std::string_view s) { return lx::cli::find_verb(s) != nullptr; }
 
 // A bare word that is no verb and no program: almost always a typo'd verb
 // (`linuxity shel`). Say so, instead of trying to run it as a program. A
@@ -411,9 +402,9 @@ bool is_verb(std::string_view s) {
         if (on_path(store.load(def).config.rootfs)) return {};
     std::string best;
     std::size_t best_d = s.size() <= 3 ? 2 : 3;
-    for (const auto v : kVerbs) {
-        if (v.front() == '-') continue;
-        if (const auto d = lx::env::edit_distance(s, v); d < best_d) { best_d = d; best = std::string{v}; }
+    for (const auto& v : lx::cli::kVerbTable) {
+        if (!lx::cli::verb_listed(v, lx::cli::host_runs_instances())) continue;
+        if (const auto d = lx::env::edit_distance(s, v.name); d < best_d) { best_d = d; best = std::string{v.name}; }
     }
     return best;
 }

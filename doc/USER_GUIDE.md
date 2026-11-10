@@ -573,7 +573,14 @@ explains odd behaviour.
 
 ## 18. Command reference
 
-`[ENV]` can be left out to use the default environment.
+`[ENV]` can be left out to use the default environment. `linuxity help` lists
+every command this host supports; `linuxity help VERB` shows one.
+
+Tab completion (verbs, environments, settings, snapshots, distros):
+
+    echo 'source <(linuxity completion bash)' >> ~/.bashrc
+    echo 'source <(linuxity completion zsh)'  >> ~/.zshrc
+    linuxity completion fish > ~/.config/fish/completions/linuxity.fish
 
 | command | |
 |---|---|

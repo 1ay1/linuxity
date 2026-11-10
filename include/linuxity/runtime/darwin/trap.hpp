@@ -5430,7 +5430,7 @@ private:
                         std::to_integer<int>(addr[0]) == 1 && std::to_integer<int>(addr[1]) == 0) {
                         char nm[8];
                         std::snprintf(nm, sizeof nm, "%05x",
-                                      static_cast<unsigned>((::getpid() * 2654435761u + sock_ino(h)) & 0xfffff));
+                                      static_cast<unsigned>((static_cast<unsigned>(::getpid()) * 2654435761u + sock_ino(h)) & 0xfffff));
                         autoname[0] = std::byte{1};
                         std::memcpy(autoname.data() + 3, nm, 5);
                         addr = {autoname.data(), autoname.size()};

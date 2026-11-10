@@ -157,6 +157,13 @@ if(TARGET test_run_instance AND TARGET linuxity)
     add_dependencies(test_run_instance linuxity)
 endif()
 
+# The command line agrees with itself: every verb help shows is known to
+# `help VERB` and offered by completion, and nothing else is (src/verbs.hpp).
+if(TARGET linuxity AND NOT WIN32)
+    add_test(NAME cli_contract
+             COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/cli_contract.sh $<TARGET_FILE:linuxity>)
+endif()
+
 # The runtime/ layering invariants (no cross-backend includes, portable
 # headers free of backend deps, shared/ free of platform APIs, every backend
 # asserting the contract). A shell check rather than a C++ test because it is
