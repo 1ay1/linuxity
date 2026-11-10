@@ -331,16 +331,24 @@ public:
         // parent we have not learned yet.
         if (const auto& c = cwds_[pid]; !c.empty()) last_cwd_ = c;
     }
-    // On fork/clone the child inherits a COPY of the parent's cwd.
+    // On fork/clone the child inherits a COPY of the parent's cwd and of its
+    // fd bindings. Both are taken here, at fork time: set_current_pid only
+    // copies when the child has no cwd record yet, and this makes one.
     void inherit_cwd(std::int32_t child, std::int32_t parent) {
         auto it = cwds_.find(parent);
         cwds_[child] = (it != cwds_.end()) ? it->second : std::string{"/"};
+        // a child that already ran has its own (copied at its first call)
+        if (!fd_tables_.count(child))
+            if (auto fp = fd_tables_.find(parent); fp != fd_tables_.end())
+                fd_tables_[child] = fp->second.copy_for_fork();
+        if (child == seeded_pid_) seeded_pid_ = 0;
     }
     // Dropping a pid's record must also drop the "already seeded" claim:
     // the kernel recycles pids, and a new task reusing this number has to
     // re-seed from ITS parent rather than skip straight past the check.
     void forget_pid(std::int32_t pid) {
         cwds_.erase(pid);
+        fd_tables_.erase(pid);
         if (pid == seeded_pid_) seeded_pid_ = 0;
     }
     [[nodiscard]] bool cwd_known(std::int32_t pid) const noexcept { return cwds_.count(pid) != 0; }
@@ -552,6 +560,7 @@ public:
             if (for_write) { dirlink_cache_.clear(); ++dirs_version_; }
             std::size_t end = 0;
             bool clean = true;
+            bool parent_in_upper = !m->upper.empty() && rel.find('/') == std::string_view::npos;
             while ((end = rel.find('/', end)) != std::string_view::npos) {
                 const std::string_view sub = rel.substr(0, end);
                 const std::string guest = (m->prefix == "/" ? std::string{} : m->prefix) + "/" + std::string{sub};
@@ -562,18 +571,22 @@ public:
                 key += m->upper;
                 key.push_back('\0');
                 key += m->host_base;
+                bool in_upper = false;
                 if (auto it = dirlink_cache_.find(key); it != dirlink_cache_.end()) {
                     p = it->second.first;
                     target = it->second.second;
+                    in_upper = it->second.third;
                 } else {
                     p = m->upper.empty() ? Probe::absent : probe_link(join_host(m->upper, sub).c_str(), target);
+                    in_upper = p != Probe::absent;
                     if (p == Probe::absent) {
                         if (!m->upper.empty() && !whiteouts_.empty() && is_whiteout(guest)) p = Probe::notdir;   // stop here
                         else p = probe_link(join_host(m->host_base, sub).c_str(), target);
                     }
                     if (dirlink_cache_.size() > 65536) dirlink_cache_.clear();
-                    dirlink_cache_.emplace(std::move(key), std::pair{p, target});
+                    dirlink_cache_.emplace(std::move(key), DirProbe{p, target, in_upper});
                 }
+                parent_in_upper = in_upper;
                 if (p == Probe::absent || p == Probe::notdir) { clean = false; break; }
                 if (p == Probe::symlink) {
                     const std::string rest{rel.substr(end + 1)};
@@ -588,7 +601,7 @@ public:
             if (clean && on_clean_dir_ && depth == 0) {
                 const std::size_t cut = abs.rfind('/');
                 if (cut != std::string_view::npos && cut > 0)
-                    on_clean_dir_(abs.substr(0, cut));
+                    on_clean_dir_(abs.substr(0, cut), m->upper.empty() || parent_in_upper);
             }
         }
 
@@ -705,8 +718,9 @@ public:
         // layers first was two wasted host syscalls per enumerated directory
         // -- and `ls -lR` enumerates thousands.
         NameMap seen;                                  // name -> type
-        const bool had_up = merge_dir(up, seen);       // upper first (wins)
-        const bool had_lo = merge_dir(lo, seen);
+        std::vector<std::string_view> order;           // readdir order, upper then lower (as overlayfs)
+        const bool had_up = merge_dir(up, seen, &order);   // upper first (wins)
+        const bool had_lo = merge_dir(lo, seen, &order);
         if (!had_up && !had_lo) return out;            // neither layer exists
         // The shadow-metadata journal is an implementation file in the upper
         // layer, not part of the guest tree — never let it show up in a listing.
@@ -757,8 +771,9 @@ public:
         out.reserve(seen.size() + 2);
         out.push_back({".",  DType::dir});
         out.push_back({"..", DType::dir});
-        for (auto& [name, info] : seen)
-            out.push_back({name, info.type, info.ino});
+        for (const std::string_view name : order)
+            if (auto it = seen.find(name); it != seen.end())
+                out.push_back({it->first, it->second.type, it->second.ino});
         return out;
     }
 
@@ -836,6 +851,59 @@ public:
         const auto& t = fds();
         auto it = t.paths.find(fd);
         return it == t.paths.end() ? std::string_view{} : std::string_view{it->second};
+    }
+    // A directory fd's listing state: 0 none, 1 an overlay union not built
+    // yet, 2 a listing being served (built union or virtual entries).
+    [[nodiscard]] int dir_state(int fd) const {
+        const auto& t = fds();
+        auto it = t.dirs.find(fd);
+        if (it == t.dirs.end()) return 0;
+        return it->second.lazy.empty() ? 2 : 1;
+    }
+    // The same, for process `pid` rather than the current one.
+    [[nodiscard]] std::string_view path_of_fd_in(std::int32_t pid, int fd) const {
+        auto t = fd_tables_.find(pid);
+        if (t == fd_tables_.end()) return {};
+        auto it = t->second.paths.find(fd);
+        return it == t->second.paths.end() ? std::string_view{} : std::string_view{it->second};
+    }
+    [[nodiscard]] int dir_state_in(std::int32_t pid, int fd) const {
+        auto t = fd_tables_.find(pid);
+        if (t == fd_tables_.end()) return 0;
+        auto it = t->second.dirs.find(fd);
+        if (it == t->second.dirs.end()) return 0;
+        return it->second.lazy.empty() ? 2 : 1;
+    }
+    // Is `abs` in a mount with an upper layer (or a virtual one)? Its listing
+    // may be a merge, not one host dir's.
+    [[nodiscard]] bool is_overlay_path(std::string_view abs) const {
+        const Mount* m = deepest(abs);
+        return !m || m->producer || !m->upper.empty();
+    }
+    // The in-guest fast path opened, dup'd or closed `fd` in process `pid`:
+    // make the table say what the fd is now, as note_opened_fd would have
+    // for a read-only open of a host path. `path` null means closed.
+    void apply_guest_fd(std::int32_t pid, int fd, const std::string* path, bool lazy_dir) {
+        // A process the dispatcher hasn't served yet gets its table (a copy
+        // of its parent's) at its first call; making one here would block
+        // that. Its first trapped call comes after this, and re-seeds the
+        // fd map from that table.
+        auto it = fd_tables_.find(pid);
+        if (it == fd_tables_.end()) return;
+        auto& t = it->second;
+        t.paths.erase(fd);
+        t.dirs.erase(fd);
+        t.ll_layers.erase(fd);
+        if (!path) return;
+        t.paths[fd] = *path;
+        if (lazy_dir) t.dirs[fd] = DirStream{{}, 0, *path, 0};
+    }
+    // Every fd with a recorded path in process `pid` (no change of the
+    // current pid, which has side effects: a first sight seeds the cwd).
+    template <class F> void for_each_fd_path_in(std::int32_t pid, F&& f) const {
+        auto t = fd_tables_.find(pid);
+        if (t == fd_tables_.end()) return;
+        for (const auto& [fd, p] : t->second.paths) f(fd, p);
     }
 
     // -- Per-process state that a fork must carry to the child --------------
@@ -1654,7 +1722,8 @@ private:
     // us everything a stat would, so stat'ing first is a wasted syscall.
     // name -> (type, real host inode). The inode rides along so the merged
     // listing can report the same d_ino a later stat() will return.
-    static bool merge_dir(const std::string& host_dir, NameMap& seen) {
+    static bool merge_dir(const std::string& host_dir, NameMap& seen,
+                          std::vector<std::string_view>* order = nullptr) {
         ::DIR* d = ::opendir(host_dir.c_str());
 #if !defined(_WIN32)
         if (!d && errno == ENAMETOOLONG) {
@@ -1696,7 +1765,8 @@ private:
                     t = DType::regular;
                 }
             }
-            seen.emplace(name, DirEntryInfo{t, ino});
+            const auto ins = seen.emplace(name, DirEntryInfo{t, ino});
+            if (order && ins.second) order->push_back(ins.first->first);
         }
         ::closedir(d);
         return true;
@@ -1907,12 +1977,13 @@ private:
     std::vector<Mount> mounts_;
     // directory -> symlink answers for classify_impl's parent walk (keyed by
     // guest path + the mount's dirs); cleared on any write
-    mutable std::unordered_map<std::string, std::pair<Probe, std::string>> dirlink_cache_;
+    struct DirProbe { Probe first; std::string second; bool third; };
+    mutable std::unordered_map<std::string, DirProbe> dirlink_cache_;
 public:
     // -- hooks for the in-guest fast path -----------------------------------
     // Called with a guest directory whose whole path the parent walk found
-    // free of symlinks.
-    void set_on_clean_dir(std::function<void(std::string_view)> f) { on_clean_dir_ = std::move(f); }
+    // free of symlinks, and whether it may exist in the upper layer.
+    void set_on_clean_dir(std::function<void(std::string_view, bool)> f) { on_clean_dir_ = std::move(f); }
     // Bumped whenever the mount table, a namespace's view of it, or a
     // directory's symlink-ness may have changed.
     [[nodiscard]] std::uint64_t layout_version() const noexcept { return layout_version_; }
@@ -1938,7 +2009,7 @@ public:
         return !pivoted_.empty();
     }
 private:
-    std::function<void(std::string_view)> on_clean_dir_;
+    std::function<void(std::string_view, bool)> on_clean_dir_;
     mutable std::uint64_t layout_version_{0};
     mutable std::uint64_t dirs_version_{0};
     std::vector<std::string>* whiteout_log_{nullptr};

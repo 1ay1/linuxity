@@ -26,21 +26,22 @@
 
 /* Offsets from the region base (= the blob's first byte). */
 #define LX_FP_CODE_MAX    0x8000ULL    /* r-x */
-#define LX_FP_PROC_OFF    0x8000ULL    /* rw, one page; then a guard */
-#define LX_FP_FDMAP_OFF   0x10000ULL   /* rw: fd -> guest path, by fd number */
-#define LX_FP_FDS         256u
-#define LX_FP_FD_PATH     220u
-#define LX_FP_STACKS_OFF  0x21000ULL   /* rw; the page before it is a guard */
+#define LX_FP_PROC_OFF    0x8000ULL    /* rw, 0x5000 (the event ring); then a guard */
+#define LX_FP_PROC_SIZE   0x5000ULL
+#define LX_FP_FDMAP_OFF   0x10000ULL   /* rw: fd -> what it is, by fd number */
+#define LX_FP_FDS         1024u
+#define LX_FP_FD_PATH     224u
+#define LX_FP_STACKS_OFF  0x51000ULL   /* rw; the page before it is a guard */
 #define LX_FP_STACKS      4u
 #define LX_FP_STACK_SIZE  0x8000ULL
-#define LX_FP_TABLE_OFF   0x41000ULL   /* r--, MAP_SHARED */
+#define LX_FP_TABLE_OFF   0x71000ULL   /* r--, MAP_SHARED */
 #define LX_FP_TABLE_SIZE  0x120000ULL
 #define LX_FP_STATS_OFF   (LX_FP_TABLE_OFF + LX_FP_TABLE_SIZE)   /* rw-, MAP_SHARED, one page */
 #define LX_FP_REGION_SIZE (LX_FP_STATS_OFF + 0x1000ULL)
 
 /* Stubs live in a region near the patched library (branch range). */
 #define LX_FP_NEAR_SIZE  0x10000ULL
-#define LX_FP_SLOT_SIZE  64u
+#define LX_FP_SLOT_SIZE  256u
 #define LX_FP_SLOTS      (LX_FP_NEAR_SIZE / LX_FP_SLOT_SIZE)
 
 #define LX_FP_PATH_MAX   1024u   /* longest guest path answered */
@@ -51,13 +52,16 @@
 #define LX_FP_PROBES     32u
 #define LX_FP_CWD_SLOTS  256u    /* processes whose cwd the blob knows */
 #define LX_FP_CWD_MAX    256u    /* longer cwds: relative paths fall back */
+#define LX_FP_EVENTS     64u     /* fd events a process can hold unapplied */
 
 /* The handler's "run the real syscall" answer. */
 #define LX_FP_FALLBACK   (-0x7fffffffffffffffLL - 1)
 
 /* exc entries: a removed path blocks itself and everything under it (plain
-   hash); the rest only the exact path (hash xor this). */
+   hash); the rest only the exact path (hash xor this). A directory holding
+   a removed name is listed by the supervisor (hash xor WO_DIR). */
 #define LX_FP_LEAF_SALT  0x9e3779b97f4a7c15ULL
+#define LX_FP_WO_DIR_SALT 0xc2b2ae3d27d4eb4fULL
 
 enum { LX_FP_MNT_VIRTUAL = 0, LX_FP_MNT_OVERLAY = 1, LX_FP_MNT_BIND = 2 };
 
@@ -76,7 +80,7 @@ struct lx_fp_dir {
     uint64_t hash;
     uint32_t gen;
     uint16_t len;
-    uint16_t pad;
+    uint16_t no_upper;  /* the dir isn't in the upper layer: neither is anything in it */
 };
 
 /* A process's cwd, by host tgid (the blob asks getpid with its key). The
@@ -96,7 +100,7 @@ struct lx_fp_table {
     uint32_t enabled;  /* 0: every call falls back */
     uint32_t dir_gen;
     uint32_t n_mounts;
-    uint32_t pad0;
+    uint32_t off_ops;  /* debug: ops the blob must leave to the trap (bit per op) */
     uint64_t key[2];   /* goes in the blob's syscalls' args 4 and 5 */
     struct lx_fp_mount mounts[LX_FP_MAX_MOUNTS];
     struct lx_fp_cwd cwds[LX_FP_CWD_SLOTS];
@@ -104,22 +108,56 @@ struct lx_fp_table {
     uint64_t exc[LX_FP_EXC_SLOTS];
 };
 
+/* An fd the blob changed, for the supervisor to replay into its table in
+   reservation order. Carries what the fd became, so a later reuse of the
+   number by another thread can't be mistaken for it. */
+struct lx_fp_ev {
+    uint32_t seq;   /* = index + 1 once the entry is complete */
+    uint8_t  op;    /* OPEN: fd is now path; CLOSE: fd is gone */
+    uint8_t  flags; /* the fd map flags it got */
+    uint16_t len;
+    int32_t  fd;
+    uint32_t pad;
+    char path[LX_FP_FD_PATH];
+};
+enum { LX_FP_EV_NOOP = 0, LX_FP_EV_OPEN = 1, LX_FP_EV_CLOSE = 2, LX_FP_EV_DUP = 3 };
+
 /* Per process, at base + LX_FP_PROC_OFF. */
 struct lx_fp_proc {
     uint32_t disabled;
     uint32_t slots;     /* stacks in use, one bit each */
+    int32_t  owner;     /* host tgid whose fd table the fd map describes; a
+                           vfork child shares this memory but not the fds,
+                           so only the owner may change fds in the guest */
+    uint32_t slot;      /* the owner's index into stats.ev; >= CWD_SLOTS: none */
+    uint32_t privileged;/* the owner may open anything it can read (root) */
+    uint32_t ev_rd;     /* events the supervisor has applied */
+    uint32_t ev_wr;     /* events reserved (blob) */
+    uint32_t pad;
+    uint64_t probe;     /* the supervisor writes here to tell a shared mm */
+    struct lx_fp_ev ev[LX_FP_EVENTS];
 };
 
-/* What an fd refers to, written by the supervisor when a trapped open
-   returns it. The blob trusts an entry only while the fd's real dev/ino
-   still match, so a stale one (closed, reused, dup2'd over) costs a
-   fallback, never a wrong answer. Private memory: fork copies it with the
-   fd table, exec drops both. */
+/* What an fd is, by fd number. The blob and the supervisor keep it exact
+   for the fds they open, dup and close; a reader of a path still checks
+   dev/ino against the real fd, so an fd changed behind both (an fd received
+   over a socket) never reads as the wrong file.
+   Private memory: fork copies it with the fd table, exec drops both. */
+enum { LX_FP_FD_NONE = 0, LX_FP_FD_HOST = 1 };
+/* flags */
+#define LX_FP_FD_DIR     1u   /* a directory */
+#define LX_FP_FD_NATIVE  2u   /* its listing is the host fd's own */
+#define LX_FP_FD_STREAM  4u   /* the supervisor serves its listing and seeks */
+#define LX_FP_FD_BYSUP   8u   /* written by the supervisor: its table agrees */
+#define LX_FP_FD_CLOSED 16u   /* closed in the guest: drop it from the table */
 struct lx_fp_fd {
-    uint32_t seq;       /* seqlock; 0 len = no entry */
+    uint32_t seq;       /* seqlock */
+    uint8_t  kind;      /* HOST: a host file or dir at path. NONE: something
+                           only the supervisor (or nobody) knows */
+    uint8_t  flags;
     uint16_t len;
-    uint8_t  is_dir, pad;
-    uint32_t gen;       /* table.dir_gen when written: a rename since makes the path stale */
+    uint32_t gen;       /* table.dir_gen when the path was last known right */
+    uint32_t pad;
     uint64_t dev, ino;
     char path[LX_FP_FD_PATH];
 };
@@ -128,6 +166,9 @@ struct lx_fp_fd {
    table in the same file, mapped writable). */
 struct lx_fp_stats {
     uint64_t hits;      /* calls answered in the guest */
+    uint32_t evsum;     /* bumped with any ev[] */
+    uint32_t pad;
+    uint32_t ev[LX_FP_CWD_SLOTS];   /* bumped when a process (by tgid) logs an fd event */
 };
 
 /* At offset 0 of the blob; offsets are from the blob start. */

@@ -50,6 +50,18 @@ static void one(const char* p) {
         r = (int)lgetxattr(p, "user.nope", buf, sizeof buf);
         if (rep == 5) printf("lgetxattr %s = %d e=%d\n", p, r, r < 0 ? errno : 0);
     }
+    for (int rep = 0; rep < 6; rep++) {
+        r = access(p, F_OK);
+        int r2 = access(p, X_OK);
+        if (rep == 5) printf("access %s = %d e=%d x=%d\n", p, r, r ? errno : 0, r2);
+    }
+    for (int rep = 0; rep < 6; rep++) {
+        int fd = open(p, O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOCTTY);
+        int e1 = fd < 0 ? errno : 0;
+        struct stat fs; memset(&fs, 0, sizeof fs);
+        if (fd >= 0) { fstat(fd, &fs); close(fd); }
+        if (rep == 5) printf("open %s = %d e=%d mode=%o size=%ld\n", p, fd >= 0, e1, fs.st_mode, (long)fs.st_size);
+    }
 }
 
 int main(int argc, char** argv) {

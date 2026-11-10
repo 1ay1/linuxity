@@ -122,6 +122,9 @@ struct Regs {
         r.rip -= 2;
         r.rax = r.orig_rax;
     }
+    // Before resuming at code that leads up to the syscall: the number goes
+    // back in rax (at a stop rax holds -ENOSYS, the number is in orig_rax).
+    void restore_nr_reg() noexcept { r.rax = r.orig_rax; }
 };
 
 #elif defined(__aarch64__)
@@ -188,6 +191,8 @@ struct Regs {
     }
     // At an exit stop: back to the `svc`, which reads x8 afresh.
     void rewind_to_syscall() noexcept { r.pc -= 4; }
+    // x8 keeps the number through the stop.
+    void restore_nr_reg() noexcept {}
 
 private:
     bool skip_{false};

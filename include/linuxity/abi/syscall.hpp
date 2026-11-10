@@ -140,6 +140,8 @@ public:
     [[nodiscard]] bool landlock_active() const noexcept { return ll_layers_ > 0; }
     // The guest path an open in flight will bind its fd to (see note_opened_fd).
     [[nodiscard]] const std::string& pending_open_path() const noexcept { return pending_open_; }
+    // The current caller bypasses file permission checks (CAP_DAC_OVERRIDE).
+    [[nodiscard]] bool caller_privileged() { return privileged(); }
 
     [[nodiscard]] Outcome dispatch(const Regs& r) {
         const Sysno sc = decode(arch_, r.nr);

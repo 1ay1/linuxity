@@ -132,6 +132,9 @@ public:
 
             // A hot read-only path query: maybe patch its site so the guest
             // answers the next ones itself (runtime/linux/fastpath.hpp).
+            // First, apply any fd changes the guest made on its own.
+            if constexpr (requires { trap_.fp_before_dispatch(kernel_); })
+                locked([&] { trap_.fp_before_dispatch(kernel_); });
             if constexpr (requires { trap_.fp_maybe_patch(f.regs, f.pc, kernel_, sys); }) {
                 if (locked([&] { return trap_.fp_maybe_patch(f.regs, f.pc, kernel_, sys); })) continue;
             }
@@ -793,11 +796,21 @@ private:
                                 existing->comm = pi.comm;
                                 existing->cmdline = pi.cmdline;
                             }
-                            existing->ns = pi.ns;   // as of the fork, incl. CLONE_NEW*
+                            // It took its namespaces from its parent at its
+                            // first call and may have unshared since: add only
+                            // what the clone itself asked for (CLONE_NEW*),
+                            // once, and keep the rest.
+                            if (!existing->clone_ns_applied) {
+                                const std::uint64_t cf = kernel_.procs().take_clone_ns(pi.ppid) | ns_flags_of(e);
+                                if (cf) kernel_.procs().unshare_ns(*existing, cf);
+                                existing->clone_ns_applied = true;
+                            }
                             kernel_.procs().assign_ns_pid(existing->pid);
-                            kernel_.files().inherit_cwd(
-                                static_cast<std::int32_t>(e.pid),
-                                static_cast<std::int32_t>(e.ppid));
+                            // its cwd and fds are its own by now
+                            if (!kernel_.files().cwd_known(static_cast<std::int32_t>(e.pid)))
+                                kernel_.files().inherit_cwd(
+                                    static_cast<std::int32_t>(e.pid),
+                                    static_cast<std::int32_t>(e.ppid));
                             break;
                         }
                         kernel_.procs().upsert(pi);

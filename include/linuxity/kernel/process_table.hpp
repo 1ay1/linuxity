@@ -89,6 +89,8 @@ struct ProcInfo {
     bool creds_given{false};
     // created by the task's own first syscall, before its spawn event
     bool live_seen{false};
+    // its clone's CLONE_NEW* flags were applied to it (see apply_proc_events)
+    bool clone_ns_applied{false};
     // owner ids of a set-user/group-ID file the pending execve runs
     std::uint32_t exec_setuid{0xffffffffu}, exec_setgid{0xffffffffu};
     // the namespaces it is in (copied at fork, changed by unshare/setns)

@@ -33,7 +33,9 @@
 namespace lx::runtime::fastpath {
 
 static_assert(sizeof(lx_fp_table) <= LX_FP_TABLE_SIZE, "fast path table outgrew its mapping");
-static_assert(sizeof(lx_fp_proc) <= 0x1000, "per-process page is one page");
+static_assert(sizeof(lx_fp_proc) <= LX_FP_PROC_SIZE, "per-process area");
+static_assert(LX_FP_PROC_OFF + LX_FP_PROC_SIZE + 0x1000 <= LX_FP_FDMAP_OFF, "proc area overlaps the fd map");
+static_assert(sizeof(lx_fp_stats) <= 0x1000, "stats page is one page");
 static_assert(sizeof(lx_fp_fd) == 256, "fd map entry");
 static_assert(LX_FP_FDMAP_OFF + LX_FP_FDS * sizeof(lx_fp_fd) + 0x1000 <= LX_FP_STACKS_OFF, "fd map overlaps the stacks");
 static_assert(LX_FP_STACKS_OFF + LX_FP_STACKS * LX_FP_STACK_SIZE <= LX_FP_TABLE_OFF, "stacks overlap the table");
@@ -99,6 +101,7 @@ public:
         t_->key[0] = key().k[0];
         t_->key[1] = key().k[1];
         t_->dir_gen = 1;
+        if (const char* o = std::getenv("LINUXITY_FP_OFF_OPS")) t_->off_ops = static_cast<std::uint32_t>(std::strtoul(o, nullptr, 0));
         return true;
 #else
         (void)dir;
@@ -118,6 +121,15 @@ public:
     static constexpr std::size_t kFileSize = LX_FP_TABLE_SIZE + 0x1000;
     [[nodiscard]] std::uint64_t hits() const {
         return stats_ ? __atomic_load_n(&stats_->hits, __ATOMIC_RELAXED) : 0;
+    }
+    // Bumped by the blob each time any process logs an fd event, and per
+    // process (by tgid slot).
+    [[nodiscard]] std::uint32_t evsum() const {
+        return stats_ ? __atomic_load_n(&stats_->evsum, __ATOMIC_ACQUIRE) : 0;
+    }
+    [[nodiscard]] std::uint32_t ev_count(int tgid) const {
+        return stats_ ? __atomic_load_n(&stats_->ev[static_cast<std::uint32_t>(tgid) & (LX_FP_CWD_SLOTS - 1)],
+                                         __ATOMIC_ACQUIRE) : 0;
     }
 
     void set_enabled(bool on) { store(&t_->enabled, on ? 1u : 0u); }
@@ -149,6 +161,15 @@ public:
 
     // A path (and everything under it) the fast path must not answer.
     void add_tree(std::string_view guest) { add_exc(lx_fp_hash(guest.data(), len(guest))); }
+    // A removed name: the path itself, and its directory may not be listed
+    // natively (the merged listing hides the name).
+    void add_whiteout(std::string_view guest) {
+        add_tree(guest);
+        const std::size_t cut = guest.rfind('/');
+        const std::string_view dir = cut == 0 ? std::string_view{"/"} : guest.substr(0, cut);
+        if (cut != std::string_view::npos)
+            add_exc(lx_fp_hash(dir.data(), len(dir)) ^ LX_FP_WO_DIR_SALT);
+    }
     // Exactly this guest path, or this host path.
     void add_leaf(std::string_view path) { add_exc(lx_fp_hash(path.data(), len(path)) ^ LX_FP_LEAF_SALT); }
 
@@ -162,7 +183,7 @@ public:
     [[nodiscard]] bool exc_crowded() const { return exc_count_ > LX_FP_EXC_SLOTS / 2; }
 
     // A guest directory whose whole path is free of symlinks right now.
-    void add_dir(std::string_view guest) {
+    void add_dir(std::string_view guest, bool in_upper = true) {
         if (guest.empty() || guest.size() > 0xffff) return;
         const std::uint64_t h = lx_fp_hash(guest.data(), len(guest));
         const std::uint32_t gen = t_->dir_gen;
@@ -175,6 +196,7 @@ public:
             store(&d.gen, 0u);
             store64(&d.hash, h);
             d.len = static_cast<std::uint16_t>(guest.size());
+            d.no_upper = in_upper ? 0 : 1;
             store(&d.gen, gen);
             return;
         }
