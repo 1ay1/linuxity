@@ -217,6 +217,13 @@ public:
         return it->second;
     }
 
+    // Every path with a record, and a sink for paths given one from now on
+    // (the in-guest fast path must leave those to the dispatcher).
+    template <class F> void for_each_path(F&& f) const {
+        for (const auto& [p, r] : table_) f(p);
+    }
+    void set_change_log(std::vector<std::string>* log) { changed_ = log; }
+
     // Given the mode the HOST inode reports (full st_mode incl. S_IFMT) and
     // this store's record for a path, compute the mode a guest stat should
     // see: the host file-type and any sticky/set-id bits the host managed to
@@ -238,6 +245,7 @@ private:
     // on replay. We rewrite the whole map only rarely (never, in practice —
     // append-only with last-writer-wins on replay keeps it correct and cheap).
     void append(const std::string& path, const MetaRecord& r) {
+        if (changed_) changed_->push_back(path);
         if (journal_path_.empty()) return;
         std::FILE* fp = std::fopen(journal_path_.c_str(), "a");
         if (!fp) return;
@@ -309,6 +317,7 @@ private:
     std::vector<std::string> host_bases_;
     std::string journal_path_;
     std::unordered_map<std::string, MetaRecord> table_;
+    std::vector<std::string>* changed_{nullptr};
 
     // Rewrite the journal to exactly the live records, atomically.
     void rewrite() {

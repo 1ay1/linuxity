@@ -46,6 +46,13 @@ public:
 
     [[nodiscard]] bool empty() const noexcept { return alias_.empty(); }
 
+    // Bumped on every change; the fast path re-reads the table when it moves.
+    [[nodiscard]] std::uint64_t version() const noexcept { return version_; }
+    // Every host path that is an alias or a backing.
+    template <class F> void for_each_path(F&& f) const {
+        for (const auto& [a, b] : alias_) { f(a); f(b); }
+    }
+
     // The backing for `p` if it is an alias, else nullptr.
     [[nodiscard]] const std::string* backing_of(const std::string& p) const {
         const auto it = alias_.find(p);
@@ -72,6 +79,7 @@ public:
 
     // `alias` is a new name for the inode at `backing` (already resolved).
     void add(const std::string& alias, const std::string& backing) {
+        ++version_;
         alias_[alias] = backing;
         names_[backing].push_back(alias);
         log('+', alias, backing);
@@ -79,6 +87,7 @@ public:
 
     // An alias name was removed.
     void drop(const std::string& alias) {
+        ++version_;
         const auto it = alias_.find(alias);
         if (it == alias_.end()) return;
         erase_name(it->second, alias);
@@ -90,6 +99,7 @@ public:
     // caller must move the file onto, and re-points the other aliases at it.
     // nullopt when there are no aliases (the file simply goes).
     [[nodiscard]] std::optional<std::string> promote(const std::string& backing) {
+        ++version_;
         const auto it = names_.find(backing);
         if (it == names_.end() || it->second.empty()) return std::nullopt;
         std::vector<std::string> rest = std::move(it->second);
@@ -150,6 +160,7 @@ private:
     std::unordered_map<std::string, std::string> alias_;                 // alias -> backing
     std::unordered_map<std::string, std::vector<std::string>> names_;    // backing -> aliases
     std::string journal_;
+    std::uint64_t version_{0};
 
     void erase_name(const std::string& backing, const std::string& alias) {
         const auto it = names_.find(backing);
@@ -188,6 +199,7 @@ private:
         std::fclose(f);
         // Keep only entries whose files are both still there, then rewrite
         // the journal compactly so it does not grow without bound.
+        ++version_;
         struct ::stat st{};
         alias_.clear();
         names_.clear();

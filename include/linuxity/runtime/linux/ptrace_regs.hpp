@@ -83,6 +83,7 @@ struct Regs {
     [[nodiscard]] std::uint64_t nr()  const noexcept { return r.orig_rax; }
     [[nodiscard]] std::uint64_t sp()  const noexcept { return r.rsp; }
     [[nodiscard]] std::uint64_t pc()  const noexcept { return r.rip; }
+    void set_pc(std::uint64_t v) noexcept { r.rip = v; }
     [[nodiscard]] std::uint64_t ret() const noexcept { return r.rax; }
 
     [[nodiscard]] std::uint64_t arg(int i) const noexcept {
@@ -143,6 +144,7 @@ struct Regs {
     [[nodiscard]] std::uint64_t nr()  const noexcept { return r.regs[8]; }
     [[nodiscard]] std::uint64_t sp()  const noexcept { return r.sp; }
     [[nodiscard]] std::uint64_t pc()  const noexcept { return r.pc; }
+    void set_pc(std::uint64_t v) noexcept { r.pc = v; }
     [[nodiscard]] std::uint64_t ret() const noexcept { return r.regs[0]; }
 
     [[nodiscard]] std::uint64_t arg(int i) const noexcept {

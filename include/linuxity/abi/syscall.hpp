@@ -130,6 +130,15 @@ class Syscalls {
 public:
     Syscalls(K& k, M& mem, Arch arch) noexcept : k_{k}, mem_{mem}, arch_{arch} {}
 
+    // -- for the in-guest fast path ------------------------------------------
+    template <class F> void for_each_sock_placeholder(F&& f) const {
+        for (const auto& p : sock_placeholders_) f(p);
+    }
+    [[nodiscard]] std::size_t sock_placeholder_count() const noexcept { return sock_placeholders_.size(); }
+    // A guest landlock domain is enforced by the dispatcher, so the fast
+    // path stays off once one exists.
+    [[nodiscard]] bool landlock_active() const noexcept { return ll_layers_ > 0; }
+
     [[nodiscard]] Outcome dispatch(const Regs& r) {
         const Sysno sc = decode(arch_, r.nr);
         cstr_valid_ = false;

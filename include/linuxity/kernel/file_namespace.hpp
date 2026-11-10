@@ -183,6 +183,7 @@ public:
         }
         mounts_.push_back(Mount{std::move(prefix), std::move(host_base),
                                 std::move(upper), {}});
+        ++layout_version_;
     }
     // A fork child (a guest process started by another guest process) must
     // not do root-only hygiene. Set before the first mount_host.
@@ -219,6 +220,7 @@ public:
     void mount_virtual(std::string prefix, Producer prod) {
         if (prefix.size() > 1 && prefix.back() == '/') prefix.pop_back();
         mounts_.push_back(Mount{std::move(prefix), {}, {}, std::move(prod)});
+        ++layout_version_;
     }
 
     // Does this path LIVE in a virtual mount, whether or not the leaf exists?
@@ -341,6 +343,7 @@ public:
         cwds_.erase(pid);
         if (pid == seeded_pid_) seeded_pid_ = 0;
     }
+    [[nodiscard]] bool cwd_known(std::int32_t pid) const noexcept { return cwds_.count(pid) != 0; }
     [[nodiscard]] std::string_view cwd_of(std::int32_t pid) const noexcept {
         auto it = cwds_.find(pid);
         return it != cwds_.end() ? std::string_view{it->second}
@@ -530,59 +533,69 @@ public:
         rel.remove_prefix(m->prefix == "/" ? 0 : m->prefix.size());
         while (!rel.empty() && rel.front() == '/') rel.remove_prefix(1);
 
+        // A path goes where the merged view says its directory is. When a
+        // directory on the way is a symlink (merged-/usr: /lib -> usr/lib),
+        // resolve it first and start over from the target, as a kernel
+        // would. Otherwise a write's copy-up makes a real upper/lib that
+        // hides the image's symlink (dpkg then says the system isn't
+        // merged-/usr), and a read through /lib looks only in the image
+        // and misses what was installed into /usr/lib since. Bind mounts
+        // too: left to the host, `ln -s /etc /tmp/x` made /tmp/x/passwd the
+        // HOST's passwd. Only the parent dirs: the last component is the
+        // caller's business (O_NOFOLLOW, unlink, rename all differ).
+        if (depth < 8) {
+            // Directories rarely become symlinks, so each answer is kept
+            // until the guest writes anything or a mount changes (a write
+            // is where a dir could be replaced by a link). Without the
+            // cache this was a readlink per path component on every
+            // stat and open.
+            if (for_write) { dirlink_cache_.clear(); ++dirs_version_; }
+            std::size_t end = 0;
+            bool clean = true;
+            while ((end = rel.find('/', end)) != std::string_view::npos) {
+                const std::string_view sub = rel.substr(0, end);
+                const std::string guest = (m->prefix == "/" ? std::string{} : m->prefix) + "/" + std::string{sub};
+                std::string target;
+                Probe p;
+                std::string key = guest;
+                key.push_back('\0');
+                key += m->upper;
+                key.push_back('\0');
+                key += m->host_base;
+                if (auto it = dirlink_cache_.find(key); it != dirlink_cache_.end()) {
+                    p = it->second.first;
+                    target = it->second.second;
+                } else {
+                    p = m->upper.empty() ? Probe::absent : probe_link(join_host(m->upper, sub).c_str(), target);
+                    if (p == Probe::absent) {
+                        if (!m->upper.empty() && !whiteouts_.empty() && is_whiteout(guest)) p = Probe::notdir;   // stop here
+                        else p = probe_link(join_host(m->host_base, sub).c_str(), target);
+                    }
+                    if (dirlink_cache_.size() > 65536) dirlink_cache_.clear();
+                    dirlink_cache_.emplace(std::move(key), std::pair{p, target});
+                }
+                if (p == Probe::absent || p == Probe::notdir) { clean = false; break; }
+                if (p == Probe::symlink) {
+                    const std::string rest{rel.substr(end + 1)};
+                    const std::string base = target.starts_with('/')
+                        ? target : guest.substr(0, guest.rfind('/') + 1) + target;
+                    return classify_impl(normalize(base + "/" + rest), for_write, follow, wi, depth + 1);
+                }
+                ++end;
+            }
+            // every directory on the way is a real one: the fast path
+            // may answer for names in the leaf's parent
+            if (clean && on_clean_dir_ && depth == 0) {
+                const std::size_t cut = abs.rfind('/');
+                if (cut != std::string_view::npos && cut > 0)
+                    on_clean_dir_(abs.substr(0, cut));
+            }
+        }
+
         // Overlay: an upper layer means writes (and files already copied up)
         // resolve to upper; reads of not-yet-copied files fall through to the
         // read-only lower.
         if (!m->upper.empty()) {
-            // A path goes where the merged view says its directory is. When a
-            // directory on the way is a symlink (merged-/usr: /lib -> usr/lib),
-            // resolve it first and start over from the target, as a kernel
-            // would. Otherwise a write's copy-up makes a real upper/lib that
-            // hides the image's symlink (dpkg then says the system isn't
-            // merged-/usr), and a read through /lib looks only in the image
-            // and misses what was installed into /usr/lib since. Only the
-            // parent dirs: the last component is the caller's business
-            // (O_NOFOLLOW, unlink, rename all differ).
-            if (depth < 8) {
-                // Directories rarely become symlinks, so each answer is kept
-                // until the guest writes anything or a mount changes (a write
-                // is where a dir could be replaced by a link). Without the
-                // cache this was a readlink per path component on every
-                // stat and open.
-                if (for_write) dirlink_cache_.clear();
-                std::size_t end = 0;
-                while ((end = rel.find('/', end)) != std::string_view::npos) {
-                    const std::string_view sub = rel.substr(0, end);
-                    const std::string guest = (m->prefix == "/" ? std::string{} : m->prefix) + "/" + std::string{sub};
-                    std::string target;
-                    Probe p;
-                    std::string key = guest;
-                    key.push_back('\0');
-                    key += m->upper;
-                    key.push_back('\0');
-                    key += m->host_base;
-                    if (auto it = dirlink_cache_.find(key); it != dirlink_cache_.end()) {
-                        p = it->second.first;
-                        target = it->second.second;
-                    } else {
-                        p = probe_link(join_host(m->upper, sub).c_str(), target);
-                        if (p == Probe::absent) {
-                            if (!whiteouts_.empty() && is_whiteout(guest)) p = Probe::notdir;   // stop here
-                            else p = probe_link(join_host(m->host_base, sub).c_str(), target);
-                        }
-                        if (dirlink_cache_.size() > 65536) dirlink_cache_.clear();
-                        dirlink_cache_.emplace(std::move(key), std::pair{p, target});
-                    }
-                    if (p == Probe::absent || p == Probe::notdir) break;
-                    if (p == Probe::symlink) {
-                        const std::string rest{rel.substr(end + 1)};
-                        const std::string base = target.starts_with('/')
-                            ? target : guest.substr(0, guest.rfind('/') + 1) + target;
-                        return classify_impl(normalize(base + "/" + rest), for_write, follow, wi, depth + 1);
-                    }
-                    ++end;
-                }
-            }
             std::string up = join_host(m->upper, rel);
             std::string lo = join_host(m->host_base, rel);
             if (for_write) {
@@ -1049,6 +1062,7 @@ public:
                 copies.push_back(std::move(c));
             }
         for (auto& c : copies) mounts_.push_back(std::move(c));
+        ++layout_version_;
     }
     // Mount a real host directory at a guest path, seen only in mount
     // namespace `ns` (a tmpfs is a fresh scratch dir; a bind is its source).
@@ -1057,6 +1071,7 @@ public:
         Mount m{std::move(prefix), std::move(host_dir), {}, {}, ns, true};
         m.ro = ro;
         mounts_.push_back(std::move(m));
+        ++layout_version_;
     }
     // Bind guest path `src` at `target` in `ns` by copying the mount that
     // holds it (a virtual tree like /proc, or an overlay) instead of naming
@@ -1101,6 +1116,7 @@ public:
             for (auto k = kids.rbegin(); k != kids.rend(); ++k)
                 mounts_.erase(mounts_.begin() + static_cast<std::ptrdiff_t>(*k));
             mounts_.erase(mounts_.begin() + static_cast<std::ptrdiff_t>(i));
+            ++layout_version_;
             return Errno::ok;
         }
         return Errno::einval;
@@ -1184,6 +1200,7 @@ public:
         for (auto& m : old) keep.push_back(std::move(m));
         mounts_ = std::move(keep);
         pivoted_.insert(ns);
+        ++layout_version_;
         set_current_mnt_ns(cur_mnt_ns_);
         for (const std::int32_t pid : pids) {
             if (auto it = cwds_.find(pid); it != cwds_.end()) it->second = renamed(it->second);
@@ -1891,6 +1908,40 @@ private:
     // directory -> symlink answers for classify_impl's parent walk (keyed by
     // guest path + the mount's dirs); cleared on any write
     mutable std::unordered_map<std::string, std::pair<Probe, std::string>> dirlink_cache_;
+public:
+    // -- hooks for the in-guest fast path -----------------------------------
+    // Called with a guest directory whose whole path the parent walk found
+    // free of symlinks.
+    void set_on_clean_dir(std::function<void(std::string_view)> f) { on_clean_dir_ = std::move(f); }
+    // Bumped whenever the mount table, a namespace's view of it, or a
+    // directory's symlink-ness may have changed.
+    [[nodiscard]] std::uint64_t layout_version() const noexcept { return layout_version_; }
+    void bump_layout() const noexcept { ++layout_version_; }
+    // Bumped on every write: a directory may have become a symlink.
+    [[nodiscard]] std::uint64_t dirs_version() const noexcept { return dirs_version_; }
+    // Paths whited out from now on (the fast path must leave them alone).
+    void set_whiteout_log(std::vector<std::string>* log) { whiteout_log_ = log; }
+    template <class F> void for_each_whiteout(F&& f) const { for (const auto& w : whiteouts_) f(w); }
+    // The mounts every namespace sees: prefix, lower, upper, virtual.
+    template <class F> void for_each_shared_mount(F&& f) const {
+        if (!pivoted_.empty()) return;
+        for (std::size_t i = 0; i < mounts_.size(); ++i) {
+            const Mount& m = mounts_[i];
+            if (m.mnt_ns != 0) continue;
+            f(m.prefix, m.host_base, m.upper, static_cast<bool>(m.producer), m.ro,
+              !m.origin.empty(), static_cast<std::uint64_t>(i));
+        }
+    }
+    // Does any mount namespace other than the initial one have mounts?
+    [[nodiscard]] bool has_private_mounts() const {
+        for (const Mount& m : mounts_) if (m.mnt_ns != 0) return true;
+        return !pivoted_.empty();
+    }
+private:
+    std::function<void(std::string_view)> on_clean_dir_;
+    mutable std::uint64_t layout_version_{0};
+    mutable std::uint64_t dirs_version_{0};
+    std::vector<std::string>* whiteout_log_{nullptr};
     // Per-process current directory (see set_current_pid/inherit_cwd). cur_pid_
     // is mutable so a const cwd()/absolutize path can select the active pid.
     mutable std::unordered_map<std::int32_t, std::string> cwds_{};
@@ -1942,7 +1993,9 @@ public:
 
     // Record a lower-only removal. Returns nothing; the caller reports success.
     void add_whiteout(const std::string& guest_path) const {
-        if (whiteouts_.insert(guest_path).second && !whiteout_journal_.empty()) {
+        if (!whiteouts_.insert(guest_path).second) return;
+        if (whiteout_log_) whiteout_log_->push_back(guest_path);
+        if (!whiteout_journal_.empty()) {
             if (std::FILE* fp = std::fopen(whiteout_journal_.c_str(), "a")) {
                 std::fputs(guest_path.c_str(), fp);
                 std::fputc('\n', fp);

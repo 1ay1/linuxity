@@ -114,6 +114,8 @@ public:
         // an instance can sit idle for minutes; apply exits as they happen
         if constexpr (requires { trap_.set_flush_events(std::function<void()>{}); })
             trap_.set_flush_events([&] { locked([&] { apply_proc_events(); }); });
+        if constexpr (requires { trap_.fp_setup(kernel_, sys); })
+            locked([&] { trap_.fp_setup(kernel_, sys); });
         for (;;) {
             TrapFrame f;
             const auto t_wait = prof_.on ? prof_clock() : 0;
@@ -121,11 +123,25 @@ public:
             const auto t_got = prof_.on ? prof_clock() : 0;
             if (prof_.on) prof_.wait_ns += t_got - t_wait;
             locked([&] { apply_proc_events(); });
-            if (!still_running) { cleanup_temps(); prof_.report(); return ok(trap_.exit_code()); }
+            if (!still_running) {
+                cleanup_temps();
+                if constexpr (requires { trap_.fp_report(); }) if (prof_.on) trap_.fp_report();
+                prof_.report();
+                return ok(trap_.exit_code());
+            }
+
+            // A hot read-only path query: maybe patch its site so the guest
+            // answers the next ones itself (runtime/linux/fastpath.hpp).
+            if constexpr (requires { trap_.fp_maybe_patch(f.regs, f.pc, kernel_, sys); }) {
+                if (locked([&] { return trap_.fp_maybe_patch(f.regs, f.pc, kernel_, sys); })) continue;
+            }
 
             // The dispatcher classifies the trapped syscall: service it from
             // our subsystems, forward it to the host kernel, or exit.
             abi::Outcome o = locked([&] { return sys.dispatch(f.regs); });
+            // publish what the call changed to the in-guest fast path
+            if constexpr (requires { trap_.fp_after_dispatch(f.regs, kernel_, sys); })
+                locked([&] { trap_.fp_after_dispatch(f.regs, kernel_, sys); });
             // the host already refused this call, so it can't be forwarded or
             // redirected; anything but a virtualized answer is ENOSYS
             if constexpr (requires { trap_.refused_call(); })

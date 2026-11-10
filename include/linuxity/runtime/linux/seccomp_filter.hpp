@@ -73,6 +73,7 @@
 #include <unistd.h>
 
 #include "linuxity/runtime/linux/seccomp_arch.hpp"
+#include "linuxity/runtime/linux/fastpath_table.hpp"
 
 namespace lx::runtime {
 
@@ -424,7 +425,17 @@ inline constexpr int kTrappedX86_64[] = {
         kUringSetup != kNoSysno && kUringRegister != kNoSysno;
     const std::size_t nGates =
         (emit_x32 ? 1u : 0u) + (emit_uring ? 2u : 0u);
-    const std::size_t firstJeq = 4 + nGates;
+    // The in-guest fast path's own calls carry a 128-bit key in args 4 and 5
+    // (fastpath_table.hpp); they skip straight to ALLOW. 10 statements:
+    // 4 loads+compares, the jump to ALLOW, reload nr. Only a few read-only
+    // calls ever carry it, but checking the key alone is enough: nothing
+    // else guesses 128 random bits.
+    const auto& fpk = fastpath::key();
+    std::size_t kKey = fpk.armed ? 10u : 0u;
+    // BPF jumps are 8 bits; past that, run without the key (the fast path
+    // then sees its calls trapped and falls back)
+    if (kKey && nGates + nTrapped + 30 > 255) kKey = 0;
+    const std::size_t firstJeq = 4 + kKey + nGates;
 
     // Jump distance to the ENOSYS leaf, which sits after the n JEQs, the
     // pread64 check and the ALLOW and TRACE leaves.
@@ -445,6 +456,27 @@ inline constexpr int kTrappedX86_64[] = {
     const auto to_enosys = [&](std::size_t idx) {
         return static_cast<std::uint8_t>((firstJeq + nTrapped + kSend + kFc + kPre + 2) - idx - 1);
     };
+    if (kKey) {
+        // idx 4..13. ALLOW sits at firstJeq + nTrapped + kSend + kFc + kPre.
+        const auto to_allow = [&](std::size_t idx) {
+            return static_cast<std::uint8_t>((firstJeq + nTrapped + kSend + kFc + kPre) - idx - 1);
+        };
+        constexpr std::uint32_t kA4 = offsetof(seccomp_data, args) + 4 * 8;
+        constexpr std::uint32_t kA5 = offsetof(seccomp_data, args) + 5 * 8;
+        const auto lo = [](std::uint64_t v) { return static_cast<std::uint32_t>(v); };
+        const auto hi = [](std::uint64_t v) { return static_cast<std::uint32_t>(v >> 32); };
+        // each miss jumps to the reload at idx 13
+        f.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, kA4));                     // 4
+        f.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, lo(fpk.k[0]), 0, 7));      // 5
+        f.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, kA4 + 4));                 // 6
+        f.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, hi(fpk.k[0]), 0, 5));      // 7
+        f.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, kA5));                     // 8
+        f.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, lo(fpk.k[1]), 0, 3));      // 9
+        f.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, kA5 + 4));                 // 10
+        f.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, hi(fpk.k[1]), 0, 1));      // 11
+        f.push_back(BPF_JUMP(BPF_JMP | BPF_JA, to_allow(f.size()), 0, 0));         // 12
+        f.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr))); // 13
+    }
     if (emit_x32) {
         f.push_back(BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, kX32Bit,
                              to_enosys(f.size()), 0));

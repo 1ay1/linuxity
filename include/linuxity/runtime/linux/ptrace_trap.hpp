@@ -26,6 +26,7 @@
 #include "linuxity/abi/wire/errno_map.hpp"
 #include "linuxity/runtime/trap.hpp"
 #include "linuxity/runtime/linux/seccomp_filter.hpp"
+#include "linuxity/runtime/linux/fastpath.hpp"
 
 #include <sys/ptrace.h>
 #include <sys/ioctl.h>
@@ -137,6 +138,8 @@ public:
                    const std::vector<std::string>& envp,
                    const std::function<void()>& pre,
                    const std::function<void()>& setup) {
+        // the fast path's key must be in the filter the child installs
+        if (fastpath::wanted()) fastpath::arm();
         // A tiny pipe lets the child report whether the seccomp trap filter
         // installed, so the parent knows to drive tasks with PTRACE_CONT (only
         // filtered syscalls stop) versus PTRACE_SYSCALL (every syscall stops).
@@ -377,6 +380,8 @@ public:
                 tasks_.erase(w);
                 stopped_.erase(w);
                 stop_owed_.erase(w);
+                // a thread group's leader gone: its region (and pid) go too
+                if (tgid_cache_.count(w) && tgid_cache_[w] == w) fp_reaped(w);
                 // the host may hand this tid to an unrelated new process
                 tgid_cache_.erase(w);
                 bootstrapping_.erase(w);
@@ -446,6 +451,7 @@ public:
                     if (pending_real_netns_.erase(w))
                         (void)host::write_identity_maps(static_cast<int>(child));
                     proc_events_.push_back({ProcEvent::spawn, gpid, gppid, {}, {}, nsf});
+                    fp_inherit(host_tgid_of(w), child);
                 } else if (np) {
                     note_thread(w, child);
                 }
@@ -478,6 +484,7 @@ public:
                 proc_events_.push_back({ProcEvent::exec, gpid_of(w), 0,
                                         comm_of(w), cmdline_of(w)});
                 tasks_[w] = Task{};        // fresh image, back at-entry
+                fp_forget(host_tgid_of(w));
                 gt_on_exec(w);
                 resume_run(w, 0);
                 continue;
@@ -681,6 +688,8 @@ public:
                 }
             }
             rewrite_siginfo_pid(w);
+            // a fault in the fast path's guarded copy: make the call fall back
+            if ((sig == SIGSEGV || sig == SIGBUS) && fp_fixup_fault(w)) { resume_run(w, 0); continue; }
             trace_fault(w, sig);
             resume_run(w, sig);
         }
@@ -1270,6 +1279,68 @@ public:
     static constexpr std::uint64_t kStr0    = 0xfeedfacecafe0100ull;
     static constexpr std::uint64_t kStepRet = 0xfeedfacecafe0200ull;   // + step index
     struct GuestCall { abi::Sysno nr; std::array<std::uint64_t, 6> a; };
+
+    // Run setup calls inside the current task, then put it back exactly as
+    // it trapped and run the trapped call again from its instruction. Its
+    // results come back in order (a negative one stops the chain), and
+    // `between` runs after the chain with the task still stopped (to write
+    // into what the chain made). Used by the fast path to map its region
+    // and patch a site: the guest's own call then takes the patched route.
+    // False only if the task died.
+    [[nodiscard]] bool inject_then_retry(const std::vector<GuestCall>& calls,
+                                         std::vector<std::int64_t>& rets,
+                                         const std::function<void(const std::vector<std::int64_t>&)>& between = {}) {
+        Task& t = tasks_[cur_];
+        const Regs entry = t.regs;          // the guest's own registers
+        rets.clear();
+        bool alive = true;
+        for (std::size_t i = 0; i < calls.size(); ++i) {
+            Regs r = entry;
+            for (int k = 0; k < 6; ++k) {
+                std::uint64_t v = calls[i].a[static_cast<std::size_t>(k)];
+                if (v >= kStepRet && v < kStepRet + rets.size()) v = static_cast<std::uint64_t>(rets[v - kStepRet]);
+                r.set_arg(k, v);
+            }
+            r.set_nr(encode(kTraceeArch, calls[i].nr));
+            if (!r.store(cur_) || !r.commit_nr(cur_)) { alive = Regs::fetch(cur_, r); break; }
+            if (!step_to_exit(cur_)) return false;
+            Regs after{};
+            (void)Regs::fetch(cur_, after);
+            const auto ret = static_cast<std::int64_t>(after.ret());
+            rets.push_back(ret);
+            const bool stop = ret < 0 && ret >= -4095;
+            if (i + 1 < calls.size() && !stop) {
+                Regs again = after;
+                again.rewind_to_syscall();
+                (void)again.store(cur_);
+                if (!step_to_entry(cur_)) return false;
+            }
+            if (stop) break;
+        }
+        if (!alive) return true;
+        if (between) between(rets);
+        // Back to the guest's own syscall instruction with its own registers,
+        // so it runs again (now down the patched route, or trapping again).
+        Regs back = entry;
+        if (!calls.empty()) {
+            // at an exit stop the pc is past the instruction
+            back.rewind_to_syscall();
+        } else {
+            // still at the entry stop: skip this run, then rewind at its exit
+            back.skip_call();
+            back.set_ret(-static_cast<std::int64_t>(EINTR));
+            if (!store_and_skip(back)) return true;
+            if (!step_to_exit(cur_)) return false;
+            back = entry;
+            back.rewind_to_syscall();
+        }
+        (void)back.store(cur_);
+        t.regs = entry;
+        sys_done(cur_);
+        t.action = Action::none;
+        resume_task(cur_);
+        return true;
+    }
     [[nodiscard]] Result<std::int64_t> run_in_guest(const std::vector<GuestCall>& calls,
                                                     const std::vector<std::string>& strings = {},
                                                     int result_of = -1, std::int64_t retry_if_zero_ns = 0,
@@ -2743,6 +2814,7 @@ private:
                     tgid_cache_[child] = child;
                     proc_events_.push_back({ProcEvent::spawn, gpid_of(child),
                                             gppid, {}, {}});
+                    fp_inherit(host_tgid_of(w), child);
                 } else if (np) {
                     note_thread(w, child);
                 }
@@ -2759,6 +2831,7 @@ private:
                 proc_events_.push_back({ProcEvent::exec, gpid_of(w), 0,
                                         comm_of(w), cmdline_of(w)});
                 tasks_[w] = Task{};
+                fp_forget(host_tgid_of(w));
                 gt_on_exec(w);
                 return true;
             }
@@ -2777,6 +2850,10 @@ private:
             // 0 and re-inject it once the syscall has exited (via pending_sig).
             // SIGTRAP (a trap, not a real signal) is swallowed as before.
             int sig = WSTOPSIG(st);
+            if ((sig == SIGSEGV || sig == SIGBUS) && fp_fixup_fault(w)) {
+                ::ptrace(PTRACE_SYSCALL, w, 0, 0);
+                continue;
+            }
             if (sig != SIGTRAP && sig != (SIGTRAP | 0x80)) {
                 rewrite_siginfo_pid(w);
                 trace_fault(w, sig);
@@ -2986,6 +3063,7 @@ private:
     int base_opts_{0};             // linuxity's own ptrace options on every task
     std::unordered_map<::pid_t, Task> tasks_;
 #include "linuxity/runtime/linux/guest_ptrace.inc"
+#include "linuxity/runtime/linux/fastpath.inc"
 
 };
 

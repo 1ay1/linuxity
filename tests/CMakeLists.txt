@@ -163,6 +163,14 @@ endif()
 if(CMAKE_SYSTEM_NAME IN_LIST LX_PTRACE_HOSTS)
     add_test(NAME syscall_coverage
              COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/../tools/check_syscall_coverage.sh)
+    # The in-guest fast path must answer exactly like the trap, and see
+    # changes made mid-run. Both need a distro rootfs with a shell; point
+    # LINUXITY_TEST_ROOT at one, or they skip.
+    foreach(t fpdiff fpchange)
+        add_test(NAME fastpath_${t}
+                 COMMAND sh -c "[ -n \"$LINUXITY_TEST_ROOT\" ] || exit 77; u=$(mktemp -d); bash ${CMAKE_CURRENT_SOURCE_DIR}/fastpath/${t}.sh $<TARGET_FILE:linuxity> \"$LINUXITY_TEST_ROOT\" $u; r=$?; rm -rf $u; exit $r")
+        set_tests_properties(fastpath_${t} PROPERTIES SKIP_RETURN_CODE 77)
+    endforeach()
 endif()
 
 # The macOS hypervisor backend. Needs the Hypervisor framework and -- because
