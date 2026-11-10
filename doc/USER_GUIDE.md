@@ -482,6 +482,27 @@ Things that are different on a phone:
 - From `adb shell` the same CLI works with the app's binary; set
   `LINUXITY_HOME` to the app's `files/linuxity` dir.
 
+### macOS (Apple Silicon)
+
+The same binary and the same commands. Programs run as aarch64 Linux code
+on the M-series CPU inside a kernel-less Hypervisor.framework VM; linuxity
+answers their syscalls (no Linux kernel, no Docker). Pick the aarch64
+images: `linuxity new alpine` does.
+
+    linuxity new alpine
+    linuxity                   # a shell
+    linuxity uname -a          # any command: runs in your default environment
+
+Things that are different on a Mac:
+
+- An environment runs while a `shell`, `exec` or `run` is open; there's no
+  background instance, so `start`, `ps`, `svc` and `logs` don't apply and
+  `list` shows it as `ready`. Files and settings persist exactly the same.
+- Guests run as root for now; `--user` and `login.user` fall back to root
+  with a notice.
+- The binary must carry the `com.apple.security.hypervisor` entitlement
+  (the build signs it ad hoc); without it linuxity says how to sign it.
+
 ---
 
 ## 15. Where things live
