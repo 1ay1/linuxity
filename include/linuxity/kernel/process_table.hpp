@@ -180,7 +180,7 @@ public:
         auto it = procs_.find(pid);
         if (it == procs_.end() || tid == pid) return;
         // a thread shares its process's pid namespaces and takes a number there
-        for (std::uint64_t ns = it->second.ns.id[static_cast<int>(NsKind::pid)]; ns;) {
+        for (std::uint64_t ns = it->second.ns[NsKind::pid]; ns;) {
             auto& p = pidns_[ns];
             if (!p.local_of.count(tid)) {
                 const auto n = p.next++;
@@ -485,7 +485,7 @@ public:
     // Give `pid` its numbers in its pid namespace and every one above it.
     void assign_ns_pid(std::int32_t pid) {
         const auto set = ns_of(pid);
-        std::uint64_t ns = set.id[static_cast<int>(NsKind::pid)];
+        std::uint64_t ns = set[NsKind::pid];
         while (ns) {
             auto& p = pidns_[ns];
             if (!p.local_of.count(pid)) {
@@ -502,7 +502,7 @@ public:
     void assign_ns_pid_from(std::int32_t pid, std::int32_t parent) {
         const auto ps = ns_of(parent);
         std::uint64_t ns = ps.pid_for_children ? ps.pid_for_children
-                                               : ps.id[static_cast<int>(NsKind::pid)];
+                                               : ps[NsKind::pid];
         while (ns) {
             auto& p = pidns_[ns];
             if (!p.local_of.count(pid)) {
@@ -514,7 +514,7 @@ public:
         }
     }
     // The pid namespace a set's processes live in (0 = initial).
-    [[nodiscard]] static std::uint64_t pid_ns(const NsSet& s) { return s.id[static_cast<int>(NsKind::pid)]; }
+    [[nodiscard]] static std::uint64_t pid_ns(const NsSet& s) { return s[NsKind::pid]; }
     // `global` as seen from pid namespace `ns`; 0 when it isn't visible there.
     [[nodiscard]] std::int32_t pid_in(std::uint64_t ns, std::int32_t global) const {
         if (!ns || global <= 0) return global;
@@ -577,7 +577,7 @@ public:
     // Give `p` a fresh namespace of each kind in `flags`, as unshare(2)
     // does (pid and time apply to its future children).
     void unshare_ns(ProcInfo& p, std::uint64_t flags) {
-        for (int k = 0; k < kNsKinds; ++k) {
+        for (std::size_t k = 0; k < kNsKinds; ++k) {
             if (!(flags & kNsFlag[k])) continue;
             const auto kind = static_cast<NsKind>(k);
             const std::uint64_t old = ns_.resolve(p.ns, kind);
@@ -598,17 +598,17 @@ public:
     // made current, plus whatever the clone asked for.
     void inherit_ns(ProcInfo& child, const ProcInfo& parent, std::uint64_t clone_flags) {
         child.ns = parent.ns;
-        if (parent.ns.pid_for_children) child.ns.id[static_cast<int>(NsKind::pid)] = parent.ns.pid_for_children;
-        if (parent.ns.time_for_children) child.ns.id[static_cast<int>(NsKind::time)] = parent.ns.time_for_children;
+        if (parent.ns.pid_for_children) child.ns[NsKind::pid] = parent.ns.pid_for_children;
+        if (parent.ns.time_for_children) child.ns[NsKind::time] = parent.ns.time_for_children;
         child.ns.pid_for_children = child.ns.time_for_children = 0;
         if (clone_flags) {
             unshare_ns(child, clone_flags);
             if (child.ns.pid_for_children) {
-                child.ns.id[static_cast<int>(NsKind::pid)] = child.ns.pid_for_children;
+                child.ns[NsKind::pid] = child.ns.pid_for_children;
                 child.ns.pid_for_children = 0;
             }
             if (child.ns.time_for_children) {
-                child.ns.id[static_cast<int>(NsKind::time)] = child.ns.time_for_children;
+                child.ns[NsKind::time] = child.ns.time_for_children;
                 child.ns.time_for_children = 0;
             }
         }

@@ -25,7 +25,9 @@
 namespace lx::kernel {
 
 enum class NsKind : int { cgroup, ipc, mnt, net, pid, time, user, uts };
-inline constexpr int kNsKinds = 8;
+inline constexpr std::size_t kNsKinds = 8;
+// The one way to turn a kind into an index of the per-kind arrays below.
+[[nodiscard]] constexpr std::size_t ns_index(NsKind k) noexcept { return static_cast<std::size_t>(k); }
 inline constexpr std::array<std::string_view, kNsKinds> kNsName = {
     "cgroup", "ipc", "mnt", "net", "pid", "time", "user", "uts"};
 // The CLONE_NEW* flag for each kind, in NsKind order.
@@ -34,11 +36,26 @@ inline constexpr std::array<std::uint64_t, kNsKinds> kNsFlag = {
     0x20000000, 0x00000080, 0x10000000, 0x04000000};
 inline constexpr std::uint64_t kCloneNewMask = 0x7e020080;
 
+// A /proc/<pid>/ns/ leaf: "<kind>" or "<kind>_for_children". The one parser
+// of those names (setns and procfs both read them).
+struct NsLeaf { NsKind kind; bool for_children; };
+[[nodiscard]] constexpr std::optional<NsLeaf> parse_ns_leaf(std::string_view n) noexcept {
+    constexpr std::string_view kSuffix = "_for_children";
+    const bool fc = n.ends_with(kSuffix);
+    if (fc) n.remove_suffix(kSuffix.size());
+    for (std::size_t k = 0; k < kNsKinds; ++k)
+        if (n == kNsName[k]) return NsLeaf{static_cast<NsKind>(k), fc};
+    return std::nullopt;
+}
+
 // Which namespaces a process is in. 0 = the initial one.
 struct NsSet {
     std::array<std::uint64_t, kNsKinds> id{};
     std::uint64_t pid_for_children{0};    // where its next child's pid lives
     std::uint64_t time_for_children{0};
+    // s[NsKind::mnt] -- the typed spelling of id[...], so no caller casts.
+    [[nodiscard]] constexpr std::uint64_t& operator[](NsKind k) noexcept { return id[ns_index(k)]; }
+    [[nodiscard]] constexpr std::uint64_t operator[](NsKind k) const noexcept { return id[ns_index(k)]; }
 };
 
 // One line of a uid_map/gid_map: ids [inside, inside+count) of the namespace
@@ -56,7 +73,7 @@ public:
             4026531836, 4026531834, 4026531837, 4026531838};
         initial_ = kCanon;
 #if !defined(_WIN32)
-        for (int k = 0; k < kNsKinds; ++k) {
+        for (std::size_t k = 0; k < kNsKinds; ++k) {
             const std::string p = "/proc/self/ns/" + std::string{kNsName[k]};
             char buf[64];
             const ::ssize_t n = ::readlink(p.c_str(), buf, sizeof buf - 1);
@@ -70,10 +87,10 @@ public:
         for (const auto v : initial_) if (v >= next_) next_ = v + 64;
     }
 
-    [[nodiscard]] std::uint64_t initial(NsKind k) const { return initial_[static_cast<int>(k)]; }
+    [[nodiscard]] std::uint64_t initial(NsKind k) const { return initial_[ns_index(k)]; }
     // The namespace a set names for `k`, 0 resolved to the initial one.
     [[nodiscard]] std::uint64_t resolve(const NsSet& s, NsKind k) const {
-        const auto v = s.id[static_cast<int>(k)];
+        const auto v = s[k];
         return v ? v : initial(k);
     }
     [[nodiscard]] bool is_initial(const NsSet& s, NsKind k) const {

@@ -107,11 +107,21 @@ template <class T>
 // `LX_TRY(expr)` unwraps a Result<T> or short-circuits the enclosing
 // function with the propagated Errno. The moral equivalent of Rust's `?`
 // or Haskell's `<-` inside a do-block.
+//
+// The unwrap goes through detail::try_value because libc++ marks
+// expected::value() [[nodiscard]], and a statement-form LX_TRY(f()) -- the
+// common case for a Status -- discards it on purpose. (A plain `return
+// r.value()` also works for Result<void>, which a lambda argument would not.)
+namespace detail {
+template <class R>
+constexpr decltype(auto) try_value(R&& r) { return static_cast<R&&>(r).value(); }
+} // namespace detail
+
 #define LX_TRY(expr)                                                          \
     __extension__({                                                           \
         auto&& _lx_r = (expr);                                                \
         if (!_lx_r) return ::std::unexpected(_lx_r.error());                  \
-        std::move(_lx_r).value();                                             \
+        ::lx::detail::try_value(std::move(_lx_r));                            \
     })
 
 } // namespace lx

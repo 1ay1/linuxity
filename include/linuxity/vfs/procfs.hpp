@@ -32,7 +32,6 @@
 #if !defined(_WIN32)
 #include <dirent.h>
 #include <sys/stat.h>
-#include <sys/sysmacros.h>
 #include <unistd.h>
 #endif
 
@@ -392,8 +391,8 @@ inline std::optional<Result<kernel::VirtualFile>> net_view(std::string_view rest
 // ids go through the reader's user namespace, pids through its pid one.
 inline std::string sysvipc_text(const kernel::ProcessTable& procs, std::string_view which) {
     const auto set = procs.ns_of(procs.reader());
-    const auto ipc_ns = set.id[static_cast<int>(kernel::NsKind::ipc)];
-    const auto user_ns = set.id[static_cast<int>(kernel::NsKind::user)];
+    const auto ipc_ns = set[kernel::NsKind::ipc];
+    const auto user_ns = set[kernel::NsKind::user];
     auto uid = [&](std::uint32_t v) { return user_ns ? procs.ns().to_ns(user_ns, v, false) : v; };
     auto gid = [&](std::uint32_t v) { return user_ns ? procs.ns().to_ns(user_ns, v, true) : v; };
     auto pid = [&](std::int32_t v) { return static_cast<unsigned>(v > 0 ? procs.view_pid(v) : 0); };
@@ -454,7 +453,7 @@ inline std::string sysvipc_text(const kernel::ProcessTable& procs, std::string_v
 inline std::string sysvipc_from_host(const kernel::ProcessTable& procs, const std::string& h,
                                      std::string_view which) {
     const auto set = procs.ns_of(procs.reader());
-    const auto user_ns = set.id[static_cast<int>(kernel::NsKind::user)];
+    const auto user_ns = set[kernel::NsKind::user];
 #if defined(_WIN32)
     const unsigned long me = 0;
 #else
@@ -552,7 +551,7 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
             // where the host has SysV IPC the syscalls go to it, so this does
             // too, with its host pids and uids shown as the guest's. A guest's
             // own IPC namespace is linuxity's.
-            const bool own_ipc_ns = procs.ns_of(procs.reader()).id[static_cast<int>(kernel::NsKind::ipc)] != 0;
+            const bool own_ipc_ns = procs.ns_of(procs.reader())[kernel::NsKind::ipc] != 0;
             if (procs.ipc().host_backed() && !own_ipc_ns)
                 if (std::string h = host_file(std::string{abs}.c_str()); !h.empty())
                     return ok(text_file(sysvipc_from_host(procs, h, abs.substr(14))));
@@ -1140,7 +1139,7 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
         if (abs == "/proc/sys/kernel/osrelease") return ok(text_file(release + "\n"));
         if (abs == "/proc/sys/kernel/hostname" || abs == "/proc/sys/kernel/domainname") {
             // the reader's UTS namespace; the initial one is the machine
-            const auto uid = procs.ns_of(procs.reader()).id[static_cast<int>(kernel::NsKind::uts)];
+            const auto uid = procs.ns_of(procs.reader())[kernel::NsKind::uts];
             const auto& names = procs.ns().uts(uid);
             const bool dom = abs.ends_with("domainname");
             const std::string v = uid ? (dom ? names.second : names.first)
@@ -1230,16 +1229,13 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                 const auto& reg = procs.ns();
                 const auto& s = I.ns;
                 auto id_of = [&](std::string_view n) -> std::uint64_t {
-                    for (int k = 0; k < kernel::kNsKinds; ++k) {
-                        const auto kd = static_cast<kernel::NsKind>(k);
-                        if (n == kernel::kNsName[k]) return reg.resolve(s, kd);
-                        if (n == std::string{kernel::kNsName[k]} + "_for_children") {
-                            const auto c = kd == kernel::NsKind::pid ? s.pid_for_children
-                                         : kd == kernel::NsKind::time ? s.time_for_children : 0;
-                            return c ? c : reg.resolve(s, kd);
-                        }
-                    }
-                    return 0;
+                    const auto leaf = kernel::parse_ns_leaf(n);
+                    if (!leaf) return 0;
+                    const auto kd = leaf->kind;
+                    if (!leaf->for_children) return reg.resolve(s, kd);
+                    const auto c = kd == kernel::NsKind::pid ? s.pid_for_children
+                                 : kd == kernel::NsKind::time ? s.time_for_children : 0;
+                    return c ? c : reg.resolve(s, kd);
                 };
                 if (tail == "ns") {
                     std::vector<kernel::VirtualDirent> e;
@@ -1257,11 +1253,11 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                 return ok(std::move(vf));
             }
             if (tail == "uid_map" || tail == "gid_map") {
-                const auto un = I.ns.id[static_cast<int>(kernel::NsKind::user)];
+                const auto un = I.ns[kernel::NsKind::user];
                 return ok(text_file(procs.ns().map_text(un, tail == "gid_map")));
             }
             if (tail == "setgroups") {
-                const auto un = I.ns.id[static_cast<int>(kernel::NsKind::user)];
+                const auto un = I.ns[kernel::NsKind::user];
                 const auto* u = procs.ns().user_ns(un);
                 return ok(text_file(!u || u->setgroups_allowed ? "allow\n" : "deny\n"));
             }

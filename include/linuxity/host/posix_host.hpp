@@ -2,6 +2,7 @@
 #pragma once
 #include "linuxity/abi/wire/errno_map.hpp"
 #include "linuxity/host/host.hpp"
+#include "linuxity/host/stat_fields.hpp"
 
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -93,25 +94,20 @@ public:
         HStat h;
         h.size     = static_cast<std::uint64_t>(st.st_size);
         h.mode     = static_cast<std::uint32_t>(st.st_mode) & 0777u;
-        h.mtime_ns = static_cast<std::uint64_t>(st.st_mtime) * 1'000'000'000ull;
-        // The rest, for answering a guest stat in one trap stop. Timestamps
-        // keep nanosecond resolution: truncating to seconds makes `make` see
-        // a just-written file as unchanged.
-        h.raw_mode = static_cast<std::uint32_t>(st.st_mode);
-        h.dev      = static_cast<std::uint64_t>(st.st_dev);
-        h.ino      = static_cast<std::uint64_t>(st.st_ino);
-        h.nlink    = static_cast<std::uint64_t>(st.st_nlink);
+        // The rest, for answering a guest stat in one trap stop.
+        const abi::wire::StatFields f = stat_fields(st);
+        h.raw_mode = f.mode;
+        h.dev      = f.dev;
+        h.ino      = f.ino;
+        h.nlink    = f.nlink;
         h.uid      = static_cast<std::uint32_t>(st.st_uid);
         h.gid      = static_cast<std::uint32_t>(st.st_gid);
-        h.rdev     = static_cast<std::uint64_t>(st.st_rdev);
-        h.blksize  = static_cast<std::int64_t>(st.st_blksize);
-        h.blocks   = static_cast<std::int64_t>(st.st_blocks);
-        h.mtime_ns = static_cast<std::uint64_t>(st.st_mtim.tv_sec) * 1'000'000'000ull +
-                     static_cast<std::uint64_t>(st.st_mtim.tv_nsec);
-        h.atime_ns = static_cast<std::uint64_t>(st.st_atim.tv_sec) * 1'000'000'000ull +
-                     static_cast<std::uint64_t>(st.st_atim.tv_nsec);
-        h.ctime_ns = static_cast<std::uint64_t>(st.st_ctim.tv_sec) * 1'000'000'000ull +
-                     static_cast<std::uint64_t>(st.st_ctim.tv_nsec);
+        h.rdev     = f.rdev;
+        h.blksize  = f.blksize;
+        h.blocks   = f.blocks;
+        h.mtime_ns = f.mtime_ns;
+        h.atime_ns = f.atime_ns;
+        h.ctime_ns = f.ctime_ns;
         if      (S_ISDIR(st.st_mode))  h.type = HFileType::directory;
         else if (S_ISLNK(st.st_mode))  h.type = HFileType::symlink;
         else if (S_ISREG(st.st_mode))  h.type = HFileType::regular;

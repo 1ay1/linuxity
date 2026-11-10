@@ -52,14 +52,19 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <net/if.h>
-#include <linux/netlink.h>
-#include <linux/rtnetlink.h>
 #include <sys/syscall.h>
 #include <sys/xattr.h>
 #include <unistd.h>
 #endif
+#if defined(__linux__)
+// rtnetlink, for host_ifindex/nl80211 below (themselves __linux__-only)
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#endif
 #include <ctime>
+#include "linuxity/host/long_path.hpp"
 #include "linuxity/host/real_netns.hpp"
+#include "linuxity/host/stat_fields.hpp"
 
 // -- Host portability: lstat ------------------------------------------------
 // The core calls lstat(2) in exactly one place (is_symlink below), to avoid a
@@ -156,7 +161,7 @@ public:
             auto id = ids();
             k_.files().set_current_pid(id.pid, id.ppid);
             k_.procs().set_reader(id.pid);
-            k_.files().set_current_mnt_ns(k_.procs().ns_of(id.pid).id[static_cast<int>(kernel::NsKind::mnt)]);
+            k_.files().set_current_mnt_ns(k_.procs().ns_of(id.pid)[kernel::NsKind::mnt]);
             // A task can trap before its spawn event is folded in; build its
             // fork-time record now so no handler sees a half-made one.
             if constexpr (requires { mem_.host_tid(); })
@@ -699,7 +704,7 @@ public:
                 // remembered no-ops, so nothing outside changes.
                 if (const std::string tgt = read_cstr(uaddr(r.arg[1])); !tgt.empty()) {
                     const std::string abs_tgt = k_.files().absolutize(tgt, k_.files().cwd());
-                    const auto mns = me().ns.id[static_cast<int>(kernel::NsKind::mnt)];
+                    const auto mns = me().ns[kernel::NsKind::mnt];
                     if (mns) return mount_in_ns(r, type, abs_tgt, mns);
                     guest_mounts_.insert(abs_tgt);
                 }
@@ -713,7 +718,7 @@ public:
                 if (raw.empty()) return eno(Errno::efault);
                 const std::string tgt =
                     k_.files().absolutize(raw, k_.files().cwd());
-                const auto mns = me().ns.id[static_cast<int>(kernel::NsKind::mnt)];
+                const auto mns = me().ns[kernel::NsKind::mnt];
                 if (mns) {
                     const bool detach = r.arg[1] & 0x2;   // MNT_DETACH
                     const Errno e = k_.files().umount_guest(tgt, mns, detach);
@@ -1076,7 +1081,7 @@ private:
     // pivot_root(new_root, put_old), on our mount table. Only inside a mount
     // namespace of the guest's own; elsewhere it is the host's root.
     [[nodiscard]] Outcome do_pivot_root(const Regs& r) {
-        const auto mns = me().ns.id[static_cast<int>(kernel::NsKind::mnt)];
+        const auto mns = me().ns[kernel::NsKind::mnt];
         if (!mns) return eno(Errno::eperm);
         auto& fs = k_.files();
         const std::string nr = fs.absolutize(read_cstr(uaddr(r.arg[0])), fs.cwd());
@@ -1087,7 +1092,7 @@ private:
         }
         std::vector<std::int32_t> pids;
         for (const std::int32_t p : k_.procs().pids())
-            if (k_.procs().ns_of(p).id[static_cast<int>(kernel::NsKind::mnt)] == mns) pids.push_back(p);
+            if (k_.procs().ns_of(p)[kernel::NsKind::mnt] == mns) pids.push_back(p);
         if (const Errno e = fs.pivot_root(mns, nr, po, pids); e != Errno::ok) return eno(e);
         return val(0);
     }
@@ -1095,7 +1100,7 @@ private:
     // mount_setattr(dfd, path, flags, attr, size): only the read-only bit
     // means anything to us; inside a mount namespace it changes our table.
     [[nodiscard]] Outcome do_mount_setattr(const Regs& r) {
-        const auto mns = me().ns.id[static_cast<int>(kernel::NsKind::mnt)];
+        const auto mns = me().ns[kernel::NsKind::mnt];
         if (!mns) return eno(Errno::enosys);
         if (r.arg[4] < 32) return eno(Errno::einval);
         std::array<std::byte, 16> a{};
@@ -2046,11 +2051,14 @@ private:
              wire::has(flags, wire::OpenFlag::trunc)))
             open_wi = Wi::parents_only;
         auto pc = k_.files().classify(abs, for_write, /*follow=*/true, open_wi);
-        // the guest's kernel log, whatever node stat shows for it
+#if defined(__linux__)
+        // the guest's kernel log, whatever node stat shows for it (a packet
+        // pipe handed over through /proc/<pid>/fd -- Linux hosts only)
         if ((abs == "/dev/kmsg" || abs == "/proc/kmsg") &&
             (pc.realm == kernel::Realm2::virtual_file || pc.realm == kernel::Realm2::host_backed) &&
             !wire::has_for(arch_, flags, wire::OpenFlag::path))
             return kmsg_open(flags, path_arg, /*proc_style=*/abs == "/proc/kmsg");
+#endif
         // A TRAILING SLASH asserts the path is a directory, and that
         // assertion is judged BEFORE O_EXCL's "the name is taken": so
         // open("d/", O_CREAT|O_EXCL) on an existing directory is EISDIR,
@@ -2151,7 +2159,9 @@ private:
                 if (!guest_may(abs, want)) return eno(Errno::eacces);
                 if (privileged()) grant_root_dir_access(abs, pc.host_path);
             }
-            // An emulated FIFO opens onto its shared pipe instead.
+            // An emulated FIFO opens onto its shared pipe instead (only the
+            // Linux launcher turns the emulation on; see fifo_open).
+#if defined(__linux__)
             if (k_.files().fifos_emulated() &&
                 !wire::has_for(arch_, flags, wire::OpenFlag::path) &&
                 k_.files().meta().is_fifo(abs)) {
@@ -2159,6 +2169,7 @@ private:
                 if (::stat(pc.host_path.c_str(), &st) == 0 && S_ISREG(st.st_mode))
                     return fifo_open(abs, st, flags, path_arg);
             }
+#endif
             // Remember the guest path for this fd after the trap assigns it.
             pending_open_ = abs;
             pending_flags_ = flags;
@@ -2372,21 +2383,7 @@ private:
             std::snprintf(link, sizeof link, "/proc/%d/fd/%d", mem_.host_tid(), fd);
             struct ::stat st{};
             if (::stat(link, &st) != 0) return eno(errno == ENOENT ? Errno::ebadf : wire::errno_from_host(errno));
-            wire::StatFields h;
-            h.mode     = static_cast<std::uint32_t>(st.st_mode);
-            h.dev      = static_cast<std::uint64_t>(st.st_dev);
-            h.ino      = static_cast<std::uint64_t>(st.st_ino);
-            h.nlink    = static_cast<std::uint64_t>(st.st_nlink);
-            h.rdev     = static_cast<std::uint64_t>(st.st_rdev);
-            h.size     = static_cast<std::uint64_t>(st.st_size);
-            h.blksize  = static_cast<std::int64_t>(st.st_blksize);
-            h.blocks   = static_cast<std::int64_t>(st.st_blocks);
-            h.mtime_ns = static_cast<std::uint64_t>(st.st_mtim.tv_sec) * 1'000'000'000ull +
-                         static_cast<std::uint64_t>(st.st_mtim.tv_nsec);
-            h.atime_ns = static_cast<std::uint64_t>(st.st_atim.tv_sec) * 1'000'000'000ull +
-                         static_cast<std::uint64_t>(st.st_atim.tv_nsec);
-            h.ctime_ns = static_cast<std::uint64_t>(st.st_ctim.tv_sec) * 1'000'000'000ull +
-                         static_cast<std::uint64_t>(st.st_ctim.tv_nsec);
+            wire::StatFields h = host::stat_fields(st);
             // the same inode by path: fill in what a path stat would (emulated
             // link counts, socket placeholders), only if it IS that inode.
             // Without either, the path stat could only repeat the fd's.
@@ -3064,8 +3061,8 @@ private:
         if (pc.realm == kernel::Realm2::host_backed) {
             // a deep dir's host path can pass PATH_MAX; walk it instead
             struct ::stat st{};
-            const int dfd = open_long(pc.host_path, O_PATH | O_CLOEXEC);
-            if (dfd < 0) return eno(Errno::enoent);
+            const int dfd = host::open_long(pc.host_path, host::kWalkDirFlags);
+            if (dfd < 0) return eno(errno == ENOTDIR ? Errno::enotdir : Errno::enoent);
             const int rc = ::fstat(dfd, &st);
             ::close(dfd);
             if (rc != 0)            return eno(Errno::enoent);
@@ -3093,26 +3090,6 @@ private:
             }
         }
         return val(0);
-    }
-
-    // open() for a host path that may be longer than PATH_MAX: walk it one
-    // component at a time. Returns an fd or -1.
-    [[nodiscard]] static int open_long(const std::string& p, int flags) {
-        if (p.size() < 4096) return ::open(p.c_str(), flags);
-        int fd = ::open("/", O_PATH | O_DIRECTORY | O_CLOEXEC);
-        std::size_t i = 0;
-        while (fd >= 0 && i < p.size()) {
-            while (i < p.size() && p[i] == '/') ++i;
-            if (i >= p.size()) break;
-            const std::size_t j = std::min(p.find('/', i), p.size());
-            const std::string part = p.substr(i, j - i);
-            i = j;
-            const bool last = p.find_first_not_of('/', j) == std::string::npos;
-            const int nfd = ::openat(fd, part.c_str(), last ? flags : (O_PATH | O_DIRECTORY | O_CLOEXEC));
-            ::close(fd);
-            fd = nfd;
-        }
-        return fd;
     }
 
     // fchdir(fd): the guest changes cwd to an already-open directory fd. The
@@ -3361,11 +3338,11 @@ private:
             auto* p = k_.procs().find_mut(it->pid);
             auto& reg = k_.procs().ns();
             if (p) {
-                const auto un = p->ns.id[static_cast<int>(kernel::NsKind::user)];
+                const auto un = p->ns[kernel::NsKind::user];
                 if (it->which == "hostname" || it->which == "domainname") {
                     while (!text.empty() && text.back() == '\n') text.pop_back();
                     if (text.size() > 64) text.resize(64);
-                    const auto uid = p->ns.id[static_cast<int>(kernel::NsKind::uts)];
+                    const auto uid = p->ns[kernel::NsKind::uts];
                     if (it->which == "domainname") reg.set_domainname(uid, text);
                     else if (uid) reg.set_hostname(uid, text);
                     else {
@@ -3792,7 +3769,7 @@ private:
                 const std::uint32_t keep =
                     host_path_is_regular(wc.host_path) ? 0600u : 0u;
                 errno = 0;
-                if (::chmod(wc.host_path.c_str(), (mode & wire::kPermMask) | keep) == 0) {
+                if (::chmod(wc.host_path.c_str(), static_cast<mode_t>((mode & wire::kPermMask) | keep)) == 0) {
                     std::uint32_t got = 0;
                     if (hostcompat::host_mode_of(wc.host_path.c_str(), got))
                         landed = got;
@@ -5143,6 +5120,8 @@ private:
                 static_cast<std::byte>(1u << (static_cast<unsigned>(c) & 7u));
         // The task's REAL mask, so sched_setaffinity reads back. Clipped to
         // the CPUs we advertise; if that leaves none, the advertised set.
+        // (Only a ptrace backend has host tids, and only Linux has the call.)
+#if defined(__linux__)
         if constexpr (requires { mem_.host_tid(); mem_.host_tid_of(0); }) {
             const auto pid = static_cast<std::int32_t>(r.arg[0]);
             if (pid < 0) return eno(Errno::esrch);
@@ -5164,6 +5143,7 @@ private:
                 return eno(Errno::esrch);
             }
         }
+#endif
         if (!mem_.copy_out(mask, buf)) return eno(Errno::efault);
         return val(static_cast<std::int64_t>(bytes));
     }
@@ -5720,7 +5700,7 @@ private:
     // namespace names it (the overflow id 65534 when it isn't mapped).
     [[nodiscard]] std::uint32_t ns_id(std::uint32_t id, bool gid) {
         if (!map_files_.empty()) apply_map_writes();
-        const auto un = me().ns.id[static_cast<int>(kernel::NsKind::user)];
+        const auto un = me().ns[kernel::NsKind::user];
         return un ? k_.procs().ns().to_ns(un, id, gid) : id;
     }
     // The reverse, for an id the caller passes in. An unmapped id becomes
@@ -5728,7 +5708,7 @@ private:
     [[nodiscard]] std::uint32_t in_ns(std::uint32_t id, bool gid) {
         if (id == creds::kKeep) return id;
         if (!map_files_.empty()) apply_map_writes();
-        const auto un = me().ns.id[static_cast<int>(kernel::NsKind::user)];
+        const auto un = me().ns[kernel::NsKind::user];
         if (!un) return id;
         return k_.procs().ns().from_ns(un, id, gid).value_or(0xfffffffeu);
     }
@@ -5793,14 +5773,13 @@ private:
         }
         if (gp.starts_with("/proc/self/ns/")) { pid = ids().pid; kind = gp.substr(14); }
         if (pid <= 0 || kind.empty()) return eno(Errno::einval);
-        int k = -1;
-        for (int i = 0; i < kernel::kNsKinds; ++i)
-            if (kind == kernel::kNsName[i] || kind == std::string{kernel::kNsName[i]} + "_for_children") k = i;
-        if (k < 0) return eno(Errno::einval);
+        const auto leaf = kernel::parse_ns_leaf(kind);
+        if (!leaf) return eno(Errno::einval);
+        const auto kd = leaf->kind;
+        const std::size_t k = kernel::ns_index(kd);
         if (want && want != kernel::kNsFlag[k]) return eno(Errno::einval);
         if (!creds::capable(p, 21 /*CAP_SYS_ADMIN*/)) return eno(Errno::eperm);
         const auto target = k_.procs().ns_of(pid);
-        const auto kd = static_cast<kernel::NsKind>(k);
         if (kd == kernel::NsKind::pid) p.ns.pid_for_children = k_.procs().ns().resolve(target, kd);
         else if (kd == kernel::NsKind::time) p.ns.time_for_children = k_.procs().ns().resolve(target, kd);
         else p.ns.id[k] = target.id[k];
@@ -5816,7 +5795,7 @@ private:
         if (len && !mem_.copy_in(uaddr(r.arg[0]), raw)) return eno(Errno::efault);
         std::string s(reinterpret_cast<const char*>(raw.data()), len);
         auto& ns = k_.procs().ns();
-        const auto id = p.ns.id[static_cast<int>(kernel::NsKind::uts)];
+        const auto id = p.ns[kernel::NsKind::uts];
         if (domain) ns.set_domainname(id, std::move(s));
         else if (id) ns.set_hostname(id, std::move(s));
         else {
@@ -5928,7 +5907,7 @@ private:
         if (!map_files_.empty()) apply_map_writes();
         const auto& m = machine();
         // the caller's UTS namespace; the initial one is the machine's name
-        const auto uts_id = me().ns.id[static_cast<int>(kernel::NsKind::uts)];
+        const auto uts_id = me().ns[kernel::NsKind::uts];
         const auto& names = k_.procs().ns().uts(uts_id);
         set(u.nodename, uts_id ? names.first.c_str() : m.nodename.c_str());
         set(u.release,  m.release.c_str());
@@ -6007,7 +5986,7 @@ public:
         if (::stat(host.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) return;
         if ((st.st_mode & 0600) == 0600 || st.st_uid != ::getuid()) return;
         const std::uint32_t real = st.st_mode & wire::kPermMask;
-        if (::chmod(host.c_str(), real | 0600) != 0) return;
+        if (::chmod(host.c_str(), static_cast<mode_t>(real | 0600)) != 0) return;
         // A mode recorded earlier is the truth already; only fill in a
         // missing one.
         const auto rec = k_.files().meta().lookup(abs);
@@ -6322,7 +6301,7 @@ public:
             std::snprintf(link, sizeof link, "/proc/%d/cwd", mem_.host_tid());
             struct ::stat a{}, b{};
             if (::stat(link, &a) != 0) return false;
-            const int fd = open_long(host_dir, O_PATH | O_DIRECTORY | O_CLOEXEC);
+            const int fd = host::open_long(host_dir, host::kWalkDirFlags);
             if (fd < 0) return false;
             const bool same = ::fstat(fd, &b) == 0 && a.st_dev == b.st_dev && a.st_ino == b.st_ino;
             ::close(fd);
@@ -6363,6 +6342,11 @@ public:
         return val(0);
     }
 
+    // An emulated FIFO's open: a shared host pipe handed over through
+    // /proc/<pid>/fd, opened O_PATH so it pins the pipe without being an end
+    // of it. All three are Linux-host facts; only the Linux launcher enables
+    // the emulation (main.cpp, for hosts whose filesystem refuses mkfifo).
+#if defined(__linux__)
     [[nodiscard]] Outcome fifo_open(const std::string& abs, const struct ::stat& node,
                                     std::uint64_t flags, int path_arg) {
         // keyed by the placeholder's inode, so a rename keeps the pipe and a
@@ -6429,6 +6413,7 @@ public:
     [[nodiscard]] static std::string self_fd(int fd) {
         return "/proc/self/fd/" + std::to_string(fd);
     }
+#endif
 
     // -- the guest's kernel log ----------------------------------------------
     void kmsg_add(int prio, std::string text) {
@@ -6479,6 +6464,9 @@ public:
     }
     // Open /dev/kmsg: a reader gets a packet pipe holding the records, one
     // per read, then EOF; a writer gets a pipe linuxity drains into the log.
+    // (O_DIRECT packet pipes and F_SETPIPE_SZ are Linux's; elsewhere the
+    // guest opens the overlay's node and syslog(2) still serves the log.)
+#if defined(__linux__)
     [[nodiscard]] Outcome kmsg_open(std::uint64_t flags, int path_arg, bool proc_style = false) {
         kmsg_seed();
         kmsg_drain();
@@ -6514,6 +6502,7 @@ public:
         return Redirect{PathArg{path_arg, "/proc/" + std::to_string(::getpid()) +
                                               "/fd/" + std::to_string(give)}};
     }
+#endif
     // syslog(2)/klogctl over the same log, in its classic text form.
     [[nodiscard]] Outcome do_syslog(const Regs& r) {
         kmsg_seed();
@@ -7437,7 +7426,11 @@ public:
                 int type = 0, proto = 0;
                 ::socklen_t tl = sizeof type, pl = sizeof proto;
                 (void)::getsockopt(hfd, SOL_SOCKET, SO_TYPE, &type, &tl);
+#if defined(SO_PROTOCOL)
                 (void)::getsockopt(hfd, SOL_SOCKET, SO_PROTOCOL, &proto, &pl);
+#else
+                (void)pl;   // no SO_PROTOCOL (Darwin): an inet stream socket is TCP
+#endif
                 ::close(hfd);
                 if (type != SOCK_STREAM || (proto != 0 && proto != 6 /*IPPROTO_TCP*/)) return Errno::ok;
                 const std::uint64_t port = (std::to_integer<unsigned>(sa[2]) << 8) | std::to_integer<unsigned>(sa[3]);
@@ -7664,7 +7657,7 @@ public:
         // link(2) and EACCES. st_dev names the filesystem exactly.
         struct ::stat dst{};
         if (::stat(dir.c_str(), &dst) != 0) return false;
-        if (const auto it = links_work_.find(dst.st_dev);
+        if (const auto it = links_work_.find(static_cast<std::uint64_t>(dst.st_dev));
             it != links_work_.end())
             return it->second;
         const std::string a = dir + "/.lx-linkprobe-a";
@@ -7677,7 +7670,7 @@ public:
         const bool works = ::link(a.c_str(), b.c_str()) == 0;
         ::unlink(a.c_str());
         ::unlink(b.c_str());
-        links_work_[dst.st_dev] = works;
+        links_work_[static_cast<std::uint64_t>(dst.st_dev)] = works;
         return works;
     }
 

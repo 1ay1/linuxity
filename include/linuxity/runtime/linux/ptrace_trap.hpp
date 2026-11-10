@@ -54,6 +54,7 @@
 #include <fcntl.h>
 #include <set>
 #include "linuxity/host/real_netns.hpp"
+#include "linuxity/host/stat_fields.hpp"
 
 namespace lx::runtime {
 
@@ -2001,22 +2002,7 @@ public:
     stat_host_path(const std::string& path) const {
         struct ::stat st{};
         if (::lstat(path.c_str(), &st) != 0) return std::nullopt;
-        abi::wire::StatFields h;
-        h.mode     = static_cast<std::uint32_t>(st.st_mode);
-        h.dev      = static_cast<std::uint64_t>(st.st_dev);
-        h.ino      = static_cast<std::uint64_t>(st.st_ino);
-        h.nlink    = static_cast<std::uint64_t>(st.st_nlink);
-        h.rdev     = static_cast<std::uint64_t>(st.st_rdev);
-        h.size     = static_cast<std::uint64_t>(st.st_size);
-        h.blksize  = static_cast<std::int64_t>(st.st_blksize);
-        h.blocks   = static_cast<std::int64_t>(st.st_blocks);
-        h.mtime_ns = static_cast<std::uint64_t>(st.st_mtim.tv_sec) * 1'000'000'000ull +
-                     static_cast<std::uint64_t>(st.st_mtim.tv_nsec);
-        h.atime_ns = static_cast<std::uint64_t>(st.st_atim.tv_sec) * 1'000'000'000ull +
-                     static_cast<std::uint64_t>(st.st_atim.tv_nsec);
-        h.ctime_ns = static_cast<std::uint64_t>(st.st_ctim.tv_sec) * 1'000'000'000ull +
-                     static_cast<std::uint64_t>(st.st_ctim.tv_nsec);
-        return h;
+        return host::stat_fields(st);
     }
 
     struct TaskIds { std::int32_t pid, tid, ppid; };

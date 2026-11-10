@@ -6,7 +6,7 @@
     // any namespace a guest made (the host has only the one) and on hosts
     // without SysV IPC at all.
     [[nodiscard]] bool host_has_sysv() { return kernel::SysvIpc::host_backed() && ipc_ns() == 0; }
-    [[nodiscard]] std::uint64_t ipc_ns() { return me().ns.id[static_cast<int>(kernel::NsKind::ipc)]; }
+    [[nodiscard]] std::uint64_t ipc_ns() { return me().ns[kernel::NsKind::ipc]; }
     [[nodiscard]] kernel::IpcSpace& ipc_space() { return k_.procs().ipc().space(ipc_ns()); }
     [[nodiscard]] static std::int64_t now_s() { return static_cast<std::int64_t>(std::time(nullptr)); }
 

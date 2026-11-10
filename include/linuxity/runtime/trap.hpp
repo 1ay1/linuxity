@@ -665,22 +665,23 @@ private:
     // round of guessing; a0/a1 is the fd and the request for ioctl, and the
     // dirfd and path pointer for the *at calls.
     void trace_fate(const char* t, const abi::Regs& rg, const abi::Outcome& o) {
-        const std::uint64_t nr = rg.nr;
+        const auto nr = static_cast<unsigned long long>(rg.nr);   // %llu below
         std::FILE* out = trace_out(t);
         std::fprintf(out, "[lx] a0=%#llx a1=%#llx ",
-                     (unsigned long long)rg.arg[0], (unsigned long long)rg.arg[1]);
+                     static_cast<unsigned long long>(rg.arg[0]),
+                     static_cast<unsigned long long>(rg.arg[1]));
         o.match(
             [&](const abi::Virtualize& v) {
                 std::fprintf(out, "[lx] nr=%llu -> VIRT ret=%lld\n",
-                    (unsigned long long)nr, (long long)v.ret);
+                    nr, static_cast<long long>(v.ret));
             },
             [&](const abi::Forward& f) {
                 if (f.mirror)
                     std::fprintf(out, "[lx] nr=%llu -> FORWARD dup_from=%d\n",
-                        (unsigned long long)nr, f.mirror->from);
+                        nr, f.mirror->from);
                 else
                     std::fprintf(out, "[lx] nr=%llu -> FORWARD\n",
-                        (unsigned long long)nr);
+                        nr);
             },
             [&](const abi::Redirect& rd) {
                 // Say when the rewrite is an identity and the loop will just
@@ -689,47 +690,47 @@ private:
                 // landed.
                 if (rd.is_noop()) {
                     std::fprintf(out, "[lx] nr=%llu -> FORWARD (identity %s)\n",
-                        (unsigned long long)nr, rd.first.host_path.c_str());
+                        nr, rd.first.host_path.c_str());
                     return;
                 }
                 std::fprintf(out, "[lx] nr=%llu -> REDIRECT %s%s%s%s\n",
-                    (unsigned long long)nr, rd.first.host_path.c_str(),
+                    nr, rd.first.host_path.c_str(),
                     rd.second ? " -> " : "",
                     rd.second ? rd.second->host_path.c_str() : "",
                     rd.scrub ? " +scrub" : "");
             },
             [&](const abi::Inject& in) {
                 std::fprintf(out, "[lx] nr=%llu -> INJECT %zu bytes%s\n",
-                    (unsigned long long)nr, in.content.size(),
+                    nr, in.content.size(),
                     in.is_dir ? " (dir)" : "");
             },
             [&](const abi::Raise& k) {
                 std::fprintf(out, "[lx] nr=%llu -> SIGNAL pid=%d sig=%d\n",
-                    (unsigned long long)nr, k.guest_pid, k.signum);
+                    nr, k.guest_pid, k.signum);
             },
             [&](const abi::ExecInterp& ei) {
                 std::fprintf(out, "[lx] nr=%llu -> EXECINT %s %s\n",
-                    (unsigned long long)nr, ei.interp_host.c_str(),
+                    nr, ei.interp_host.c_str(),
                     ei.prog_guest.c_str());
             },
             [&](const abi::SockRewrite& sr) {
                 std::fprintf(out, "[lx] nr=%llu -> SOCKREWRITE %s\n",
-                    (unsigned long long)nr, sr.host_path.c_str());
+                    nr, sr.host_path.c_str());
             },
             [&](const abi::ArgRewrite& ar) {
                 std::fprintf(out, "[lx] nr=%llu -> ARGREWRITE a%d=%#llx%s\n",
-                    (unsigned long long)nr, ar.arg,
-                    (unsigned long long)ar.to,
+                    nr, ar.arg,
+                    static_cast<unsigned long long>(ar.to),
                     ar.convert == abi::ArgRewrite::Convert::termios_to_termios2
                         ? " +widen_termios" : "");
             },
             [&](const abi::GuestCalls& gc) {
                 std::fprintf(out, "[lx] nr=%llu -> GUESTCALLS steps=%zu\n",
-                    (unsigned long long)nr, gc.steps.size());
+                    nr, gc.steps.size());
             },
             [&](const abi::Exited& e) {
                 std::fprintf(out, "[lx] nr=%llu -> EXIT code=%d\n",
-                    (unsigned long long)nr, e.code);
+                    nr, e.code);
             });
     }
 

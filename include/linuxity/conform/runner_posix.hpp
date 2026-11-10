@@ -33,6 +33,7 @@
 #include <unistd.h>
 
 #include "linuxity/conform/probe_runner.hpp"
+#include "linuxity/host/environ.hpp"
 
 namespace lx::conform {
 
@@ -69,7 +70,7 @@ public:
 
         ::pid_t pid = -1;
         const int rc = ::posix_spawn(&pid, prog.c_str(), &acts, nullptr,
-                                     argv.data(), ::environ);
+                                     argv.data(), host::host_environ());
         ::posix_spawn_file_actions_destroy(&acts);
         ::close(fds[1]);
 

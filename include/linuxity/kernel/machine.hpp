@@ -98,13 +98,14 @@ public:
     [[nodiscard]] static double host_uptime_now() {
 #if defined(__APPLE__)
         // CLOCK_MONOTONIC on Darwin includes sleep and starts at boot.
-        timespec ts{};
-        if (::clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
-            return static_cast<double>(ts.tv_sec) + ts.tv_nsec / 1e9;
+        constexpr clockid_t kBootClock = CLOCK_MONOTONIC;
 #elif defined(__linux__)
+        constexpr clockid_t kBootClock = CLOCK_BOOTTIME;
+#endif
+#if defined(__APPLE__) || defined(__linux__)
         timespec ts{};
-        if (::clock_gettime(CLOCK_BOOTTIME, &ts) == 0)
-            return static_cast<double>(ts.tv_sec) + ts.tv_nsec / 1e9;
+        if (::clock_gettime(kBootClock, &ts) == 0)
+            return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) / 1e9;
 #endif
         return 0.0;
     }

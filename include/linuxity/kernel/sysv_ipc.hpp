@@ -91,15 +91,23 @@ public:
     // Does the host kernel have SysV IPC? Then the syscalls (and
     // /proc/sysvipc) are the host's; otherwise linuxity's own objects.
     // LINUXITY_EMULATE_SYSV=1 forces the emulation, for testing.
+    //
+    // Darwin always has all three SysV families; its backend translates the
+    // ABI (runtime/darwin/trap.hpp do_ipc), so there is nothing to probe --
+    // and the probe's syscall(2) is deprecated (unsupported) on Darwin.
+    // A Linux kernel can be built without SysV, or a sandbox (Android's
+    // seccomp) can refuse it, so there it is asked once.
     [[nodiscard]] static bool host_backed() {
 #if defined(_WIN32)
         return false;
 #else
         static const bool has = [] {
             if (std::getenv("LINUXITY_EMULATE_SYSV")) return false;
+#if defined(__linux__)
             const long id = ::syscall(SYS_msgget, 0 /*IPC_PRIVATE*/, 01000 | 0600);
             if (id < 0) return errno != ENOSYS;
             ::syscall(SYS_msgctl, id, 0 /*IPC_RMID*/, nullptr);
+#endif
             return true;
         }();
         return has;

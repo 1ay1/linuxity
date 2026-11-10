@@ -36,6 +36,7 @@
 #include <unistd.h>
 #include "linuxity/host/win_posix.hpp"
 #include "linuxity/host/dirent_type.hpp"
+#include "linuxity/host/long_path.hpp"
 
 #include <cstdint>
 #include <algorithm>
@@ -300,8 +301,9 @@ public:
             // No record for the parent either. That happens when a task's
             // first syscall arrives before its parent link is known -- under
             // `make -j10` the dispatcher saw ppid=0 for roughly one task per
-            // run. inherited_cwd_ is only ever assigned by the macOS
-            // fresh-process fork path, so on Linux it stayed "/" forever and
+            // run. The fallback used to be inherited_cwd_, which only the
+            // macOS fresh-process fork path ever assigned, so on Linux it
+            // stayed "/" forever and
             // the task resolved every relative path against the ROOT. That is
             // the "gcc: can't create s7.o: Permission denied" under a parallel
             // build: the trace shows it opening /s7.o.
@@ -975,12 +977,15 @@ public:
         };
         // The fork child is a FRESH host process: its cwd table holds no
         // record for its own pid or its parent's, so its first syscall's
-        // set_current_pid() would fall back to "/". (Storing via set_cwd()
-        // here filed it under the default cur_pid_ 1 instead -- every
-        // relative path in a forked child, e.g. `g++ hey.cpp` -> cc1,
-        // resolved against "/".) Make the parent's cwd the fallback.
-        inherited_cwd_ = normalize(str());
-        if (inherited_cwd_.empty()) inherited_cwd_ = "/";
+        // set_current_pid() takes the fallback, last_cwd_. (Storing via
+        // set_cwd() here filed it under the default cur_pid_ 1 instead --
+        // every relative path in a forked child, e.g. `g++ hey.cpp` -> cc1,
+        // resolved against "/". And when the fallback moved from
+        // inherited_cwd_ to last_cwd_, a write to inherited_cwd_ alone
+        // stopped reaching anything: every macOS child started at "/".)
+        // So the parent's cwd IS the fallback; there is no second copy.
+        last_cwd_ = normalize(str());
+        if (last_cwd_.empty()) last_cwd_ = "/";
         cwds_.clear();
         seeded_pid_ = 0;          // no record survives the clear
         // The child's pid is not known yet, so park the inherited fds; the
@@ -1637,39 +1642,10 @@ private:
         });
     }
 
-    // Run fn(dirfd, leaf) for a path too long for the host, by opening its
-    // parent a component at a time. Returns false if that walk fails.
+    // Run fn(dirfd, leaf) for a path too long for the host (host/long_path.hpp).
     template <class F>
     static bool at_long_parent(const char* path, F&& fn) {
-#if defined(_WIN32)
-        (void)path; (void)fn;
-        return false;
-#else
-        const std::string_view p{path};
-        const std::size_t cut = p.rfind('/');
-        if (cut == std::string_view::npos || cut + 1 >= p.size()) return false;
-        int fd = ::open("/", O_PATH | O_DIRECTORY | O_CLOEXEC);
-        std::size_t i = 0;
-        while (fd >= 0 && i < cut) {
-            while (i < cut && p[i] == '/') ++i;
-            if (i >= cut) break;
-            const std::size_t j = std::min(p.find('/', i), cut);
-            const std::string part{p.substr(i, j - i)};
-            i = j;
-            const int nfd = ::openat(fd, part.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
-            const int e = errno;
-            ::close(fd);
-            fd = nfd;
-            errno = e;
-        }
-        if (fd < 0) return false;
-        const std::string leaf{p.substr(cut + 1)};
-        const bool ok = fn(fd, leaf.c_str());
-        const int e = errno;
-        ::close(fd);
-        errno = e;
-        return ok;
-#endif
+        return host::at_long_parent(path, std::forward<F>(fn));
     }
 
     // One readlink answers the three questions the overlay read path asks of
@@ -2056,13 +2032,11 @@ private:
     // path that CLEARS or re-seeds cwds_ must reset this to a pid that can
     // never match (0 is not a valid guest pid).
     mutable std::int32_t seeded_pid_{0};
-    // cwd for a pid with no record and no recorded parent: "/" for the root
-    // process, the parent's cwd in a forked child (import_process_state).
-    std::string inherited_cwd_{"/"};
     // The SUPERVISOR's cwd (not any guest's), for absolute_host().
     std::string host_cwd_;
     // The cwd of the most recently seen task, used to seed a task whose parent
-    // link is not known yet (see set_current_pid). Mutable for the same reason
+    // link is not known yet (see set_current_pid) -- and, in a macOS fork
+    // child, the parent's cwd (import_process_state). Mutable for the same reason
     // cwds_ is: set_current_pid is const because it only updates bookkeeping.
     mutable std::string last_cwd_{"/"};
     // Per guest pid; see FdTable. mutable for the same reason cur_pid_ is:
