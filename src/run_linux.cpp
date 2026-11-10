@@ -180,6 +180,7 @@ void maybe_reexec_delegated(int argc, char** argv, bool want_cgroup) {
 // The Linux host: the guest's own syscalls run natively under ptrace and a
 // seccomp filter; the trap is only for what linuxity must answer itself.
 const char* lx::cli::host_name() noexcept { return "linux"; }
+bool lx::cli::host_runs_instances() noexcept { return true; }
 
 int lx::cli::host_internal(const Options&, int, char**, int) { return -1; }
 

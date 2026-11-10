@@ -157,6 +157,7 @@ int check() {
 } // namespace
 
 const char* lx::cli::host_name() noexcept { return "windows (WHP)"; }
+bool lx::cli::host_runs_instances() noexcept { return false; }
 
 // --check: report whether this machine can host the backend.
 int lx::cli::host_internal(const Options&, int, char** argv, int i) {

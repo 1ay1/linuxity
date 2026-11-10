@@ -16,6 +16,7 @@
 #include "linuxity/kernel/resources.hpp"
 
 #if !defined(_WIN32)
+#include "linuxity/env/config.hpp"
 #include "linuxity/env/passwd.hpp"
 #include "linuxity/env/status.hpp"
 #include "linuxity/env/store.hpp"
@@ -382,15 +383,39 @@ int with_args(int (*fn)(int, char**), std::vector<std::string> a) {
 }
 
 // Words that are commands, not programs to run.
+constexpr std::string_view kVerbs[] = {
+    "new", "import", "export", "images", "list", "ls", "default", "shell", "exec", "ps",
+    "kill", "status", "svc", "logs", "reload", "stop", "down", "set", "get", "unset",
+    "edit", "info", "check", "path", "users", "adduser", "snapshot", "snapshots",
+    "restore", "drop-snapshot", "reset", "rm", "remove", "rename", "schema", "env",
+    "help", "--help", "-h", "version", "--version", "up", "start", "run"};
+
 bool is_verb(std::string_view s) {
-    static constexpr std::string_view kVerbs[] = {
-        "new", "import", "export", "images", "list", "ls", "default", "shell", "exec", "ps",
-        "kill", "status", "svc", "logs", "reload", "stop", "down", "set", "get", "unset",
-        "edit", "info", "check", "path", "users", "adduser", "snapshot", "snapshots",
-        "restore", "drop-snapshot", "reset", "rm", "remove", "rename", "schema", "env",
-        "help", "--help", "-h", "version", "--version"};
     for (const auto v : kVerbs) if (s == v) return true;
     return false;
+}
+
+// A bare word that is no verb and no program: almost always a typo'd verb
+// (`linuxity shel`). Say so, instead of trying to run it as a program. A
+// word the host or guest has a program for (`linuxity uname`) is not a typo.
+[[nodiscard]] std::string verb_suggestion(std::string_view s) {
+    if (s.empty() || s.find('/') != std::string_view::npos || s.front() == '-') return {};
+    auto on_path = [&](const std::string& root) {
+        for (const char* d : {"/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"})
+            if (::access((root + d + "/" + std::string{s}).c_str(), F_OK) == 0) return true;
+        return false;
+    };
+    if (on_path("")) return {};
+    lx::env::Store store;
+    if (const auto def = store.default_env(); !def.empty() && store.has(def))
+        if (on_path(store.load(def).config.rootfs)) return {};
+    std::string best;
+    std::size_t best_d = s.size() <= 3 ? 2 : 3;
+    for (const auto v : kVerbs) {
+        if (v.front() == '-') continue;
+        if (const auto d = lx::env::edit_distance(s, v); d < best_d) { best_d = d; best = std::string{v}; }
+    }
+    return best;
 }
 #endif
 
@@ -410,6 +435,11 @@ int main(int argc, char** argv) {
     }
     if (sub == "run") return with_args(cmd_run, lx_with_default_env(argc, argv));
     if (is_verb(sub)) return lx_cli_main(argc, argv);
+    if (const auto s = verb_suggestion(sub); !s.empty()) {
+        std::fprintf(stderr, "linuxity: '%s' is not a command. Did you mean `linuxity %s`?  (linuxity help)\n",
+                     argv[1], s.c_str());
+        return 2;
+    }
 #endif
     // anything else: run one program, as linuxity always has
     Options o;
@@ -422,6 +452,21 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (i >= argc) { usage(argv[0]); return 2; }
+#if !defined(_WIN32)
+    // On a host that isn't Linux there is no "the host's /" to run a Linux
+    // program in, so `linuxity uname -a` means: in my default environment.
+    // (On Linux, no --root still means the host's own tree.)
+    if (o.root.empty() && o.env_name.empty() && !lx::cli::host_runs_instances()) {
+        const auto def = lx::env::Store{}.default_env();
+        if (!def.empty() && lx::env::Store{}.has(def)) {
+            std::vector<std::string> a = {argv[0], "run", def};
+            for (int j = 1; j < i; ++j) a.emplace_back(argv[j]);   // flags given
+            a.emplace_back("--");
+            for (int j = i; j < argc; ++j) a.emplace_back(argv[j]);
+            return with_args(cmd_run, a);
+        }
+    }
+#endif
     for (int j = i; j < argc; ++j) o.argv.emplace_back(argv[j]);
     setup_status(o);
     return lx::cli::host_run(o, argc, argv);

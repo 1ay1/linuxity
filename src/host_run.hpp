@@ -15,6 +15,12 @@ namespace lx::cli {
 // Which host this binary was built for, for help text and `linuxity info`.
 [[nodiscard]] const char* host_name() noexcept;
 
+// Can this host keep an environment running in the background (`linuxity
+// up`), with sessions joining it? Where it can't, a session is a foreground
+// run of the environment instead -- same files, same settings, its own
+// kernel. The one answer the CLI asks before choosing either.
+[[nodiscard]] bool host_runs_instances() noexcept;
+
 // Run the guest `o` describes (o.argv, or an instance when o.instance) to
 // completion. argc/argv are the process's own, for hosts that re-exec
 // themselves (cgroup delegation, fork children). Returns the exit status.

@@ -21,6 +21,8 @@
 #include "linuxity/host/self_exe.hpp"
 #include "linuxity/kernel/meta_store.hpp"
 
+#include "host_run.hpp"
+
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -49,8 +51,26 @@ namespace {
 
 using namespace lx::env;
 
+// -- Terminal style: one place decides whether we colour ------------------
+// Only on a terminal, never under NO_COLOR (no-color.org) or TERM=dumb.
+bool styled(int fd) {
+    static const bool off = [] {
+        const char* nc = std::getenv("NO_COLOR");
+        const char* t = std::getenv("TERM");
+        return (nc && *nc) || (t && std::string_view{t} == "dumb");
+    }();
+    return !off && ::isatty(fd);
+}
+std::string paint(int fd, const char* sgr, std::string_view s) {
+    if (!styled(fd)) return std::string{s};
+    return std::string{"\033["} + sgr + "m" + std::string{s} + "\033[0m";
+}
+std::string bold(std::string_view s)  { return paint(1, "1", s); }
+std::string dim(std::string_view s)   { return paint(1, "2", s); }
+std::string green(std::string_view s) { return paint(1, "32", s); }
+
 int fail(const std::string& why) {
-    std::fprintf(stderr, "linuxity: %s\n", why.c_str());
+    std::fprintf(stderr, "%s %s\n", paint(2, "1;31", "linuxity:").c_str(), why.c_str());
     return 1;
 }
 
@@ -62,21 +82,22 @@ bool has_flag(int argc, char** argv, std::string_view f) {
 using lx::host::self_exe;
 
 void help() {
-    std::puts(
-        "linuxity: Linux, without a VM.\n"
+    const bool bg = lx::cli::host_runs_instances();
+    std::printf(
+        "%s\n"
         "\n"
         "  linuxity                      a shell in your default environment\n"
-        "  linuxity new ubuntu [name]    download and set up a distro (see `linuxity images`)\n"
+        "%s"
+        "  linuxity new alpine [name]    download and set up a distro (see `linuxity images`)\n"
         "  linuxity import NAME FILE     bring your own rootfs (tar.gz/xz/zst, or a directory)\n"
         "  linuxity export [ENV] FILE    the whole environment as a tarball\n"
-        "  linuxity list                 your environments\n"
+        "  linuxity list                 your environments (* is the default)\n"
         "  linuxity default ENV          which one `linuxity` opens\n"
         "\n"
         "  linuxity shell [ENV]          a login shell\n"
         "  linuxity exec [ENV] -- CMD    run a command (-u USER, -C DIR, -e K=V, -t/-T)\n"
         "  linuxity run ENV [-- CMD]     one program as pid 1, in the foreground\n"
-        "  linuxity start|stop [ENV]     keep it running in the background, or stop it\n"
-        "  linuxity status|ps [ENV]      what's running\n"
+        "%s"
         "\n"
         "  linuxity set [ENV] KEY=VALUE  change a setting: hostname, user, memory, cpus,\n"
         "                                dns, timezone, env.NAME, ... (`linuxity get` lists them)\n"
@@ -87,8 +108,14 @@ void help() {
         "\n"
         "  linuxity snapshot [ENV] NAME  save the current state;  restore [ENV] NAME\n"
         "  linuxity reset [ENV]          back to the clean image\n"
-        "  linuxity rename OLD NEW       linuxity rm ENV\n"
-        "  linuxity svc [ENV] [start|stop|restart NAME]   linuxity logs [ENV] [SVC] [-f]\n"
+        "  linuxity rename OLD NEW       linuxity rm ENV\n",
+        bold("linuxity: Linux, without a VM.").c_str(),
+        bg ? "" : "  linuxity CMD [ARGS...]        run CMD in it          (e.g. linuxity uname -a)\n",
+        bg ? "  linuxity start|stop [ENV]     keep it running in the background, or stop it\n"
+             "  linuxity status|ps [ENV]      what's running\n"
+           : "");
+    if (bg) std::puts("  linuxity svc [ENV] [start|stop|restart NAME]   linuxity logs [ENV] [SVC] [-f]");
+    std::puts(
         "\n"
         "ENV can be left out when you have a default (the first env you make is).\n"
         "Run one program without an environment: linuxity --root DIR PROGRAM  (linuxity help --all).\n"
@@ -99,6 +126,9 @@ void help() {
 struct Conn {
     int fd{-1};
     control::LineReader in;
+    // Set instead of fd where this host runs no background instances: a
+    // session is then a foreground run of this environment (run_session).
+    std::string foreground_env;
     ~Conn() { if (fd >= 0) ::close(fd); }
 };
 
@@ -118,8 +148,15 @@ bool connect_env(const std::string& name, Conn& c) {
     return true;
 }
 
-// Start the instance (as `linuxity up`) if it isn't running.
+// Somewhere to run a session in `name`: its live instance (started as
+// `linuxity up` if need be), or -- on a host without background instances
+// -- a foreground run of it. Every session verb goes through here.
 bool ensure_up(const std::string& name, Conn& c) {
+    if (!lx::cli::host_runs_instances()) {
+        if (!Store{}.has(name)) { fail("no environment '" + name + "'"); return false; }
+        c.foreground_env = name;
+        return true;
+    }
     if (connect_env(name, c)) return true;
     Store s;
     if (!s.has(name)) return false;
@@ -138,7 +175,13 @@ bool ensure_up(const std::string& name, Conn& c) {
 
 bool need_running(const std::string& name, Conn& c) {
     if (connect_env(name, c)) return true;
-    if (Store{}.has(name)) fail(name + " is not running (start it with `linuxity up " + name + "`)");
+    if (!Store{}.has(name)) return false;
+    if (!lx::cli::host_runs_instances())
+        fail("on " + std::string{lx::cli::host_name()} + ", " + name +
+             " runs only while a `linuxity shell` or `exec` is open, so there is "
+             "no live instance to ask");
+    else
+        fail(name + " is not running (start it with `linuxity up " + name + "`)");
     return false;
 }
 
@@ -146,6 +189,36 @@ int print_reply(const std::optional<JValue>& r) {
     if (!r) return fail("lost the connection to the instance");
     if (!r->flag("ok")) return fail(r->str("error", "request failed"));
     return 0;
+}
+
+// Run `argv` in env `name` as a foreground `linuxity run` of it: the same
+// rootfs, upper and settings, its own kernel. What a session IS on a host
+// with no background instances (lx::cli::host_runs_instances), and the
+// reason the verbs below never ask which kind of host they're on.
+int run_foreground(const std::string& name, const std::vector<std::string>& argv,
+                   const std::string& user, const std::string& cwd,
+                   const std::vector<std::pair<std::string, std::string>>& env,
+                   int in_fd, int out_fd) {
+    std::vector<std::string> a = {self_exe(), "run", name, "--quiet"};
+    if (!user.empty()) a.insert(a.end(), {"--user", user});
+    if (!cwd.empty())  a.insert(a.end(), {"--cwd", cwd});
+    for (const auto& [k, v] : env) a.insert(a.end(), {"-e", k + "=" + v});
+    a.emplace_back("--");
+    a.insert(a.end(), argv.begin(), argv.end());
+    std::vector<char*> av;
+    for (auto& x : a) av.push_back(x.data());
+    av.push_back(nullptr);
+    const ::pid_t pid = ::fork();
+    if (pid < 0) return fail("fork failed");
+    if (pid == 0) {
+        if (in_fd != 0)  ::dup2(in_fd, 0);
+        if (out_fd != 1) ::dup2(out_fd, 1);
+        ::execv(av[0], av.data());
+        ::_exit(127);
+    }
+    int st = 0;
+    while (::waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
 }
 
 // ---- the terminal relay ------------------------------------------------------
@@ -181,6 +254,8 @@ bool write_all(int fd, const char* p, std::size_t n) {
 int run_session(Conn& c, std::vector<std::string> argv, const std::string& user,
                 const std::string& cwd, const std::vector<std::pair<std::string, std::string>>& env,
                 bool tty, int in_fd = 0, int out_fd = 1) {
+    if (!c.foreground_env.empty())
+        return run_foreground(c.foreground_env, argv, user, cwd, env, in_fd, out_fd);
     Json j;
     j.obj().kv("op", "spawn").kv("argv", argv).kv("user", user).kv("cwd", cwd).kv("wait", true);
     j.key("env").obj();
@@ -389,6 +464,8 @@ int cmd_status(int argc, char** argv) {
     if (!connect_env(argv[2], c)) {
         if (!Store{}.has(argv[2])) return 1;
         if (json) std::puts(R"({"ok":true,"running":false})");
+        else if (!lx::cli::host_runs_instances())
+            std::printf("%s: ready (each `linuxity shell` runs it in the foreground)\n", argv[2]);
         else std::printf("%s: not running\n", argv[2]);
         return 0;
     }
@@ -1045,8 +1122,13 @@ int finish_env(const Store& s, const std::string& name, std::string_view setup,
     }
     const bool first = !exists(s.home() + "/default") || s.default_env().empty();
     if (first) (void)s.set_default(name);
-    std::printf("\n%s is ready. Open it with:  linuxity%s\n", name.c_str(),
-                s.default_env() == name ? "" : (" shell " + name).c_str());
+    const bool is_def = s.default_env() == name;
+    std::printf("\n%s %s is ready.\n", green("✓").c_str(), bold(name).c_str());
+    std::printf("  %-28s %s\n", is_def ? "linuxity" : ("linuxity shell " + name).c_str(), dim("a shell in it").c_str());
+    const bool bare = is_def && !lx::cli::host_runs_instances();   // `linuxity CMD` runs in it
+    std::printf("  %-28s %s\n", bare ? "linuxity uname -a"
+                                      : ("linuxity exec " + (is_def ? std::string{} : name + " ") + "-- uname -a").c_str(),
+                dim("run one command").c_str());
     return 0;
 }
 
@@ -1231,12 +1313,33 @@ int cmd_env(int argc, char** argv) {
             std::puts(j.end().end().take().c_str());
             return 0;
         }
-        if (names.empty()) { std::puts("no environments yet: linuxity new ubuntu"); return 0; }
-        std::printf("%-16s %-9s %-10s %s\n", "NAME", "STATE", "USER", "ROOTFS");
+        if (names.empty()) { std::puts("no environments yet: linuxity new alpine  (see `linuxity images`)"); return 0; }
+        // NAME (the default starred), STATE, USER, how much it has changed
+        // from its image, and the distro. Columns sized to the data.
+        const std::string def = s.default_env();
+        std::size_t w = 4;
+        for (const auto& n : names) w = std::max(w, n.size());
+        std::printf("  %s\n", bold(std::string{"NAME"} + std::string(w - 4, ' ') + "  STATE     USER       CHANGES   DISTRO").c_str());
         for (const auto& n : names) {
             const auto r = s.load(n);
-            std::printf("%-16s %-9s %-10s %s%s\n", n.c_str(), s.running_pid(n) > 0 ? "running" : "stopped",
-                        r.config.user.c_str(), r.config.rootfs.c_str(), r.ok() ? "" : "  (config has errors)");
+            const bool up = s.running_pid(n) > 0;
+            const std::string state = up ? "running" : lx::cli::host_runs_instances() ? "stopped" : "ready";
+            std::string distro = "?";
+            for (const auto& l : {r.config.upper, r.config.rootfs}) {
+                const auto os = slurp(l + "/etc/os-release");
+                if (!os) continue;
+                const auto at = os->find("PRETTY_NAME=");
+                if (at == std::string::npos) continue;
+                distro = os->substr(at + 12, os->find('\n', at) - at - 12);
+                std::erase(distro, '"');
+                break;
+            }
+            std::string label = n + std::string(w - n.size(), ' ');
+            std::string st = state + std::string(9 - state.size(), ' ');
+            if (up) st = green(st);
+            std::printf("%s %s  %s %-10s %-9s %s%s\n", n == def ? "*" : " ", bold(label).c_str(), st.c_str(),
+                        r.config.user.c_str(), human_bytes(tree_bytes(r.config.upper)).c_str(),
+                        dim(distro).c_str(), r.ok() ? "" : "  (config has errors: linuxity check)");
         }
         return 0;
     }

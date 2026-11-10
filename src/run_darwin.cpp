@@ -776,6 +776,7 @@ void process_start() {
 }  // namespace
 
 const char* cli::host_name() noexcept { return "macos (Hypervisor.framework)"; }
+bool cli::host_runs_instances() noexcept { return false; }
 
 // The private ways linuxity starts itself: a fork child (`--fork-child
 // SERVICE PIDFD GROUPFDS`) or a pre-spawned zygote (`--zygote SERVICE`).
@@ -942,12 +943,25 @@ int cli::host_internal(const Options& o, int argc, char** argv, int i) {
 int cli::host_run(Options& o, int, char**) {
     process_start();
     if (o.instance) {
-        std::fputs("linuxity: background environments need a Linux host for now;\n"
-                   "          use `linuxity run` on this Mac\n", stderr);
+        // The CLI never asks for one here (host_runs_instances); a direct
+        // `linuxity up` on a Mac lands here.
+        std::fputs("linuxity: environments run in the foreground on macOS: "
+                   "`linuxity shell` or `linuxity run` (no `up` needed)\n", stderr);
         return 2;
     }
-    if (o.root.empty() || !is_dir(o.root)) {
-        std::fputs("linuxity: --root must name an extracted aarch64 rootfs\n", stderr);
+    if (o.root.empty()) {
+        // A Mac can't run Linux programs from its own disk: there has to be
+        // a distro to run them in.
+        std::fprintf(stderr,
+            "linuxity: '%s' needs a Linux environment to run in, and you don't have one yet:\n"
+            "  linuxity new alpine        a 4 MB distro; then `linuxity %s` just works\n"
+            "  linuxity --root DIR %s     or use an extracted aarch64 rootfs\n",
+            o.argv[0].c_str(), o.argv[0].c_str(), o.argv[0].c_str());
+        return 2;
+    }
+    if (!is_dir(o.root)) {
+        std::fprintf(stderr, "linuxity: --root %s is not a directory (an extracted aarch64 rootfs)\n",
+                     o.root.c_str());
         return 2;
     }
 
