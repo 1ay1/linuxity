@@ -97,9 +97,7 @@ public:
         auto it = fp_regions_.find(tg);
         if (it == fp_regions_.end() || !it->second.base) return;
         using S2 = abi::Sysno;
-        if (sc == S2::close) { fp_mark_bound(it->second, static_cast<int>(ar.arg[0])); fp_clear_fd(it->second, static_cast<int>(ar.arg[0])); }
-        else if (sc == S2::dup2 || sc == S2::dup3) { fp_mark_bound(it->second, static_cast<int>(ar.arg[1])); fp_clear_fd(it->second, static_cast<int>(ar.arg[1])); }
-        else if (sc == S2::close_range) fp_clear_range(it->second, ar.arg[0], ar.arg[1]);
+        if (sc == S2::dup2 || sc == S2::dup3) { fp_mark_bound(it->second, static_cast<int>(ar.arg[1])); fp_clear_fd(it->second, static_cast<int>(ar.arg[1])); }
         else if (sc == S2::chdir || sc == S2::fchdir) fp_note_cwd_of(k, tg);
         else if (sc == S2::getdents64 || sc == S2::lseek) fp_note_stream(k, it->second, static_cast<int>(ar.arg[0]));
         else fp_note_privileged(it->second, sys.caller_privileged());
@@ -114,6 +112,20 @@ public:
         if (fp_regions_.empty()) return;
         using S2 = abi::Sysno;
         const abi::Sysno sc = abi::decode(kTraceeArch, ar.nr);
+        // A trapped close: forget the fd while this task still holds the
+        // number. Once the kernel frees it another thread can open it, and a
+        // late clear would wipe that thread's entry.
+        if (sc == S2::close || sc == S2::close_range) {
+            auto it = fp_regions_.find(host_tgid_of(cur_));
+            if (it == fp_regions_.end() || !it->second.base) return;
+            if (sc == S2::close) {
+                fp_mark_bound(it->second, static_cast<int>(ar.arg[0]));
+                fp_clear_fd(it->second, static_cast<int>(ar.arg[0]));
+            } else {
+                fp_clear_range(it->second, ar.arg[0], ar.arg[1]);
+            }
+            return;
+        }
         const bool exec = sc == S2::execve || sc == S2::execveat;
         if (!exec && sc != S2::getdents64 && sc != S2::lseek && sc != S2::dup &&
             sc != S2::dup2 && sc != S2::dup3 && sc != S2::fcntl)
@@ -393,7 +405,8 @@ private:
 
     // Take fd's merged listing from the blob (see fp_before_call). Close the
     // slot to new users first, let a call already inside finish, then read
-    // where it got to.
+    // where it got to. Closed is -(fd+1), not 0: union_alloc takes a 0 slot
+    // as free and would rewind it before we read cum.
     template <class K>
     void fp_take_union(K& k, ::pid_t tg, std::uint64_t base, int fd) {
         if (fd < 0 || fd >= static_cast<int>(LX_FP_FDS)) return;
@@ -405,8 +418,9 @@ private:
         std::int32_t fd1 = 0;
         if (!fp_get(cur_, ua + offsetof(lx_fp_union, fd), fd1)) return;
         std::uint64_t cum = 0;
-        if (fd1 == fd + 1) {
-            (void)fp_put(cur_, ua + offsetof(lx_fp_union, fd), std::int32_t{0});
+        const bool ours = fd1 == fd + 1;
+        if (ours) {
+            (void)fp_put(cur_, ua + offsetof(lx_fp_union, fd), std::int32_t{-(fd + 1)});
             // a thread mid-call releases the lock within microseconds; a
             // stopped one never will, so don't wait for long
             for (int i = 0; i < 20000; ++i) {
@@ -419,6 +433,7 @@ private:
         e.flags = static_cast<std::uint8_t>((e.flags | LX_FP_FD_STREAM) & ~LX_FP_FD_UNION);
         e.ref = 0;
         fp_write_fd(base, fd, e);
+        if (ours) (void)fp_put(cur_, ua + offsetof(lx_fp_union, fd), std::int32_t{0});
     }
 
     // Apply process tg's logged fd events to the dispatcher's table. An

@@ -938,8 +938,12 @@ static long do_close(const struct env* e, uint64_t* f) {
     /* clear first: once the kernel frees the number, another thread's open
        may get it and its entry must not be wiped by ours */
     fd_clear(e, fd);
-    if ((ent.flags & LX_FP_FD_UNION) && ent.ref && ent.ref <= LX_FP_UNIONS)
-        __atomic_store_n(&e->u[ent.ref - 1].fd, 0, __ATOMIC_RELEASE);
+    /* the slot may already be another fd's: union_alloc took it once the
+       entry above was cleared */
+    if ((ent.flags & LX_FP_FD_UNION) && ent.ref && ent.ref <= LX_FP_UNIONS) {
+        int32_t mine = (int32_t)fd + 1;
+        __atomic_compare_exchange_n(&e->u[ent.ref - 1].fd, &mine, 0, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+    }
     const long rc = sys(e, NR_close, fd, 0, 0, 0);
     ev_commit(e, &ev, tg, LX_FP_EV_CLOSE, fd, 0);
     return rc;
