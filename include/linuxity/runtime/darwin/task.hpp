@@ -184,6 +184,9 @@ public:
         return environ_;
     }
     std::atomic<std::uint64_t> rchar{0}, wchar{0}, syscr{0}, syscw{0};
+    // The guest-address window whose page-table permissions were narrowed
+    // from the default RWX (mmap/mprotect); exec resets it. Empty: lo >= hi.
+    std::uint64_t pte_lo{~std::uint64_t{0}}, pte_hi{0};
     // RLIMIT_* as the guest set them (Linux numbering, 16 resources), kept
     // per process and inherited across fork and exec. Only NOFILE and STACK
     // shape this backend; the rest round-trip so a guest sees what it set.
@@ -293,6 +296,20 @@ private:
     SignalDispositions signals_;
     std::vector<Thread> threads_;
     std::vector<SharedMap> shared_maps_;
+public:
+    // Guest ranges whose host pages ARE a shared object's (HvfMachine::
+    // back_shared): MAP_SHARED anonymous memory (an unlinked shm object) and
+    // page-aligned MAP_SHARED file maps. Coherent with every other mapping
+    // of the object, across fork and with read()/write(); `fd` is our own
+    // reference, kept so a fork can map the same object in the child.
+    struct Backing { std::uint64_t at, len; int fd; std::int64_t off; };
+    template <class Fn>
+    decltype(auto) with_backings(Fn&& fn) {
+        std::lock_guard g{mu_};
+        return fn(backings_);
+    }
+private:
+    std::vector<Backing> backings_;
     std::optional<Ids> ids_;
     std::string environ_;
     std::vector<NamedRange> names_;

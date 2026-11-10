@@ -62,6 +62,8 @@ namespace lx::runtime {
 struct HvfLayout {
     static constexpr std::uint64_t page       = 0x1000;
     static constexpr std::uint64_t vectors    = 0x0000;   // VBAR_EL1 (2 KiB-aligned)
+    // The TLB-flush stub, right after the 16 vectors in the same page.
+    static constexpr std::uint64_t tlb_flush_stub = 0x0800;
     // 512 syscall numbers x {value, live} -- see darwin/inguest.hpp.
     static constexpr std::uint64_t answers_bytes = 512 * 16;
     // The in-guest syscall table (darwin/inguest.hpp). It sits right after the
@@ -168,6 +170,17 @@ inline void write_vector_stub(std::byte* mem, std::uint64_t ram) {
     auto* v8 = reinterpret_cast<std::uint32_t*>(mem + HvfLayout::vectors + 8 * 0x80);
     (void)inguest::emit_handler(v8, HvfLayout::answers(ram), 8);
     std::memset(mem + HvfLayout::answers(ram), 0, HvfLayout::answers_bytes);
+    // Past the 16 vectors (0x800), the TLB-flush stub: after the host edits
+    // the guest's page tables (mprotect), the vCPU enters here at EL1 and
+    // drops every cached translation -- broadcast, so every vCPU of the VM
+    // -- then returns to the guest through ELR_EL1/SPSR_EL1.
+    const std::uint32_t flush[] = {
+        0xD508831Fu,     // tlbi vmalle1is
+        0xD5033B9Fu,     // dsb  ish
+        0xD5033FDFu,     // isb
+        0xD69F03E0u,     // eret
+    };
+    std::memcpy(mem + HvfLayout::tlb_flush_stub, flush, sizeof flush);
 }
 
 // Build a 3-level, 4 KiB-granule identity map of [0, ram). The private area
@@ -427,6 +440,62 @@ public:
         if (!win.empty()) ::sys_icache_invalidate(win.data(), win.size());
     }
 
+    // -- Page protection ---------------------------------------------------
+    // Rewrite the EL0 permissions of [gpa, gpa+n) in the guest's own stage-1
+    // tables (VA == GPA, so the L3 entry for a page is found by arithmetic):
+    // AP[2:1] = 01 read/write, 11 read-only, 00 EL1-only (PROT_NONE), and
+    // UXN for anything not executable. The caller must then flush the
+    // guest's TLB (HvfCpu::flush_tlb_on_entry) before the guest runs again.
+    // The private area is never touched.
+    void protect(std::uint64_t gpa, std::uint64_t n, bool r, bool w, bool x) noexcept {
+        const std::uint64_t lo = gpa & ~(HvfLayout::page - 1);
+        const std::uint64_t hi = (gpa + n + HvfLayout::page - 1) & ~(HvfLayout::page - 1);
+        const std::uint64_t priv = HvfLayout::priv_end(size_);
+        const bool win = HvfLayout::has_nonpie_window(size_);
+        constexpr std::uint64_t kApMask = 3ull << 6, kUxn = 1ull << 54;
+        const std::uint64_t ap = !r && !w ? 0ull : (w ? 1ull : 3ull);
+        for (std::uint64_t pa = lo; pa < hi && pa < size_; pa += HvfLayout::page) {
+            if (pa < priv && !(win && HvfLayout::is_nonpie_window(pa))) continue;
+            const std::uint64_t at = HvfLayout::l3_tables(size_) + (pa >> 12) * 8;
+            std::uint64_t e;
+            std::memcpy(&e, base_ + at, 8);
+            e = (e & ~(kApMask | kUxn)) | (ap << 6) | (x ? 0 : kUxn);
+            std::memcpy(base_ + at, &e, 8);
+        }
+    }
+
+    // -- Shared pages -------------------------------------------------------
+    // Back [gpa, gpa+n) with `fd` at `off`, MAP_SHARED: the guest then reads
+    // and writes the object's own pages, so every process that maps it
+    // (another guest process, a fork child, read()/write() on the file)
+    // sees the same bytes at once -- MAP_SHARED, for real.
+    //
+    // The host mapping can't simply be replaced under a live VM (the IPA
+    // keeps translating to the OLD pages, see zero()), so the range leaves
+    // the VM, is remapped, and comes back. gpa, n and off must be host-page
+    // aligned (16 KiB on Apple Silicon). fd < 0 restores private anonymous
+    // (zero) memory there.
+    [[nodiscard]] static std::uintptr_t host_page() noexcept {
+        static const std::uintptr_t p = static_cast<std::uintptr_t>(::getpagesize());
+        return p;
+    }
+    [[nodiscard]] bool back_shared(std::uint64_t gpa, std::uint64_t n, int fd, std::int64_t off) noexcept {
+        const std::uintptr_t hp = host_page();
+        if ((gpa | n) & (hp - 1) || (off & static_cast<std::int64_t>(hp - 1)) || !n) return false;
+        auto win = ram().at(gpa, n);
+        if (win.empty()) return false;
+        const auto flags = static_cast<hv_memory_flags_t>(HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
+        if (vm_live_ && ::hv_vm_unmap(gpa, n) != HV_SUCCESS) return false;
+        void* got = fd >= 0
+            ? ::mmap(win.data(), n, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, off)
+            : ::mmap(win.data(), n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+        const bool ok = got == win.data();
+        if (!ok)        // keep the range usable: plain private memory
+            (void)::mmap(win.data(), n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+        if (vm_live_ && ::hv_vm_map(win.data(), gpa, n, flags) != HV_SUCCESS) return false;
+        return ok;
+    }
+
 private:
     [[nodiscard]] Status attach(bool build_tables = true) {
         if (build_tables) {
@@ -506,6 +575,10 @@ public:
 
     [[nodiscard]] bool live() const noexcept { return live_; }
     [[nodiscard]] hv_vcpu_t handle() const noexcept { return cpu_; }
+    // The guest's page tables changed: drop its TLB before it runs again.
+    // The stub's `tlbi vmalle1is` is inner-shareable, so ONE vCPU entering
+    // it flushes every vCPU of the VM.
+    void flush_tlb_on_entry() noexcept { flush_pending_ = true; }
 
     // -- Execution --------------------------------------------------------
     void set_entry(std::uint64_t pc, std::uint64_t sp) noexcept {
@@ -518,6 +591,19 @@ public:
     // reasons other than EXCEPTION (vtimer, hv_vcpus_exit) are not guest
     // events, so they surface as EINTR for the caller to retry.
     [[nodiscard]] Result<GuestRegs> run() {
+        if (flush_pending_) {
+            // Enter at EL1 on the flush stub, which erets to the guest's
+            // real PC/PSTATE (parked in ELR_EL1/SPSR_EL1): its translations
+            // are rebuilt from the edited tables before it runs one insn.
+            flush_pending_ = false;
+            std::uint64_t pc = 0, cpsr = 0;
+            ::hv_vcpu_get_reg(cpu_, HV_REG_PC, &pc);
+            ::hv_vcpu_get_reg(cpu_, HV_REG_CPSR, &cpsr);
+            ::hv_vcpu_set_sys_reg(cpu_, HV_SYS_REG_ELR_EL1, pc);
+            ::hv_vcpu_set_sys_reg(cpu_, HV_SYS_REG_SPSR_EL1, cpsr);
+            ::hv_vcpu_set_reg(cpu_, HV_REG_PC, HvfLayout::tlb_flush_stub);
+            ::hv_vcpu_set_reg(cpu_, HV_REG_CPSR, 0x3c5);       // EL1h, DAIF masked
+        }
         if (::hv_vcpu_run(cpu_) != HV_SUCCESS) return err<GuestRegs>(Errno::eio);
         if (exit_->reason != HV_EXIT_REASON_EXCEPTION)
             return err<GuestRegs>(Errno::eintr);
@@ -604,6 +690,7 @@ private:
     hv_vcpu_t cpu_{};
     hv_vcpu_exit_t* exit_{nullptr};
     bool live_{false};
+    bool flush_pending_{false};
 };
 
 } // namespace lx::runtime

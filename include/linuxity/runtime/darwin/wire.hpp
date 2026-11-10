@@ -97,6 +97,8 @@ private:
     w.pod(f.sig_actions); w.pod(f.sig_mask); w.pod(f.altstack);
     w.str(f.namespace_state);
     w.pod(f.rlimits); w.str(f.environ); w.str(f.range_names);
+    w.vec(f.backings);
+    w.pod(f.pte_lo); w.pod(f.pte_hi);
     return w.take();
 }
 
@@ -107,7 +109,7 @@ private:
            r.vec(f.vmas) && r.pod(f.brk) && r.pod(f.arena) && r.vec(f.fds) && r.vec(f.fd_hosts) &&
            r.pod(f.sig_actions) && r.pod(f.sig_mask) && r.pod(f.altstack) &&
            r.str(f.namespace_state) && r.pod(f.rlimits) && r.str(f.environ) &&
-           r.str(f.range_names);
+           r.str(f.range_names) && r.vec(f.backings) && r.pod(f.pte_lo) && r.pod(f.pte_hi);
 }
 
 } // namespace lx::runtime::wire

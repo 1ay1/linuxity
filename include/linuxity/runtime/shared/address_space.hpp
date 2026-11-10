@@ -131,8 +131,12 @@ public:
     // MAP_FIXED replaces whatever is there (Linux semantics: it unmaps the
     // range first). Otherwise place top-down in the first gap that fits,
     // which keeps the heap and mmap arena growing toward each other.
+    // `align` (a power of two, at least a page) is for a backend whose host
+    // pages are bigger than the guest's: a range it backs with host-shared
+    // pages must start on a host page.
     [[nodiscard]] std::uint64_t map(std::uint64_t hint, std::uint64_t len,
-                                    GuestProt prot, bool fixed, bool anon) {
+                                    GuestProt prot, bool fixed, bool anon,
+                                    std::uint64_t align = kPageSize) {
         len = page_up(len);
         if (len == 0) return kFail;
         std::uint64_t at;
@@ -141,7 +145,7 @@ public:
             if (at < arena_low_ || at + len > arena_high_) return kFail;
             unmap(at, len);                   // MAP_FIXED clobbers
         } else {
-            auto found = find_gap(len);
+            auto found = find_gap(len, align);
             if (!found) return kFail;
             at = *found;
         }
@@ -217,15 +221,19 @@ private:
     // First-fit from the TOP of the arena down, mirroring Linux's default
     // topdown layout so the heap (growing up) and mmap (growing down) share
     // the arena without a fixed split point.
-    [[nodiscard]] std::optional<std::uint64_t> find_gap(std::uint64_t len) const {
+    [[nodiscard]] std::optional<std::uint64_t> find_gap(std::uint64_t len,
+                                                        std::uint64_t align = kPageSize) const {
+        const std::uint64_t mask = ~(align - 1);
         std::uint64_t ceiling = arena_high_;
         for (auto it = vmas_.rbegin(); it != vmas_.rend(); ++it) {
-            if (ceiling >= it->end && ceiling - it->end >= len)
-                return ceiling - len;
+            if (ceiling >= it->end && ceiling - it->end >= len &&
+                ((ceiling - len) & mask) >= it->end)
+                return (ceiling - len) & mask;
             ceiling = std::min(ceiling, it->begin);
         }
         std::uint64_t floor = std::max(page_up(brk_cur_), arena_low_);
-        if (ceiling >= floor && ceiling - floor >= len) return ceiling - len;
+        if (ceiling >= floor && ceiling - floor >= len && ((ceiling - len) & mask) >= floor)
+            return (ceiling - len) & mask;
         return std::nullopt;
     }
 

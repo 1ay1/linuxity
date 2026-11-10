@@ -77,6 +77,7 @@
 
 #include <Hypervisor/Hypervisor.h>
 #include <libkern/OSCacheControl.h>
+#include <mach/mach.h>
 #include <sys/clonefile.h>
 #include <sys/mman.h>
 #include <time.h>
@@ -693,14 +694,24 @@ private:
         }
 
         // No handler (or the signal is blocked, which Linux treats as fatal
-        // for a synchronous fault): die by the signal, and say where, because
-        // an unexplained 139 is the least actionable thing we could print.
-        std::fprintf(stderr,
-            "linuxity: guest %s at pc=%#llx addr=%#llx (%s) esr=%#llx\n",
-            kind, static_cast<unsigned long long>(regs_.elr),
-            static_cast<unsigned long long>(far),
-            v ? "mapped" : "UNMAPPED",
-            static_cast<unsigned long long>(regs_.esr));
+        // for a synchronous fault): die BY the signal, so the parent's wait
+        // sees WIFSIGNALED (a shell's "Segmentation fault", Python's -11) --
+        // an exit(139) is a different answer. Where it happened goes to
+        // stderr only when debugging: Linux prints nothing.
+        if (std::getenv("LINUXITY_DEBUG"))
+            std::fprintf(stderr,
+                "linuxity: guest %s at pc=%#llx addr=%#llx (%s) esr=%#llx\n",
+                kind, static_cast<unsigned long long>(regs_.elr),
+                static_cast<unsigned long long>(far),
+                v ? "mapped" : "UNMAPPED",
+                static_cast<unsigned long long>(regs_.esr));
+        if (!is_namespace_init()) {
+            // The host default for SIGSEGV/SIGBUS/SIGILL would also write a
+            // crash report for LINUXITY; the guest's death needs only the
+            // status, so leave via the signal with the core bit unset.
+            kill_with(sig);
+            return false;
+        }
         std::fflush(nullptr);
         exited_ = true;
         code_ = 128 + sig;
@@ -1741,6 +1752,20 @@ private:
     void kill_with(int linux_sig) {
         route_host_signal(linux_sig, false);
         std::fflush(nullptr);
+        // Dying by SIGSEGV/SIGABRT/... is the GUEST's death; without this
+        // the host's crash reporter would file (and take time writing) a
+        // report for linuxity itself. Unhooking the task's crash exception
+        // ports leaves the signal -- and the wait status -- untouched.
+        (void)::task_set_exception_ports(::mach_task_self(),
+                                         EXC_MASK_CRASH | EXC_MASK_CORPSE_NOTIFY,
+                                         MACH_PORT_NULL, EXCEPTION_DEFAULT, 0);
+        {
+            // the host thread may have it blocked (a tty shield): unblock
+            sigset_t one;
+            sigemptyset(&one);
+            sigaddset(&one, signal_from_linux(linux_sig));
+            ::pthread_sigmask(SIG_UNBLOCK, &one, nullptr);
+        }
         ::raise(signal_from_linux(linux_sig));
         exited_ = true;
         code_ = 128 + linux_sig;
@@ -1983,6 +2008,8 @@ private:
         img.sig_mask = task_.sig_mask;
         img.altstack = task_.alt_stack;
         img.rlimits = proc_.rlimits;
+        img.pte_lo = proc_.pte_lo;
+        img.pte_hi = proc_.pte_hi;
         img.environ = proc_.environ();
         proc_.with_names([&](auto& v) {
             for (const auto& r : v)
@@ -2000,6 +2027,16 @@ private:
             img.fds = std::move(ex.entries);
             img.fd_hosts = std::move(ex.host_fds);
         }
+        // Shared backings ride as extra fd groups after the table's own: the
+        // child maps the SAME objects, so writes on either side are seen by
+        // the other, as MAP_SHARED promises across fork.
+        proc_.with_backings([&](auto& v) {
+            for (const auto& b : v) {
+                img.backings.push_back({b.at, b.len, b.off, static_cast<std::int32_t>(img.fd_hosts.size())});
+                img.fd_hosts.push_back(b.fd);
+            }
+            return 0;
+        });
         proc_.with_signals([&](SignalDispositions& d) {
             img.sig_actions = d.table();
         });
@@ -2048,6 +2085,9 @@ public:
         std::array<ProcessState::Rlim, 16> rlimits{};
         std::string environ;            // /proc/<pid>/environ, until exec
         std::string range_names;        // "begin end name\n"..., for maps
+        struct Backed { std::uint64_t at, len; std::int64_t off; std::int32_t group; };
+        std::vector<Backed> backings;   // shared host pages; `group` indexes fd_hosts
+        std::uint64_t pte_lo{~std::uint64_t{0}}, pte_hi{0};   // narrowed page permissions
     };
     using SpawnFork = std::function<pid_t(ForkImage&)>;
     void set_fork_spawner(SpawnFork f) { spawn_ = std::move(f); }
@@ -2106,7 +2146,18 @@ public:
         ::umask(static_cast<mode_t>(img.umask));
         proc_.with_space([&](AddressSpace& t) { return t.restore(img.vmas, img.brk, img.arena); });
         proc_.with_fds([&](FdTable& t) { return t.import_table(img.fds, host_fds); });
+        for (const auto& b : img.backings) {
+            const auto gi = static_cast<std::size_t>(b.group);
+            if (gi >= host_fds.size()) continue;
+            // The snapshot COPIED these pages; map the shared object back.
+            if (add_backing(b.at, b.len, host_fds[gi], b.off)) {}
+        }
+        // The extra groups are ours alone (the fd table never names them).
+        for (const auto& b : img.backings)
+            if (static_cast<std::size_t>(b.group) < host_fds.size()) ::close(host_fds[static_cast<std::size_t>(b.group)]);
         proc_.rlimits = img.rlimits;
+        proc_.pte_lo = img.pte_lo;              // the tables came in the snapshot
+        proc_.pte_hi = img.pte_hi;
         proc_.set_environ(img.environ);
         for (std::size_t at = 0; at < img.range_names.size();) {
             const std::size_t nl = std::min(img.range_names.find('\n', at), img.range_names.size());
@@ -2317,6 +2368,16 @@ private:
                     std::chrono::steady_clock::now() - e0).count()));
         };
         std::uint64_t zeroed = 0, nvma = 0;
+        // Shared objects leave the address space FIRST: zeroing a range still
+        // backed by one would wipe it for every other process mapping it.
+        drop_backings(0, ~std::uint64_t{0} >> 1);
+        if (proc_.pte_hi > proc_.pte_lo) {
+            // the old image's page permissions go with it
+            machine_.protect(proc_.pte_lo, proc_.pte_hi - proc_.pte_lo, true, true, true);
+            proc_.pte_lo = ~std::uint64_t{0};
+            proc_.pte_hi = 0;
+            cpu_.flush_tlb_on_entry();
+        }
         for (const Vma& v : proc_.with_space([&](AddressSpace& t) { return t.vmas(); })) {
             // Read-only, file-backed mappings (library text, rodata, the
             // program image) were never written by the guest; their bytes
@@ -3442,6 +3503,70 @@ private:
         }
     }
 
+    // -- Page protection in the guest's own page tables ----------------------
+    // The stage-1 tables start RWX everywhere guest-visible; mmap/mprotect
+    // narrow ranges (HvfMachine::protect) and munmap puts them back. The
+    // touched window rides through fork (the tables are in the snapshot)
+    // and is reset at exec, so a new image starts from the default.
+    void set_pte_prot(std::uint64_t at, std::uint64_t len, GuestProt p) {
+        if (!len) return;
+        machine_.protect(at, len, has(p, GuestProt::read) || has(p, GuestProt::write),
+                         has(p, GuestProt::write), has(p, GuestProt::exec));
+        proc_.pte_lo = std::min(proc_.pte_lo, at);
+        proc_.pte_hi = std::max(proc_.pte_hi, at + len);
+        // Other threads may hold old translations: the stub's tlbi is
+        // broadcast (inner-shareable), so this vCPU running it before the
+        // syscall returns drops them for every vCPU of the VM.
+        cpu_.flush_tlb_on_entry();
+    }
+    void reset_pte_prot(std::uint64_t at, std::uint64_t len) {
+        if (!len || proc_.pte_hi <= proc_.pte_lo) return;      // nothing narrowed yet
+        machine_.protect(at, len, true, true, true);
+        cpu_.flush_tlb_on_entry();
+    }
+    // -- Real shared pages ---------------------------------------------------
+    // Drop the shared backings inside [at, at+len): the guest range goes back
+    // to private zero memory (munmap, MAP_FIXED over it, exec). A backing
+    // only PARTLY covered stays shared whole: its host pages are bigger
+    // than the guest's, and the guest still maps the rest of them.
+    void drop_backings(std::uint64_t at, std::uint64_t len) {
+        std::vector<ProcessState::Backing> gone;
+        proc_.with_backings([&](auto& v) {
+            for (auto it = v.begin(); it != v.end();) {
+                if (it->at < at || it->at + it->len > at + len) { ++it; continue; }
+                gone.push_back(*it);
+                it = v.erase(it);
+            }
+            return 0;
+        });
+        for (const auto& b : gone) {
+            (void)machine_.back_shared(b.at, b.len, -1, 0);
+            ::close(b.fd);
+        }
+    }
+    // Back [at, at+len) with `fd` at `off`, shared, and remember it. The
+    // backing takes its own reference to the object.
+    [[nodiscard]] bool add_backing(std::uint64_t at, std::uint64_t len, int fd, std::int64_t off) {
+        const int own = ::fcntl(fd, F_DUPFD_CLOEXEC, 3);
+        if (own < 0) return false;
+        if (!machine_.back_shared(at, len, own, off)) { ::close(own); return false; }
+        proc_.with_backings([&](auto& v) { v.push_back({at, len, own, off}); return 0; });
+        return true;
+    }
+    // A fresh object for MAP_SHARED|MAP_ANONYMOUS: an unlinked shm object
+    // of `len` bytes. Fork children map the same one, so the memory is
+    // shared the way Linux shares it (and not merely copied at fork).
+    [[nodiscard]] static int anon_shared_object(std::uint64_t len) {
+        static std::atomic<unsigned> seq{0};
+        char name[64];
+        std::snprintf(name, sizeof name, "/lx%d.%u", ::getpid(), seq.fetch_add(1));
+        const int fd = ::shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+        if (fd < 0) return -1;
+        ::shm_unlink(name);
+        if (::ftruncate(fd, static_cast<off_t>(len)) < 0) { ::close(fd); return -1; }
+        return fd;
+    }
+
     [[nodiscard]] Maybe do_memory(abi::Sysno sc) {
         using S = abi::Sysno;
         const std::uint64_t a0 = regs_.arg(0), a1 = regs_.arg(1),
@@ -3468,15 +3593,46 @@ private:
                 }
                 // A MAP_FIXED map replaces whatever was there: a shared file
                 // map it covers must reach its file first.
-                if (abi::wire::wants_fixed(a3)) sync_shared(a0, len, /*drop=*/true);
-                std::uint64_t at = proc_.with_space([&](AddressSpace& t) { return t.map(a0, a1, prot_from_linux(a2),
-                                           abi::wire::wants_fixed(a3), anon); });
+                if (abi::wire::wants_fixed(a3)) {
+                    sync_shared(a0, len, /*drop=*/true);
+                    drop_backings(a0, len);
+                }
+                const bool shared = abi::wire::has_map(a3, abi::wire::MapFlag::shared);
+                const std::uint64_t hp = HvfMachine::host_page();
+                // A shared map gets REAL shared pages, which the host only
+                // has at its own page size: place it on a host page, and
+                // round its span up (the tail is the object's, unseen).
+                const bool host_shared = shared && (anon || (regs_.arg(5) % hp) == 0) &&
+                                         (!abi::wire::wants_fixed(a3) || a0 % hp == 0);
+                const std::uint64_t span = host_shared ? (len + hp - 1) / hp * hp : len;
+                std::uint64_t at = proc_.with_space([&](AddressSpace& t) { return t.map(a0, host_shared ? span : a1, prot_from_linux(a2),
+                                           abi::wire::wants_fixed(a3), anon,
+                                           host_shared ? hp : AddressSpace::kPageSize); });
                 if (at == AddressSpace::kFail) return -12;          // ENOMEM
+                {
+                    // the new range's permissions, enforced (the range may
+                    // also carry a narrower one from an earlier mapping)
+                    const GuestProt np = prot_from_linux(a2);
+                    const GuestProt rwx = GuestProt::read | GuestProt::write | GuestProt::exec;
+                    if (np != rwx) set_pte_prot(at, span, np);
+                    else reset_pte_prot(at, span);
+                }
+                // (a shared map's host-page tail is part of its VMA: what
+                // lies past the object's end faults there, as past EOF)
                 proc_.unname(at, at + len);
                 auto win = machine_.ram().at(at, len);
                 if (win.empty()) return -12;
 
                 if (anon) {
+                    if (host_shared) {
+                        const int obj = anon_shared_object(span);
+                        const bool ok = obj >= 0 && add_backing(at, span, obj, 0);
+                        if (obj >= 0) ::close(obj);
+                        if (ok) {
+                            proc_.name(at, at + len, "/dev/zero (deleted)");
+                            return static_cast<std::int64_t>(at);
+                        }
+                    }
                     // A fresh anonymous mapping must read as zero -- and for
                     // an ANON map the guest asked for the whole page span, so
                     // clearing to the page-rounded end is correct here.
@@ -3506,9 +3662,25 @@ private:
                 // covers, so rounding up here would wipe a neighbour.
                 const int ffd = proc_.with_fds([&](FdTable& t) { return t.host(static_cast<int>(regs_.arg(4))); }).value_or(-1);
                 if (ffd < 0) return -9;                              // EBADF
+                const auto foff = static_cast<off_t>(regs_.arg(5));
+                if (shared) {
+                    // A shared WRITABLE map needs a writable file (EACCES).
+                    const int fl = ::fcntl(ffd, F_GETFL);
+                    if (abi::wire::has_prot(a2, abi::wire::Prot::write) && fl >= 0 &&
+                        (fl & O_ACCMODE) == O_RDONLY) return -13;
+                }
                 if (char fp[PATH_MAX]; ::fcntl(ffd, F_GETPATH, fp) == 0)
                     proc_.name(at, at + len, unresolve_ ? unresolve_(fp) : std::string{fp});
-                const auto foff = static_cast<off_t>(regs_.arg(5));
+                if (host_shared) {
+                    // The file's own pages: coherent with read()/write() and
+                    // every other process mapping it -- and with another
+                    // mapping of it here (a JIT's RW view and RX view). Past
+                    // EOF the host faults; the guest sees that as SIGBUS.
+                    if (add_backing(at, span, ffd, foff)) {
+                        if (has(prot_from_linux(a2), GuestProt::exec)) machine_.publish_code(at, span);
+                        return static_cast<std::int64_t>(at);
+                    }
+                }
                 auto n = ::pread(ffd, win.data(), a1, foff);
                 if (n < 0) return darwin::fail();
                 const auto got = static_cast<std::uint64_t>(n);
@@ -3533,18 +3705,35 @@ private:
                 }
                 return static_cast<std::int64_t>(at);
             }
-            case S::munmap:
-                sync_shared(a0, AddressSpace::page_up(a1), /*drop=*/true);
-                proc_.with_space([&](AddressSpace& t) { return t.unmap(a0, a1); });
-                proc_.unname(a0, a0 + AddressSpace::page_up(a1));
+            case S::munmap: {
+                std::uint64_t len = AddressSpace::page_up(a1);
+                // A shared map's VMA spans whole host pages; unmapping the
+                // part the guest asked for (its own length) releases them all.
+                proc_.with_backings([&](auto& v) {
+                    for (const auto& b : v)
+                        if (b.at == a0 && b.len > len && b.len - len < HvfMachine::host_page()) len = b.len;
+                    return 0;
+                });
+                sync_shared(a0, len, /*drop=*/true);
+                drop_backings(a0, len);
+                proc_.with_space([&](AddressSpace& t) { return t.unmap(a0, len); });
+                proc_.unname(a0, a0 + len);
+                reset_pte_prot(a0, len);
                 return 0;
-            case S::mprotect:
-                // Tracked in the VMA map but NOT enforced in the page tables:
-                // the stage-1 tables are built RWX once, and per-page
-                // reprotection would need a table walk plus TLB maintenance
-                // on every call. Recorded so /proc/self/maps is truthful and
-                // so enforcement can be added without an ABI change.
-                return proc_.with_space([&](AddressSpace& t) { return t.protect(a0, a1, prot_from_linux(a2)); }) ? 0 : -12;
+            }
+            case S::mprotect: {
+                // ENFORCED: the VMA map records it (/proc/self/maps) and the
+                // guest's stage-1 entries carry it (AP/UXN), so a write to a
+                // read-only page, any touch of PROT_NONE and a jump into
+                // non-executable memory fault -- SIGSEGV, as on Linux. Code
+                // flipped to executable is published to the I-cache.
+                if (a0 % AddressSpace::kPageSize) return -22;
+                const GuestProt p = prot_from_linux(a2);
+                if (!proc_.with_space([&](AddressSpace& t) { return t.protect(a0, a1, p); })) return -12;
+                set_pte_prot(a0, AddressSpace::page_up(a1), p);
+                if (has(p, GuestProt::exec)) machine_.publish_code(a0, AddressSpace::page_up(a1));
+                return 0;
+            }
             // -- mlock family. Guest RAM is a single host mapping that
             //    linuxity already keeps resident, so locking a guest range
             //    means locking the host pages behind it -- which is exactly
@@ -3592,7 +3781,13 @@ private:
                 constexpr std::uint64_t kDontNeed = 4;
                 if (a2 == kDontNeed) {
                     const Vma* v = proc_.with_space([&](AddressSpace& t) { return t.find(a0); });
-                    if (v && v->anonymous) machine_.zero(a0, AddressSpace::page_up(a1));
+                    // (a shared object keeps its contents: DONTNEED only
+                    // drops OUR view of them, which then reads them back)
+                    const bool backed = proc_.with_backings([&](auto& bv) {
+                        for (const auto& b : bv) if (a0 >= b.at && a0 < b.at + b.len) return true;
+                        return false;
+                    });
+                    if (v && v->anonymous && !backed) machine_.zero(a0, AddressSpace::page_up(a1));
                 }
                 return 0;
             }
@@ -3608,6 +3803,7 @@ private:
                 if (!v) return -14;
                 if (new_len <= old_len) {
                     proc_.with_space([&](AddressSpace& t) { return t.unmap(a0 + new_len, old_len - new_len); });
+                    reset_pte_prot(a0 + new_len, old_len - new_len);
                     return static_cast<std::int64_t>(a0);
                 }
                 if (!(a3 & kMayMove)) return -12;
@@ -3621,6 +3817,8 @@ private:
                 std::memmove(dst.data(), src.data(), old_len);
                 machine_.zero(to + old_len, new_len - old_len);
                 proc_.with_space([&](AddressSpace& t) { return t.unmap(a0, old_len); });
+                reset_pte_prot(a0, old_len);
+                set_pte_prot(to, new_len, prot);
                 return static_cast<std::int64_t>(to);
             }
             default:
