@@ -39,6 +39,7 @@ enum Req : std::uint64_t {
     L_TIOCGWINSZ = 0x5413, L_TIOCSWINSZ = 0x5414, L_FIONREAD = 0x541B,
     L_TIOCNOTTY = 0x5422, L_TIOCGSID = 0x5429, L_FIONBIO = 0x5421,
     L_FIOCLEX = 0x5451, L_FIONCLEX = 0x5450, L_TCFLSH = 0x540B, L_TCXONC = 0x540A,
+    L_TCSBRK = 0x5409, L_TCSBRKP = 0x5425,
     L_TIOCGPTN = 0x80045430, L_TIOCSPTLCK = 0x40045431, L_TIOCGPTPEER = 0x5441,
     // termios2 (glibc >= 2.42 uses these instead of TCGETS/TCSETS*): the
     // same leading fields as struct termios, plus explicit input/output
@@ -109,6 +110,28 @@ inline constexpr std::pair<int, int> kCc[] = {
     return l;
 }
 
+// Linux's baud codes (CBAUD, cflag & 010017) and the rates they name. Darwin
+// keeps the rate itself in c_ispeed/c_ospeed (B9600 == 9600), so this one
+// table is the whole translation, both ways. The rate round-trips: a guest
+// that sets B9600 reads B9600 back (stty, minicom, tests all check).
+struct Baud { std::uint32_t code; speed_t rate; };
+inline constexpr Baud kBaud[] = {
+    {0000000, 0}, {0000001, 50}, {0000002, 75}, {0000003, 110}, {0000004, 134},
+    {0000005, 150}, {0000006, 200}, {0000007, 300}, {0000010, 600}, {0000011, 1200},
+    {0000012, 1800}, {0000013, 2400}, {0000014, 4800}, {0000015, 9600},
+    {0000016, 19200}, {0000017, 38400}, {0010001, 57600}, {0010002, 115200},
+    {0010003, 230400},
+};
+inline constexpr std::uint32_t kCbaud = 0010017;
+[[nodiscard]] inline std::uint32_t baud_code(speed_t rate) {
+    for (auto b : kBaud) if (b.rate == rate) return b.code;
+    return 0000017;                                // unknown: B38400
+}
+[[nodiscard]] inline speed_t baud_rate(std::uint32_t code) {
+    for (auto b : kBaud) if (b.code == (code & kCbaud)) return b.rate;
+    return 38400;
+}
+
 [[nodiscard]] inline LinuxTermios from_darwin(const struct ::termios& t) {
     LinuxTermios l{};
     l.c_iflag = map_in(t.c_iflag, kIflag);
@@ -121,7 +144,7 @@ inline constexpr std::pair<int, int> kCc[] = {
         case CS7: l.c_cflag |= 0000040; break;
         default:  l.c_cflag |= 0000060; break;
     }
-    l.c_cflag |= 0000017;                        // B38400: report a sane baud
+    l.c_cflag |= baud_code(::cfgetospeed(&t));    // the real rate, as a Linux code
     for (auto [li, di] : kCc) l.c_cc[li] = t.c_cc[di];
     return l;
 }
@@ -140,6 +163,8 @@ inline void to_darwin(const LinuxTermios& l, struct ::termios& t) {
         default:      t.c_cflag |= CS8; break;
     }
     for (auto [li, di] : kCc) t.c_cc[di] = l.c_cc[li];
+    // Linux has one baud field for both directions in c_cflag
+    (void)::cfsetspeed(&t, baud_rate(l.c_cflag));
 }
 
 } // namespace lx::runtime::tty

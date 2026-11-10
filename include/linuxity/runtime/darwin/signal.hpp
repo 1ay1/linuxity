@@ -205,6 +205,17 @@ extern "C" inline void hvf_host_signal(int host_sig) {
     g_pending.notify_waiters();
 }
 
+// linuxity's internal mailbox kick: wake every vCPU and blocked host call,
+// raise nothing for the guest. No SA_RESTART, so a blocked read/pause/wait
+// returns EINTR, traps, and the trap loop reads the mailbox.
+inline void install_kick_handler() {
+    struct ::sigaction sa{};
+    sa.sa_handler = [](int) { g_pending.kick_all(); g_pending.notify_waiters(); };
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    ::sigaction(kKickSignal, &sa, nullptr);
+}
+
 // Route host signal `ls` (Linux number) to the guest: catch it on the host,
 // or restore the host default so e.g. SIGKILL semantics stay exact.
 inline void route_host_signal(int linux_sig, bool catch_it) {

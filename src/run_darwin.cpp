@@ -313,7 +313,12 @@ public:
         // message as fileports. A fresh zygote is started right after, off
         // the fork's critical path, for the next fork.
         if (static const bool no_zyg = std::getenv("LINUXITY_NO_ZYGOTE") != nullptr; !no_zyg) {
-            if (Zygote z = take_zygote(); z.pid > 0) {
+            Zygote z = take_zygote();
+            if (z.pid > 0 && z.sid != ::getsid(0)) {     // spawned before a setsid: stale
+                drop_stale_zygotes();
+                z = {};
+            }
+            if (z.pid > 0) {
                 std::vector<int> fds{0, 1, 2};
                 fds.insert(fds.end(), img.fd_hosts.begin(), img.fd_hosts.end());
                 fds.push_back(pids_.fd());
@@ -458,7 +463,10 @@ private:
     // a fork child's process-level setup, looks up SERVICE, sends us its
     // reply port ("hello") and blocks receiving the handoff. We keep at most
     // ONE warm per guest process (it costs a parked process, ~6 MB RSS).
-    struct Zygote { pid_t pid{-1}; mach_port_t reply{MACH_PORT_NULL}; };
+    // A spare inherits its creator's host SESSION when spawned and can never
+    // change it. So it is only a valid fork child while the creator is still
+    // in that session (a pty child setsid()s, then forks its job): record it.
+    struct Zygote { pid_t pid{-1}; mach_port_t reply{MACH_PORT_NULL}; pid_t sid{-1}; };
     struct ZygoteSlot {
         std::mutex mu;
         std::condition_variable cv;
@@ -466,6 +474,23 @@ private:
         std::vector<Zygote> ready;
     };
     ZygoteSlot& slot() { static ZygoteSlot s; return s; }
+    // Every parked spare belongs to a session we left (see Zygote): kill
+    // them and give their VMs back; fresh ones are spawned in the new one.
+    void drop_stale_zygotes() {
+        std::vector<Zygote> old;
+        {
+            auto& s = slot();
+            std::lock_guard l{s.mu};
+            old.swap(s.ready);
+        }
+        for (const auto& z : old) {
+            ::mach_port_deallocate(::mach_task_self(), z.reply);
+            ::kill(z.pid, SIGKILL);
+            int st = 0;
+            ::waitpid(z.pid, &st, 0);
+            pids_.release_warm_vm();
+        }
+    }
     // Pool depth: back-to-back forks (a shell loop, `make -j`, configure)
     // drain warm zygotes faster than fresh ones start (~5 ms each, spawned
     // in parallel). Measured: depth 3 ran dry every third fork of a tight
@@ -566,7 +591,7 @@ private:
             int st = 0; ::waitpid(pid, &st, 0);
             return {};
         }
-        return {pid, hello.h.msgh_remote_port};
+        return {pid, hello.h.msgh_remote_port, ::getsid(0)};
     }
 
     const Options& opts_;
@@ -771,6 +796,12 @@ void attach_live_procs(Machine& m, runtime::PidSpace& pids) {
             pi.exe = exe;
             return pi;
         }
+        std::int32_t pgid(std::int32_t pid) const override {
+            return ps.is_process(pid) ? ps.pgid_of(pid) : 0;
+        }
+        std::int32_t sid(std::int32_t pid) const override {
+            return ps.is_process(pid) ? ps.sid_of(pid) : 0;
+        }
     };
     static Live live{pids};
     m.k.procs().set_live_source(&live);
@@ -788,8 +819,12 @@ void smark(const char* w) {
             std::chrono::steady_clock::now() - s0).count()));
 }
 
-// Once per process, whichever way in: the start timer and crash handler.
+// Once per process, whichever way in: the start timer, the crash handler,
+// and linuxity's own mailbox kick (kKickSignal). The kick handler must be in
+// place from the first instruction: a parent can kick a fork child the
+// moment it exists (a setpgid race), and SIGEMT's DEFAULT action kills.
 void process_start() {
+    runtime::install_kick_handler();
     if (start_profiling()) {
         // Time from exec (kernel's process start) to main: dyld + static init.
         struct kinfo_proc kp{};

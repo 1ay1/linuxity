@@ -293,6 +293,7 @@ public:
     // have said and keeps callers from having to special-case it.
     [[nodiscard]] std::int32_t pgid_of(std::int32_t pid) const {
         if (pid <= 0) return pid;
+        if (live_) if (const auto g = live_->pgid(pid)) return g;
         const ProcInfo* p = find(pid);
         if (p == nullptr) return pid;
         // Walk up until a pid with a recorded group. A link that's gone (an
@@ -310,6 +311,7 @@ public:
     }
     [[nodiscard]] std::int32_t sid_of(std::int32_t pid) const {
         if (pid <= 0) return pid;
+        if (live_) if (const auto s = live_->sid(pid)) return s;
         const ProcInfo* p = find(pid);
         if (p == nullptr) return pid;
         for (int hops = 0; p != nullptr && hops < 4096; ++hops) {
@@ -499,6 +501,13 @@ public:
         [[nodiscard]] virtual bool alive(std::int32_t pid) const = 0;
         [[nodiscard]] virtual std::vector<std::int32_t> pids() const = 0;
         [[nodiscard]] virtual ProcInfo info(std::int32_t pid) const = 0;
+        // A backend whose process tree spans HOST processes (macOS: one per
+        // guest process) keeps groups and sessions in its shared table --
+        // the only place every process sees. Then it is the authority, and
+        // this table asks instead of keeping a copy that only the process
+        // that made the change would see. 0 = "not mine to say".
+        [[nodiscard]] virtual std::int32_t pgid(std::int32_t) const { return 0; }
+        [[nodiscard]] virtual std::int32_t sid(std::int32_t) const { return 0; }
     };
     void set_live_source(const LiveSource* s) noexcept { live_ = s; }
 

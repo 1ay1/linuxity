@@ -141,6 +141,24 @@ public:
     [[nodiscard]] TaskIds current_ids() const noexcept {
         return {task_.tid, task_.tid, parent_};
     }
+    // The host pid of guest pid `g` (this process included), or nullopt.
+    // And back: a host pid -- or a host group/session id, which is its
+    // leader's pid -- as the guest numbers it. A host id outside the guest
+    // tree (linuxity's own launching shell's group or session) reads as 1:
+    // the guest's world begins at its init, as in a container.
+    [[nodiscard]] std::optional<pid_t> host_pid_of(std::int32_t g) const noexcept {
+        if (g == task_.tid || g == tgid_) return ::getpid();
+        return pids_.host_of(g);
+    }
+    [[nodiscard]] std::int32_t guest_pid_of(pid_t host) const noexcept {
+        if (host == ::getpid()) return tgid_;
+        const std::int32_t g = pids_.guest_of(host);
+        return g > 0 ? g : 1;
+    }
+    // The host fd behind guest fd `gfd`, or -1 (for HvfMem::host_fd_of).
+    [[nodiscard]] int host_fd_of(int gfd) const {
+        return proc_.with_fds([&](const FdTable& t) { return t.host(gfd).value_or(-1); });
+    }
     // The same facts in abi/identity.hpp's shape, so the shared answers can
     // be used by this backend's own service routine too (not just through
     // the portable dispatcher's current_ids() probe).
@@ -279,10 +297,24 @@ public:
     // RLIMIT_STACK, which is what prlimit64 reports).
     static constexpr std::uint64_t kStackReserve = ExecArena::stack_reserve;
 
+    // A parent's setpgid of us, posted to the shared table (see setpgid):
+    // apply it ourselves, which Darwin always allows.
+    void apply_posted_pgid() {
+        if (!pids_.pgid_posted(tgid_)) return;
+        // apply FIRST, then acknowledge: the parent's setpgid returns when
+        // the post is gone, and must find the group already changed
+        const std::int32_t g = pids_.posted_pgid(tgid_);
+        const auto hg = g == tgid_ ? std::optional<pid_t>{::getpid()} : pids_.host_of(g);
+        if (hg) (void)::setpgid(0, *hg);
+        (void)pids_.take_pgid(tgid_);
+    }
+
     [[nodiscard]] Result<bool> next(TrapFrame& f) {
         constexpr std::uint64_t kEcSvc64 = 0x15;
+        if (!ready_announced_) { pids_.mark_ready(tgid_); ready_announced_ = true; }
         for (;;) {
             if (exited_) return ok(false);
+            apply_posted_pgid();
             // A sibling called exit_group(2): this thread dies too, with the
             // group's status. Checked here (and again after every trap)
             // because the kick that woke us may have arrived while we were
@@ -362,11 +394,10 @@ public:
         // it -- and, crucially, a positive pid that happens to BE a group
         // leader signals only that one process, as Linux does.
         if (gpid <= 0) {
-            const std::int32_t pgid = gpid == 0 ? pids_.pgid_of(task_.tid)
-                                                : (gpid == -1 ? 0 : -gpid);
+            const std::int32_t own = guest_pid_of(::getpgrp());
+            const std::int32_t pgid = gpid == 0 ? own : (gpid == -1 ? 0 : -gpid);
             std::int64_t delivered = 0;
-            const auto members = pgid ? pids_.members_of(pgid)
-                                      : pids_.members_of(pids_.pgid_of(task_.tid));
+            const auto members = pids_.members_of(pgid ? pgid : own);
             for (std::int32_t member : members) {
                 if (member == task_.tid) { mark_self_pending(sig); ++delivered; continue; }
                 if (auto h = pids_.host_of(member); h && (sig == 0 || ::kill(*h, hs) == 0))
@@ -896,9 +927,7 @@ private:
         ::fcntl(h, F_SETFD, FD_CLOEXEC);      // the HOST fd is ours; never leak it
     }
 
-    [[nodiscard]] int host_fd(int gfd) {
-        return proc_.with_fds([&](FdTable& t) { return t.host(gfd).value_or(-1); });
-    }
+    [[nodiscard]] int host_fd(int gfd) { return host_fd_of(gfd); }
     [[nodiscard]] std::int64_t install_socket(int h, bool cloexec) {
         const int g = proc_.with_fds([&](FdTable& t) { return t.install(h, cloexec); });
         if (g < 0) { ::close(h); return -24; }
@@ -1603,48 +1632,75 @@ private:
                     return *a;
                 return -38;                                  // ENOSYS
 
-            // -- Process groups and sessions. The core models a flat world
-            //    (every task its own leader), which is wrong for anything
-            //    that uses a group as a unit -- see deliver_signal. These
-            //    record the real relationships in the shared pid table.
+            // -- Process groups and sessions --------------------------------
+            // Every guest process is a real host process, so the HOST
+            // kernel's groups and sessions are the one truth -- the same
+            // ones the terminal driver uses to deliver ^C/^Z and to stop a
+            // background reader. Keeping a second copy in the shared table
+            // made getpgrp (table) and tcgetpgrp (host) disagree whenever the
+            // two calls of a setpgid race (parent and child each set it, as
+            // POSIX shells do) -- a job spun forever waiting to be in the
+            // foreground. The table only translates pids (a group id is its
+            // leader's pid); its pgid/sid fields are a published copy for
+            // other processes' /proc.
             case S::setpgid: {
                 const std::int32_t pid = a0 ? static_cast<std::int32_t>(a0) : task_.tid;
                 const std::int32_t pgid = a1 ? static_cast<std::int32_t>(a1) : pid;
-                if (!pids_.host_of(pid) && pid != task_.tid) return -3;   // ESRCH
+                const auto hp = host_pid_of(pid);
+                const auto hg = pgid == pid ? hp : host_pid_of(pgid);
+                if (!hp) return -3;                                  // ESRCH
+                if (!hg) return -1;                                  // EPERM: no such group
+                if (::setpgid(*hp, *hg) < 0) {
+                    // Darwin: EACCES for a child that has exec'd, and every
+                    // HVF child has (on the host) -- but the GUEST child has
+                    // not unless execed() says so. Then the child moves
+                    // itself: post the group, kick it, wait until it took it.
+                    if (errno != EACCES || pid == task_.tid || pids_.has_execed(pid)) return darwin::fail();
+                    // Already there (the child set its own group first, as
+                    // a job-control child does): nothing to do, as on Linux.
+                    if (::getpgid(*hp) == *hg) { pids_.set_pgid(pid, pgid); return 0; }
+                    pids_.post_pgid(pid, pgid);
+                    // Kick it only once it can take a kick: before its first
+                    // trap it is still starting up (SIGEMT's default kills),
+                    // and it reads the post at that first trap anyway.
+                    if (pids_.ready(pid)) (void)::kill(*hp, kKickSignal);
+                    // until it took it, or is in that group by its own hand,
+                    // or has died: getpgid fails for a zombie on Darwin, but
+                    // Linux still lets a parent set an unreaped child's
+                    // group, so a gone child is success (its group no longer
+                    // matters to anyone).
+                    while (pids_.pgid_posted(pid) && ::getpgid(*hp) > 0 && ::getpgid(*hp) != *hg)
+                        ::usleep(200);
+                    (void)pids_.take_pgid(pid);
+                    const pid_t now = ::getpgid(*hp);
+                    if (now > 0 && now != *hg) return -1;
+                }
                 pids_.set_pgid(pid, pgid);
-                // Mirror it in the HOST process groups. The terminal driver
-                // (the real one, on the Mac) delivers ^C/^Z/^\ to the
-                // terminal's foreground HOST group, and stops background
-                // HOST groups that read it. With every guest process in
-                // linuxity's single host group, ^Z stopped the shell along
-                // with its job -- the session froze -- and ^C hit every
-                // process. Best effort: the guest's model stays authoritative.
-                const auto hp = pid == task_.tid ? std::optional<pid_t>{::getpid()} : pids_.host_of(pid);
-                const auto hg = pgid == task_.tid ? std::optional<pid_t>{::getpid()} : pids_.host_of(pgid);
-                if (hp && hg) (void)::setpgid(*hp, *hg);
                 return 0;
             }
             case S::getpgid: {
                 const std::int32_t pid = a0 ? static_cast<std::int32_t>(a0) : task_.tid;
-                if (!pids_.host_of(pid) && pid != task_.tid) return -3;
-                return pids_.pgid_of(pid);
+                const auto hp = host_pid_of(pid);
+                if (!hp) return -3;
+                const pid_t g = ::getpgid(*hp);
+                return g < 0 ? darwin::fail() : guest_pid_of(g);
             }
             case S::getpgrp:
-                return pids_.pgid_of(task_.tid);
-            case S::setsid:
-                // A new session, with this process as leader of a new group.
-                // Linux refuses if the caller is ALREADY a group leader.
-                if (pids_.pgid_of(task_.tid) == task_.tid &&
-                    pids_.sid_of(task_.tid) == task_.tid)
-                    return -1;                                       // EPERM
+                return guest_pid_of(::getpgrp());
+            case S::setsid: {
+                // Linux: EPERM if the caller already leads a process group.
+                const pid_t s = ::setsid();
+                if (s < 0) return darwin::fail();
                 pids_.set_sid(task_.tid, task_.tid);
                 pids_.set_pgid(task_.tid, task_.tid);
-                (void)::setsid();                    // mirror on the host (see setpgid)
                 return task_.tid;
+            }
             case S::getsid: {
                 const std::int32_t pid = a0 ? static_cast<std::int32_t>(a0) : task_.tid;
-                if (!pids_.host_of(pid) && pid != task_.tid) return -3;
-                return pids_.sid_of(pid);
+                const auto hp = host_pid_of(pid);
+                if (!hp) return -3;
+                const pid_t s = ::getsid(*hp);
+                return s < 0 ? darwin::fail() : guest_pid_of(s);
             }
             default:                         return std::nullopt;
         }
@@ -1842,6 +1898,15 @@ public:
         task_.tid = img.self;
         parent_ = img.parent;
         tgid_ = img.self;             // a fork child is its own thread group
+        // fork(2) puts the child in the parent's process group as it is
+        // NOW. A pre-spawned spare inherited its creator's group from back
+        // when it was spawned, and the parent may have moved since (a
+        // job-control shell's setpgid, a pty child's setsid); join it. Only
+        // the child may: Darwin refuses a parent's setpgid of an exec'd
+        // process. (The session cannot move: the forker never hands over a
+        // spare from another session.)
+        if (const auto hp = pids_.host_of(img.parent))
+            if (const pid_t g = ::getpgid(*hp); g > 0 && g != ::getpgrp()) (void)::setpgid(0, g);
         refresh_guest_answers();          // new pid/ppid for this process
         proc_.umask = img.umask;
         proc_.with_space([&](AddressSpace& t) { return t.restore(img.vmas, img.brk, img.arena); });
@@ -1892,7 +1957,7 @@ private:
         } else {
             // -1: every child; 0: our group; < -1: that group.
             std::optional<std::int32_t> want_pgid;
-            if (gpid == 0) want_pgid = pids_.pgid_of(task_.tid);
+            if (gpid == 0) want_pgid = guest_pid_of(::getpgrp());
             else if (gpid < -1) want_pgid = -gpid;
             for (;;) {
                 std::vector<pid_t> hs;
@@ -3915,7 +3980,13 @@ private:
 
     // ioctl(fd, req, arg). Terminals are the whole story for an interactive
     // shell; see hvf_tty.hpp for why every field is translated by name.
-    [[nodiscard]] std::int64_t do_ioctl(int hfd, std::uint64_t req, std::uint64_t arg) {
+    [[nodiscard]] std::int64_t do_ioctl(int hfd, std::uint64_t req64, std::uint64_t arg) {
+        // ioctl(2)'s request is `unsigned int` in the kernel: only the low 32
+        // bits exist. musl passes it as an int, so on a 64-bit register a
+        // request with bit 31 set (every _IOR, e.g. TIOCGPTN 0x80045430)
+        // arrives sign-extended; comparing all 64 bits made it ENOTTY, and
+        // openpty() reported "out of pty devices".
+        const std::uint32_t req = static_cast<std::uint32_t>(req64);
         const GuestRam ram = machine_.ram();
         using namespace tty;
         switch (req) {
@@ -3929,18 +4000,38 @@ private:
             }
             case L_TCSETS: case L_TCSETSW: case L_TCSETSF:
             case L_TCSETS2: case L_TCSETSW2: case L_TCSETSF2: {
-                // termios2 starts with a plain termios, so reading the base
-                // struct serves both; the explicit speeds are ignored (a
-                // pty has no line speed).
-                LinuxTermios l{};
-                if (!ram.get(arg, l)) return -14;
+                // termios2 starts with a plain termios plus explicit speeds.
+                const bool v2 = req == L_TCSETS2 || req == L_TCSETSW2 || req == L_TCSETSF2;
+                LinuxTermios2 l2{};
+                if (v2 ? !ram.get(arg, l2) : !ram.get(arg, l2.base)) return -14;
                 struct ::termios t{};
                 if (::tcgetattr(hfd, &t) < 0) return darwin::fail();
-                to_darwin(l, t);
+                to_darwin(l2.base, t);
+                if (v2 && (l2.base.c_cflag & kCbaud) == 0010000 /*BOTHER*/) {
+                    ::cfsetispeed(&t, l2.c_ispeed);
+                    ::cfsetospeed(&t, l2.c_ospeed);
+                }
                 const int when = (req == L_TCSETS || req == L_TCSETS2)   ? TCSANOW
                                : (req == L_TCSETSW || req == L_TCSETSW2) ? TCSADRAIN
                                                                          : TCSAFLUSH;
                 return ::tcsetattr(hfd, when, &t) < 0 ? darwin::fail() : 0;
+            }
+            // TCSBRK(0) is tcsendbreak, TCSBRK(nonzero) is tcdrain; TCSBRKP is
+            // the POSIX tcsendbreak with a duration. On a PTY Linux has no
+            // transmitter: drain returns once output is in the line
+            // discipline, and a break is nothing to send. Darwin's pty drain
+            // instead waits until the MASTER has read everything -- so a
+            // program that drains before its reader reads (any test of
+            // output, `script`, expect) hung forever, deaf to signals. A real
+            // serial line keeps the host's semantics.
+            case L_TCSBRK: case L_TCSBRKP: {
+                char name[128];
+                const bool pty = ::ttyname_r(hfd, name, sizeof name) == 0 &&
+                                 lx::vfs::pty_slave_number(name) >= 0;
+                if (pty) return ::isatty(hfd) ? 0 : -25;
+                if (req == L_TCSBRK && arg != 0) return ::tcdrain(hfd) < 0 ? darwin::fail() : 0;
+                return ::tcsendbreak(hfd, req == L_TCSBRKP ? static_cast<int>(arg) : 0) < 0
+                           ? darwin::fail() : 0;
             }
             case L_TIOCGWINSZ: {
                 struct ::winsize w{};
@@ -3969,8 +4060,20 @@ private:
             case L_TCFLSH:
                 return ::tcflush(hfd, arg == 0 ? TCIFLUSH : arg == 1 ? TCOFLUSH : TCIOFLUSH) < 0
                            ? darwin::fail() : 0;
-            case L_TCXONC: case L_TIOCSCTTY: case L_TIOCNOTTY:
-                return 0;
+            // The controlling terminal is the host's (this guest process is
+            // a real host process with a real session): claim or drop it
+            // for real, so the host's job control -- ^C to the foreground
+            // group, SIGHUP on hangup, tcgetpgrp -- works on it.
+            case L_TIOCSCTTY:
+                return ::ioctl(hfd, TIOCSCTTY, static_cast<int>(arg)) < 0 ? darwin::fail() : 0;
+            case L_TIOCNOTTY:
+                return ::ioctl(hfd, TIOCNOTTY) < 0 ? darwin::fail() : 0;
+            case L_TCXONC: {
+                // Linux TCOOFF 0, TCOON 1, TCIOFF 2, TCION 3 -> tcflow's
+                constexpr int kAct[] = {TCOOFF, TCOON, TCIOFF, TCION};
+                if (arg > 3) return -22;
+                return ::tcflow(hfd, kAct[arg]) < 0 ? darwin::fail() : 0;
+            }
             // -- Job control: tcgetpgrp/tcsetpgrp/tcgetsid -----------------
             // The terminal's foreground process group, in GUEST pids. bash
             // hands each foreground job the terminal (tcsetpgrp) and takes
@@ -3980,13 +4083,12 @@ private:
             case L_TIOCGPGRP: {
                 const pid_t h = ::tcgetpgrp(hfd);
                 if (h < 0) return darwin::fail();
-                const std::int32_t g = pids_.guest_of(h);
-                return ram.put(arg, g > 0 ? g : std::int32_t{1}) ? 0 : -14;
+                return ram.put(arg, guest_pid_of(h)) ? 0 : -14;
             }
             case L_TIOCSPGRP: {
                 std::int32_t g = 0;
                 if (!ram.get(arg, g)) return -14;
-                const auto h = pids_.host_of(g);
+                const auto h = host_pid_of(g);
                 if (!h) return -3;                                   // ESRCH
                 // POSIX: tcsetpgrp from a BACKGROUND group raises SIGTTOU
                 // unless the caller blocks/ignores it -- and bash does, in
@@ -4010,8 +4112,7 @@ private:
             case L_TIOCGSID: {
                 const pid_t h = ::tcgetsid(hfd);
                 if (h < 0) return darwin::fail();
-                const std::int32_t g = pids_.guest_of(h);
-                return ram.put(arg, g > 0 ? g : std::int32_t{1}) ? 0 : -14;
+                return ram.put(arg, guest_pid_of(h)) ? 0 : -14;
             }
             // -- Guest-created ptys (tmux, script, expect, Python's pty) ----
             // glibc's posix_openpt opens /dev/ptmx (the host's), then
@@ -4525,6 +4626,7 @@ private:
     std::vector<Child> children_;
     std::vector<ProcEvent> proc_events_;
     std::vector<ExitHook> exit_hooks_;
+    bool ready_announced_{false};   // PidSpace::ready: the kick handler is in
     Resolver resolve_;
     Resolver unresolve_;
     std::string fd_path_storage_;
@@ -4597,6 +4699,13 @@ public:
     // sessions (the shared pid table), so set/getpgid and friends are
     // forwarded here instead of answered with the core's flat model.
     static constexpr void models_process_groups() noexcept {}
+
+    // The host fd behind guest fd `gfd`, or -1. Lets the portable core ask
+    // the host about an fd it has no path for (an inherited terminal, a
+    // TIOCGPTPEER slave) the way ptrace asks /proc/<tid>/fd.
+    [[nodiscard]] int host_fd_of(int gfd) const {
+        return trap_ ? trap_->host_fd_of(gfd) : -1;
+    }
 
     [[nodiscard]] Status copy_in(UAddr src, std::span<std::byte> dst) const {
         auto win = machine_.ram().at(value(src), dst.size());

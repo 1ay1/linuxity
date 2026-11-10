@@ -114,6 +114,8 @@ public:
     void bind(std::int32_t g, pid_t host) noexcept {
         if (g > 0 && g < kMax) {
             shared_->execed[g].store(false, std::memory_order_relaxed);
+            shared_->ready[g].store(false, std::memory_order_relaxed);
+            shared_->want_pgid[g].store(0, std::memory_order_relaxed);
             shared_->host[g].store(host, std::memory_order_release);
         }
     }
@@ -157,6 +159,26 @@ public:
         return s ? s : pid;
     }
     // vfork support: a child announces it has exec'd (its parent may run).
+    // A parent's setpgid for child `g`, for the child to apply (see Shared).
+    void post_pgid(std::int32_t g, std::int32_t pgid) noexcept {
+        if (g > 0 && g < kMax && shared_) shared_->want_pgid[g].store(pgid, std::memory_order_release);
+    }
+    [[nodiscard]] std::int32_t take_pgid(std::int32_t g) noexcept {
+        return (g > 0 && g < kMax && shared_) ? shared_->want_pgid[g].exchange(0, std::memory_order_acq_rel) : 0;
+    }
+    [[nodiscard]] bool pgid_posted(std::int32_t g) const noexcept {
+        return g > 0 && g < kMax && shared_ && shared_->want_pgid[g].load(std::memory_order_acquire) != 0;
+    }
+    [[nodiscard]] std::int32_t posted_pgid(std::int32_t g) const noexcept {
+        return (g > 0 && g < kMax && shared_) ? shared_->want_pgid[g].load(std::memory_order_acquire) : 0;
+    }
+    void mark_ready(std::int32_t g) noexcept {
+        if (g > 0 && g < kMax && shared_) shared_->ready[g].store(true, std::memory_order_release);
+    }
+    [[nodiscard]] bool ready(std::int32_t g) const noexcept {
+        return g > 0 && g < kMax && shared_ && shared_->ready[g].load(std::memory_order_acquire);
+    }
+
     void mark_execed(std::int32_t g) noexcept {
         if (g > 0 && g < kMax) shared_->execed[g].store(true, std::memory_order_release);
     }
@@ -240,6 +262,15 @@ private:
         // buffer is always NUL-terminated at kExe-1).
         char exe[kMax][kExe]{};
         std::atomic<std::int32_t> ppid[kMax]{};
+        // setpgid(child, g) the PARENT asked for. Darwin refuses setpgid on
+        // a child that has exec'd (EACCES), and every HVF child has exec'd
+        // on the host from its first instruction -- though the GUEST child
+        // has not. So the parent posts the group here and the child, which
+        // may always move itself, applies it at its next trap. 0 = none.
+        std::atomic<std::int32_t> want_pgid[kMax]{};
+        // The process is past startup (its kick handler is installed): it
+        // may be sent kKickSignal. Cleared with the slot.
+        std::atomic<bool> ready[kMax]{};
         // Hypervisor.framework VMs held by PARKED zygotes, tree-wide.
         std::atomic<int> warm_vms{0};
     };
@@ -251,8 +282,14 @@ private:
 // same bit layout), but not on every signal NUMBER. Translate the ones that
 // differ so a guest shell reports "Killed"/"Terminated"/"Segmentation fault"
 // correctly. The low 15 are POSIX-fixed and identical.
+// The host signal one guest process sends another to say "look at your
+// mailbox in the shared table" (a parent's setpgid). Darwin's SIGEMT: it
+// exists on no Linux arch the guest runs, so no guest signal maps to it.
+inline constexpr int kKickSignal = SIGEMT;
+
 [[nodiscard]] constexpr int signal_to_linux(int s) noexcept {
     switch (s) {
+        case SIGEMT:  return 0;          // linuxity's own kick (kKickSignal)
         case SIGBUS:  return 7;
         case SIGUSR1: return 10;
         case SIGUSR2: return 12;

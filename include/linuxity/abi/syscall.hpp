@@ -54,6 +54,7 @@
 #include <net/if.h>
 #include <sys/syscall.h>
 #include <sys/xattr.h>
+#include <termios.h>
 #include <unistd.h>
 #endif
 #if defined(__linux__)
@@ -156,6 +157,34 @@ public:
         const auto& p = me();
         return {ns_id(p.uids[0], false), ns_id(p.uids[1], false),
                 ns_id(p.gids[0], true), ns_id(p.gids[1], true)};
+    }
+    // The caller's controlling terminal, as a pty slave number, or -1. ONE
+    // answer for every reader (/dev/tty, the tty ioctls, auto-acquire on
+    // open). A backend whose guest processes are real host processes in
+    // real sessions (HVF: models_process_groups) holds it in the HOST's tty
+    // layer -- TIOCSCTTY is forwarded there -- so the host decides.
+    // Otherwise it is ours to track.
+    [[nodiscard]] std::int32_t caller_ctty() {
+        if constexpr (requires { mem_.models_process_groups(); mem_.host_fd_of(0); }) {
+            // Darwin's /dev/tty never names the terminal behind it, but
+            // tcgetsid() succeeds only on the CALLER'S controlling terminal:
+            // ask it of each pty this process has open. (A ctty with no fd
+            // left open on it is unreachable by name anyway.)
+            std::int32_t found = -1;
+            k_.files().for_each_fd_path_in(ids().pid, [&](int gfd, const std::string& p) {
+                if (found >= 0 || !p.starts_with("/dev/pts/")) return;
+                const int h = mem_.host_fd_of(gfd);
+                if (h >= 0 && ::tcgetsid(h) >= 0) found = pty_slave_of_fd(gfd);
+            });
+            if (found < 0)
+                for (int gfd = 0; gfd < 256 && found < 0; ++gfd) {   // inherited, untracked fds
+                    const int h = mem_.host_fd_of(gfd);
+                    if (h >= 0 && ::isatty(h) && ::tcgetsid(h) >= 0) found = host_fd_slave_no(gfd);
+                }
+            return found;
+        } else {
+            return k_.procs().ctty_of(ids().pid);
+        }
     }
     // Did `sc` (just dispatched) possibly change the caller's credentials?
     [[nodiscard]] static constexpr bool changes_creds(Sysno sc) noexcept {
@@ -2167,7 +2196,7 @@ private:
             // /dev/tty with no controlling terminal: the node is there, the
             // open is ENXIO. (The host task may still have linuxity's own
             // terminal, which is not the guest's.)
-            if (abs == "/dev/tty" && pc.host_path == "/dev/tty" && k_.procs().ctty_of(ids().pid) < 0)
+            if (abs == "/dev/tty" && pc.host_path == "/dev/tty" && caller_ctty() < 0)
                 return eno(Errno::enxio);
             pending_new_ = wire::has(flags, wire::OpenFlag::creat) && !guest_exists(abs);
             // creating a name writes its directory, like mkdir and unlink
@@ -5277,10 +5306,16 @@ private:
                     uaddr(r.arg[2])};
         }
         // A backend that models real process groups (HVF) also owns the
-        // terminal's foreground group: forward, so tcsetpgrp actually moves
-        // ^C/^Z delivery to the job and the shell survives ^Z.
+        // terminal's foreground group AND its controlling terminal: each
+        // guest process is a real host process that setsid()s for real, so
+        // the host's tty layer is the authority. Forward all four, so
+        // tcsetpgrp actually moves ^C/^Z delivery to the job, and so the
+        // ctty the host's TIOCGPGRP checks is the one TIOCSCTTY claimed (a
+        // virtual TIOCSCTTY left the host child with no ctty, and its
+        // tcgetpgrp said ENOTTY -- pty.fork's child, every time).
         if constexpr (requires { mem_.models_process_groups(); })
-            if (request == kTIOCGPGRP || request == kTIOCSPGRP || request == kTIOCGSID)
+            if (request == kTIOCGPGRP || request == kTIOCSPGRP || request == kTIOCGSID ||
+                request == kTIOCSCTTY || request == kTIOCNOTTY)
                 return fwd();
         switch (request) {
             // TIOCSCTTY / TIOCNOTTY: who owns the terminal.
@@ -6784,7 +6819,7 @@ public:
             if (pending_open_.starts_with("/dev/pts/") &&
                 (pending_flags_ & static_cast<std::uint64_t>(wire::OpenFlag::noctty)) == 0) {
                 const std::int32_t me = ids().pid;
-                if (k_.procs().sid_of(me) == me && k_.procs().ctty_of(me) < 0) {
+                if (k_.procs().sid_of(me) == me && caller_ctty() < 0) {
                     const std::int32_t n = pty_slave_of_fd(static_cast<int>(fd));
                     if (n >= 0) k_.procs().set_ctty(me, n);
                 }
@@ -6998,7 +7033,7 @@ public:
     // it was never opened through us and has no tracked path. That is the
     // common case for an interactive session, not an edge case.
     [[nodiscard]] bool fd_is_our_ctty(int fd) {
-        const std::int32_t have = k_.procs().ctty_of(ids().pid);
+        const std::int32_t have = caller_ctty();
         const std::int32_t n = pty_slave_of_fd(fd);
         if (n >= 0) return have == n;
         // Untracked fd (bash reaches the terminal as dup(2)->9, dup3(9,255),
@@ -7014,7 +7049,14 @@ public:
     // identify an fd we never saw opened -- and an inherited-then-duped
     // terminal is the common case, not an edge case.
     [[nodiscard]] std::int32_t host_fd_slave_no(int fd) {
-        if constexpr (!requires { mem_.host_tid(); }) {
+        if constexpr (requires { mem_.host_fd_of(0); }) {
+            // a kernel-less backend holds the real fd itself: ask the host
+            // which pty it is (ttyname: /dev/pts/N or /dev/ttysNNN)
+            const int h = mem_.host_fd_of(fd);
+            char name[128];
+            if (h < 0 || ::ttyname_r(h, name, sizeof name) != 0) return -1;
+            return lx::vfs::pty_slave_number(name);
+        } else if constexpr (!requires { mem_.host_tid(); }) {
             return -1;   // no tracee /proc to consult
         } else {
             char link[64];

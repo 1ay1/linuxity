@@ -128,6 +128,11 @@ public:
         return fn(fds_);
     }
     template <class Fn>
+    decltype(auto) with_fds(Fn&& fn) const {
+        std::lock_guard g{mu_};
+        return fn(fds_);
+    }
+    template <class Fn>
     decltype(auto) with_space(Fn&& fn) {
         std::lock_guard g{mu_};
         return fn(space_);
