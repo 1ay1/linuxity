@@ -139,10 +139,11 @@ static_assert(offsetof(LinuxStat, st_blocks) == 64);
     // A pty slave: Darwin's ttys major; Linux's is 136 + n/256, minor n%256.
     static const int pts_major = [] {
         struct ::stat s{};
-        return ::stat("/dev/ttys000", &s) == 0 ? static_cast<int>(major(s.st_rdev)) : -1;
+        return ::stat("/dev/ttys000", &s) == 0 ? static_cast<int>(major(static_cast<std::uint32_t>(s.st_rdev))) : -1;
     }();
-    if (pts_major >= 0 && static_cast<int>(major(host)) == pts_major) {
-        const auto n = static_cast<std::uint32_t>(minor(host));
+    const auto hdev = static_cast<std::uint32_t>(host);   // Darwin dev_t is a signed 32-bit
+    if (pts_major >= 0 && static_cast<int>(major(hdev)) == pts_major) {
+        const auto n = static_cast<std::uint32_t>(minor(hdev));
         return linux_makedev(136 + n / 256, n % 256);
     }
     return static_cast<std::uint64_t>(host);

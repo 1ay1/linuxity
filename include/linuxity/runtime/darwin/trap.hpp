@@ -196,6 +196,7 @@ public:
     }
 
     void set_arena(std::uint64_t image_end, std::uint64_t stack_floor) {
+        sync_all_shared();                     // exec discards the old image
         proc_.with_space([&](AddressSpace& t) { return t.reset(image_end, stack_floor); });
         // A non-PIE image sits in the low window BELOW the page tables, so
         // its arena [image_end, ...) spans them. Reserve the table range as
@@ -953,7 +954,7 @@ private:
             if (!fds_out.empty()) {
                 hctl.resize(CMSG_SPACE(fds_out.size() * sizeof(int)));
                 auto* hc = reinterpret_cast<::cmsghdr*>(hctl.data());
-                hc->cmsg_len = CMSG_LEN(fds_out.size() * sizeof(int));
+                hc->cmsg_len = static_cast<socklen_t>(CMSG_LEN(fds_out.size() * sizeof(int)));
                 hc->cmsg_level = SOL_SOCKET;
                 hc->cmsg_type = SCM_RIGHTS;
                 std::memcpy(CMSG_DATA(hc), fds_out.data(), fds_out.size() * sizeof(int));
@@ -1708,7 +1709,7 @@ private:
             img.fd_hosts = std::move(ex.host_fds);
         }
         proc_.with_signals([&](SignalDispositions& d) {
-            for (int s = 1; s <= kLinuxNsig; ++s) img.sig_actions[s - 1] = d.get(s);
+            img.sig_actions = d.table();
         });
 
         std::fflush(nullptr);
@@ -1748,7 +1749,7 @@ public:
         AddressSpace::Arena arena{};
         std::vector<FdTable::Exported> fds;
         std::vector<int> fd_hosts;        // parent-side host fd per open-file group
-        std::array<LinuxSigaction, kLinuxNsig> sig_actions{};
+        SignalDispositions::Table sig_actions{};
         std::uint64_t sig_mask{};
         LinuxStack altstack{};
         std::string namespace_state;    // FileNamespace::export_process_state
@@ -1802,7 +1803,7 @@ public:
         proc_.with_fds([&](FdTable& t) { return t.import_table(img.fds, host_fds); });
         // fork(2): the child inherits handlers, mask and alt stack verbatim.
         proc_.with_signals([&](SignalDispositions& d) {
-            for (int s = 1; s <= kLinuxNsig; ++s) (void)d.set(s, img.sig_actions[s - 1]);
+            d.set_table(img.sig_actions);
         });
         task_.sig_mask = img.sig_mask;
         task_.alt_stack = img.altstack;
@@ -1824,16 +1825,62 @@ private:
     // wait4(pid, status*, options, rusage*). Linux and Darwin share the wait
     // option bits we accept (WNOHANG=1, WUNTRACED=2); the STATUS is
     // re-encoded so signal numbers match the guest's.
+    //
+    // "Any child" (-1) and "any in my group" (0, -pgid) mean the GUEST's
+    // children. The host process also parents its warm zygotes, which never
+    // exit while it lives -- so a host waitpid(-1) in a guest with no children
+    // left blocked forever instead of answering ECHILD (busybox xargs calls
+    // wait4(-1) after reaping its command, and hung every time). So: no guest
+    // children is ECHILD at once; otherwise sleep in one kevent on exactly
+    // those pids (EVFILT_PROC/NOTE_EXIT), which a signal interrupts with
+    // EINTR the same way it interrupts waitpid.
     [[nodiscard]] std::int64_t do_wait4(std::int32_t gpid, std::uint64_t status,
                                         int options, std::uint64_t rusage) {
-        pid_t which;
-        if (gpid == -1)      which = -1;
-        else if (gpid == 0)  which = 0;
-        else if (gpid < -1) { auto h = pids_.host_of(-gpid); if (!h) return -10; which = -*h; }
-        else                { auto h = pids_.host_of(gpid);  if (!h) return -10; which = *h; }
         int st = 0;
-        const pid_t got = ::waitpid(which, &st, options & (WNOHANG | WUNTRACED));
-        if (got < 0) return darwin::fail();
+        pid_t got = 0;
+        const int hopts = options & (WNOHANG | WUNTRACED);
+        if (gpid > 0) {
+            auto h = pids_.host_of(gpid);
+            if (!h) return -10;
+            got = ::waitpid(*h, &st, hopts);
+            if (got < 0) return darwin::fail();
+        } else {
+            // -1: every child; 0: our group; < -1: that group.
+            std::optional<std::int32_t> want_pgid;
+            if (gpid == 0) want_pgid = pids_.pgid_of(task_.tid);
+            else if (gpid < -1) want_pgid = -gpid;
+            for (;;) {
+                std::vector<pid_t> hs;
+                for (const Child& c : children_)
+                    if (!want_pgid || pids_.pgid_of(c.guest) == *want_pgid) hs.push_back(c.host);
+                if (hs.empty()) return -10;                     // ECHILD
+                for (pid_t h : hs) {
+                    got = ::waitpid(h, &st, WNOHANG | (hopts & WUNTRACED));
+                    if (got > 0) break;
+                    if (got < 0 && errno == ECHILD)            // reaped elsewhere
+                        std::erase_if(children_, [h](const Child& c) { return c.host == h; });
+                }
+                if (got > 0) break;
+                if (hopts & WNOHANG) return 0;
+                // Sleep until one of them exits (or stops, for WUNTRACED: a
+                // stop raises no NOTE_EXIT, so bound the sleep and re-poll).
+                const int kq = ::kqueue();
+                if (kq < 0) return darwin::fail();
+                std::vector<struct ::kevent> evs(hs.size());
+                for (std::size_t i = 0; i < hs.size(); ++i)
+                    EV_SET(&evs[i], static_cast<uintptr_t>(hs[i]), EVFILT_PROC,
+                           EV_ADD | EV_ONESHOT, NOTE_EXIT, 0, nullptr);
+                struct ::kevent out{};
+                const struct ::timespec tick{0, 50'000'000};
+                const int n = ::kevent(kq, evs.data(), static_cast<int>(evs.size()), &out, 1,
+                                       (hopts & WUNTRACED) ? &tick : nullptr);
+                const int e = errno;
+                ::close(kq);
+                if (n < 0 && e == EINTR) return -4;             // EINTR, as Linux
+                // n > 0: an exit (or an EV_ERROR for a pid already gone --
+                // either way the WNOHANG sweep above now finds it).
+            }
+        }
         if (got == 0) return 0;                                   // WNOHANG
         std::int32_t g = pids_.guest_of(got);
         if (status) (void)machine_.ram().put(status, std::int32_t{wstatus_to_linux(st)});
@@ -2052,8 +2099,9 @@ private:
                 // close (so a parent reading our pipes sees EOF), and the
                 // parent's wait sees this status. Waiting for siblings
                 // instead hung pacman's download child -- see run() in
-                // src/main_macos.cpp for the whole story.
+                // src/run_darwin.cpp for the whole story.
                 proc_.request_group_exit(static_cast<int>(a0 & 0xff));
+                sync_all_shared();
                 std::fflush(nullptr);
                 ::_exit(static_cast<int>(a0 & 0xff));
 
@@ -2952,6 +3000,60 @@ private:
         }
     }
 
+public:
+    // Write back and forget EVERY shared file mapping: the address space is
+    // going away (exec, exit) and the guest's stores must not go with it.
+    void sync_all_shared() { sync_shared(0, ~std::uint64_t{0} >> 1, /*drop=*/true); }
+private:
+
+    // Write the shared file mappings overlapping [at, at+len) back to their
+    // files; with `drop`, the range is going away, so forget the covered
+    // mappings (a partial unmap keeps the rest registered). The ONE place a
+    // MAP_SHARED store reaches its file: munmap, MAP_FIXED, msync, exit.
+    void sync_shared(std::uint64_t at, std::uint64_t len, bool drop) {
+        struct Job { std::uint64_t from, n; int fd; std::int64_t off; bool close; };
+        std::vector<Job> jobs;
+        proc_.with_shared_maps([&](auto& v) {
+            for (auto it = v.begin(); it != v.end();) {
+                const std::uint64_t lo = std::max(at, it->at);
+                const std::uint64_t hi = std::min(at + len, it->at + it->len);
+                if (lo >= hi) { ++it; continue; }
+                const bool whole = drop && lo <= it->at && hi >= it->at + it->len;
+                jobs.push_back({lo, hi - lo, it->fd,
+                                it->off + static_cast<std::int64_t>(lo - it->at), whole});
+                if (whole) { it = v.erase(it); continue; }
+                if (drop && lo == it->at) {           // unmapped a head
+                    it->off += static_cast<std::int64_t>(hi - it->at);
+                    it->len -= hi - it->at;
+                    it->at = hi;
+                } else if (drop && hi == it->at + it->len) {   // ... a tail
+                    it->len = lo - it->at;
+                }
+                ++it;
+            }
+            return 0;
+        });
+        const auto ram = machine_.ram();
+        for (const Job& j : jobs) {
+            // Never write past the file's end: the mapping can be longer
+            // than the file (its tail reads as zeros and does not exist).
+            struct ::stat st{};
+            std::uint64_t n = j.n;
+            if (::fstat(j.fd, &st) == 0) {
+                const auto size = static_cast<std::int64_t>(st.st_size);
+                n = j.off >= size ? 0 : std::min<std::uint64_t>(n, static_cast<std::uint64_t>(size - j.off));
+            }
+            const auto win = n ? ram.at(j.from, n) : decltype(ram.at(0, 0)){};
+            for (std::uint64_t done = 0; done < win.size();) {
+                const ::ssize_t w = ::pwrite(j.fd, win.data() + done, win.size() - done,
+                                             static_cast<off_t>(j.off) + static_cast<off_t>(done));
+                if (w <= 0) break;
+                done += static_cast<std::uint64_t>(w);
+            }
+            if (j.close) ::close(j.fd);
+        }
+    }
+
     [[nodiscard]] Maybe do_memory(abi::Sysno sc) {
         using S = abi::Sysno;
         const std::uint64_t a0 = regs_.arg(0), a1 = regs_.arg(1),
@@ -2965,6 +3067,9 @@ private:
                 // which is how a constant ends up with no single place to fix.
                 const bool anon = abi::wire::is_anonymous(a3);
                 const std::uint64_t len = AddressSpace::page_up(a1);
+                // A MAP_FIXED map replaces whatever was there: a shared file
+                // map it covers must reach its file first.
+                if (abi::wire::wants_fixed(a3)) sync_shared(a0, len, /*drop=*/true);
                 std::uint64_t at = proc_.with_space([&](AddressSpace& t) { return t.map(a0, a1, prot_from_linux(a2),
                                            abi::wire::wants_fixed(a3), anon); });
                 if (at == AddressSpace::kFail) return -12;          // ENOMEM
@@ -3013,9 +3118,21 @@ private:
                 // host's data view; publish it to the instruction stream.
                 if (has(prot_from_linux(a2), GuestProt::exec))
                     machine_.publish_code(at, len);
+                // Writable and shared: remember it, so the guest's stores
+                // are written back to the file (see ProcessState::SharedMap).
+                if (abi::wire::has_map(a3, abi::wire::MapFlag::shared) &&
+                    abi::wire::has_prot(a2, abi::wire::Prot::write)) {
+                    const int own = ::fcntl(ffd, F_DUPFD_CLOEXEC, 3);
+                    if (own >= 0)
+                        proc_.with_shared_maps([&](auto& v) {
+                            v.push_back({at, a1, own, static_cast<std::int64_t>(foff)});
+                            return 0;
+                        });
+                }
                 return static_cast<std::int64_t>(at);
             }
             case S::munmap:
+                sync_shared(a0, AddressSpace::page_up(a1), /*drop=*/true);
                 proc_.with_space([&](AddressSpace& t) { return t.unmap(a0, a1); });
                 return 0;
             case S::mprotect:
@@ -3056,12 +3173,14 @@ private:
                 return 0;
             }
             case S::msync: {
-                // msync(addr, len, flags): a file-backed MAP_SHARED mapping
-                // is materialised by pread in this backend, so there is no
-                // dirty page to write back. Validate the range like Linux.
+                // msync(addr, len, flags): write a shared file mapping's
+                // pages back to its file (they live in guest RAM, not in the
+                // host's page cache). Validate the range like Linux.
                 if (a0 % AddressSpace::kPageSize) return -22;    // EINVAL
-                return proc_.with_space([&](AddressSpace& sp) { return sp.find(a0) != nullptr; })
-                    ? 0 : -12;
+                if (!proc_.with_space([&](AddressSpace& sp) { return sp.find(a0) != nullptr; }))
+                    return -12;
+                sync_shared(a0, AddressSpace::page_up(a1), /*drop=*/false);
+                return 0;
             }
             case S::madvise: {
                 // Only MADV_DONTNEED changes visible state: anonymous pages
@@ -3253,9 +3372,9 @@ private:
                 if (!in->valid()) return darwin::fail();
                 const int dup_kq = ::dup(in->kq());          // the guest's pollable fd
                 if (dup_kq < 0) return darwin::fail();
-                const int g = install_or_close(dup_kq, (a0 & 1) != 0);
+                const auto g = install_or_close(dup_kq, (a0 & 1) != 0);
                 if (g < 0) return g;
-                inotifies_[g] = std::move(in);
+                inotifies_[static_cast<int>(g)] = std::move(in);
                 return g;
             }
             case S::inotify_add_watch: {
@@ -3278,8 +3397,8 @@ private:
                 if (!h) return -3;                           // ESRCH
                 const int fd = make_pidfd(*h);
                 if (fd < 0) return darwin::fail();
-                const int g = install_or_close(fd, true);
-                if (g >= 0) pidfds_[g] = static_cast<std::int32_t>(a0);
+                const auto g = install_or_close(fd, true);
+                if (g >= 0) pidfds_[static_cast<int>(g)] = static_cast<std::int32_t>(a0);
                 return g;
             }
             case S::pidfd_send_signal: {
@@ -3337,7 +3456,7 @@ private:
                 if (auto it = inotifies_.find(gfd); it != inotifies_.end()) {
                     if (win.size() < sizeof(LinuxInotifyEvent)) return -22;   // EINVAL
                     const bool nb = (::fcntl(*hfd, F_GETFL) & O_NONBLOCK) != 0;
-                    for (int round = 0;; ++round) {
+                    for (;;) {
                         const std::size_t n = it->second->drain(win);
                         if (n) return static_cast<std::int64_t>(n);
                         if (nb) return -11;                                    // EAGAIN
@@ -3963,7 +4082,7 @@ private:
         for (auto& s : sets) std::fill(s.begin(), s.end(), 0);
         int ready = 0;
         for (std::size_t i = 0; i < p.size(); ++i) {
-            const int fd = guest[i];
+            const auto fd = static_cast<std::size_t>(guest[i]);
             const auto bit = static_cast<std::uint8_t>(1u << (fd % 8));
             if (p[i].revents & (POLLIN | POLLHUP | POLLERR)) { sets[0][fd / 8] |= bit; ++ready; }
             if (p[i].revents & POLLOUT) { sets[1][fd / 8] |= bit; ++ready; }

@@ -404,10 +404,10 @@ public:
             }();
             bool ok = zero_src != nullptr;
             for (std::uintptr_t at = lo; ok && at < hi; at += kZeroSrc) {
-                const std::size_t n = std::min<std::size_t>(kZeroSrc, hi - at);
+                const std::size_t chunk = std::min<std::size_t>(kZeroSrc, hi - at);
                 ok = ::mach_vm_write(::mach_task_self(), at,
                                      reinterpret_cast<vm_offset_t>(zero_src),
-                                     static_cast<mach_msg_type_number_t>(n)) == KERN_SUCCESS;
+                                     static_cast<mach_msg_type_number_t>(chunk)) == KERN_SUCCESS;
             }
             if (ok) {
                 std::memset(win.data(), 0, lo - base);
@@ -547,7 +547,7 @@ public:
 
     [[nodiscard]] CpuState save() const noexcept {
         CpuState s;
-        for (int i = 0; i < 31; ++i)
+        for (unsigned i = 0; i < 31; ++i)
             ::hv_vcpu_get_reg(cpu_, static_cast<hv_reg_t>(HV_REG_X0 + i), &s.x[i]);
         ::hv_vcpu_get_reg(cpu_, HV_REG_PC, &s.pc);
         ::hv_vcpu_get_reg(cpu_, HV_REG_CPSR, &s.cpsr);
@@ -556,14 +556,14 @@ public:
         ::hv_vcpu_get_sys_reg(cpu_, HV_SYS_REG_SP_EL0, &s.sp_el0);
         ::hv_vcpu_get_sys_reg(cpu_, HV_SYS_REG_TPIDR_EL0, &s.tpidr_el0);
         ::hv_vcpu_get_sys_reg(cpu_, HV_SYS_REG_TPIDRRO_EL0, &s.tpidrro_el0);
-        for (int i = 0; i < 32; ++i)
+        for (unsigned i = 0; i < 32; ++i)
             ::hv_vcpu_get_simd_fp_reg(
                 cpu_, static_cast<hv_simd_fp_reg_t>(HV_SIMD_FP_REG_Q0 + i), &s.q[i]);
         return s;
     }
 
     void load(const CpuState& s) noexcept {
-        for (int i = 0; i < 31; ++i)
+        for (unsigned i = 0; i < 31; ++i)
             ::hv_vcpu_set_reg(cpu_, static_cast<hv_reg_t>(HV_REG_X0 + i), s.x[i]);
         ::hv_vcpu_set_reg(cpu_, HV_REG_PC, s.pc);
         ::hv_vcpu_set_reg(cpu_, HV_REG_CPSR, s.cpsr);
@@ -572,7 +572,7 @@ public:
         ::hv_vcpu_set_sys_reg(cpu_, HV_SYS_REG_SP_EL0, s.sp_el0);
         ::hv_vcpu_set_sys_reg(cpu_, HV_SYS_REG_TPIDR_EL0, s.tpidr_el0);
         ::hv_vcpu_set_sys_reg(cpu_, HV_SYS_REG_TPIDRRO_EL0, s.tpidrro_el0);
-        for (int i = 0; i < 32; ++i)
+        for (unsigned i = 0; i < 32; ++i)
             ::hv_vcpu_set_simd_fp_reg(
                 cpu_, static_cast<hv_simd_fp_reg_t>(HV_SIMD_FP_REG_Q0 + i), s.q[i]);
     }
@@ -582,7 +582,7 @@ public:
     void set_sp(std::uint64_t v) noexcept { ::hv_vcpu_set_sys_reg(cpu_, HV_SYS_REG_SP_EL0, v); }
     void set_tls(std::uint64_t v) noexcept { ::hv_vcpu_set_sys_reg(cpu_, HV_SYS_REG_TPIDR_EL0, v); }
     void set_x(int i, std::uint64_t v) noexcept {
-        ::hv_vcpu_set_reg(cpu_, static_cast<hv_reg_t>(HV_REG_X0 + i), v);
+        ::hv_vcpu_set_reg(cpu_, static_cast<hv_reg_t>(HV_REG_X0 + static_cast<unsigned>(i)), v);
     }
 
     // Force this vCPU out of hv_vcpu_run from ANOTHER thread. The only

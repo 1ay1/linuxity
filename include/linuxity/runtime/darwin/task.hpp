@@ -175,6 +175,28 @@ public:
     std::atomic<std::uint64_t> pending{0};
     std::atomic<std::uint32_t> umask{022};
 
+    // -- Writable MAP_SHARED file mappings ---------------------------------
+    // Guest RAM is one flat allocation, so a file mapping here is a pread
+    // COPY of the file. For MAP_PRIVATE that is exactly the semantics; for a
+    // writable MAP_SHARED mapping the guest's stores must reach the file, or
+    // a program that writes through mmap (apk extracts every package that
+    // way) leaves files full of zeros. So each such mapping keeps its own
+    // dup of the fd and is written back when it goes away (munmap, a
+    // MAP_FIXED overlay, exit) or on msync. Without other processes mapping
+    // the same pages, write-back-on-sync is indistinguishable from coherent
+    // page sharing to everything except a concurrent reader -- the same
+    // guarantee msync(2) itself gives.
+    struct SharedMap {
+        std::uint64_t at, len;   // guest range (len = what the file backs)
+        int fd;                  // our own dup, closed with the mapping
+        std::int64_t off;        // file offset of `at`
+    };
+    template <class Fn>
+    decltype(auto) with_shared_maps(Fn&& fn) {
+        std::lock_guard g{mu_};
+        return fn(shared_maps_);
+    }
+
     // (No tid allocator here on purpose: tids share ONE namespace with pids
     // across the whole guest tree, so they come from the shared PidSpace.
     // A per-process counter collides with other processes' pids.)
@@ -185,6 +207,7 @@ private:
     AddressSpace space_;
     SignalDispositions signals_;
     std::vector<Thread> threads_;
+    std::vector<SharedMap> shared_maps_;
     std::atomic<bool> group_exiting_{false};
     int group_status_{0};
 };

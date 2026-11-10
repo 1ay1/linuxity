@@ -70,7 +70,7 @@ public:
     // 0,1,2-only process the two collide on fd 3 and the wakeups land INSIDE
     // the database: measured, core.db began 01 00 00 00 00 00 00 00 and
     // pacman rejected it as "Unrecognized archive format". The Linux backend
-    // reserves these slots for the same reason (src/main.cpp,
+    // reserves these slots for the same reason (src/run_linux.cpp,
     // reserve_low_fds); both backends must agree.
     void reserve_low_fds() {
         for (int want = 3; want <= 8; ++want) {
@@ -93,9 +93,9 @@ public:
     [[nodiscard]] int install(int host_fd, bool cloexec) {
         auto file = std::make_shared<HostFd>(host_fd);
         for (std::size_t g = 0; g < slots_.size(); ++g)
-            if (!slots_[g].file) { slots_[g] = {std::move(file), cloexec}; return static_cast<int>(g); }
+            if (!slots_[g].file) { slots_[g] = {std::move(file), cloexec, {}}; return static_cast<int>(g); }
         if (slots_.size() >= kMaxFds) return -24;
-        slots_.push_back({std::move(file), cloexec});
+        slots_.push_back({std::move(file), cloexec, {}});
         return static_cast<int>(slots_.size() - 1);
     }
 

@@ -87,7 +87,9 @@ public:
                 break;
             case kEpollCtlDel:
                 if (!known) return -2;
-                apply(guest_fd, host_fd, 0, regs_[guest_fd].mask);
+                // best-effort: the host fd may already be closed, which
+                // drops its kevents anyway
+                (void)apply(guest_fd, host_fd, 0, regs_[guest_fd].mask);
                 regs_.erase(guest_fd);
                 return 0;
             default:
@@ -142,7 +144,7 @@ public:
             if (same != out.end()) same->events |= bits;
             else out.push_back({bits, it->second.token});
             if (it->second.mask & epoll_bit::oneshot) {
-                apply(gfd, it->second.host_fd, 0, it->second.mask);
+                (void)apply(gfd, it->second.host_fd, 0, it->second.mask);   // best-effort, as DEL
                 regs_.erase(it);
             }
         }

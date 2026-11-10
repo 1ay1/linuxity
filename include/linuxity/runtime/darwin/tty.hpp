@@ -130,7 +130,8 @@ inline void to_darwin(const LinuxTermios& l, struct ::termios& t) {
     t.c_iflag = map_out(l.c_iflag, kIflag);
     t.c_oflag = map_out(l.c_oflag, kOflag);
     t.c_lflag = map_out(l.c_lflag, kLflag);
-    const tcflag_t keep_speed = t.c_cflag & ~(CSIZE | CSTOPB | CREAD | PARENB | PARODD | HUPCL | CLOCAL);
+    constexpr tcflag_t kFraming = CSIZE | CSTOPB | CREAD | PARENB | PARODD | HUPCL | CLOCAL;
+    const tcflag_t keep_speed = t.c_cflag & ~kFraming;
     t.c_cflag = keep_speed | map_out(l.c_cflag, kCflag);
     switch (l.c_cflag & 0000060) {
         case 0000000: t.c_cflag |= CS5; break;

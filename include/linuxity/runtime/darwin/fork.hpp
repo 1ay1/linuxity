@@ -92,6 +92,21 @@ struct HandoffRecv {
            std::to_string(::mach_absolute_time());
 }
 
+// The pid that made `name` (unique_service_name's), or -1. A zygote must
+// know its creator from the name, not getppid(): if the creator has already
+// exited, getppid() says 1 (launchd), and a zygote watching launchd for its
+// exit stays parked forever.
+[[nodiscard]] inline pid_t service_creator(std::string_view name) noexcept {
+    constexpr std::string_view pre = "org.linuxity.fork.";
+    if (!name.starts_with(pre)) return -1;
+    name.remove_prefix(pre.size());
+    pid_t pid = 0;
+    std::size_t i = 0;
+    for (; i < name.size() && name[i] >= '0' && name[i] <= '9'; ++i)
+        pid = pid * 10 + (name[i] - '0');
+    return i > 0 && i < name.size() && name[i] == '.' ? pid : -1;
+}
+
 [[nodiscard]] inline bool send(mach_port_t dest, mach_port_t memory,
                                std::uint64_t mem_size,
                                const std::vector<std::byte>& blob) {

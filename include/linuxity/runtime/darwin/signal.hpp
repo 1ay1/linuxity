@@ -90,13 +90,19 @@ enum class Default { term, core, ignore, stop, cont };
 // lives in ProcessState under its lock.
 class SignalDispositions {
 public:
+    // The whole table, for a fork's handoff: a child inherits every
+    // disposition verbatim (SIGKILL/SIGSTOP are SIG_DFL in both).
+    using Table = std::array<LinuxSigaction, kLinuxNsig>;
+    [[nodiscard]] const Table& table() const noexcept { return act_; }
+    void set_table(const Table& t) noexcept { act_ = t; }
+
     [[nodiscard]] LinuxSigaction get(int s) const noexcept {
-        return valid(s) ? act_[s - 1] : LinuxSigaction{};
+        return valid(s) ? act_[slot(s)] : LinuxSigaction{};
     }
     // Returns false for SIGKILL/SIGSTOP, whose disposition cannot change.
     bool set(int s, const LinuxSigaction& a) noexcept {
         if (!valid(s) || s == 9 || s == 19) return false;
-        act_[s - 1] = a;
+        act_[slot(s)] = a;
         return true;
     }
     // execve(2): handlers point at code that no longer exists, so caught
@@ -107,9 +113,13 @@ public:
     [[nodiscard]] static constexpr bool valid(int s) noexcept {
         return s >= 1 && s <= kLinuxNsig;
     }
+    // Signal s lives in act_[s - 1]; callers checked valid(s).
+    [[nodiscard]] static constexpr std::size_t slot(int s) noexcept {
+        return static_cast<std::size_t>(s - 1);
+    }
 
 private:
-    std::array<LinuxSigaction, kLinuxNsig> act_{};
+    Table act_{};
 };
 
 // -- Host-side pending set ----------------------------------------------------
