@@ -52,7 +52,7 @@ namespace lx::runtime::fastpath {
 [[nodiscard]] inline bool handled(abi::Sysno sc) noexcept {
     using S = abi::Sysno;
     switch (sc) {
-        case S::stat: case S::lstat: case S::newfstatat: case S::statx:
+        case S::stat: case S::lstat: case S::newfstatat: case S::statx: case S::fstat:
         case S::readlink: case S::readlinkat:
         case S::getxattr: case S::lgetxattr: case S::listxattr: case S::llistxattr:
             return true;

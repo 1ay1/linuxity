@@ -34,6 +34,9 @@ namespace lx::runtime::fastpath {
 
 static_assert(sizeof(lx_fp_table) <= LX_FP_TABLE_SIZE, "fast path table outgrew its mapping");
 static_assert(sizeof(lx_fp_proc) <= 0x1000, "per-process page is one page");
+static_assert(sizeof(lx_fp_fd) == 256, "fd map entry");
+static_assert(LX_FP_FDMAP_OFF + LX_FP_FDS * sizeof(lx_fp_fd) + 0x1000 <= LX_FP_STACKS_OFF, "fd map overlaps the stacks");
+static_assert(LX_FP_STACKS_OFF + LX_FP_STACKS * LX_FP_STACK_SIZE <= LX_FP_TABLE_OFF, "stacks overlap the table");
 
 // The 128-bit key the fast path's own syscalls carry (see seccomp_filter.hpp).
 // Made once, before the first guest is forked, so the filter and the table
@@ -178,6 +181,7 @@ public:
     }
     // Every directory answer so far may be wrong (a rename, an rmdir).
     void bump_dirs() { begin(); bump_dirs_locked(); end(); }
+    [[nodiscard]] std::uint32_t dir_gen() const { return t_ ? t_->dir_gen : 0; }
 
     // The cwd the blob uses for relative paths in host process `tgid`.
     // Unknown, long or full: no slot, and relative paths fall back.

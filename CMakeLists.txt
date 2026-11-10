@@ -121,7 +121,7 @@ if(CMAKE_SYSTEM_NAME IN_LIST LX_PTRACE_HOSTS)
     endif()
     add_custom_command(OUTPUT ${LX_FP_BIN}
         COMMAND ${CMAKE_C_COMPILER} ${LX_FP_TARGET} -nostdlib -static -fno-sanitize=all
-            -Wl,-T,${CMAKE_SOURCE_DIR}/src/fastpath/blob.ld -Wl,--no-dynamic-linker
+            -Wl,-T,${CMAKE_SOURCE_DIR}/src/fastpath/blob.ld -Wl,--no-dynamic-linker -Wl,--no-undefined
             -Wl,--build-id=none -o ${LX_FP_ELF} $<TARGET_OBJECTS:linuxity_fp_objs>
         COMMAND ${CMAKE_OBJCOPY} -O binary ${LX_FP_ELF} ${LX_FP_BIN}
         DEPENDS linuxity_fp_objs $<TARGET_OBJECTS:linuxity_fp_objs> ${CMAKE_SOURCE_DIR}/src/fastpath/blob.ld

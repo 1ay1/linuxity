@@ -8,6 +8,7 @@ d=$(mktemp -d)
 cat > "$d/t.c" <<'EOF'
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -73,6 +74,33 @@ int main(void) {
     if (ra != rb || a.st_size != b.st_size || a.st_ino != b.st_ino) {
         fails++;
         printf("FAIL swapped dir resolves outside the guest: %d/%ld vs %d/%ld\n", ra, (long)a.st_size, rb, (long)b.st_size);
+    }
+    // fds: an fd number reused for another file, a dup2 over a warm fd, a
+    // chmod seen through fstat. (A dirfd whose dir was renamed away resolves
+    // by its old name in the dispatcher too; fpdiff-style agreement is
+    // what the fast path owes there, and the blob checks the parent's
+    // inode so it never answers from the wrong dir by itself.)
+    {
+        system("mkdir -p /tmp/c/fa; echo 1 > /tmp/c/fa/one; echo 22 > /tmp/c/fa/two");
+        struct stat s;
+        for (int k = 0; k < 6; k++) {
+            int fd = open(k % 2 ? "/tmp/c/fa/two" : "/tmp/c/fa/one", O_RDONLY);
+            for (int j = 0; j < 4; j++) fstat(fd, &s);
+            if (s.st_size != (k % 2 ? 3 : 2)) { fails++; printf("FAIL fd reuse round %d size %ld\n", k, (long)s.st_size); }
+            close(fd);
+        }
+        int a = open("/tmp/c/fa/one", O_RDONLY), b = open("/tmp/c/fa/two", O_RDONLY);
+        for (int j = 0; j < 4; j++) fstat(a, &s);
+        dup2(b, a);
+        fstat(a, &s);
+        if (s.st_size != 3) { fails++; printf("FAIL fstat after dup2 size %ld\n", (long)s.st_size); }
+        chmod("/tmp/c/fa/two", 0640);
+        fstat(a, &s);
+        if ((s.st_mode & 0777) != 0640) { fails++; printf("FAIL fstat after chmod mode %o\n", s.st_mode & 0777); }
+        int d = open("/tmp/c/fa", O_RDONLY | O_DIRECTORY);
+        for (int j = 0; j < 4; j++) fstatat(d, "one", &s, AT_SYMLINK_NOFOLLOW);
+        if (s.st_size != 2) { fails++; printf("FAIL fstatat dirfd size %ld\n", (long)s.st_size); }
+        close(a); close(b); close(d);
     }
     printf(fails ? "fpchange: %d failures\n" : "fpchange: all good\n", fails);
     return fails != 0;

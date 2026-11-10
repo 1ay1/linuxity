@@ -138,6 +138,8 @@ public:
     // A guest landlock domain is enforced by the dispatcher, so the fast
     // path stays off once one exists.
     [[nodiscard]] bool landlock_active() const noexcept { return ll_layers_ > 0; }
+    // The guest path an open in flight will bind its fd to (see note_opened_fd).
+    [[nodiscard]] const std::string& pending_open_path() const noexcept { return pending_open_; }
 
     [[nodiscard]] Outcome dispatch(const Regs& r) {
         const Sysno sc = decode(arch_, r.nr);

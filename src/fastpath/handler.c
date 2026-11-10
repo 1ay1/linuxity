@@ -15,6 +15,7 @@
 #define AT_FDCWD_ (-100)
 #define AT_SYMLINK_NOFOLLOW_ 0x100
 #define AT_NO_AUTOMOUNT_ 0x800
+#define AT_EMPTY_PATH_ 0x1000
 #define AT_STATX_SYNC_MASK_ 0x6000
 
 #define ENOENT_ 2
@@ -31,7 +32,7 @@ enum {
     NR_stat = 4, NR_lstat = 6, NR_newfstatat = 262, NR_statx = 332,
     NR_readlink = 89, NR_readlinkat = 267,
     NR_getxattr = 191, NR_lgetxattr = 192, NR_listxattr = 194, NR_llistxattr = 195,
-    NR_rt_sigprocmask = 14, NR_getpid = 39,
+    NR_rt_sigprocmask = 14, NR_getpid = 39, NR_fstat = 5,
 };
 struct kstat {
     uint64_t dev, ino, nlink;
@@ -49,7 +50,7 @@ enum {
     NR_stat = -1, NR_lstat = -2, NR_newfstatat = 79, NR_statx = 291,
     NR_readlink = -3, NR_readlinkat = 78,
     NR_getxattr = 8, NR_lgetxattr = 9, NR_listxattr = 11, NR_llistxattr = 12,
-    NR_rt_sigprocmask = 135, NR_getpid = 172,
+    NR_rt_sigprocmask = 135, NR_getpid = 172, NR_fstat = 80,
 };
 struct kstat {
     uint64_t dev, ino;
@@ -99,6 +100,18 @@ static void zero(void* p, unsigned long n) {
 static void move(char* d, const char* s, unsigned long n) {
     while (n--) *d++ = *s++;
 }
+/* The compiler may turn struct copies into these calls. */
+void* memcpy(void* d, const void* s, unsigned long n) {
+    volatile char* dc = (volatile char*)d;
+    const volatile char* sc = (const volatile char*)s;
+    while (n--) *dc++ = *sc++;
+    return d;
+}
+void* memset(void* d, int c, unsigned long n) {
+    volatile char* dc = (volatile char*)d;
+    while (n--) *dc++ = (char)c;
+    return d;
+}
 
 #define FNV_INIT 1469598103934665603ULL
 static inline uint64_t fnv_step(uint64_t h, unsigned char c) { return (h ^ c) * 1099511628211ULL; }
@@ -110,6 +123,7 @@ static inline uint64_t fnv_finish(uint64_t h, uint32_t n) {
 struct env {
     const struct lx_fp_table* t;
     struct lx_fp_proc* p;
+    const struct lx_fp_fd* fds;
     struct lx_fp_stats* s;
     const uint64_t* key;
 };
@@ -206,6 +220,26 @@ struct ctx { const struct env* e; uint64_t* frame; long nr; };
 
 enum op { OP_STAT, OP_STATX, OP_READLINK, OP_XATTR };
 
+/* The fd map entry for `fd`, if the fd still refers to the same file:
+   copies its path into `out` (NUL-terminated) and returns its length, or
+   -1. `st` gets the fd's own host stat. */
+static long fd_path(const struct env* e, long fd, char* out, struct kstat* st, int want_dir) {
+    if (fd < 0 || fd >= (long)LX_FP_FDS) return -1;
+    const struct lx_fp_fd* ent = &e->fds[fd];
+    const uint32_t s1 = load_acq(&ent->seq);
+    const uint32_t len = ent->len;
+    if ((s1 & 1) || len == 0 || len >= LX_FP_FD_PATH) return -1;
+    if (want_dir && !ent->is_dir) return -1;
+    if (ent->gen != load_acq(&e->t->dir_gen)) return -1;
+    const uint64_t dev = ent->dev, ino = ent->ino;
+    move(out, ent->path, len);
+    out[len] = 0;
+    if (load_acq(&ent->seq) != s1) return -1;
+    if (lx_fp_gate(NR_fstat, fd, (long)st, 0, 0, e->key) != 0) return -1;
+    if (st->dev != dev || st->ino != ino) return -1;
+    return (long)len;
+}
+
 static long work(void* arg) {
     const struct ctx* c = (const struct ctx*)arg;
     const struct env* e = c->e;
@@ -214,20 +248,26 @@ static long work(void* arg) {
 
     enum op op;
     long dirfd = AT_FDCWD_;
-    uint64_t path_ptr, buf, size = 0, name = 0;
+    uint64_t path_ptr = 0, buf, size = 0, name = 0;
     int follow = 1;
+    int by_fd = 0;   /* stat the fd itself (fstat, AT_EMPTY_PATH with "") */
     if (nr == NR_stat || nr == NR_lstat) {
         op = OP_STAT; path_ptr = ARG(f, 0); buf = ARG(f, 1); follow = nr == NR_stat;
+    } else if (nr == NR_fstat) {
+        op = OP_STAT; dirfd = (long)(int)ARG(f, 0); buf = ARG(f, 1); by_fd = 1;
     } else if (nr == NR_newfstatat) {
         op = OP_STAT; dirfd = (long)(int)ARG(f, 0); path_ptr = ARG(f, 1); buf = ARG(f, 2);
         const long flags = (long)(int)ARG(f, 3);
-        if (flags & ~(AT_SYMLINK_NOFOLLOW_ | AT_NO_AUTOMOUNT_)) return FALLBACK;
+        if (flags & ~(AT_SYMLINK_NOFOLLOW_ | AT_NO_AUTOMOUNT_ | AT_EMPTY_PATH_)) return FALLBACK;
         follow = !(flags & AT_SYMLINK_NOFOLLOW_);
+        by_fd = (flags & AT_EMPTY_PATH_) != 0;
     } else if (nr == NR_statx) {
         op = OP_STATX; dirfd = (long)(int)ARG(f, 0); path_ptr = ARG(f, 1); buf = ARG(f, 4);
         const long flags = (long)(int)ARG(f, 2);
-        if (flags & ~(AT_SYMLINK_NOFOLLOW_ | AT_NO_AUTOMOUNT_ | AT_STATX_SYNC_MASK_)) return FALLBACK;
+        if (flags & ~(AT_SYMLINK_NOFOLLOW_ | AT_NO_AUTOMOUNT_ | AT_EMPTY_PATH_ | AT_STATX_SYNC_MASK_))
+            return FALLBACK;
         follow = !(flags & AT_SYMLINK_NOFOLLOW_);
+        by_fd = (flags & AT_EMPTY_PATH_) != 0;
     } else if (nr == NR_readlink) {
         op = OP_READLINK; path_ptr = ARG(f, 0); buf = ARG(f, 1); size = ARG(f, 2); follow = 0;
     } else if (nr == NR_readlinkat) {
@@ -249,10 +289,37 @@ static long work(void* arg) {
 
     /* the guest path, made absolute */
     char g[LX_FP_PATH_MAX];
-    long n = lx_fp_strcpy(g, (const char*)path_ptr, LX_FP_PATH_MAX - 1);
-    if (n <= 0 || n >= (long)LX_FP_PATH_MAX - 1) return FALLBACK;
-    g[n] = 0;
-    if (g[0] != '/') {
+    long n;
+    int dir_check = 0;  /* g's parent must be fst's inode */
+    struct kstat fst;   /* the fd's own stat, when there is an fd */
+    if (path_ptr) {
+        n = lx_fp_strcpy(g, (const char*)path_ptr, LX_FP_PATH_MAX - 1);
+        if (n < 0 || n >= (long)LX_FP_PATH_MAX - 1) return FALLBACK;
+        g[n] = 0;
+    } else {
+        n = 0;
+        g[0] = 0;
+    }
+    if (n == 0) {
+        /* only "the fd itself" makes an empty path legal */
+        if (!by_fd || dirfd < 0) return FALLBACK;
+        n = fd_path(e, dirfd, g, &fst, 0);
+        if (n <= 0) return FALLBACK;
+        by_fd = 2;   /* answer from fst, the fd's real inode */
+    } else if (g[0] != '/' && dirfd >= 0) {
+        /* relative to a directory fd, if its recorded path still names the
+           directory it has open (a rename moves the dir away from the name) */
+        char d[LX_FP_FD_PATH];
+        const long dl = fd_path(e, dirfd, d, &fst, 1);
+        if (dl <= 0) return FALLBACK;
+        dir_check = 1;
+        const uint32_t lead = dl == 1 ? 1 : (uint32_t)dl + 1;
+        if (lead + (uint32_t)n >= LX_FP_PATH_MAX) return FALLBACK;
+        for (long i = n; i >= 0; --i) g[i + lead] = g[i];
+        move(g, d, (unsigned long)dl);
+        g[lead - 1] = '/';
+        n += lead;
+    } else if (g[0] != '/') {
         if (dirfd != AT_FDCWD_) return FALLBACK;
         const long tg = lx_fp_gate(NR_getpid, 0, 0, 0, 0, e->key);
         if (tg <= 0) return FALLBACK;
@@ -320,22 +387,50 @@ static long work(void* arg) {
         if (upn < 0 || host_special(up, upn)) return FALLBACK;
     }
 
-    /* pick the layer with an lstat, as the supervisor's probe does */
+    /* pick the layer with an lstat, as the supervisor's probe does; an fd
+       stat is the fd's own inode, whichever layer it was opened in */
     struct kstat st;
     const char* hp = lo;
     int hn = lon;
     long r = -ENOENT_;
-    if (upn >= 0) {
-        r = lx_fp_gate(NR_newfstatat, AT_FDCWD_, (long)up, (long)&st, AT_SYMLINK_NOFOLLOW_, e->key);
-        if (r == 0) { hp = up; hn = upn; }
-        else if (r != -ENOENT_) return FALLBACK;
+    if (dir_check) {
+        /* the leaf's parent, in either layer, must be the dir the fd has
+           open; otherwise the name now means another directory */
+        int ok = 0;
+        for (int layer = 0; layer < 2 && !ok; ++layer) {
+            char* p = layer ? lo : up;
+            const int pn = layer ? lon : upn;
+            if (pn <= 0) continue;
+            int cut = pn;
+            while (cut > 0 && p[cut] != '/') --cut;
+            if (cut <= 0) continue;
+            p[cut] = 0;
+            struct kstat ds;
+            if (lx_fp_gate(NR_newfstatat, AT_FDCWD_, (long)p, (long)&ds, 0, e->key) == 0 &&
+                ds.dev == fst.dev && ds.ino == fst.ino)
+                ok = 1;
+            p[cut] = '/';
+        }
+        if (!ok) return FALLBACK;
     }
-    if (r != 0) {
-        r = lx_fp_gate(NR_newfstatat, AT_FDCWD_, (long)lo, (long)&st, AT_SYMLINK_NOFOLLOW_, e->key);
-        if (r != 0) return FALLBACK;   /* missing: let the supervisor say why */
+    if (by_fd == 2) {
+        if (op != OP_STAT && op != OP_STATX) return FALLBACK;
+        st = fst;
+        r = 0;
+        if (upn >= 0 && exc_has(e, lx_fp_hash(up, (uint32_t)upn) ^ LX_FP_LEAF_SALT)) return FALLBACK;
+    } else {
+        if (upn >= 0) {
+            r = lx_fp_gate(NR_newfstatat, AT_FDCWD_, (long)up, (long)&st, AT_SYMLINK_NOFOLLOW_, e->key);
+            if (r == 0) { hp = up; hn = upn; }
+            else if (r != -ENOENT_) return FALLBACK;
+        }
+        if (r != 0) {
+            r = lx_fp_gate(NR_newfstatat, AT_FDCWD_, (long)lo, (long)&st, AT_SYMLINK_NOFOLLOW_, e->key);
+            if (r != 0) return FALLBACK;   /* missing: let the supervisor say why */
+        }
     }
     const int is_link = (st.mode & S_IFMT_) == S_IFLNK_;
-    if (follow && is_link) return FALLBACK;
+    if (follow && is_link && by_fd != 2) return FALLBACK;
     /* an emulated hardlink's placeholder */
     if (exc_has(e, lx_fp_hash(hp, (uint32_t)hn) ^ LX_FP_LEAF_SALT)) return FALLBACK;
 
@@ -393,6 +488,7 @@ long lx_fp_handle(uint64_t* frame, unsigned nr) {
     struct env e;
     e.t = (const struct lx_fp_table*)(base + LX_FP_TABLE_OFF);
     e.p = (struct lx_fp_proc*)(base + LX_FP_PROC_OFF);
+    e.fds = (const struct lx_fp_fd*)(base + LX_FP_FDMAP_OFF);
     e.s = (struct lx_fp_stats*)(base + LX_FP_STATS_OFF);
     e.key = e.t->key;
     if (e.t->magic != LX_FP_MAGIC || !load_acq(&e.t->enabled) || e.p->disabled) return FALLBACK;

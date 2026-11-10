@@ -313,6 +313,14 @@ public:
                                 locked([&] { sys.note_moved(rd.moved->first, rd.moved->second); });
                             if constexpr (requires { trap_.set_ret_now(std::int64_t{0}); })
                                 if (rd.force_ret) trap_.set_ret_now(*rd.force_ret);
+                            // a new fd: tell the in-guest fast path what it is
+                            // now, before the task runs on and uses it
+                            if constexpr (requires { trap_.fp_note_fd(kernel_, 0, std::string{}); })
+                                if (rc >= 0 && !rd.force_ret)
+                                    locked([&] {
+                                        if (!sys.pending_open_path().empty())
+                                            trap_.fp_note_fd(kernel_, static_cast<int>(rc), sys.pending_open_path());
+                                    });
                         },
                         arg2, hp2_fit);
                     if (!retr) return recover(retr.error());
@@ -431,6 +439,11 @@ public:
                                         sys.on_fd_closed(closed);
                                     sys.on_fd_dup(from, static_cast<int>(ret));
                                 });
+                                if constexpr (requires { trap_.fp_note_fd(kernel_, 0, std::string{}); })
+                                    locked([&] {
+                                        trap_.fp_note_fd(kernel_, static_cast<int>(ret),
+                                                         std::string{kernel_.files().path_of_fd(static_cast<int>(ret))});
+                                    });
                             });
                             if (!fr) return recover(fr.error());
                             return Step::next;

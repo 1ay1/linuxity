@@ -26,11 +26,14 @@
 
 /* Offsets from the region base (= the blob's first byte). */
 #define LX_FP_CODE_MAX    0x8000ULL    /* r-x */
-#define LX_FP_PROC_OFF    0x8000ULL    /* rw, one page */
-#define LX_FP_STACKS_OFF  0x10000ULL   /* rw; the gap before it is PROT_NONE */
+#define LX_FP_PROC_OFF    0x8000ULL    /* rw, one page; then a guard */
+#define LX_FP_FDMAP_OFF   0x10000ULL   /* rw: fd -> guest path, by fd number */
+#define LX_FP_FDS         256u
+#define LX_FP_FD_PATH     220u
+#define LX_FP_STACKS_OFF  0x21000ULL   /* rw; the page before it is a guard */
 #define LX_FP_STACKS      4u
 #define LX_FP_STACK_SIZE  0x8000ULL
-#define LX_FP_TABLE_OFF   0x30000ULL   /* r--, MAP_SHARED */
+#define LX_FP_TABLE_OFF   0x41000ULL   /* r--, MAP_SHARED */
 #define LX_FP_TABLE_SIZE  0x120000ULL
 #define LX_FP_STATS_OFF   (LX_FP_TABLE_OFF + LX_FP_TABLE_SIZE)   /* rw-, MAP_SHARED, one page */
 #define LX_FP_REGION_SIZE (LX_FP_STATS_OFF + 0x1000ULL)
@@ -105,6 +108,20 @@ struct lx_fp_table {
 struct lx_fp_proc {
     uint32_t disabled;
     uint32_t slots;     /* stacks in use, one bit each */
+};
+
+/* What an fd refers to, written by the supervisor when a trapped open
+   returns it. The blob trusts an entry only while the fd's real dev/ino
+   still match, so a stale one (closed, reused, dup2'd over) costs a
+   fallback, never a wrong answer. Private memory: fork copies it with the
+   fd table, exec drops both. */
+struct lx_fp_fd {
+    uint32_t seq;       /* seqlock; 0 len = no entry */
+    uint16_t len;
+    uint8_t  is_dir, pad;
+    uint32_t gen;       /* table.dir_gen when written: a rename since makes the path stale */
+    uint64_t dev, ino;
+    char path[LX_FP_FD_PATH];
 };
 
 /* Shared by every process, at base + LX_FP_STATS_OFF (the page after the

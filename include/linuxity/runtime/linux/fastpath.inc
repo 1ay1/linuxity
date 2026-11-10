@@ -72,10 +72,70 @@ public:
         fp_sync(k, sys);
         if (fp_regions_.empty()) return;
         const abi::Sysno sc = abi::decode(kTraceeArch, ar.nr);
-        if (sc != abi::Sysno::chdir && sc != abi::Sysno::fchdir) return;
         const ::pid_t tg = host_tgid_of(cur_);
-        if (fp_regions_.count(tg)) fp_note_cwd_of(k, tg);
+        if (!fp_regions_.count(tg)) return;
+        using S2 = abi::Sysno;
+        // an fd number that is about to mean something else
+        if (sc == S2::close) fp_clear_fd(tg, static_cast<int>(ar.arg[0]));
+        else if (sc == S2::dup2 || sc == S2::dup3) fp_clear_fd(tg, static_cast<int>(ar.arg[1]));
+        else if (sc == S2::chdir || sc == S2::fchdir) fp_note_cwd_of(k, tg);
     }
+
+    // A trapped open or dup just made fd `fd` for guest path `gp`: write what
+    // it is into the process's fd map (host-backed files and dirs only).
+    // Called with the task still stopped, so its next call sees the entry.
+    template <class K>
+    void fp_note_fd(K& k, int fd, const std::string& gp) {
+        if (!fp_table_ || fd < 0 || fd >= static_cast<int>(LX_FP_FDS)) return;
+        const ::pid_t tg = host_tgid_of(cur_);
+        auto it = fp_regions_.find(tg);
+        if (it == fp_regions_.end() || !it->second.base) return;
+        auto& fs = k.files();
+        lx_fp_fd e{};
+        if (!gp.empty() && gp.size() < LX_FP_FD_PATH && gp[0] == '/') {
+            const auto pc = fs.classify(gp);
+            char link[64];
+            std::snprintf(link, sizeof link, "/proc/%d/fd/%d", cur_, fd);
+            struct ::stat st{};
+            if (pc.realm == kernel::Realm2::host_backed && ::stat(link, &st) == 0 &&
+                (S_ISDIR(st.st_mode) || S_ISREG(st.st_mode))) {
+                e.len = static_cast<std::uint16_t>(gp.size());
+                e.is_dir = S_ISDIR(st.st_mode) ? 1 : 0;
+                e.gen = fp_own_.dir_gen();
+                e.dev = static_cast<std::uint64_t>(st.st_dev);
+                e.ino = static_cast<std::uint64_t>(st.st_ino);
+                std::memcpy(e.path, gp.data(), gp.size());
+            }
+        }
+        fp_write_fd(it->second.base, fd, e);
+        if (fp_debug()) std::fprintf(stderr, "[fp] %d fd %d = '%s' %s\n", cur_, fd, gp.c_str(), e.len ? "" : "(none)");
+    }
+
+private:
+    void fp_clear_fd(::pid_t tg, int fd) {
+        if (fd < 0 || fd >= static_cast<int>(LX_FP_FDS)) return;
+        auto it = fp_regions_.find(tg);
+        if (it == fp_regions_.end() || !it->second.base) return;
+        fp_write_fd(it->second.base, fd, lx_fp_fd{});
+    }
+    // Seqlock write of one entry into the current task's memory.
+    void fp_write_fd(std::uint64_t base, int fd, lx_fp_fd e) {
+        const std::uint64_t at = base + LX_FP_FDMAP_OFF + static_cast<std::uint64_t>(fd) * sizeof(lx_fp_fd);
+        std::uint32_t seq = 0;
+        ::iovec l{&seq, sizeof seq}, r{reinterpret_cast<void*>(at), sizeof seq};
+        if (::process_vm_readv(cur_, &l, 1, &r, 1, 0) != static_cast<ssize_t>(sizeof seq)) return;
+        const std::uint32_t odd = seq | 1u;
+        ::iovec lo{const_cast<std::uint32_t*>(&odd), sizeof odd};
+        if (::process_vm_writev(cur_, &lo, 1, &r, 1, 0) != static_cast<ssize_t>(sizeof odd)) return;
+        e.seq = odd;
+        ::iovec lb{reinterpret_cast<char*>(&e) + sizeof e.seq, sizeof e - sizeof e.seq};
+        ::iovec rb{reinterpret_cast<void*>(at + sizeof e.seq), sizeof e - sizeof e.seq};
+        (void)::process_vm_writev(cur_, &lb, 1, &rb, 1, 0);
+        const std::uint32_t even = odd + 1;
+        ::iovec le{const_cast<std::uint32_t*>(&even), sizeof even};
+        (void)::process_vm_writev(cur_, &le, 1, &r, 1, 0);
+    }
+public:
 
     void fp_report() {
         if (!fp_table_) return;
@@ -355,10 +415,11 @@ private:
                    fp_poke(cur_, base, blob.data(), blob.size());
         }
         if (good) {
-            // code r-x, the gap below the stacks inaccessible (a guard)
+            // code r-x; guard pages after the proc page and below the stacks
             good = fp_run1(S::mprotect, {base, LX_FP_CODE_MAX, PROT_READ | PROT_EXEC, 0, 0, 0}) == 0 &&
                    fp_run1(S::mprotect, {base + LX_FP_PROC_OFF + 0x1000,
-                                         LX_FP_STACKS_OFF - LX_FP_PROC_OFF - 0x1000, PROT_NONE, 0, 0, 0}) == 0;
+                                         LX_FP_FDMAP_OFF - LX_FP_PROC_OFF - 0x1000, PROT_NONE, 0, 0, 0}) == 0 &&
+                   fp_run1(S::mprotect, {base + LX_FP_STACKS_OFF - 0x1000, 0x1000, PROT_NONE, 0, 0, 0}) == 0;
         }
         if (!good) {
             (void)fp_run1(S::munmap, {base, sz, 0, 0, 0, 0});
