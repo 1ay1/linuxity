@@ -16,6 +16,7 @@
 
 #if defined(__APPLE__)
 
+#include "linuxity/abi/wire/errno_map.hpp"
 #include "linuxity/abi/wire/dirent64.hpp"
 #include "linuxity/abi/wire/open_flags.hpp"
 #include "linuxity/abi/wire/stat.hpp"
@@ -336,70 +337,12 @@ using abi::wire::dirent_reclen;
 using abi::wire::dtype_from_mode;
 
 // -- errno -----------------------------------------------------------------
-// 1..34 are identical on both kernels (EPERM..ERANGE). Past that they
-// diverge, and these are the ones real programs branch on.
+// Host errno -> the guest's number: abi/wire/errno_map.hpp, the one table
+// every backend shares (this backend once kept its own copy, which the
+// shared one lacked half of -- so the dispatcher said EIO where this said
+// ECONNRESET for the same host error).
 [[nodiscard]] inline std::int32_t errno_to_linux(int e) noexcept {
-    switch (e) {
-        // Darwin 35 is EAGAIN/EWOULDBLOCK; Linux's is 11, and Linux's 35 is
-        // EDEADLK. Getting this wrong turns every non-blocking "try again"
-        // into an I/O error -- which is exactly how a TLS handshake died
-        // here with "Recv failure: Input/output error".
-        case EAGAIN:         return 11;
-        case EDEADLK:        return 35;
-        case ENAMETOOLONG:   return 36;
-        case ENOLCK:         return 37;
-        case ENOSYS:         return 38;
-        case ENOTEMPTY:      return 39;
-        case ELOOP:          return 40;
-        case ENOMSG:         return 42;
-        case EIDRM:          return 43;
-        case ENOSTR:         return 60;
-        case ENODATA:        return 61;
-        case ETIME:          return 62;
-        case ENOSR:          return 63;
-        case EREMOTE:        return 66;
-        case ENOLINK:        return 67;
-        case EPROTO:         return 71;
-        case EMULTIHOP:      return 72;
-        case EBADMSG:        return 74;
-        case EOVERFLOW:      return 75;
-        case EILSEQ:         return 84;
-        case EUSERS:         return 87;
-        case ENOTSOCK:       return 88;
-        case EDESTADDRREQ:   return 89;
-        case EMSGSIZE:       return 90;
-        case EPROTOTYPE:     return 91;
-        case ENOPROTOOPT:    return 92;
-        case EPROTONOSUPPORT:return 93;
-        case ESOCKTNOSUPPORT:return 94;
-        case EOPNOTSUPP:     return 95;
-        case EPFNOSUPPORT:   return 96;
-        case EAFNOSUPPORT:   return 97;
-        case EADDRINUSE:     return 98;
-        case EADDRNOTAVAIL:  return 99;
-        case ENETDOWN:       return 100;
-        case ENETUNREACH:    return 101;
-        case ENETRESET:      return 102;
-        case ECONNABORTED:   return 103;
-        case ECONNRESET:     return 104;
-        case ENOBUFS:        return 105;
-        case EISCONN:        return 106;
-        case ENOTCONN:       return 107;
-        case ETIMEDOUT:      return 110;
-        case ECONNREFUSED:   return 111;
-        case EHOSTDOWN:      return 112;
-        case EHOSTUNREACH:   return 113;
-        case EALREADY:       return 114;
-        case EINPROGRESS:    return 115;
-        case ESTALE:         return 116;
-        case EDQUOT:         return 122;
-        case ECANCELED:      return 125;
-        case EOWNERDEAD:     return 130;
-        case ENOTRECOVERABLE:return 131;
-        // 1..34 are identical in both ABIs (EPERM..ERANGE). Anything else
-        // unmapped would be a LIE if passed through, so report EIO.
-        default:             return e <= 34 ? e : 5 /*EIO*/;
-    }
+    return static_cast<std::int32_t>(abi::wire::errno_from_host(e));
 }
 
 // The negative-errno return value a Linux syscall gives on failure.

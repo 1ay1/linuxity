@@ -883,6 +883,18 @@ private:
                 socklen_t len = static_cast<socklen_t>(want);
                 if (::getsockopt(h, opt->level, opt->name, val.data(), &len) < 0)
                     return darwin::fail();
+                // the VALUE's encoding (net::Val), for an int-sized answer
+                if (opt->val != net::Val::raw && len == sizeof(int)) {
+                    int v = 0;
+                    std::memcpy(&v, val.data(), sizeof v);
+                    switch (opt->val) {
+                        case net::Val::boolean:  v = v != 0; break;
+                        case net::Val::errno_:   v = v ? darwin::errno_to_linux(v) : 0; break;
+                        case net::Val::socktype: break;   // SOCK_STREAM/DGRAM/RAW/SEQPACKET agree
+                        case net::Val::raw:      break;
+                    }
+                    std::memcpy(val.data(), &v, sizeof v);
+                }
                 return ram.put(a4, static_cast<std::uint32_t>(len)) ? 0 : -14;
             }
             case S::sendmsg: case S::recvmsg:
@@ -922,6 +934,15 @@ private:
     void finish_socket(int h, std::uint64_t linux_type_flags) const noexcept {
         int on = 1;
         ::setsockopt(h, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
+        // Linux's default buffers (net.core.{w,r}mem_default, 212992).
+        // Darwin's are tiny -- 2 KiB for a unix datagram, 9 KiB for UDP --
+        // and on Darwin the SEND buffer is also the largest datagram, so a
+        // 30000-byte socketpair message or a 60000-byte UDP packet was
+        // EMSGSIZE where Linux sends it. Raising them only ever matches
+        // Linux; a guest that sets its own still wins.
+        int buf = 212992;
+        (void)::setsockopt(h, SOL_SOCKET, SO_SNDBUF, &buf, sizeof buf);
+        (void)::setsockopt(h, SOL_SOCKET, SO_RCVBUF, &buf, sizeof buf);
         if (linux_type_flags & net::kSockNonblock)
             ::fcntl(h, F_SETFL, ::fcntl(h, F_GETFL) | O_NONBLOCK);
         ::fcntl(h, F_SETFD, FD_CLOEXEC);      // the HOST fd is ours; never leak it
@@ -3337,6 +3358,38 @@ private:
         }
     }
 
+    // One eventfd read or write (see do_io). The pipe holds the counter as
+    // a run of 8-byte deltas; reading drains them into one sum.
+    [[nodiscard]] std::int64_t eventfd_io(const FdTable::EventFdEnds& ev, bool reading,
+                                          std::uint64_t buf, std::uint64_t len) {
+        const GuestRam ram = machine_.ram();
+        if (len < 8) return -22;                                         // EINVAL
+        if (!reading) {
+            std::uint64_t add = 0;
+            if (!ram.get(buf, add)) return -14;
+            if (add == ~std::uint64_t{0}) return -22;
+            if (add == 0) return 8;
+            return ::write(ev.write, &add, sizeof add) < 0 ? darwin::fail() : 8;
+        }
+        // Block (or EAGAIN) until there is a delta, like the pipe would.
+        std::uint64_t first = 0;
+        const ::ssize_t n = ::read(ev.read, &first, sizeof first);
+        if (n < 0) return darwin::fail();
+        if (n != 8) return -5;
+        const int fl = ::fcntl(ev.read, F_GETFL);
+        (void)::fcntl(ev.read, F_SETFL, fl | O_NONBLOCK);
+        std::uint64_t sum = first, d = 0;
+        while (::read(ev.read, &d, sizeof d) == 8) sum += d;
+        std::uint64_t give = sum;
+        if (ev.semaphore) {
+            give = 1;
+            const std::uint64_t rest = sum - 1;
+            if (rest) (void)::write(ev.write, &rest, sizeof rest);
+        }
+        (void)::fcntl(ev.read, F_SETFL, fl);
+        return ram.put(buf, give) ? 8 : -14;
+    }
+
     [[nodiscard]] Maybe do_io(abi::Sysno sc) {
         using S = abi::Sysno;
         const auto gfd = static_cast<int>(regs_.arg(0));
@@ -3383,7 +3436,9 @@ private:
                 // signals. The write end is kept alive by the EventFd record
                 // so the read end never sees EOF.
                 const int g = proc_.with_fds([&](FdTable& t) {
-                    return t.install_eventfd(p[0], p[1], (a1 & abi::wire::kOCloexec) != 0);
+                    return t.install_eventfd(p[0], p[1], (a1 & abi::wire::kOCloexec) != 0,
+                                             (a1 & 1u) /*EFD_SEMAPHORE*/ ? HostFd::Kind::eventfd_sem
+                                                                        : HostFd::Kind::eventfd);
                 });
                 if (g < 0) { ::close(p[0]); ::close(p[1]); return -24; }
                 if (a0) {
@@ -3554,6 +3609,15 @@ private:
         // end, writes signal the write end.
         const auto wfd = proc_.with_fds([&](FdTable& t) { return t.write_host(gfd); });
         auto need_fd = [&]() -> bool { return hfd.has_value(); };
+        // eventfd(2): a 64-bit counter over a pipe of 8-byte deltas. A read
+        // takes the whole counter (or 1, under EFD_SEMAPHORE) and resets it
+        // (or decrements it); a write adds; reads and writes of anything
+        // but 8 bytes are EINVAL. The pipe gives poll/epoll and blocking for
+        // free; the arithmetic is here. Passing the pipe's bytes straight
+        // through made `write 5, write 7, read` return 5, not 12.
+        if (sc == S::read || sc == S::write)
+            if (const auto ev = proc_.with_fds([&](const FdTable& t) { return t.eventfd(gfd); }))
+                return eventfd_io(*ev, sc == S::read, a1, a2);
         switch (sc) {
             case S::read: {
                 if (!need_fd()) return -9;                          // EBADF

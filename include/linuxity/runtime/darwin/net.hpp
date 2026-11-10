@@ -167,36 +167,44 @@ struct LinuxSockaddr {
 }
 
 // -- setsockopt/getsockopt -------------------------------------------------
-struct Option { int level, name; };
+// What an option's VALUE is, because the encodings differ: Darwin reports a
+// set boolean as the option's own bit (TCP_NODELAY reads back 4), Linux as
+// 1; SO_ERROR is an errno; SO_TYPE a socket type. One table says it, and
+// get/set both translate through it.
+enum class Val : std::uint8_t { raw, boolean, errno_, socktype };
+struct Option { int level, name; Val val{Val::raw}; };
 
 [[nodiscard]] inline std::optional<Option> opt_to_darwin(int level, int name) noexcept {
     constexpr int kSolSocket = 1, kSolTcp = 6, kSolIp = 0, kSolIpv6 = 41;
     if (level == kSolSocket) {
         switch (name) {
-            case 1:  return Option{SOL_SOCKET, SO_DEBUG};
-            case 2:  return Option{SOL_SOCKET, SO_REUSEADDR};
-            case 3:  return Option{SOL_SOCKET, SO_TYPE};
-            case 4:  return Option{SOL_SOCKET, SO_ERROR};
-            case 5:  return Option{SOL_SOCKET, SO_DONTROUTE};
-            case 6:  return Option{SOL_SOCKET, SO_BROADCAST};
+            case 1:  return Option{SOL_SOCKET, SO_DEBUG, Val::boolean};
+            case 2:  return Option{SOL_SOCKET, SO_REUSEADDR, Val::boolean};
+            case 3:  return Option{SOL_SOCKET, SO_TYPE, Val::socktype};
+            case 4:  return Option{SOL_SOCKET, SO_ERROR, Val::errno_};
+            case 5:  return Option{SOL_SOCKET, SO_DONTROUTE, Val::boolean};
+            case 6:  return Option{SOL_SOCKET, SO_BROADCAST, Val::boolean};
             case 7:  return Option{SOL_SOCKET, SO_SNDBUF};
             case 8:  return Option{SOL_SOCKET, SO_RCVBUF};
-            case 9:  return Option{SOL_SOCKET, SO_KEEPALIVE};
-            case 10: return Option{SOL_SOCKET, SO_OOBINLINE};
+            case 9:  return Option{SOL_SOCKET, SO_KEEPALIVE, Val::boolean};
+            case 10: return Option{SOL_SOCKET, SO_OOBINLINE, Val::boolean};
             case 13: return Option{SOL_SOCKET, SO_LINGER};
-            case 15: return Option{SOL_SOCKET, SO_REUSEPORT};
+            case 15: return Option{SOL_SOCKET, SO_REUSEPORT, Val::boolean};
             case 20: return Option{SOL_SOCKET, SO_RCVLOWAT};
             case 19: return Option{SOL_SOCKET, SO_SNDLOWAT};
             case 21: return Option{SOL_SOCKET, SO_RCVTIMEO};
             case 22: return Option{SOL_SOCKET, SO_SNDTIMEO};
+            case 30: return Option{SOL_SOCKET, SO_ACCEPTCONN, Val::boolean};
             default: return std::nullopt;
         }
     }
     if (level == kSolTcp) {
         switch (name) {
-            case 1:  return Option{IPPROTO_TCP, TCP_NODELAY};
+            case 1:  return Option{IPPROTO_TCP, TCP_NODELAY, Val::boolean};
             case 2:  return Option{IPPROTO_TCP, TCP_MAXSEG};
-            case 4:  return Option{IPPROTO_TCP, TCP_KEEPALIVE};
+            case 4:  return Option{IPPROTO_TCP, TCP_KEEPALIVE};        // TCP_KEEPIDLE
+            case 5:  return Option{IPPROTO_TCP, TCP_KEEPINTVL};
+            case 6:  return Option{IPPROTO_TCP, TCP_KEEPCNT};
             default: return std::nullopt;
         }
     }

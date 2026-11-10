@@ -85,6 +85,132 @@ namespace lx::abi::wire {
 #if defined(EOPNOTSUPP) && (!defined(ENOTSUP) || EOPNOTSUPP != ENOTSUP)
         case EOPNOTSUPP:   return Errno::enotsup;
 #endif
+#ifdef ETXTBSY
+        case ETXTBSY: return Errno::etxtbsy;
+#endif
+#ifdef EDOM
+        case EDOM: return Errno::edom;
+#endif
+#ifdef EDEADLK
+        case EDEADLK: return Errno::edeadlk;
+#endif
+#ifdef ENOLCK
+        case ENOLCK: return Errno::enolck;
+#endif
+#ifdef ENOSTR
+        case ENOSTR: return Errno::enostr;
+#endif
+#ifdef ETIME
+        case ETIME: return Errno::etime;
+#endif
+#ifdef ENOSR
+        case ENOSR: return Errno::enosr;
+#endif
+#ifdef EREMOTE
+        case EREMOTE: return Errno::eremote;
+#endif
+#ifdef ENOLINK
+        case ENOLINK: return Errno::enolink;
+#endif
+#ifdef EPROTO
+        case EPROTO: return Errno::eproto;
+#endif
+#ifdef EMULTIHOP
+        case EMULTIHOP: return Errno::emultihop;
+#endif
+#ifdef EBADMSG
+        case EBADMSG: return Errno::ebadmsg;
+#endif
+#ifdef EOVERFLOW
+        case EOVERFLOW: return Errno::eoverflow;
+#endif
+#ifdef EILSEQ
+        case EILSEQ: return Errno::eilseq;
+#endif
+#ifdef EUSERS
+        case EUSERS: return Errno::eusers;
+#endif
+#ifdef ENOTSOCK
+        case ENOTSOCK: return Errno::enotsock;
+#endif
+#ifdef EDESTADDRREQ
+        case EDESTADDRREQ: return Errno::edestaddrreq;
+#endif
+#ifdef EMSGSIZE
+        case EMSGSIZE: return Errno::emsgsize;
+#endif
+#ifdef EPROTOTYPE
+        case EPROTOTYPE: return Errno::eprototype;
+#endif
+#ifdef ENOPROTOOPT
+        case ENOPROTOOPT: return Errno::enoprotoopt;
+#endif
+#ifdef ESOCKTNOSUPPORT
+        case ESOCKTNOSUPPORT: return Errno::esocktnosupport;
+#endif
+#ifdef EPFNOSUPPORT
+        case EPFNOSUPPORT: return Errno::epfnosupport;
+#endif
+#ifdef EAFNOSUPPORT
+        case EAFNOSUPPORT: return Errno::eafnosupport;
+#endif
+#ifdef EADDRNOTAVAIL
+        case EADDRNOTAVAIL: return Errno::eaddrnotavail;
+#endif
+#ifdef ENETDOWN
+        case ENETDOWN: return Errno::enetdown;
+#endif
+#ifdef ENETUNREACH
+        case ENETUNREACH: return Errno::enetunreach;
+#endif
+#ifdef ENETRESET
+        case ENETRESET: return Errno::enetreset;
+#endif
+#ifdef ECONNABORTED
+        case ECONNABORTED: return Errno::econnaborted;
+#endif
+#ifdef ECONNRESET
+        case ECONNRESET: return Errno::econnreset;
+#endif
+#ifdef ENOBUFS
+        case ENOBUFS: return Errno::enobufs;
+#endif
+#ifdef EISCONN
+        case EISCONN: return Errno::eisconn;
+#endif
+#ifdef ENOTCONN
+        case ENOTCONN: return Errno::enotconn;
+#endif
+#ifdef ESHUTDOWN
+        case ESHUTDOWN: return Errno::eshutdown;
+#endif
+#ifdef EHOSTDOWN
+        case EHOSTDOWN: return Errno::ehostdown;
+#endif
+#ifdef EHOSTUNREACH
+        case EHOSTUNREACH: return Errno::ehostunreach;
+#endif
+#ifdef EALREADY
+        case EALREADY: return Errno::ealready;
+#endif
+#ifdef EINPROGRESS
+        case EINPROGRESS: return Errno::einprogress;
+#endif
+#ifdef ESTALE
+        case ESTALE: return Errno::estale;
+#endif
+#ifdef EDQUOT
+        case EDQUOT: return Errno::edquot;
+#endif
+#ifdef ECANCELED
+        case ECANCELED: return Errno::ecanceled;
+#endif
+#ifdef EOWNERDEAD
+        case EOWNERDEAD: return Errno::eownerdead;
+#endif
+#ifdef ENOTRECOVERABLE
+        case ENOTRECOVERABLE: return Errno::enotrecoverable;
+#endif
         default:           return Errno::eio;
     }
 }

@@ -37,6 +37,17 @@ enum class Errno : std::int32_t {
     enotsup = 95,  eprotonosupport = 93,
     econnrefused = 111, etimedout = 110, eaddrinuse = 98,
     enomsg = 42, eidrm = 43, enodata = 61,
+    // the rest of what a host can report and a guest branches on
+    etxtbsy = 26, edom = 33, edeadlk = 35, enolck = 37,
+    enostr = 60, etime = 62, enosr = 63, eremote = 66, enolink = 67,
+    eproto = 71, emultihop = 72, ebadmsg = 74, eoverflow = 75, eilseq = 84,
+    eusers = 87, enotsock = 88, edestaddrreq = 89, emsgsize = 90,
+    eprototype = 91, enoprotoopt = 92, esocktnosupport = 94, epfnosupport = 96,
+    eafnosupport = 97, eaddrnotavail = 99, enetdown = 100, enetunreach = 101,
+    enetreset = 102, econnaborted = 103, econnreset = 104, enobufs = 105,
+    eisconn = 106, enotconn = 107, eshutdown = 108, ehostdown = 112,
+    ehostunreach = 113, ealready = 114, einprogress = 115, estale = 116,
+    edquot = 122, ecanceled = 125, eownerdead = 130, enotrecoverable = 131,
 };
 
 [[nodiscard]] constexpr std::string_view name(Errno e) noexcept {

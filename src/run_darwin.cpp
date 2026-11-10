@@ -26,6 +26,7 @@
 #include <mach-o/dyld.h>
 #include <signal.h>
 #include <spawn.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -38,6 +39,8 @@
 #include <sys/sysctl.h>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
+#include <climits>
 #include <cstring>
 #include <string>
 #include <string_view>
@@ -825,6 +828,14 @@ void smark(const char* w) {
 // moment it exists (a setpgid race), and SIGEMT's DEFAULT action kills.
 void process_start() {
     runtime::install_kick_handler();
+    // Every guest fd is a host fd here, and the guest is promised 1024
+    // (FdTable::kMaxFds, the RLIMIT_NOFILE it reads), plus linuxity's own.
+    // macOS starts a process at a soft limit of 256: raise ours to what
+    // the hard limit allows, as a shell's `ulimit -n` would.
+    if (struct ::rlimit rl{}; ::getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+        const rlim_t want = std::min<rlim_t>(rl.rlim_max, OPEN_MAX);
+        if (rl.rlim_cur < want) { rl.rlim_cur = want; (void)::setrlimit(RLIMIT_NOFILE, &rl); }
+    }
     if (start_profiling()) {
         // Time from exec (kernel's process start) to main: dyld + static init.
         struct kinfo_proc kp{};

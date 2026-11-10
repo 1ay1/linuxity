@@ -41,6 +41,12 @@ public:
     HostFd& operator=(const HostFd&) = delete;
     ~HostFd() { if (fd_ >= 0) ::close(fd_); }
     [[nodiscard]] int get() const noexcept { return fd_; }
+    // What a pipe-pair descriptor IS (the read end carries it, so every dup
+    // and forked copy agrees): a plain pipe end, an eventfd counter (and
+    // whether EFD_SEMAPHORE), or another pollable record source (timerfd,
+    // signalfd) whose reads the backend formats itself.
+    enum class Kind : std::uint8_t { plain, eventfd, eventfd_sem, records };
+    Kind kind{Kind::plain};
 private:
     int fd_;
 };
@@ -140,8 +146,10 @@ public:
     // writes the same descriptor, so the table holds both ends and keeps the
     // write end alive -- otherwise the read end would report EOF instead of
     // blocking, and an event loop would spin.
-    [[nodiscard]] int install_eventfd(int read_end, int write_end, bool cloexec) {
+    [[nodiscard]] int install_eventfd(int read_end, int write_end, bool cloexec,
+                                      HostFd::Kind kind = HostFd::Kind::records) {
         auto file = std::make_shared<HostFd>(read_end);
+        file->kind = kind;
         auto peer = std::make_shared<HostFd>(write_end);
         for (std::size_t g = 0; g < slots_.size(); ++g)
             if (!slots_[g].file) {
@@ -151,6 +159,17 @@ public:
         if (slots_.size() >= kMaxFds) return -24;
         slots_.push_back({std::move(file), cloexec, std::move(peer)});
         return static_cast<int>(slots_.size() - 1);
+    }
+
+    // If `g` is an eventfd (a counter): its two host ends and its mode.
+    struct EventFdEnds { int read, write; bool semaphore; };
+    [[nodiscard]] std::optional<EventFdEnds> eventfd(int g) const noexcept {
+        if (g < 0 || static_cast<std::size_t>(g) >= slots_.size()) return std::nullopt;
+        const Slot& s = slots_[static_cast<std::size_t>(g)];
+        if (!s.file || !s.peer) return std::nullopt;
+        const auto k = s.file->kind;
+        if (k != HostFd::Kind::eventfd && k != HostFd::Kind::eventfd_sem) return std::nullopt;
+        return EventFdEnds{s.file->get(), s.peer->get(), k == HostFd::Kind::eventfd_sem};
     }
 
     // The write end, if `g` is an eventfd; a write must go there, not to the
@@ -185,6 +204,7 @@ public:
         int group;          // the open file, numbered densely
         int peer_group;     // eventfd write end's group, or -1
         bool cloexec;
+        HostFd::Kind kind;  // what the open file is (see HostFd::Kind)
     };
     struct Export {
         std::vector<Exported> entries;
@@ -205,7 +225,7 @@ public:
             const Slot& s = slots_[g];
             if (!s.file) continue;
             out.entries.push_back({static_cast<int>(g), group_of(s.file),
-                                   group_of(s.peer), s.cloexec});
+                                   group_of(s.peer), s.cloexec, s.file->kind});
         }
         return out;
     }
@@ -223,6 +243,7 @@ public:
         for (const Exported& e : in) {
             auto file = file_for(e.group);
             if (!file) continue;
+            file->kind = e.kind;
             install_at(e.guest, std::move(file), e.cloexec, file_for(e.peer_group));
         }
     }
