@@ -41,6 +41,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -154,6 +155,7 @@ public:
     // chmods from package installs (13k of them here) all land in this case.
     void set_mode(const std::string& guest_path, std::uint32_t mode,
                   std::uint32_t host_mode = 0xffffffffu) {
+        catch_up();
         if (host_mode != 0xffffffffu && (host_mode & abi::wire::kPermMask) == (mode & abi::wire::kPermMask)) {
             auto it = table_.find(guest_path);
             if (it == table_.end()) return;
@@ -178,6 +180,7 @@ public:
     // root, which left 53k redundant records that every fork re-parsed.
     void set_owner(const std::string& guest_path, std::uint32_t uid,
                    std::uint32_t gid) {
+        catch_up();
         auto it = table_.find(guest_path);
         if (it == table_.end() && (uid == 0 || uid == 0xffffffffu) &&
             (gid == 0 || gid == 0xffffffffu))
@@ -192,11 +195,13 @@ public:
     // A FIFO the host wouldn't let us create (Android forbids them), kept as
     // an empty regular file that the guest sees as S_IFIFO.
     void set_fifo(const std::string& guest_path) {
+        catch_up();
         auto& r = table_[guest_path];
         r.have |= MetaRecord::kFifo;
         append(guest_path, r);
     }
     [[nodiscard]] bool is_fifo(const std::string& guest_path) const {
+        catch_up();
         auto it = table_.find(guest_path);
         return it != table_.end() && (it->second.have & MetaRecord::kFifo) != 0;
     }
@@ -213,6 +218,7 @@ public:
     // On rename/link the metadata should travel with the file. Move any record
     // from `from` to `to` (overwriting `to`'s prior record if present).
     void rename(const std::string& from, const std::string& to) {
+        catch_up();
         auto it = table_.find(from);
         // Always journal the removal of `to`'s and `from`'s old state so a
         // replay reconstructs the post-rename world exactly (even if `from`
@@ -229,14 +235,22 @@ public:
     // same path start fresh at the host defaults. Journaled as a tombstone so
     // a later replay does NOT resurrect the stale record.
     void forget(const std::string& guest_path) {
+        catch_up();
         bool had = table_.erase(guest_path) != 0;
         if (had) append_tombstone(guest_path);
     }
 
     // The recorded overlay for a path, or nullopt if the guest never touched
     // its metadata (so the host inode's real values stand).
+    //
+    // The journal is the store's truth and the table a cache of it. Where
+    // every guest process is its own linuxity (macOS: fork = new process),
+    // each has its own cache, so it first catches up on lines OTHER
+    // processes appended -- or `su nobody -c 'touch f'` would leave the
+    // parent seeing f as root's. One stat when nothing changed.
     [[nodiscard]] std::optional<MetaRecord> lookup(
         const std::string& guest_path) const {
+        catch_up();
         auto it = table_.find(guest_path);
         if (it == table_.end()) return std::nullopt;
         return it->second;
@@ -245,6 +259,7 @@ public:
     // Every path with a record, and a sink for paths given one from now on
     // (the in-guest handler must leave those to the dispatcher).
     template <class F> void for_each_path(F&& f) const {
+        catch_up();
         for (const auto& [p, r] : table_) f(p);
     }
     void set_change_log(std::vector<std::string>* log) { changed_ = log; }
@@ -276,6 +291,10 @@ private:
         if (!fp) return;
         write_line(fp, path, r);
         std::fclose(fp);
+        // seen_ is NOT advanced: another process may have appended before
+        // us, and jumping to the end would skip its line (a parent kept the
+        // stale owner a child had just changed). The next catch_up replays
+        // from seen_ -- theirs and ours; ours again is harmless, last wins.
     }
 
     // nlink goes LAST and only when set, so a journal written before this
@@ -298,17 +317,49 @@ private:
         std::FILE* fp = std::fopen(journal_path_.c_str(), "a");
         if (!fp) return;
         std::fprintf(fp, "0 0 0 255 %s\n", path.c_str());
-        std::fclose(fp);
+        std::fclose(fp);   // seen_ stays: see append
+    }
+
+    // Fold in what other processes appended since we last read. The journal
+    // only ever grows, except when compaction REPLACES it (a new inode, or a
+    // smaller file): then read it whole again. Last line wins either way, so
+    // applying a tail on top of the table is exactly a full replay.
+    void catch_up() const {
+        if (journal_path_.empty()) return;
+        struct ::stat st{};
+        if (::stat(journal_path_.c_str(), &st) != 0) return;
+        const auto size = static_cast<long long>(st.st_size);
+        const auto ino = static_cast<std::uint64_t>(st.st_ino);
+        if (size == seen_ && ino == seen_ino_) return;
+        if (ino != seen_ino_ || size < seen_) {
+            table_.clear();
+            seen_ = 0;
+        }
+        seen_ino_ = ino;
+        (void)replay_from(seen_);
     }
 
     // Replay the journal into memory, last-writer-wins (a later append for the
     // same path supersedes the earlier one — so append-only is self-healing).
     std::size_t replay() {
+        struct ::stat st{};
+        seen_ino_ = ::stat(journal_path_.c_str(), &st) == 0 ? static_cast<std::uint64_t>(st.st_ino) : 0;
+        seen_ = 0;
+        return replay_from(0);
+    }
+    // From byte `from`; leaves seen_ at the end of the last COMPLETE line,
+    // so a line another process is half-way through appending is read later.
+    std::size_t replay_from(long long from) const {
         std::FILE* fp = std::fopen(journal_path_.c_str(), "r");
         if (!fp) return 0;
+        if (from > 0 && std::fseek(fp, static_cast<long>(from), SEEK_SET) != 0) { std::fclose(fp); return 0; }
         std::size_t lines = 0;
         char line[8192];
+        long long at = from;
         while (std::fgets(line, sizeof line, fp)) {
+            const std::size_t len = std::strlen(line);
+            if (len == 0 || line[len - 1] != '\n') break;   // torn tail: not yet
+            at += static_cast<long long>(len);
             ++lines;
             unsigned mode = 0, uid = 0, gid = 0, have = 0;
             int off = 0;
@@ -335,13 +386,18 @@ private:
             table_[path] = r;   // last line for a path wins
         }
         std::fclose(fp);
+        seen_ = at;
         return lines;
     }
 
     std::string upper_;
     std::vector<std::string> host_bases_;
     std::string journal_path_;
-    std::unordered_map<std::string, MetaRecord> table_;
+    // A cache of the journal (see lookup); mutable so a const lookup can
+    // catch up on other processes' appends.
+    mutable std::unordered_map<std::string, MetaRecord> table_;
+    mutable long long seen_{0};          // journal bytes folded into table_
+    mutable std::uint64_t seen_ino_{0};  // ...of this inode
     std::vector<std::string>* changed_{nullptr};
 
     // Rewrite the journal to exactly the live records, atomically.
@@ -352,6 +408,12 @@ private:
         for (const auto& [path, r] : table_) write_line(fp, path, r);
         if (std::fclose(fp) == 0) std::rename(tmp.c_str(), journal_path_.c_str());
         else std::remove(tmp.c_str());
+        // the table IS this file now: don't re-read it as someone else's
+        struct ::stat st{};
+        if (::stat(journal_path_.c_str(), &st) == 0) {
+            seen_ = static_cast<long long>(st.st_size);
+            seen_ino_ = static_cast<std::uint64_t>(st.st_ino);
+        }
     }
 };
 
