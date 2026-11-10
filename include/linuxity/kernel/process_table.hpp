@@ -16,6 +16,7 @@
 #pragma once
 
 #include "linuxity/abi/types.hpp"
+#include "linuxity/kernel/fork_state.hpp"
 #include "linuxity/kernel/landlock.hpp"
 #include "linuxity/kernel/namespaces.hpp"
 #include "linuxity/kernel/sysv_ipc.hpp"
@@ -34,9 +35,38 @@
 
 namespace lx::kernel {
 
+// What a process INHERITS across fork and keeps across exec, transformed
+// only by the kernel's rules (abi/creds.hpp): its credentials, capability
+// sets, no_new_privs, Landlock domain and nice value. One value, so a fork
+// copies it with one assignment instead of three hand-kept lists of a dozen
+// fields (the dispatcher, the event loop and the supervisor each had one,
+// and a field added to one would silently not be inherited by the others).
+struct Creds {
+    static constexpr std::uint64_t kAllCaps = (std::uint64_t{1} << 41) - 1;   // 0..40
+
+    // setgroups(2) list; root's [0] until set
+    std::vector<std::uint32_t> groups{};
+    bool groups_set{false};
+    // real, effective, saved, filesystem
+    std::array<std::uint32_t, 4> uids{0, 0, 0, 0};
+    std::array<std::uint32_t, 4> gids{0, 0, 0, 0};
+    // capability sets (bit n = capability n). kAllCaps until something drops them.
+    std::uint64_t cap_eff{kAllCaps}, cap_prm{kAllCaps}, cap_inh{0},
+                  cap_bnd{kAllCaps}, cap_amb{0};
+    bool keepcaps{false};
+    bool no_new_privs{false};
+    // Landlock layers linuxity enforces itself (hosts with no Landlock);
+    // shared with a fork, replaced by a new restriction
+    landlock::Domain landlock{};
+    std::int32_t nice{0};
+
+    [[nodiscard]] Creds& creds() noexcept { return *this; }
+    [[nodiscard]] const Creds& creds() const noexcept { return *this; }
+};
+
 // The per-process facts /proc needs. A deliberately small, total record —
 // extends naturally as more /proc fields are synthesized.
-struct ProcInfo {
+struct ProcInfo : Creds {
     std::int32_t pid{1};
     std::int32_t ppid{0};
     // Process GROUP. 0 means "not set yet, so it is my own pid" -- resolved
@@ -70,22 +100,6 @@ struct ProcInfo {
     std::vector<std::int32_t> threads{}; // guest tids besides the main thread
     // names of non-main threads that set one; comm is the main thread's
     std::vector<std::pair<std::int32_t, std::string>> thread_comms{};
-    // setgroups(2) list; inherited across fork, root's [0] until set
-    std::vector<std::uint32_t> groups{};
-    bool groups_set{false};
-    // Credentials: real, effective, saved, filesystem. Copied at fork.
-    std::array<std::uint32_t, 4> uids{0, 0, 0, 0};
-    std::array<std::uint32_t, 4> gids{0, 0, 0, 0};
-    // Capability sets (bit n = capability n), moved by the kernel's rules
-    // on setuid and exec. kAllCaps until something drops them.
-    std::uint64_t cap_eff{kAllCaps}, cap_prm{kAllCaps}, cap_inh{0},
-                  cap_bnd{kAllCaps}, cap_amb{0};
-    bool keepcaps{false};
-    bool no_new_privs{false};
-    // Landlock layers linuxity enforces itself (hosts with no Landlock);
-    // shared with a fork, replaced by a new restriction
-    landlock::Domain landlock{};
-    std::int32_t nice{0};
     // set on a spawn record that carries the parent's credentials
     bool creds_given{false};
     // created by the task's own first syscall, before its spawn event
@@ -97,7 +111,7 @@ struct ProcInfo {
     // the namespaces it is in (copied at fork, changed by unshare/setns)
     NsSet ns{};
 
-    static constexpr std::uint64_t kAllCaps = (std::uint64_t{1} << 41) - 1;   // 0..40
+    using Creds::kAllCaps;
 };
 
 // The virtual process table. Ordered by pid so /proc enumerates numerically.
@@ -156,22 +170,19 @@ public:
         const std::int32_t pg = p.pgid ? p.pgid : cur.pgid;
         const std::int32_t sd = p.sid ? p.sid : cur.sid;
         auto threads = std::move(cur.threads);   // reaped one by one, not by exec
-        auto groups = std::move(cur.groups);     // exec keeps credentials
-        const bool groups_set = cur.groups_set;
-        const auto uids = cur.uids, gids = cur.gids;
-        const ProcInfo old = cur;
+        const Creds kept = cur.creds();           // exec keeps credentials
         const bool had_creds = cur.pid != 0;
         cur = p;
         cur.pgid = pg;
         cur.sid = sd;
         if (cur.threads.empty()) cur.threads = std::move(threads);
-        if (!cur.groups_set) { cur.groups = std::move(groups); cur.groups_set = groups_set; }
+        if (!cur.groups_set) { cur.groups = kept.groups; cur.groups_set = kept.groups_set; }
         if (had_creds && !p.creds_given) {
-            cur.uids = uids; cur.gids = gids;
-            cur.cap_eff = old.cap_eff; cur.cap_prm = old.cap_prm; cur.cap_inh = old.cap_inh;
-            cur.cap_bnd = old.cap_bnd; cur.cap_amb = old.cap_amb;
-            cur.keepcaps = old.keepcaps; cur.no_new_privs = old.no_new_privs; cur.nice = old.nice;
-            cur.landlock = old.landlock;
+            const auto groups = std::move(cur.groups);
+            const bool groups_set = cur.groups_set;
+            cur.creds() = kept;
+            cur.groups = std::move(groups);
+            cur.groups_set = groups_set;
         }
         cur.creds_given = false;
     }
@@ -243,6 +254,38 @@ public:
     // Guest ids are handed out in order, so the highest one seen counts every
     // fork and thread since start: /proc/stat's processes, loadavg's last pid.
     void note_pid(std::int32_t id) { if (id > last_pid_) last_pid_ = id; }
+
+    // -- Fork to a fresh process (see fork_state.hpp) -----------------------
+    // A fork child on a backend that forks into a NEW linuxity process has
+    // an empty table: without this, its first syscall creates a record with
+    // the default (root) credentials, and `su nobody`'s child is root again.
+    // So the forking process's Creds travel, and seed whoever the child is.
+    // (The Landlock domain is not serialized: it holds shared rule sets the
+    // fresh process would have to rebuild. A restricted macOS guest's fork
+    // child starts unrestricted; Linux hosts enforce Landlock in the kernel.)
+    void export_creds(std::int32_t pid, fork_state::Writer& w) const {
+        const auto it = procs_.find(pid);
+        const Creds c = it == procs_.end() ? Creds{} : it->second.creds();
+        w.vec(c.groups);
+        w.pod(c.groups_set);
+        w.pod(c.uids); w.pod(c.gids);
+        w.pod(c.cap_eff); w.pod(c.cap_prm); w.pod(c.cap_inh); w.pod(c.cap_bnd); w.pod(c.cap_amb);
+        w.pod(c.keepcaps); w.pod(c.no_new_privs); w.pod(c.nice);
+    }
+    void import_creds(fork_state::Reader& r) {
+        Creds c;
+        c.groups = r.vec<std::uint32_t>();
+        c.groups_set = r.pod<bool>();
+        c.uids = r.pod<decltype(c.uids)>(); c.gids = r.pod<decltype(c.gids)>();
+        c.cap_eff = r.pod<std::uint64_t>(); c.cap_prm = r.pod<std::uint64_t>();
+        c.cap_inh = r.pod<std::uint64_t>(); c.cap_bnd = r.pod<std::uint64_t>();
+        c.cap_amb = r.pod<std::uint64_t>();
+        c.keepcaps = r.pod<bool>(); c.no_new_privs = r.pod<bool>(); c.nice = r.pod<std::int32_t>();
+        inherited_creds_ = std::move(c);
+    }
+    // The credentials a record created on first sight starts with: what
+    // the fork handed over, or the defaults.
+    [[nodiscard]] const std::optional<Creds>& inherited_creds() const noexcept { return inherited_creds_; }
     [[nodiscard]] std::int32_t last_pid() const { return last_pid_; }
 
     // The process group of `pid`, resolving the "0 means my own pid" default.
@@ -623,6 +666,7 @@ private:
     std::int32_t init_pid_{1};
     bool host_pids_{false};
     std::int32_t last_pid_{1};
+    std::optional<Creds> inherited_creds_;   // a fresh-process fork's (import_creds)
     Namespaces ns_;
     SysvIpc ipc_;
     std::map<std::uint64_t, PidNs> pidns_;

@@ -72,6 +72,22 @@ public:
     [[nodiscard]] ProcessTable& procs() noexcept { return procs_; }
     [[nodiscard]] const ProcessTable& procs() const noexcept { return procs_; }
 
+    // -- Fork into a fresh process ------------------------------------------
+    // Everything per-process a fork must carry when the child is a NEW
+    // linuxity (macOS): `pid`'s credentials and the file namespace's cwd and
+    // fd paths. One blob, one pair of calls; the parts each own their bytes.
+    [[nodiscard]] std::string export_fork(std::int32_t pid) const {
+        fork_state::Writer w;
+        procs_.export_creds(pid, w);
+        w.str(files_.export_process_state());
+        return w.take();
+    }
+    void import_fork(std::string_view blob) {
+        fork_state::Reader r{blob};
+        procs_.import_creds(r);
+        files_.import_process_state(r.str());
+    }
+
     // -- Process subsystem --------------------------------------------------
     [[nodiscard]] Pid self() const noexcept { return self_; }
 

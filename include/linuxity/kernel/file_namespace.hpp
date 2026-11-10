@@ -37,6 +37,7 @@
 #include "linuxity/host/win_posix.hpp"
 #include "linuxity/host/dirent_type.hpp"
 #include "linuxity/host/long_path.hpp"
+#include "linuxity/kernel/fork_state.hpp"
 
 #include <cstdint>
 #include <algorithm>
@@ -945,36 +946,18 @@ public:
     // complete list; a length-prefixed byte format keeps them trivially
     // forward-compatible.
     [[nodiscard]] std::string export_process_state() const {
-        std::string out;
-        auto put = [&out](std::string_view s) {
-            const auto n = static_cast<std::uint32_t>(s.size());
-            out.append(reinterpret_cast<const char*>(&n), 4);
-            out.append(s);
-        };
-        put(cwd());
+        fork_state::Writer w;
+        w.str(cwd());
         const auto& paths = fds().paths;
-        const auto count = static_cast<std::uint32_t>(paths.size());
-        out.append(reinterpret_cast<const char*>(&count), 4);
+        w.pod(static_cast<std::uint32_t>(paths.size()));
         for (const auto& [fd, path] : paths) {
-            out.append(reinterpret_cast<const char*>(&fd), sizeof fd);
-            put(path);
+            w.pod(fd);
+            w.str(path);
         }
-        return out;
+        return w.take();
     }
     void import_process_state(std::string_view in) {
-        std::size_t at = 0;
-        auto u32 = [&]() -> std::uint32_t {
-            std::uint32_t v = 0;
-            if (at + 4 <= in.size()) std::memcpy(&v, in.data() + at, 4);
-            at += 4;
-            return v;
-        };
-        auto str = [&]() {
-            const std::uint32_t n = u32();
-            std::string s{in.substr(std::min(at, in.size()), n)};
-            at += n;
-            return s;
-        };
+        fork_state::Reader r{in};
         // The fork child is a FRESH host process: its cwd table holds no
         // record for its own pid or its parent's, so its first syscall's
         // set_current_pid() takes the fallback, last_cwd_. (Storing via
@@ -984,7 +967,7 @@ public:
         // inherited_cwd_ to last_cwd_, a write to inherited_cwd_ alone
         // stopped reaching anything: every macOS child started at "/".)
         // So the parent's cwd IS the fallback; there is no second copy.
-        last_cwd_ = normalize(str());
+        last_cwd_ = normalize(r.str());
         if (last_cwd_.empty()) last_cwd_ = "/";
         cwds_.clear();
         seeded_pid_ = 0;          // no record survives the clear
@@ -992,11 +975,9 @@ public:
         // child's first set_current_pid() adopts them (see inherited_fds_).
         fd_tables_.clear();
         inherited_fds_ = FdTable{};
-        for (std::uint32_t i = 0, n = u32(); i < n && at < in.size(); ++i) {
-            int fd = 0;
-            std::memcpy(&fd, in.data() + at, sizeof fd);
-            at += sizeof fd;
-            inherited_fds_.paths[fd] = str();
+        for (std::uint32_t i = 0, n = r.pod<std::uint32_t>(); i < n && r.more(); ++i) {
+            const int fd = r.pod<int>();
+            inherited_fds_.paths[fd] = r.str();
         }
         have_inherited_fds_ = true;
     }

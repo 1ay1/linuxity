@@ -182,4 +182,29 @@ inline void on_exec(ProcInfo& p, std::uint32_t set_uid, std::uint32_t set_gid) {
     return capable(c, kCapDacOverride);
 }
 
+// execve(2) of `pid` took effect: the set-ID bits path_exec recorded become
+// its credentials, and its SysV attaches go. The ONE place, called by
+// whichever backend learns the exec happened -- an event from ptrace, the
+// in-process exec on HVF.
+inline void exec_happened(kernel::ProcessTable& procs, std::int32_t pid) {
+    auto* p = procs.find_mut(pid);
+    if (!p) return;
+    on_exec(*p, p->exec_setuid, p->exec_setgid);
+    p->exec_setuid = p->exec_setgid = kKeep;
+    procs.ipc().process_gone_maps(pid);
+}
+
+// A process starting as a login user (pid 1 of a run, or a session spawned
+// into an instance): all four ids that user's, its groups, and root's
+// capabilities only if it IS root -- what login(1)+setuid would leave.
+inline void login(ProcInfo& p, std::uint32_t uid, std::uint32_t gid,
+                  const std::vector<std::uint32_t>& groups) {
+    p.uids = {uid, uid, uid, uid};
+    p.gids = {gid, gid, gid, gid};
+    p.groups = groups.empty() ? std::vector<std::uint32_t>{gid} : groups;
+    p.groups_set = true;
+    if (uid != 0) p.cap_eff = p.cap_prm = p.cap_inh = p.cap_amb = 0;
+    p.creds_given = true;
+}
+
 }  // namespace lx::abi::creds

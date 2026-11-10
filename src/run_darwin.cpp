@@ -290,7 +290,7 @@ public:
         };
         {
             std::lock_guard l{machine_wrap_.k.mutex()};
-            img.namespace_state = machine_wrap_.k.files().export_process_state();
+            img.namespace_state = machine_wrap_.k.export_fork(img.parent);
         }
         // FAST PATH: a ZYGOTE -- a linuxity spawned ahead of time, already
         // through dyld, static init, Machine setup and the bootstrap lookup,
@@ -816,7 +816,7 @@ int cli::host_internal(const Options& o, int argc, char** argv, int i) {
             return 127;
         }
         cmark("vm-up");
-        m.k.files().import_process_state(img.namespace_state);
+        m.k.import_fork(img.namespace_state);
         runtime::g_pending.reset_for_fork_child();
         runtime::PidSpace pids{ca.pid_fd};
         // The initial thread of the forked process.
@@ -924,7 +924,7 @@ int cli::host_internal(const Options& o, int argc, char** argv, int i) {
             return 127;
         }
         zmark("vm");
-        m.k.files().import_process_state(img.namespace_state);
+        m.k.import_fork(img.namespace_state);
         runtime::g_pending.reset_for_fork_child();
         runtime::PidSpace pids{pid_fd};
         zmark("vcpu");
@@ -986,17 +986,6 @@ int cli::host_run(Options& o, int, char**) {
     // (src/guest_env.hpp) -- the guest's /etc/passwd, --user, -e, its PATH
     // and a locale its libc can load -- not the Mac user's HOME and USER.
     auto ge = cli::guest_env(o);
-    if (ge.error.empty() && ge.login.uid != 0) {
-        // This backend answers identity from abi/identity.hpp: the guest is
-        // root and set*id only accepts 0. Running a 'nobody' environment on
-        // root syscalls would be a guest that disagrees with itself (HOME=/
-        // but id -u = 0), so keep it coherent and say why.
-        std::fprintf(stderr, "linuxity: --user %s: the macOS backend runs guests as root for now\n",
-                     o.user.c_str());
-        Options as_root = o;
-        as_root.user = "root";
-        ge = cli::guest_env(as_root);
-    }
     if (!ge.error.empty()) {
         std::fprintf(stderr, "linuxity: %s\n", ge.error.c_str());
         return 2;
@@ -1021,6 +1010,8 @@ int cli::host_run(Options& o, int, char**) {
             init.cmdline += o.argv[j];
             if (j + 1 < o.argv.size()) init.cmdline.push_back('\0');   // ProcInfo: NUL-joined
         }
+        // pid 1 runs as the login user (the same rule as every host)
+        abi::creds::login(init, ge.login.uid, ge.login.gid, ge.login.groups);
         m.k.procs().upsert(init);
     }
     // --cwd / login.cwd: where pid 1 starts (a missing one falls back to /)

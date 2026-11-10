@@ -182,11 +182,58 @@ public:
         machine_.set_guest_answer(172, static_cast<std::uint64_t>(tgid_));          // getpid
         if (!threaded_) machine_.set_guest_answer(178, static_cast<std::uint64_t>(task_.tid));  // gettid
         machine_.set_guest_answer(173, static_cast<std::uint64_t>(parent_));         // getppid
-        machine_.set_guest_answer(174, 0);                                          // getuid
-        machine_.set_guest_answer(175, 0);                                          // geteuid
-        machine_.set_guest_answer(176, 0);                                          // getgid
-        machine_.set_guest_answer(177, 0);                                          // getegid
         machine_.set_guest_answer(124, 0);                                          // sched_yield
+        publish_ids();
+    }
+    // getuid & co: the dispatcher's per-process credentials (abi/creds.hpp),
+    // as last learned by ig_after_dispatch. Until then they are NOT
+    // published -- the guest's getuid traps and the dispatcher answers --
+    // because a default (0) here would be a wrong answer, not a slow one.
+    void publish_ids() {
+        const auto ids = proc_.ids();
+        if (!ids) {
+            for (int nr : {174, 175, 176, 177}) machine_.clear_guest_answer(nr);
+            return;
+        }
+        machine_.set_guest_answer(174, ids->uid);    // getuid
+        machine_.set_guest_answer(175, ids->euid);   // geteuid
+        machine_.set_guest_answer(176, ids->gid);    // getgid
+        machine_.set_guest_answer(177, ids->egid);   // getegid
+    }
+
+    // After every dispatch (runtime::AnswersInGuest): a call that may have
+    // changed the caller's credentials republishes them, so a getuid the
+    // guest answers in-VM agrees with what the dispatcher would say.
+    template <class K, class S>
+    void ig_after_dispatch(const abi::Regs& r, K&, S& sys) {
+        if (!S::changes_creds(abi::decode(abi::Arch::aarch64, r.nr)) && proc_.ids()) return;
+        if (!proc_events_.empty()) return;   // an exec not yet applied: wait for it
+        const auto c = sys.caller_ids();
+        if (proc_.note_ids({c.uid, c.euid, c.gid, c.egid})) publish_ids();
+    }
+
+    // -- Process events (runtime::ReportsProcEvents) ------------------------
+    // The exec this backend performs in-process, reported so the shared
+    // loop applies execve's kernel-side transform (abi/creds.hpp
+    // exec_happened): set-ID credentials, SysV detach. Forks and exits
+    // need no event here -- each is its own linuxity with its own table.
+    struct ProcEvent {
+        enum Kind { spawn, exec, reap, thread, stop, cont, reparent } kind;
+        std::int32_t pid;
+        std::int32_t ppid;
+        std::string comm;
+        std::string cmdline;
+    };
+    [[nodiscard]] std::vector<ProcEvent> drain_proc_events() {
+        // An exec queued here changes credentials only once the loop has
+        // applied it -- after this returns -- so the published ids are
+        // stale until then: withdraw them, and the image's first getuid
+        // traps and relearns them from the dispatcher.
+        if (!proc_events_.empty()) {
+            proc_.forget_ids();
+            publish_ids();
+        }
+        return std::exchange(proc_events_, {});
     }
 
     // A thread adopts its creator's process identity (tgid) and its own tid.
@@ -1547,13 +1594,11 @@ private:
                                       static_cast<std::int32_t>(tg ? a2 : a1));
             }
 
-            // Identity and credentials come from abi/identity.hpp, shared
-            // with the portable dispatcher -- these are pure policy over
-            // state we already own, and three separate copies was three
-            // chances to disagree (Windows hardcoded pid 1 for everything).
+            // Identity: pid/tid/ppid are this backend's own task facts (the
+            // shared answers in abi/identity.hpp). The CREDENTIAL calls are
+            // not here: the portable dispatcher owns them (abi/creds.hpp),
+            // and ig_after_dispatch republishes them for the in-guest table.
             case S::getpid: case S::gettid: case S::getppid:
-            case S::getuid: case S::geteuid:
-            case S::getgid: case S::getegid:
                 if (auto a = abi::identity_answer(sc, task_identity()))
                     return *a;
                 return -38;                                  // ENOSYS
@@ -1752,7 +1797,7 @@ public:
         SignalDispositions::Table sig_actions{};
         std::uint64_t sig_mask{};
         LinuxStack altstack{};
-        std::string namespace_state;    // FileNamespace::export_process_state
+        std::string namespace_state;    // Kernel::export_fork: creds, cwd, fd paths
     };
     using SpawnFork = std::function<pid_t(ForkImage&)>;
     void set_fork_spawner(SpawnFork f) { spawn_ = std::move(f); }
@@ -2038,6 +2083,9 @@ private:
         refresh_guest_answers();          // same pid, but a fresh image
         pids_.set_exe(task_.tid, exe_path_of(host_path, guest_path));
         pids_.mark_execed(task_.tid);           // releases a vfork parent
+        // The kernel side of execve (set-ID credentials, SysV detach) is the
+        // shared loop's: report the exec like any backend would.
+        proc_events_.push_back({ProcEvent::exec, tgid_, parent_, {}, {}});
         return 0;
     }
 
@@ -2893,21 +2941,8 @@ private:
                 return 0;
             }
 
-            // -- Credentials. linuxity's world is uid 0 and has exactly one
-            //    identity, so a request to BECOME root (or stay root) is
-            //    satisfied; a request to become someone else cannot be, and
-            //    EPERM is what a real kernel tells an unprivileged caller.
-            //    Refusing with ENOSYS instead makes libc think the kernel is
-            //    broken rather than the operation disallowed.
-            case S::setuid: case S::setgid: case S::setfsuid: case S::setfsgid:
-                return a0 == 0 || a0 == static_cast<std::uint64_t>(-1) ? 0 : -1;
-            case S::setreuid: case S::setregid:
-                return (a0 == 0 || a0 == ~0ull) && (a1 == 0 || a1 == ~0ull) ? 0 : -1;
-            case S::setresuid: case S::setresgid:
-                return (a0 == 0 || a0 == ~0ull) && (a1 == 0 || a1 == ~0ull) &&
-                       (a2 == 0 || a2 == ~0ull) ? 0 : -1;
-            case S::setgroups:
-                return 0;                        // only the empty/root set exists
+            // (Credentials -- set*id, setgroups -- are the portable
+            //  dispatcher's: abi/creds.hpp's rules over per-process state.)
 
             // -- Time of day. gettimeofday is the single most-called syscall
             //    in a shell session (every prompt, every `date`, every log
@@ -4476,6 +4511,7 @@ private:
     bool threaded_{false};        // a clone(CLONE_THREAD) has happened
     struct Child { std::int32_t guest; pid_t host; };
     std::vector<Child> children_;
+    std::vector<ProcEvent> proc_events_;
     Resolver resolve_;
     Resolver unresolve_;
     std::string fd_path_storage_;

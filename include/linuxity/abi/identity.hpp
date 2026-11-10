@@ -15,11 +15,13 @@
 // every process there reports pid 1, so a guest cannot tell its children
 // apart and `$!`, `wait`, job control and pgrep are all broken by design.
 //
-// The credential calls are the same shape. linuxity presents a root-owned
-// world (uid 0 is the whole point of the fake-root model), so getuid and
-// friends must answer 0 everywhere. A backend that forwarded them raw would
-// report the real host uid -- 1000, say -- which has no /etc/passwd entry in
-// the guest, and bash greets you with "I have no name!".
+// The credential calls are NOT answered here any more. They have one
+// authority: the portable dispatcher's per-process credentials, moved only by
+// the kernel's rules (abi/creds.hpp) -- so `su nobody` really is nobody, a
+// setuid sudo really raises euid, and a backend that answers getuid in-guest
+// (darwin) republishes the dispatcher's value (Syscalls::caller_ids) rather
+// than a constant. The one exception is a backend with no process model to
+// hold credentials (windows): it asks root_credentials_answer() below.
 #pragma once
 
 #include <cstdint>
@@ -38,7 +40,8 @@ struct TaskIdentity {
     std::int32_t ppid{0};
 };
 
-// Answer an identity or credential syscall, or nullopt if `sc` isn't one.
+// Answer an identity syscall (getpid/gettid/getppid), or nullopt if `sc`
+// isn't one.
 //
 // Returns the raw value for the guest's return register, which is what every
 // dispatcher wants: the portable one wraps it in Virtualize, the kernel-less
@@ -46,26 +49,21 @@ struct TaskIdentity {
 [[nodiscard]] constexpr std::optional<std::int64_t>
 identity_answer(Sysno sc, const TaskIdentity& id) noexcept {
     switch (sc) {
-        // -- who am I ------------------------------------------------------
         case Sysno::getpid:  return id.pid;
         case Sysno::gettid:  return id.tid;
         case Sysno::getppid: return id.ppid;
+        default: return std::nullopt;
+    }
+}
 
-        // -- credentials: a root-owned world -------------------------------
-        // Not "pretend to be root" as a convenience -- the overlay's whole
-        // model is that the guest owns its tree, and a package manager
-        // verifies ownership after every install.
-        case Sysno::getuid:  case Sysno::geteuid:
-        case Sysno::getgid:  case Sysno::getegid:
+// get[e]uid/get[e]gid for a backend with NO process model to hold
+// credentials (windows): the guest owns its tree as root. Anything that can
+// keep per-process credentials uses the dispatcher's instead (see top).
+[[nodiscard]] constexpr std::optional<std::int64_t> root_credentials_answer(Sysno sc) noexcept {
+    switch (sc) {
+        case Sysno::getuid: case Sysno::geteuid:
+        case Sysno::getgid: case Sysno::getegid:
             return 0;
-
-        // NOTE setuid/setgid are deliberately NOT here. The portable
-        // dispatcher answers them as part of a WIDER credential group
-        // (setreuid/setresuid/setgroups/setfsuid...), all of which accept and
-        // ignore, and duplicating two of that set here would be the same
-        // mistake this file exists to remove. A kernel-less backend wanting
-        // them should answer the whole group, not a subset.
-
         default: return std::nullopt;
     }
 }
@@ -89,9 +87,11 @@ identity_answer(Sysno sc, const TaskIdentity& id) noexcept {
 static_assert(identity_answer(Sysno::getpid, {7, 7, 1}) == 7);
 static_assert(identity_answer(Sysno::gettid, {7, 9, 1}) == 9);
 static_assert(identity_answer(Sysno::getppid, {7, 7, 1}) == 1);
-static_assert(identity_answer(Sysno::getuid, {7, 7, 1}) == 0);
-static_assert(identity_answer(Sysno::geteuid, {7, 7, 1}) == 0);
-// set*id belong to the dispatcher's wider credential group, not here.
+// credentials are not identity: the dispatcher (or, with no process model,
+// root_credentials_answer) answers them
+static_assert(!identity_answer(Sysno::getuid, {7, 7, 1}).has_value());
+static_assert(root_credentials_answer(Sysno::geteuid) == 0);
+static_assert(!root_credentials_answer(Sysno::getpid).has_value());
 static_assert(!identity_answer(Sysno::setuid, {7, 7, 1}).has_value());
 // A non-identity syscall must fall through, not be swallowed.
 static_assert(!identity_answer(Sysno::read, {7, 7, 1}).has_value());

@@ -145,7 +145,7 @@ public:
             // our subsystems, forward it to the host kernel, or exit.
             abi::Outcome o = locked([&] { return sys.dispatch(f.regs); });
             // publish what the call changed to the in-guest handler
-            if constexpr (requires { trap_.ig_after_dispatch(f.regs, kernel_, sys); })
+            if constexpr (runtime::AnswersInGuest<T, K, decltype(sys)>)
                 locked([&] { trap_.ig_after_dispatch(f.regs, kernel_, sys); });
             // the host already refused this call, so it can't be forwarded or
             // redirected; anything but a virtualized answer is ENOSYS
@@ -775,19 +775,7 @@ private:
                             pi.cmdline = pp->cmdline;
                             pi.vsize_bytes = pp->vsize_bytes;
                             pi.rss_pages = pp->rss_pages;
-                            pi.groups = pp->groups;
-                            pi.groups_set = pp->groups_set;
-                            pi.uids = pp->uids;
-                            pi.gids = pp->gids;
-                            pi.cap_eff = pp->cap_eff;
-                            pi.cap_prm = pp->cap_prm;
-                            pi.cap_inh = pp->cap_inh;
-                            pi.cap_bnd = pp->cap_bnd;
-                            pi.cap_amb = pp->cap_amb;
-                            pi.keepcaps = pp->keepcaps;
-                            pi.no_new_privs = pp->no_new_privs;
-                            pi.landlock = pp->landlock;
-                            pi.nice = pp->nice;
+                            pi.creds() = pp->creds();       // fork: one value, every field
                             pi.creds_given = true;
                             kernel_.procs().inherit_ns(pi, *pp, kernel_.procs().take_clone_ns(pi.ppid) | ns_flags_of(e));
                         }
@@ -845,14 +833,11 @@ private:
                                                                : e.cmdline;
                             }
                             np.state = 'R';
-                            // execve's credential transform, with the set-ID
-                            // bits of the file path_exec resolved
-                            abi::creds::on_exec(np, np.exec_setuid, np.exec_setgid);
-                            np.exec_setuid = np.exec_setgid = abi::creds::kKeep;
-                            np.creds_given = true;
+                            np.creds_given = false;      // exec keeps them (upsert)
                             kernel_.procs().upsert(np);
-                            // exec unmaps every SysV segment it had attached
-                            kernel_.procs().ipc().process_gone_maps(np.pid);
+                            // execve's credential transform (set-ID bits
+                            // path_exec resolved) and SysV detach, shared
+                            abi::creds::exec_happened(kernel_.procs(), np.pid);
                         }
                         break;
                     case EV::thread:

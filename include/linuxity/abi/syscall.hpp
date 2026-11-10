@@ -147,6 +147,27 @@ public:
     [[nodiscard]] const std::string& pending_open_path() const noexcept { return pending_open_; }
     // The current caller bypasses file permission checks (CAP_DAC_OVERRIDE).
     [[nodiscard]] bool caller_privileged() { return privileged(); }
+    // What getuid/geteuid/getgid/getegid answer for the current caller. A
+    // backend that answers those IN-GUEST (a published constant, no trap)
+    // publishes exactly these, so the answer has one source: the per-process
+    // credentials abi/creds.hpp maintains.
+    struct CallerIds { std::uint32_t uid, euid, gid, egid; };
+    [[nodiscard]] CallerIds caller_ids() {
+        const auto& p = me();
+        return {ns_id(p.uids[0], false), ns_id(p.uids[1], false),
+                ns_id(p.gids[0], true), ns_id(p.gids[1], true)};
+    }
+    // Did `sc` (just dispatched) possibly change the caller's credentials?
+    [[nodiscard]] static constexpr bool changes_creds(Sysno sc) noexcept {
+        switch (sc) {
+            case Sysno::setuid: case Sysno::setgid: case Sysno::setreuid: case Sysno::setregid:
+            case Sysno::setresuid: case Sysno::setresgid: case Sysno::setfsuid: case Sysno::setfsgid:
+            case Sysno::setgroups: case Sysno::capset: case Sysno::prctl:
+            case Sysno::unshare: case Sysno::setns: case Sysno::execve: case Sysno::execveat:
+                return true;
+            default: return false;
+        }
+    }
 
     [[nodiscard]] Outcome dispatch(const Regs& r) {
         const Sysno sc = decode(arch_, r.nr);
@@ -162,10 +183,11 @@ public:
             k_.files().set_current_pid(id.pid, id.ppid);
             k_.procs().set_reader(id.pid);
             k_.files().set_current_mnt_ns(k_.procs().ns_of(id.pid)[kernel::NsKind::mnt]);
-            // A task can trap before its spawn event is folded in; build its
-            // fork-time record now so no handler sees a half-made one.
-            if constexpr (requires { mem_.host_tid(); })
-                if (!k_.procs().find_mut(id.pid)) (void)me();
+            // A task can trap before its spawn event is folded in (or, on a
+            // fresh-process fork, have no parent record at all); build its
+            // fork-time record now -- inherited credentials included -- so
+            // no handler (setpgid, a comm write) creates a default, root one.
+            if (!k_.procs().find_mut(id.pid)) (void)me();
         }
         // a process under a landlock domain linuxity keeps (no host Landlock)
         if (ll_layers_ > 0)
@@ -242,11 +264,12 @@ public:
                 return fwd();
             }
             // The guest's own credentials, tracked per process (abi/creds.hpp),
-            // as its user namespace names them.
-            case Sysno::getuid:  return val(ns_id(me().uids[0], false));
-            case Sysno::geteuid: return val(ns_id(me().uids[1], false));
-            case Sysno::getgid:  return val(ns_id(me().gids[0], true));
-            case Sysno::getegid: return val(ns_id(me().gids[1], true));
+            // as its user namespace names them -- caller_ids, the same answer
+            // a backend publishes for in-guest getuid.
+            case Sysno::getuid:  return val(caller_ids().uid);
+            case Sysno::geteuid: return val(caller_ids().euid);
+            case Sysno::getgid:  return val(caller_ids().gid);
+            case Sysno::getegid: return val(caller_ids().egid);
 
             // -- getresuid(ruid*,euid*,suid*) / getresgid(rgid*,egid*,sgid*):
             //    bash and sudo read these at startup to populate $UID/$EUID.
@@ -5598,21 +5621,13 @@ private:
         if (const auto* pp = id.ppid > 0 ? k_.procs().find(id.ppid) : nullptr) {
             pi.comm = pp->comm;
             pi.cmdline = pp->cmdline;
-            pi.groups = pp->groups;
-            pi.groups_set = pp->groups_set;
-            pi.uids = pp->uids;
-            pi.gids = pp->gids;
-            pi.cap_eff = pp->cap_eff;
-            pi.cap_prm = pp->cap_prm;
-            pi.cap_inh = pp->cap_inh;
-            pi.cap_bnd = pp->cap_bnd;
-            pi.cap_amb = pp->cap_amb;
-            pi.keepcaps = pp->keepcaps;
-            pi.no_new_privs = pp->no_new_privs;
-            pi.landlock = pp->landlock;
-            pi.nice = pp->nice;
+            pi.creds() = pp->creds();       // fork: one value, every field
             k_.procs().inherit_ns(pi, *pp, 0);
         }
+        // A fork child in a FRESH process: its parent's real record lives in
+        // the parent's linuxity -- the one here is only this process's seed
+        // (pid 1, default root) -- so the creds the fork handed over win.
+        if (const auto& ic = k_.procs().inherited_creds()) pi.creds() = *ic;
         pi.creds_given = true;
         pi.live_seen = true;
         k_.procs().upsert(pi);

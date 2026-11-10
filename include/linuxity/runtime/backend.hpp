@@ -48,6 +48,8 @@
 #include "linuxity/abi/result.hpp"
 #include "linuxity/abi/types.hpp"
 
+namespace lx::abi { struct Regs; }   // abi/syscall.hpp; only named here
+
 namespace lx::runtime {
 
 struct TrapFrame;   // defined in trap.hpp
@@ -166,6 +168,16 @@ concept ReportsProcEvents = SyscallTrap<T> && requires(T t) {
     requires requires(decltype(*std::begin(t.drain_proc_events())) e) {
         e.kind; e.pid; e.ppid;
     };
+};
+
+// Answer some syscalls INSIDE the guest without a trap (a published table
+// or patched code). Such a backend is told after every dispatch, with the
+// dispatcher, so it can republish what the call may have changed -- the
+// guest's uid after a setuid, an fd map after a dup2. Spelled once, so the
+// loop's call cannot drift from the backends' signature.
+template <class T, class K, class S>
+concept AnswersInGuest = requires(T t, const abi::Regs& r, K& k, S& s) {
+    { t.ig_after_dispatch(r, k, s) };
 };
 
 // -- the honest summary ----------------------------------------------------

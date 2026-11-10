@@ -498,8 +498,9 @@ Things that are different on a Mac:
 - An environment runs while a `shell`, `exec` or `run` is open; there's no
   background instance, so `start`, `ps`, `svc` and `logs` don't apply and
   `list` shows it as `ready`. Files and settings persist exactly the same.
-- Guests run as root for now; `--user` and `login.user` fall back to root
-  with a notice.
+- Users, `su` and `sudo` work as on Linux: `--user`, `login.user` and
+  `linuxity adduser` give a real unprivileged user, and a setuid `sudo`
+  raises it to root.
 - The binary must carry the `com.apple.security.hypervisor` entitlement
   (the build signs it ad hoc); without it linuxity says how to sign it.
 

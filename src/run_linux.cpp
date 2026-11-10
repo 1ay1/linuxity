@@ -347,12 +347,7 @@ int lx::cli::host_run(lx::cli::Options& o, int argc, char** argv) {
                 if (j + 1 < prog_argv.size()) init.cmdline.push_back('\0');   // ProcInfo: NUL-joined
             }
             // pid 1 runs as the login user, with root's powers only if it is root
-            init.uids = {login.uid, login.uid, login.uid, login.uid};
-            init.gids = {login.gid, login.gid, login.gid, login.gid};
-            init.groups = login.groups.empty() ? std::vector<std::uint32_t>{login.gid} : login.groups;
-            init.groups_set = login.uid != 0;
-            if (login.uid != 0) init.cap_eff = init.cap_prm = init.cap_inh = init.cap_amb = 0;
-            init.creds_given = true;
+            abi::creds::login(init, login.uid, login.gid, login.groups);
         }
         k.procs().upsert(init);
         // login.cwd / --cwd: where pid 1 starts. Without a rootfs the guest

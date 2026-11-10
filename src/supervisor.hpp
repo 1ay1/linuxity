@@ -436,12 +436,7 @@ private:
             pi.cmdline += argv[i];
         }
         pi.exe = guest;
-        pi.uids = {u->uid, u->uid, u->uid, u->uid};
-        pi.gids = {u->gid, u->gid, u->gid, u->gid};
-        pi.groups = u->groups;
-        pi.groups_set = true;
-        if (u->uid != 0) pi.cap_eff = pi.cap_prm = pi.cap_inh = pi.cap_amb = 0;
-        pi.creds_given = true;
+        abi::creds::login(pi, u->uid, u->gid, u->groups);
         if (const auto* init = k_.procs().find(pi.ppid)) k_.procs().inherit_ns(pi, *init, 0);
         k_.procs().upsert(pi);
         k_.procs().assign_ns_pid(gpid);

@@ -449,6 +449,9 @@ public:
             // identity source changes, not the answers.
             case SYS_getuid: case SYS_geteuid:
             case SYS_getgid: case SYS_getegid:
+                if (auto a = abi::root_credentials_answer(abi::decode(abi::Arch::x86_64, nr)))
+                    return ret(*a);
+                return ret(-win32::LNOSYS);
             case SYS_getpid: case SYS_getppid: case SYS_gettid:
                 if (auto a = abi::identity_answer(
                         abi::decode(abi::Arch::x86_64, nr),

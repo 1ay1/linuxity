@@ -37,6 +37,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 namespace lx::runtime {
@@ -197,17 +198,42 @@ public:
         return fn(shared_maps_);
     }
 
+    // What getuid/geteuid/getgid/getegid answer in-guest for THIS process.
+    // Credentials are per process, as is the in-guest table they go in, so
+    // the record of what was published is too: a new thread must not reset
+    // it. nullopt = not learned yet (nothing published; the guest traps).
+    struct Ids {
+        std::uint32_t uid{0}, euid{0}, gid{0}, egid{0};
+        bool operator==(const Ids&) const = default;
+    };
+    // Record `now`; true if it differs from what was published.
+    [[nodiscard]] bool note_ids(const Ids& now) {
+        std::lock_guard g{mu_};
+        if (ids_ && *ids_ == now) return false;
+        ids_ = now;
+        return true;
+    }
+    [[nodiscard]] std::optional<Ids> ids() const {
+        std::lock_guard g{mu_};
+        return ids_;
+    }
+    void forget_ids() {
+        std::lock_guard g{mu_};
+        ids_.reset();
+    }
+
     // (No tid allocator here on purpose: tids share ONE namespace with pids
     // across the whole guest tree, so they come from the shared PidSpace.
     // A per-process counter collides with other processes' pids.)
 
 private:
-    std::mutex mu_;
+    mutable std::mutex mu_;
     FdTable fds_;
     AddressSpace space_;
     SignalDispositions signals_;
     std::vector<Thread> threads_;
     std::vector<SharedMap> shared_maps_;
+    std::optional<Ids> ids_;
     std::atomic<bool> group_exiting_{false};
     int group_status_{0};
 };
