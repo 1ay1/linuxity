@@ -1,27 +1,27 @@
-// In-guest fast path entry, aarch64. Position independent.
+// In-guest handler entry, aarch64. Position independent.
     .section .lx_header, "a"
-    .globl lx_fp_header
+    .globl lx_ig_header
     .balign 8
-lx_fp_header:
+lx_ig_header:
     .quad 0x4c5846505441424c
     .word 1
-    .word lx_fp_common - lx_fp_header
-    .word lx_fp_guard_start - lx_fp_header
-    .word lx_fp_guard_end - lx_fp_header
-    .word lx_fp_fault_ret - lx_fp_header
+    .word lx_ig_common - lx_ig_header
+    .word lx_ig_guard_start - lx_ig_header
+    .word lx_ig_guard_end - lx_ig_header
+    .word lx_ig_fault_ret - lx_ig_header
     .word 0
 
     .text
     .balign 4
-    .globl lx_fp_base
-lx_fp_base:
-    adr x0, lx_fp_header
+    .globl lx_ig_base
+lx_ig_base:
+    adr x0, lx_ig_header
     ret
 
-// long lx_fp_gate(long nr, long a0, long a1, long a2, long a3, const uint64_t key[2])
-    .globl lx_fp_gate
-    .type lx_fp_gate, %function
-lx_fp_gate:
+// long lx_ig_gate(long nr, long a0, long a1, long a2, long a3, const uint64_t key[2])
+    .globl lx_ig_gate
+    .type lx_ig_gate, %function
+lx_ig_gate:
     mov x8, x0
     mov x0, x1
     mov x1, x2
@@ -31,9 +31,9 @@ lx_fp_gate:
     svc #0
     ret
 
-// long lx_fp_on_stack(long (*fn)(void*), void* arg, void* top)
-    .globl lx_fp_on_stack
-lx_fp_on_stack:
+// long lx_ig_on_stack(long (*fn)(void*), void* arg, void* top)
+    .globl lx_ig_on_stack
+lx_ig_on_stack:
     stp x29, x30, [sp, #-16]!
     mov x29, sp
     mov sp, x2
@@ -47,9 +47,9 @@ lx_fp_on_stack:
 // Called by `blr x16` from a stub that saved x16 and x30; x8 = nr. Keeps
 // every register a syscall keeps. Returns x0 = result and x16 = 1, or
 // x16 = 0 (x0 untouched) to make the stub run the real syscall.
-    .globl lx_fp_common
-    .type lx_fp_common, %function
-lx_fp_common:
+    .globl lx_ig_common
+    .type lx_ig_common, %function
+lx_ig_common:
     sub sp, sp, #176
     stp x0, x1, [sp, #0]
     stp x2, x3, [sp, #16]
@@ -64,7 +64,7 @@ lx_fp_common:
     stp x9, x30, [sp, #144]
     mov x0, sp
     mov x1, x8
-    bl lx_fp_handle
+    bl lx_ig_handle
     mov x16, #0
     mov x9, #0x8000000000000000
     cmp x0, x9
@@ -86,9 +86,9 @@ lx_fp_common:
     ret
 
 // Guest memory is touched only in here (see the x86-64 file).
-lx_fp_guard_start:
-    .globl lx_fp_copy
-lx_fp_copy:
+lx_ig_guard_start:
+    .globl lx_ig_copy
+lx_ig_copy:
     cbz x2, 2f
 1:  ldrb w3, [x1], #1
     strb w3, [x0], #1
@@ -96,8 +96,8 @@ lx_fp_copy:
     b.ne 1b
 2:  mov x0, #0
     ret
-    .globl lx_fp_strcpy
-lx_fp_strcpy:
+    .globl lx_ig_strcpy
+lx_ig_strcpy:
     mov x3, #0
 1:  cmp x3, x2
     b.hs 2f
@@ -108,8 +108,8 @@ lx_fp_strcpy:
     b 1b
 2:  mov x0, x3
     ret
-lx_fp_guard_end:
-lx_fp_fault_ret:
+lx_ig_guard_end:
+lx_ig_fault_ret:
     mov x0, #-14
     ret
 

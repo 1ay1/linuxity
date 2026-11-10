@@ -96,7 +96,6 @@ struct EnvConfig {
     bool private_tmp{true};
 
     // compat
-    bool seccomp{true};
     bool emulate_fifos{false};
     bool emulate_sysv{false};
     bool emulate_nl80211{false};
@@ -195,8 +194,6 @@ inline constexpr Field kFields[] = {
     {"storage.private-tmp", Type::boolean, "true", "Give the guest its own /tmp.", "", false,
         [](EnvConfig& c, const Val& v) { c.private_tmp = v.b; }},
 
-    {"compat.seccomp", Type::boolean, "true", "Use the seccomp fast path. Off is slower and only useful for debugging.", "", false,
-        [](EnvConfig& c, const Val& v) { c.seccomp = v.b; }},
     {"compat.fifos", Type::choice, "auto", "Named FIFOs: real where the host allows them, or always emulated.", "auto|emulate", false,
         [](EnvConfig& c, const Val& v) { c.emulate_fifos = v.s == "emulate"; }},
     {"compat.sysv-ipc", Type::choice, "auto", "SysV IPC: the host's where it has one, or always emulated.", "auto|emulate", false,
@@ -641,7 +638,6 @@ inline void check_runnable(const EnvConfig& c, std::vector<Diag>& diags) {
     j.kv("cpuset", c.limits.cpuset.value_or("")).end()
         .key("storage").obj().kv("persist", c.persist).kv("private-tmp", c.private_tmp).end()
         .key("compat").obj()
-            .kv("seccomp", c.seccomp)
             .kv("fifos", c.emulate_fifos ? "emulate" : "auto")
             .kv("sysv-ipc", c.emulate_sysv ? "emulate" : "auto")
             .kv("nl80211", c.emulate_nl80211 ? "emulate" : "auto")

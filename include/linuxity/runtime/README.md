@@ -12,7 +12,7 @@ doesn't know or care.
 | `trap.hpp` | the native-execution run loop, written ONCE against that contract | every host |
 | `resource_governor.hpp` | cgroup-style limits | every host |
 | `shared/` | host-agnostic logic two backends need | every host |
-| `linux/` | ptrace + seccomp (`PTRACE_SYSCALL`, SIGSYS fast path) | Linux |
+| `linux/` | ptrace + seccomp (`PTRACE_SYSCALL`, seccomp filter) | Linux |
 | `darwin/` | Hypervisor.framework | macOS/arm64 |
 | `windows/` | Windows Hypervisor Platform | Windows/x86-64 |
 

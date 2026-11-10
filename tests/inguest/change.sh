@@ -1,5 +1,5 @@
 #!/bin/bash
-# fpchange.sh LINUXITY ROOT: the fast path must notice changes made while a
+# change.sh LINUXITY ROOT: the in-guest handler must notice changes made while a
 # process is running: chmod, chown, rm of a lower file, rename, a new link,
 # chdir. One long-lived guest probes, changes, probes again.
 set -u
@@ -77,8 +77,8 @@ int main(void) {
     }
     // fds: an fd number reused for another file, a dup2 over a warm fd, a
     // chmod seen through fstat. (A dirfd whose dir was renamed away resolves
-    // by its old name in the dispatcher too; fpdiff-style agreement is
-    // what the fast path owes there, and the blob checks the parent's
+    // by its old name in the dispatcher too; diff-style agreement is
+    // what the in-guest handler owes there, and the blob checks the parent's
     // inode so it never answers from the wrong dir by itself.)
     {
         system("mkdir -p /tmp/c/fa; echo 1 > /tmp/c/fa/one; echo 22 > /tmp/c/fa/two");
@@ -102,19 +102,19 @@ int main(void) {
         if (s.st_size != 2) { fails++; printf("FAIL fstatat dirfd size %ld\n", (long)s.st_size); }
         close(a); close(b); close(d);
     }
-    printf(fails ? "fpchange: %d failures\n" : "fpchange: all good\n", fails);
+    printf(fails ? "change: %d failures\n" : "change: all good\n", fails);
     return fails != 0;
 }
 EOF
 cc -O1 -o "$d/t" "$d/t.c" -include sys/wait.h || exit 2
 u=$(mktemp -d)
 rc=0
-for fp in 1 0; do
-    LINUXITY_FASTPATH=$fp LINUXITY_PROFILE=1 "$L" --quiet --root "$R" --persist "$u" --bind "$d:/fpc" /fpc/t 2>"$d/err" || rc=1
-    grep 'fast path' "$d/err"
+for trap in "" 1; do
+    LINUXITY_TEST_ALL_TRAP=$trap LINUXITY_PROFILE=1 "$L" --quiet --root "$R" --persist "$u" --bind "$d:/fpc" /fpc/t 2>"$d/err" || rc=1
+    grep 'linuxity in-guest' "$d/err"
     rm -rf "$u"; mkdir -p "$u"
 done
 LINUXITY_FORCE_LINK_EMULATION=1 LINUXITY_PROFILE=1 "$L" --quiet --root "$R" --persist "$u" --bind "$d:/fpc" /fpc/t 2>"$d/err" || rc=1
-grep 'fast path' "$d/err"
+grep 'linuxity in-guest' "$d/err"
 rm -rf "$d" "$u"
 exit $rc

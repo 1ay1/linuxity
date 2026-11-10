@@ -1,6 +1,6 @@
 // Prints what stat/lstat/statx/readlink/xattr return for a list of paths,
-// each call made from the SAME site many times so the fast path kicks in.
-// Run it with the fast path on and off and diff the output.
+// each call made from the SAME site many times so the in-guest handler kicks in.
+// Run it with the in-guest handler on and off and diff the output.
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>

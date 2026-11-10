@@ -1,6 +1,6 @@
-// linuxity/runtime/darwin/fastcall.hpp
+// linuxity/runtime/darwin/inguest.hpp
 //
-// The in-guest syscall fast path: answer the pure ones WITHOUT a VM exit.
+// the in-guest handler: answer the pure ones WITHOUT a VM exit.
 //
 // Every guest `svc` is a VM exit, and an exit costs ~900 ns on an M-series
 // (measured: hv_vcpu_run round trip 894 ns, register shuffling 169 ns) --
@@ -26,7 +26,7 @@
 #include <cstdint>
 #include <cstring>
 
-namespace lx::runtime::fastcall {
+namespace lx::runtime::inguest {
 
 // One entry per syscall number, in the private page.
 //   value  -- what x0 becomes
@@ -91,6 +91,6 @@ inline constexpr std::size_t kTableBytes = kMaxNr * sizeof(Entry);
     return sizeof c / sizeof c[0];
 }
 
-}  // namespace lx::runtime::fastcall
+}  // namespace lx::runtime::inguest
 
 #endif  // __APPLE__ && __aarch64__

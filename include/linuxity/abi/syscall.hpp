@@ -130,7 +130,7 @@ class Syscalls {
 public:
     Syscalls(K& k, M& mem, Arch arch) noexcept : k_{k}, mem_{mem}, arch_{arch} {}
 
-    // -- for the in-guest fast path ------------------------------------------
+    // -- for the in-guest handler ------------------------------------------
     template <class F> void for_each_sock_placeholder(F&& f) const {
         for (const auto& p : sock_placeholders_) f(p);
     }
@@ -6721,7 +6721,7 @@ public:
         if (fd >= 0) {
             // A newly opened fd REPLACES whatever that number meant before.
             //
-            // close(2) is deliberately untrapped on the seccomp fast path (it
+            // close(2) is deliberately untrapped on the seccomp filter (it
             // fires on every fd teardown), so when a guest closes a directory
             // fd we never hear about it -- its DirStream stays registered. The
             // kernel then hands the SAME number to the next open(). If that

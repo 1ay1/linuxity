@@ -318,7 +318,6 @@ service {
 | `storage.private-tmp` | `true` | its own `/tmp` |
 | `bridge.enabled` | `true` | `xdg-open`, clipboard, notifications reach the host |
 | `bridge.host-fallback` | `true` | use host tools when no app is attached |
-| `compat.seccomp` | `true` | fast path; off only for debugging |
 | `compat.fifos`, `compat.sysv-ipc`, `compat.nl80211`, `compat.hardlinks` | `auto` | `emulate` forces linuxity's own version |
 | `compat.pacman-overwrite` | `true` | lets bootstrap Arch images install packages |
 | `debug.trace` | off | log every syscall decision to a file |

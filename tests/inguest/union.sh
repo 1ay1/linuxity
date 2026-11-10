@@ -1,5 +1,5 @@
 #!/bin/bash
-# fpunion.sh LINUXITY ROOT: merged (upper + lower) directory listings served
+# union.sh LINUXITY ROOT: merged (upper + lower) directory listings served
 # in the guest must read exactly like the supervisor's: same names, order,
 # d_ino, d_type and cookies, through small buffers, rewinds, seeks to saved
 # cookies, a dup or fork mid-listing, and an exec-free handover.
@@ -74,17 +74,17 @@ run() {
     "$L" --quiet --root "$R" --persist "$u" --bind "$d:/fpu" /fpu/t $dirs 2>&1
 }
 # the files only one layer has, made once so both runs see the same inodes
-LINUXITY_FASTPATH=0 "$L" --quiet --root "$R" --persist "$u" /bin/sh -c "$setup" >/dev/null 2>&1
+LINUXITY_TEST_ALL_TRAP=1 "$L" --quiet --root "$R" --persist "$u" /bin/sh -c "$setup" >/dev/null 2>&1
 run > "$d/on"
-LINUXITY_FASTPATH=0 run > "$d/off"
+LINUXITY_TEST_ALL_TRAP=1 run > "$d/off"
 rc=0
 if cmp -s "$d/off" "$d/on"; then
-    echo "fpunion: $(grep -c . "$d/on") lines match"
+    echo "union: $(grep -c . "$d/on") lines match"
 else
-    echo "fpunion: listings differ (< trap, > fast):"
+    echo "union: listings differ (< all trapped, > in-guest):"
     diff "$d/off" "$d/on" | head -20
     rc=1
 fi
-LINUXITY_PROFILE=1 "$L" --quiet --root "$R" --persist "$u" --bind "$d:/fpu" /fpu/t /usr/include 2>&1 >/dev/null | grep 'fast path'
+LINUXITY_PROFILE=1 "$L" --quiet --root "$R" --persist "$u" --bind "$d:/fpu" /fpu/t /usr/include 2>&1 >/dev/null | grep 'linuxity in-guest'
 rm -rf "$d" "$u"
 exit $rc

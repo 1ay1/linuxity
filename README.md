@@ -287,7 +287,7 @@ linuxity's subsystems or **forwarded** to the host kernel acting on the guest.
   and reset, the long-running instance (`up`, `shell`, `exec`, `ps`, `svc`),
   the host bridge, and the JSON control protocol frontends use.
 - **[doc/ARCHITECTURE.md](doc/ARCHITECTURE.md)** — the internals: the trap
-  backend, syscall fates, the seccomp fast path, the filesystem namespace and
+  backend, syscall fates, the seccomp filter, the filesystem namespace and
   copy-on-write overlay, shadow-metadata fake-root, the pid namespace, signals,
   synthesized `/proc`/`/sys`/`/dev`, the loader/exec rewriting, resource
   governance, and how to extend it. **Read this to *understand* linuxity.**

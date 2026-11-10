@@ -30,15 +30,15 @@ coherent tiny pid namespace (which proot does NOT have — proot leaks host pids
      syscalls; the tracer arms PTRACE_O_TRACESECCOMP and drives every task with
      PTRACE_CONT, so non-intercepted syscalls (read/write/mmap/futex/lseek/…)
      run natively. Measured ~140× on a 2M-syscall microbenchmark (0.35s vs 50s).
-     Correctness is unchanged: `run_seccomp` proves the fast path is byte-for-
-     byte equivalent to the PTRACE_SYSCALL fallback, and LINUXITY_NO_SECCOMP=1
+     Correctness is unchanged: `run_seccomp` proves the filter is byte-for-
+     byte equivalent to the PTRACE_SYSCALL fallback, and LINUXITY_TEST_NO_SECCOMP=1
      forces that fallback (also used when the host lacks CONFIG_SECCOMP_FILTER).
    - Bootstrap subtlety solved: execve/execveat/gettid/tgkill/tkill/close are
      deliberately LEFT NATIVE — a trapped syscall in the window between filter
      install and the tracer arming TRACESECCOMP would ENOSYS-fail and abort the
      launch. Exec is still observed via PTRACE_EVENT_EXEC; guest binaries are
      loaded by the real ld.so through the (filtered, translated) openat.
-   - clone/fork/wait pid translation is preserved under the fast path:
+   - clone/fork/wait pid translation is preserved under the filter:
      resume_after_event() steps a mid-serviced clone to its EXIT stop even
      across the intervening fork event, so $!/jobs stay coherent.
 

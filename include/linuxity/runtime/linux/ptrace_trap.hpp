@@ -26,7 +26,7 @@
 #include "linuxity/abi/wire/errno_map.hpp"
 #include "linuxity/runtime/trap.hpp"
 #include "linuxity/runtime/linux/seccomp_filter.hpp"
-#include "linuxity/runtime/linux/fastpath.hpp"
+#include "linuxity/runtime/linux/inguest.hpp"
 
 #include <sys/ptrace.h>
 #include <sys/ioctl.h>
@@ -138,8 +138,8 @@ public:
                    const std::vector<std::string>& envp,
                    const std::function<void()>& pre,
                    const std::function<void()>& setup) {
-        // the fast path's key must be in the filter the child installs
-        if (fastpath::wanted()) fastpath::arm();
+        // the in-guest handler's key must be in the filter the child installs
+        if (inguest::wanted()) inguest::arm();
         // A tiny pipe lets the child report whether the seccomp trap filter
         // installed, so the parent knows to drive tasks with PTRACE_CONT (only
         // filtered syscalls stop) versus PTRACE_SYSCALL (every syscall stops).
@@ -193,9 +193,9 @@ public:
             // Report the outcome to the parent, then let the filter be
             // inherited across the coming execve and every future fork. If
             // seccomp is unavailable the parent falls back to PTRACE_SYSCALL,
-            // which is always correct (just slower). LINUXITY_NO_SECCOMP=1
-            // forces that fallback (for benchmarking / debugging the slow path).
-            char ok_byte = (!std::getenv("LINUXITY_NO_SECCOMP") &&
+            // which is always correct (just slower). LINUXITY_TEST_NO_SECCOMP=1
+            // forces that fallback (tests only).
+            char ok_byte = (!std::getenv("LINUXITY_TEST_NO_SECCOMP") &&
                             install_trap_filter()) ? 1 : 0;
             if (seccomp_pipe[1] >= 0) {
                 (void)!::write(seccomp_pipe[1], &ok_byte, 1);
@@ -381,7 +381,7 @@ public:
                 stopped_.erase(w);
                 stop_owed_.erase(w);
                 // a thread group's leader gone: its region (and pid) go too
-                if (tgid_cache_.count(w) && tgid_cache_[w] == w) fp_reaped(w);
+                if (tgid_cache_.count(w) && tgid_cache_[w] == w) ig_reaped(w);
                 // the host may hand this tid to an unrelated new process
                 tgid_cache_.erase(w);
                 bootstrapping_.erase(w);
@@ -451,7 +451,7 @@ public:
                     if (pending_real_netns_.erase(w))
                         (void)host::write_identity_maps(static_cast<int>(child));
                     proc_events_.push_back({ProcEvent::spawn, gpid, gppid, {}, {}, nsf});
-                    fp_inherit(host_tgid_of(w), child);
+                    ig_inherit(host_tgid_of(w), child);
                 } else if (np) {
                     note_thread(w, child);
                 }
@@ -484,13 +484,13 @@ public:
                 proc_events_.push_back({ProcEvent::exec, gpid_of(w), 0,
                                         comm_of(w), cmdline_of(w)});
                 tasks_[w] = Task{};        // fresh image, back at-entry
-                fp_forget(host_tgid_of(w));
+                ig_forget(host_tgid_of(w));
                 gt_on_exec(w);
                 resume_run(w, 0);
                 continue;
             }
             // A seccomp-filter trap: the guest hit one of the syscalls we
-            // intercept. This IS the syscall-ENTRY stop under the fast path;
+            // intercept. This IS the syscall-ENTRY stop under the filter;
             // service it exactly like an ordinary entry (the seccomp event
             // fires BEFORE the syscall runs). Non-filtered syscalls never get
             // here — they ran natively without stopping.
@@ -597,7 +597,7 @@ public:
                 continue;
             }
             // A real syscall stop (TRACESYSGOOD => SIGTRAP|0x80). Under the
-            // seccomp fast path this is ONLY an EXIT stop (from the one-shot
+            // seccomp filter this is ONLY an EXIT stop (from the one-shot
             // PTRACE_SYSCALL a serviced entry issued); entries arrive as
             // PTRACE_EVENT_SECCOMP above. Without seccomp it is BOTH the entry
             // and the exit, distinguished by the -ENOSYS-primed RAX.
@@ -617,7 +617,7 @@ public:
                             : static_cast<long long>(rr.ret()) == -38 /*ENOSYS*/ && !t.in_call);
                 if (is_entry) {
                     // Same bootstrap exemption as the seccomp path, for the
-                    // PTRACE_SYSCALL fallback (LINUXITY_NO_SECCOMP): the ROOT's
+                    // PTRACE_SYSCALL fallback (LINUXITY_TEST_NO_SECCOMP): the ROOT's
                     // first execve targets path_ (a resolved HOST path), which
                     // path_exec would mis-resolve as a guest path. Forward it
                     // natively; its PTRACE_EVENT_EXEC sets booted_root_ and
@@ -688,8 +688,8 @@ public:
                 }
             }
             rewrite_siginfo_pid(w);
-            // a fault in the fast path's guarded copy: make the call fall back
-            if ((sig == SIGSEGV || sig == SIGBUS) && fp_fixup_fault(w)) { resume_run(w, 0); continue; }
+            // a fault in the in-guest handler's guarded copy: make the call fall back
+            if ((sig == SIGSEGV || sig == SIGBUS) && ig_fixup_fault(w)) { resume_run(w, 0); continue; }
             trace_fault(w, sig);
             resume_run(w, sig);
         }
@@ -981,7 +981,7 @@ public:
         Regs r = t.regs;
         r.skip_call();
         if (seccomp_) {
-            // Fast path: one stop, not two. At a PTRACE_EVENT_SECCOMP stop,
+            // One stop, not two. At a PTRACE_EVENT_SECCOMP stop,
             // orig_rax = -1 skips the call and the kernel returns whatever we
             // leave in rax (seccomp(2), SECCOMP_RET_TRACE). The old path
             // stepped to the syscall EXIT just to write rax there: 7 ptrace
@@ -1189,7 +1189,7 @@ public:
         const auto host = static_cast<std::int32_t>(static_cast<std::uint32_t>(w0));
         std::int32_t g = host > 0 ? known_gpid_of(host) : 0;
         // a child that connected before its fork event was processed (the
-        // slow, no-seccomp path makes this race easy to hit) is still one
+        // no-seccomp test mode makes this race easy to hit) is still one
         // we trace: give it its pid now, as the fork event would
         if (g <= 0 && host > 0 && tasks_.count(host)) g = gpid_of(host);
         if (g <= 0) return;   // not ours: leave the host's answer alone
@@ -1284,7 +1284,7 @@ public:
     // it trapped and run the trapped call again from its instruction. Its
     // results come back in order (a negative one stops the chain), and
     // `between` runs after the chain with the task still stopped (to write
-    // into what the chain made). Used by the fast path to map its region
+    // into what the chain made). Used by the in-guest handler to map its region
     // and patch a site: the guest's own call then takes the patched route.
     // False only if the task died.
     [[nodiscard]] bool inject_then_retry(const std::vector<GuestCall>& calls,
@@ -2814,7 +2814,7 @@ private:
                     tgid_cache_[child] = child;
                     proc_events_.push_back({ProcEvent::spawn, gpid_of(child),
                                             gppid, {}, {}});
-                    fp_inherit(host_tgid_of(w), child);
+                    ig_inherit(host_tgid_of(w), child);
                 } else if (np) {
                     note_thread(w, child);
                 }
@@ -2831,7 +2831,7 @@ private:
                 proc_events_.push_back({ProcEvent::exec, gpid_of(w), 0,
                                         comm_of(w), cmdline_of(w)});
                 tasks_[w] = Task{};
-                fp_forget(host_tgid_of(w));
+                ig_forget(host_tgid_of(w));
                 gt_on_exec(w);
                 return true;
             }
@@ -2850,7 +2850,7 @@ private:
             // 0 and re-inject it once the syscall has exited (via pending_sig).
             // SIGTRAP (a trap, not a real signal) is swallowed as before.
             int sig = WSTOPSIG(st);
-            if ((sig == SIGSEGV || sig == SIGBUS) && fp_fixup_fault(w)) {
+            if ((sig == SIGSEGV || sig == SIGBUS) && ig_fixup_fault(w)) {
                 ::ptrace(PTRACE_SYSCALL, w, 0, 0);
                 continue;
             }
@@ -3063,7 +3063,7 @@ private:
     int base_opts_{0};             // linuxity's own ptrace options on every task
     std::unordered_map<::pid_t, Task> tasks_;
 #include "linuxity/runtime/linux/guest_ptrace.inc"
-#include "linuxity/runtime/linux/fastpath.inc"
+#include "linuxity/runtime/linux/inguest.inc"
 
 };
 

@@ -42,7 +42,6 @@ struct Options {
     bool manage_hosts{false};
 
     // compat / debug (become the LINUXITY_* variables the runtime reads)
-    bool seccomp{true};
     bool emulate_fifos{false}, emulate_sysv{false}, emulate_nl80211{false}, emulate_hardlinks{false};
     std::string trace;
 
@@ -88,7 +87,6 @@ inline void apply_config(const env::EnvConfig& c, Options& o) {
     o.dns = c.dns;
     o.manage_dns = c.manage_dns;
     o.manage_hosts = c.manage_hosts;
-    o.seccomp = c.seccomp;
     o.emulate_fifos = c.emulate_fifos;
     o.emulate_sysv = c.emulate_sysv;
     o.emulate_nl80211 = c.emulate_nl80211;

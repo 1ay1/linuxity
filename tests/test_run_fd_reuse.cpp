@@ -1,7 +1,7 @@
 // A FILE fd that reuses the number of a closed DIRECTORY fd must seek as a
 // file, not as the directory it replaced.
 //
-// close(2) runs natively on the seccomp fast path -- it fires on every fd
+// close(2) runs natively on the seccomp filter -- it fires on every fd
 // teardown, so it is deliberately untrapped -- which means linuxity never
 // hears that a guest closed a directory. That directory's DirStream stays
 // registered against its fd number. The kernel then hands the SAME number
@@ -37,7 +37,7 @@ static const char* kSrc =
     "  if (!d) return 1;\n"
     "  int dfd = dirfd(d);\n"
     "  while (readdir(d)) {}\n"
-    // 2. Close it. On the fast path linuxity does not see this.
+    // 2. Close it. Under the seccomp filter linuxity does not see this.
     "  closedir(d);\n"
     // 3. Open a FILE; the kernel reuses the directory's fd number.
     "  int fd = open(\"/proc/meminfo\", O_RDONLY);\n"

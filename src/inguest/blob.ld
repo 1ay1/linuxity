@@ -1,6 +1,6 @@
-/* Lays the fast path blob out flat: header first, then code, read-only
+/* Lays the in-guest blob out flat: header first, then code, read-only
    constants last. Nothing may need a runtime relocation. */
-ENTRY(lx_fp_header)
+ENTRY(lx_ig_header)
 SECTIONS {
     . = 0;
     .lx_header : { KEEP(*(.lx_header)) }

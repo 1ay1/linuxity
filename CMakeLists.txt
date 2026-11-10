@@ -99,42 +99,42 @@ if(CMAKE_SYSTEM_NAME IN_LIST LX_PTRACE_HOSTS)
         ".section .note.GNU-stack,\"\",%progbits\n")
     set_source_files_properties(${CMAKE_BINARY_DIR}/bridge_blob.S PROPERTIES OBJECT_DEPENDS ${LX_BRIDGE_BIN})
 
-    # The in-guest fast path (src/fastpath): freestanding, position
+    # the in-guest handler (src/inguest): freestanding, position
     # independent, linked flat with no relocations, embedded like the bridge.
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
-        set(LX_FP_ENTRY ${CMAKE_SOURCE_DIR}/src/fastpath/entry_x86_64.S)
-        set(LX_FP_ARCH_FLAGS -fcf-protection=none)
+        set(LX_IG_ENTRY ${CMAKE_SOURCE_DIR}/src/inguest/entry_x86_64.S)
+        set(LX_IG_ARCH_FLAGS -fcf-protection=none)
     else()
-        set(LX_FP_ENTRY ${CMAKE_SOURCE_DIR}/src/fastpath/entry_aarch64.S)
-        set(LX_FP_ARCH_FLAGS -mno-outline-atomics)
+        set(LX_IG_ENTRY ${CMAKE_SOURCE_DIR}/src/inguest/entry_aarch64.S)
+        set(LX_IG_ARCH_FLAGS -mno-outline-atomics)
     endif()
-    add_library(linuxity_fp_objs OBJECT src/fastpath/handler.c ${LX_FP_ENTRY})
-    target_include_directories(linuxity_fp_objs PRIVATE ${CMAKE_SOURCE_DIR}/include)
-    target_compile_options(linuxity_fp_objs PRIVATE
+    add_library(linuxity_ig_objs OBJECT src/inguest/handler.c ${LX_IG_ENTRY})
+    target_include_directories(linuxity_ig_objs PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    target_compile_options(linuxity_ig_objs PRIVATE
         $<$<COMPILE_LANGUAGE:C>:-O2 -fPIC -ffreestanding -fno-builtin -fno-stack-protector
             -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-jump-tables
-            -mgeneral-regs-only -fno-sanitize=all -U_FORTIFY_SOURCE ${LX_FP_ARCH_FLAGS} -w>)
-    set(LX_FP_ELF ${CMAKE_BINARY_DIR}/linuxity-fastpath.elf)
-    set(LX_FP_BIN ${CMAKE_BINARY_DIR}/linuxity-fastpath.bin)
+            -mgeneral-regs-only -fno-sanitize=all -U_FORTIFY_SOURCE ${LX_IG_ARCH_FLAGS} -w>)
+    set(LX_IG_ELF ${CMAKE_BINARY_DIR}/linuxity-inguest.elf)
+    set(LX_IG_BIN ${CMAKE_BINARY_DIR}/linuxity-inguest.bin)
     if(CMAKE_C_COMPILER_TARGET)
-        set(LX_FP_TARGET --target=${CMAKE_C_COMPILER_TARGET})
+        set(LX_IG_TARGET --target=${CMAKE_C_COMPILER_TARGET})
     endif()
-    add_custom_command(OUTPUT ${LX_FP_BIN}
-        COMMAND ${CMAKE_C_COMPILER} ${LX_FP_TARGET} -nostdlib -static -fno-sanitize=all
-            -Wl,-T,${CMAKE_SOURCE_DIR}/src/fastpath/blob.ld -Wl,--no-dynamic-linker -Wl,--no-undefined
-            -Wl,--build-id=none -o ${LX_FP_ELF} $<TARGET_OBJECTS:linuxity_fp_objs>
-        COMMAND ${CMAKE_OBJCOPY} -O binary ${LX_FP_ELF} ${LX_FP_BIN}
-        DEPENDS linuxity_fp_objs $<TARGET_OBJECTS:linuxity_fp_objs> ${CMAKE_SOURCE_DIR}/src/fastpath/blob.ld
+    add_custom_command(OUTPUT ${LX_IG_BIN}
+        COMMAND ${CMAKE_C_COMPILER} ${LX_IG_TARGET} -nostdlib -static -fno-sanitize=all
+            -Wl,-T,${CMAKE_SOURCE_DIR}/src/inguest/blob.ld -Wl,--no-dynamic-linker -Wl,--no-undefined
+            -Wl,--build-id=none -o ${LX_IG_ELF} $<TARGET_OBJECTS:linuxity_ig_objs>
+        COMMAND ${CMAKE_OBJCOPY} -O binary ${LX_IG_ELF} ${LX_IG_BIN}
+        DEPENDS linuxity_ig_objs $<TARGET_OBJECTS:linuxity_ig_objs> ${CMAKE_SOURCE_DIR}/src/inguest/blob.ld
         COMMAND_EXPAND_LISTS VERBATIM)
-    add_custom_target(linuxity-fastpath DEPENDS ${LX_FP_BIN})
-    file(WRITE ${CMAKE_BINARY_DIR}/fastpath_blob.S
-        ".section .rodata\n.balign 16\n.global lx_fastpath_blob\nlx_fastpath_blob:\n"
-        ".incbin \"${LX_FP_BIN}\"\n.global lx_fastpath_blob_end\nlx_fastpath_blob_end:\n"
+    add_custom_target(linuxity-inguest DEPENDS ${LX_IG_BIN})
+    file(WRITE ${CMAKE_BINARY_DIR}/inguest_blob.S
+        ".section .rodata\n.balign 16\n.global lx_inguest_blob\nlx_inguest_blob:\n"
+        ".incbin \"${LX_IG_BIN}\"\n.global lx_inguest_blob_end\nlx_inguest_blob_end:\n"
         ".section .note.GNU-stack,\"\",%progbits\n")
-    set_source_files_properties(${CMAKE_BINARY_DIR}/fastpath_blob.S PROPERTIES OBJECT_DEPENDS ${LX_FP_BIN})
+    set_source_files_properties(${CMAKE_BINARY_DIR}/inguest_blob.S PROPERTIES OBJECT_DEPENDS ${LX_IG_BIN})
 
     add_executable(linuxity src/main.cpp src/cli.cpp ${CMAKE_BINARY_DIR}/bridge_blob.S
-                            ${CMAKE_BINARY_DIR}/fastpath_blob.S)
+                            ${CMAKE_BINARY_DIR}/inguest_blob.S)
     target_link_libraries(linuxity PRIVATE linuxity_core linuxity_host z)
     # Every guest exec re-runs nothing of ours, but every linuxity run does:
     # resolving symbols against a shared libstdc++ was 0.7ms of a 0.9ms
@@ -142,7 +142,7 @@ if(CMAKE_SYSTEM_NAME IN_LIST LX_PTRACE_HOSTS)
     if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND NOT ANDROID)
         target_link_options(linuxity PRIVATE -static-libstdc++ -static-libgcc)
     endif()
-    add_dependencies(linuxity linuxity-bridge linuxity-fastpath)
+    add_dependencies(linuxity linuxity-bridge linuxity-inguest)
 elseif(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
     # macOS: the Hypervisor.framework backend. hv_vm_create is entitlement-
     # gated, so sign ad-hoc with com.apple.security.hypervisor after linking.

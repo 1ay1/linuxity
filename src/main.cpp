@@ -299,7 +299,6 @@ int run_runtime(lx::cli::Options& o, int argc, char** argv) {
     // The compat and debug switches are read by the runtime from the
     // environment, once, where they take effect.
     auto flag_env = [](const char* k, bool on) { if (on) ::setenv(k, "1", 1); };
-    flag_env("LINUXITY_NO_SECCOMP", !o.seccomp);
     flag_env("LINUXITY_EMULATE_FIFOS", o.emulate_fifos);
     flag_env("LINUXITY_EMULATE_SYSV", o.emulate_sysv);
     flag_env("LINUXITY_EMULATE_NL80211", o.emulate_nl80211);

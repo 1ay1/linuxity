@@ -46,7 +46,7 @@ public:
 
     [[nodiscard]] bool empty() const noexcept { return alias_.empty(); }
 
-    // Bumped on every change; the fast path re-reads the table when it moves.
+    // Bumped on every change; the in-guest handler re-reads the table when it moves.
     [[nodiscard]] std::uint64_t version() const noexcept { return version_; }
     // Every host path that is an alias or a backing.
     template <class F> void for_each_path(F&& f) const {

@@ -161,12 +161,12 @@ public:
         // creator gave it -- adopting its own tid would publish the wrong
         // getpid for the whole process.
         if (!threaded_) tgid_ = task_.tid;
-        refresh_fastcalls();
+        refresh_guest_answers();
         return ok();
     }
 
     // Publish the syscalls the guest may answer WITHOUT a VM exit (see
-    // hvf_fastcall.hpp). The rule: a constant for this process image, no
+    // darwin/inguest.hpp). The rule: a constant for this process image, no
     // side effect, nothing written to guest memory. Identity is exactly
     // that -- and it is ~8-20% of the syscalls a real workload makes
     // (measured over screenfetch, python, ls, git).
@@ -174,19 +174,19 @@ public:
     // Called whenever identity can change: start, after fork, after exec,
     // after setpgid/setsid. Anything NOT listed keeps trapping, so a
     // missing refresh is a lost optimisation, never a wrong answer.
-    void refresh_fastcalls() {
+    void refresh_guest_answers() {
         // The table is PROCESS-wide (one VM, one private page), so only a
         // value every thread agrees on may go in it. getpid is the THREAD
         // GROUP id -- the main thread's tid -- which is exactly that;
         // gettid is not, so a second thread revokes it for good.
-        machine_.set_fastcall(172, static_cast<std::uint64_t>(tgid_));          // getpid
-        if (!threaded_) machine_.set_fastcall(178, static_cast<std::uint64_t>(task_.tid));  // gettid
-        machine_.set_fastcall(173, static_cast<std::uint64_t>(parent_));         // getppid
-        machine_.set_fastcall(174, 0);                                          // getuid
-        machine_.set_fastcall(175, 0);                                          // geteuid
-        machine_.set_fastcall(176, 0);                                          // getgid
-        machine_.set_fastcall(177, 0);                                          // getegid
-        machine_.set_fastcall(124, 0);                                          // sched_yield
+        machine_.set_guest_answer(172, static_cast<std::uint64_t>(tgid_));          // getpid
+        if (!threaded_) machine_.set_guest_answer(178, static_cast<std::uint64_t>(task_.tid));  // gettid
+        machine_.set_guest_answer(173, static_cast<std::uint64_t>(parent_));         // getppid
+        machine_.set_guest_answer(174, 0);                                          // getuid
+        machine_.set_guest_answer(175, 0);                                          // geteuid
+        machine_.set_guest_answer(176, 0);                                          // getgid
+        machine_.set_guest_answer(177, 0);                                          // getegid
+        machine_.set_guest_answer(124, 0);                                          // sched_yield
     }
 
     // A thread adopts its creator's process identity (tgid) and its own tid.
@@ -1627,7 +1627,7 @@ private:
         // the in-guest table can't tell threads apart: give it back to the
         // trap path, for every thread, permanently.
         threaded_ = true;
-        machine_.clear_fastcall(178);
+        machine_.clear_guest_answer(178);
         if (!spawn_thread_) return -38;
         if (!req.stack) return -22;                      // a thread needs a stack
         // A thread's tid lives in the SAME number space as every pid in the
@@ -1796,7 +1796,7 @@ public:
         task_.tid = img.self;
         parent_ = img.parent;
         tgid_ = img.self;             // a fork child is its own thread group
-        refresh_fastcalls();          // new pid/ppid for this process
+        refresh_guest_answers();          // new pid/ppid for this process
         proc_.umask = img.umask;
         proc_.with_space([&](AddressSpace& t) { return t.restore(img.vmas, img.brk, img.arena); });
         proc_.with_fds([&](FdTable& t) { return t.import_table(img.fds, host_fds); });
@@ -1988,7 +1988,7 @@ private:
         execed_ = true;
         tgid_ = task_.tid;            // exec collapses the thread group to us
         threaded_ = false;            // ...and kills every other thread
-        refresh_fastcalls();          // same pid, but a fresh image
+        refresh_guest_answers();          // same pid, but a fresh image
         pids_.set_exe(task_.tid, exe_path_of(host_path, guest_path));
         pids_.mark_execed(task_.tid);           // releases a vfork parent
         return 0;

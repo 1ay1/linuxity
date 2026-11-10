@@ -38,7 +38,7 @@ A practical, task-oriented guide to running real Linux userlands under
 
 | Requirement | Detail |
 |---|---|
-| **OS / kernel** | Linux. The native trap backend uses `ptrace(2)`; the fast path additionally uses `seccomp` BPF filtering (`CONFIG_SECCOMP_FILTER`). Without seccomp, linuxity falls back to a slower `PTRACE_SYSCALL` mode automatically. |
+| **OS / kernel** | Linux. The native trap backend uses `ptrace(2)`; it also uses `seccomp` BPF filtering (`CONFIG_SECCOMP_FILTER`). Without seccomp, linuxity falls back to a slower `PTRACE_SYSCALL` mode automatically. |
 | **Host CPU / ISA** | Same ISA as the guest binaries. On an **x86-64** host you run **x86-64** rootfs binaries. A foreign-arch binary is refused with a clear error (there is no cross-emulator built in). |
 | **Compiler** | A C++23 toolchain (`std::expected`, concepts). Tested with **GCC 16**. |
 | **Build tools** | CMake + Ninja (or Make). |
@@ -182,7 +182,7 @@ from; the guest does **not** see them as special):
 
 | Variable | Effect |
 |---|---|
-| `LINUXITY_NO_SECCOMP=1` | Force the slow `PTRACE_SYSCALL` drive mode instead of the seccomp fast path. Useful for debugging or on kernels without `CONFIG_SECCOMP_FILTER` (which is auto-detected anyway). |
+| `LINUXITY_TEST_NO_SECCOMP=1` | Force the slow `PTRACE_SYSCALL` drive mode instead of the seccomp filter. Useful for debugging or on kernels without `CONFIG_SECCOMP_FILTER` (which is auto-detected anyway). |
 | `LINUXITY_NO_DNS=1` | Disable the automatic host-`resolv.conf` binding (see [§10](#10-networking--dns)). The guest then sees only the rootfs's own `/etc/resolv.conf`. |
 | `LINUXITY_TRACE=<path>` | Write a per-syscall dispatch log (what was virtualized / forwarded / redirected / injected, and the return value) to `<path>` if it looks like a path, else stderr. Invaluable for debugging a program that misbehaves under linuxity. |
 | `LINUXITY_DELEGATED=1` | **Internal.** Set automatically when linuxity re-execs itself through `systemd-run` for a delegated cgroup scope. You should not set this yourself. |
@@ -443,7 +443,7 @@ JIT. The only overhead is at the *syscall boundary*, and even there:
 
 If the host lacks `CONFIG_SECCOMP_FILTER`, linuxity automatically uses the
 `PTRACE_SYSCALL` fallback (correct, just slower). You can force it with
-`LINUXITY_NO_SECCOMP=1` for debugging.
+`LINUXITY_TEST_NO_SECCOMP=1` for debugging.
 
 **Rule of thumb:** CPU-bound work runs at bare-metal speed; syscall-heavy work
 pays a small trap cost only on the intercepted subset.
@@ -483,10 +483,10 @@ Guest writes go to a **copy-on-write overlay** in a per-run scratch dir
 (`/tmp/linuxity-upper-<pid>`), leaving the rootfs pristine. Use `--bind` to
 write to a directory you control if you need writes to persist on the host.
 
-**Force the slow, most-compatible mode** (rules out a seccomp fast-path issue):
+**Force the slow, most-compatible mode** (rules out a seccomp filter issue; for debugging only):
 
 ```sh
-LINUXITY_NO_SECCOMP=1 linuxity --root ./fs /bin/sh
+LINUXITY_TEST_NO_SECCOMP=1 linuxity --root ./fs /bin/sh
 ```
 
 ---

@@ -1,8 +1,8 @@
-// SECCOMP trap acceleration — the fast path runs non-intercepted syscalls
+// The seccomp filter runs non-intercepted syscalls
 // natively, and must stay FUNCTIONALLY identical to the PTRACE_SYSCALL path.
 //
 // This test runs the SAME probe under both drive modes (seccomp filter active,
-// and forced fallback via LINUXITY_NO_SECCOMP) and requires an identical exit
+// and forced fallback via LINUXITY_TEST_NO_SECCOMP) and requires an identical exit
 // code. The probe exercises the things that differ between the paths: a
 // path-translated open (/etc/os-release synthesized owner), a fork+wait pid
 // round-trip (translated at the seccomp EXIT stop even across the intervening
@@ -51,7 +51,7 @@ int main() {
         "/bin/scprobe");
     if (!lxtest::compile_guest("run_seccomp", tree, kProbe)) return 0;
 
-    // The same guest is run twice -- once with the seccomp fast path, once
+    // The same guest is run twice -- once with the seccomp filter, once
     // forced onto PTRACE_SYSCALL -- and both must agree, so wrap the harness.
     auto run = [&] {
         auto r = lxtest::run_guest(tree, [&](auto& k) {
@@ -63,13 +63,13 @@ int main() {
         return r ? *r : -1;
     };
 
-    // Fast path (seccomp filter installed if the host supports it).
-    ::unsetenv("LINUXITY_NO_SECCOMP");
+    // Normal run (seccomp filter installed if the host supports it).
+    ::unsetenv("LINUXITY_TEST_NO_SECCOMP");
     int fast = run();
     // Forced fallback (PTRACE_SYSCALL on every syscall).
-    ::setenv("LINUXITY_NO_SECCOMP", "1", 1);
+    ::setenv("LINUXITY_TEST_NO_SECCOMP", "1", 1);
     int slow = run();
-    ::unsetenv("LINUXITY_NO_SECCOMP");
+    ::unsetenv("LINUXITY_TEST_NO_SECCOMP");
 
     lxtest::remove_tree(tree);
 
@@ -84,7 +84,7 @@ int main() {
                     "seccomp path diverged from PTRACE_SYSCALL\n", fast, slow);
         return 1;
     }
-    std::puts("run_seccomp: the seccomp fast path (non-intercepted syscalls run "
+    std::puts("run_seccomp: the seccomp filter (non-intercepted syscalls run "
               "native) is functionally identical to the PTRACE_SYSCALL path — "
               "path translation, fork/wait pid round-trip, and a native lseek "
               "burst all agree");

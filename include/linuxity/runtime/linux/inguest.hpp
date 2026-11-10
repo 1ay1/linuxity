@@ -1,6 +1,6 @@
-// linuxity/runtime/linux/fastpath.hpp
+// linuxity/runtime/linux/inguest.hpp
 //
-// The supervisor side of the in-guest fast path: puts the blob into a guest
+// The supervisor side of the in-guest handler: puts the blob into a guest
 // process, patches its hot syscall sites, and keeps the shared table in step
 // with the dispatcher's state.
 //
@@ -24,8 +24,8 @@
 // patch_site), and every failure leaves the site as it was.
 #pragma once
 
-#include "linuxity/runtime/linux/fastpath_abi.h"
-#include "linuxity/runtime/linux/fastpath_table.hpp"
+#include "linuxity/runtime/linux/inguest_abi.h"
+#include "linuxity/runtime/linux/inguest_table.hpp"
 
 #include <sys/mman.h>
 #include <sys/uio.h>
@@ -42,11 +42,11 @@
 #include <vector>
 
 // Linked in by the linuxity binary (CMakeLists.txt); weak so that a test
-// binary without it builds and simply runs with the fast path off.
-extern "C" __attribute__((weak)) const unsigned char lx_fastpath_blob[];
-extern "C" __attribute__((weak)) const unsigned char lx_fastpath_blob_end[];
+// binary without it builds and simply runs with the in-guest handler off.
+extern "C" __attribute__((weak)) const unsigned char lx_inguest_blob[];
+extern "C" __attribute__((weak)) const unsigned char lx_inguest_blob_end[];
 
-namespace lx::runtime::fastpath {
+namespace lx::runtime::inguest {
 
 // The syscalls the blob answers, or does natively in the guest. A site that
 // trapped on one of these gets patched.
@@ -67,8 +67,8 @@ namespace lx::runtime::fastpath {
 }
 
 [[nodiscard]] inline std::span<const unsigned char> blob() {
-    if (!lx_fastpath_blob || !lx_fastpath_blob_end) return {};
-    return {lx_fastpath_blob, static_cast<std::size_t>(lx_fastpath_blob_end - lx_fastpath_blob)};
+    if (!lx_inguest_blob || !lx_inguest_blob_end) return {};
+    return {lx_inguest_blob, static_cast<std::size_t>(lx_inguest_blob_end - lx_inguest_blob)};
 }
 
 // What a mapped region looks like in one process.
@@ -101,10 +101,10 @@ inline const Layout& layout() {
     static const Layout l = [] {
         Layout l;
         const auto b = blob();
-        if (b.size() < sizeof(lx_fp_header) || b.size() > LX_FP_CODE_MAX) return l;
-        lx_fp_header h;
+        if (b.size() < sizeof(lx_ig_header) || b.size() > LX_IG_CODE_MAX) return l;
+        lx_ig_header h;
         std::memcpy(&h, b.data(), sizeof h);
-        if (h.magic != LX_FP_MAGIC || h.version != LX_FP_VERSION) return l;
+        if (h.magic != LX_IG_MAGIC || h.version != LX_IG_VERSION) return l;
         l.common = h.common;
         l.guard_start = h.guard_start;
         l.guard_end = h.guard_end;
@@ -265,4 +265,4 @@ inline constexpr std::size_t kMoveLen = 4;
 #endif
 }
 
-}  // namespace lx::runtime::fastpath
+}  // namespace lx::runtime::inguest

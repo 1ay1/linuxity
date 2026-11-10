@@ -116,7 +116,6 @@ screen should be built from.
 | `limits.cpuset` | string | - | CPUs to pin to, e.g. `0-3`. |
 | `storage.persist` | boolean | `true` | Keep writes across runs. Off: every run starts clean. |
 | `storage.private-tmp` | boolean | `true` | Give the guest its own `/tmp`. |
-| `compat.seccomp` | boolean | `true` | The seccomp fast path. Off is slower; for debugging. |
 | `compat.fifos` | `auto`/`emulate` | `auto` | Named FIFOs: real where the host allows them, or always emulated. |
 | `compat.sysv-ipc` | `auto`/`emulate` | `auto` | SysV IPC: the host's, or always emulated. |
 | `compat.nl80211` | `auto`/`emulate` | `auto` | Wifi netlink: the host's, or always emulated. |

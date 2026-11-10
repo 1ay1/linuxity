@@ -1,5 +1,5 @@
 #!/bin/bash
-# fpstress.sh LINUXITY ROOT: the in-guest fast path under concurrency.
+# stress.sh LINUXITY ROOT: the in-guest handler under concurrency.
 # Threads open/close/stat/readdir at once while the supervisor serves other
 # calls; forks inherit open dirs; vfork children share memory; results must
 # match a plain run.
@@ -83,16 +83,16 @@ int main(void) {
         close(fd);
         if (count_dir("/etc") != want[3]) { fails++; printf("FAIL list after spawn\n"); }
     }
-    printf(fails ? "fpstress: %d failures\n" : "fpstress: all good\n", fails);
+    printf(fails ? "stress: %d failures\n" : "stress: all good\n", fails);
     return fails != 0;
 }
 EOF
 cc -O1 -pthread -o "$d/t" "$d/t.c" || exit 2
 u=$(mktemp -d)
 rc=0
-for fp in ${FPS:-1 0 1 1}; do
-    LINUXITY_FASTPATH=$fp LINUXITY_PROFILE=1 "$L" --quiet --root "$R" --persist "$u" --bind "$d:/fps" /fps/t 2>"$d/err" || rc=1
-    grep 'fast path' "$d/err"
+for trap in "" 1 "" ""; do
+    LINUXITY_TEST_ALL_TRAP=$trap LINUXITY_PROFILE=1 "$L" --quiet --root "$R" --persist "$u" --bind "$d:/fps" /fps/t 2>"$d/err" || rc=1
+    grep 'linuxity in-guest' "$d/err"
 done
 rm -rf "$d" "$u"
 exit $rc

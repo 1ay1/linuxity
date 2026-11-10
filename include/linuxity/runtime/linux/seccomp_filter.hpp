@@ -73,7 +73,7 @@
 #include <unistd.h>
 
 #include "linuxity/runtime/linux/seccomp_arch.hpp"
-#include "linuxity/runtime/linux/fastpath_table.hpp"
+#include "linuxity/runtime/linux/inguest_table.hpp"
 
 namespace lx::runtime {
 
@@ -425,14 +425,14 @@ inline constexpr int kTrappedX86_64[] = {
         kUringSetup != kNoSysno && kUringRegister != kNoSysno;
     const std::size_t nGates =
         (emit_x32 ? 1u : 0u) + (emit_uring ? 2u : 0u);
-    // The in-guest fast path's own calls carry a 128-bit key in args 4 and 5
-    // (fastpath_table.hpp); they skip straight to ALLOW. 10 statements:
+    // the in-guest handler's own calls carry a 128-bit key in args 4 and 5
+    // (inguest_table.hpp); they skip straight to ALLOW. 10 statements:
     // 4 loads+compares, the jump to ALLOW, reload nr. Only a few read-only
     // calls ever carry it, but checking the key alone is enough: nothing
     // else guesses 128 random bits.
-    const auto& fpk = fastpath::key();
+    const auto& fpk = inguest::key();
     std::size_t kKey = fpk.armed ? 10u : 0u;
-    // BPF jumps are 8 bits; past that, run without the key (the fast path
+    // BPF jumps are 8 bits; past that, run without the key (the in-guest handler
     // then sees its calls trapped and falls back)
     if (kKey && nGates + nTrapped + 30 > 255) kKey = 0;
     const std::size_t firstJeq = 4 + kKey + nGates;

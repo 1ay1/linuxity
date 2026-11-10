@@ -34,11 +34,11 @@ more fault.
 ## Where to resume
 
 The decisive step this round was adding `fastcall::enabled()`, gated on
-`LINUXITY_FASTCALL`, and testing the real `tests/test_hvf_run` rather than
+`LINUXITY_INGUEST`, and testing the real `tests/test_hvf_run` rather than
 a probe. That gives a clean A/B:
 
-    LINUXITY_FASTCALL=0 ./build-mac/tests/test_hvf_run   -> passes
-    LINUXITY_FASTCALL=1 ./build-mac/tests/test_hvf_run   -> hangs
+    LINUXITY_INGUEST=0 ./build-mac/tests/test_hvf_run   -> passes
+    LINUXITY_INGUEST=1 ./build-mac/tests/test_hvf_run   -> hangs
 
 Use it. It is the only reliable signal found so far, and it needs no new
 harness.

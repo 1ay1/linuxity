@@ -243,7 +243,7 @@ public:
     }
 
     // Every path with a record, and a sink for paths given one from now on
-    // (the in-guest fast path must leave those to the dispatcher).
+    // (the in-guest handler must leave those to the dispatcher).
     template <class F> void for_each_path(F&& f) const {
         for (const auto& [p, r] : table_) f(p);
     }

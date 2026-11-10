@@ -1,28 +1,28 @@
-// In-guest fast path entry, x86-64. Position independent; the blob runs at
+// In-guest handler entry, x86-64. Position independent; the blob runs at
 // whatever address the guest's mmap gave it.
     .section .lx_header, "a"
-    .globl lx_fp_header
-lx_fp_header:
+    .globl lx_ig_header
+lx_ig_header:
     .quad 0x4c5846505441424c
     .long 1
-    .long lx_fp_common - lx_fp_header
-    .long lx_fp_guard_start - lx_fp_header
-    .long lx_fp_guard_end - lx_fp_header
-    .long lx_fp_fault_ret - lx_fp_header
+    .long lx_ig_common - lx_ig_header
+    .long lx_ig_guard_start - lx_ig_header
+    .long lx_ig_guard_end - lx_ig_header
+    .long lx_ig_fault_ret - lx_ig_header
     .long 0
 
     .text
-// void* lx_fp_base(void): where the blob (and so the region) starts
-    .globl lx_fp_base
-lx_fp_base:
-    lea lx_fp_header(%rip), %rax
+// void* lx_ig_base(void): where the blob (and so the region) starts
+    .globl lx_ig_base
+lx_ig_base:
+    lea lx_ig_header(%rip), %rax
     ret
 
-// long lx_fp_gate(long nr, long a0, long a1, long a2, long a3, const uint64_t key[2])
+// long lx_ig_gate(long nr, long a0, long a1, long a2, long a3, const uint64_t key[2])
 // a3 is the 4th syscall argument (r10); the key goes in the 5th and 6th.
-    .globl lx_fp_gate
-    .type lx_fp_gate, @function
-lx_fp_gate:
+    .globl lx_ig_gate
+    .type lx_ig_gate, @function
+lx_ig_gate:
     push %r12
     mov %r9, %r12
     mov %rdi, %rax
@@ -36,9 +36,9 @@ lx_fp_gate:
     pop %r12
     ret
 
-// long lx_fp_on_stack(long (*fn)(void*), void* arg, void* top)
-    .globl lx_fp_on_stack
-lx_fp_on_stack:
+// long lx_ig_on_stack(long (*fn)(void*), void* arg, void* top)
+    .globl lx_ig_on_stack
+lx_ig_on_stack:
     push %rbp
     mov %rsp, %rbp
     mov %rdx, %rsp
@@ -52,9 +52,9 @@ lx_fp_on_stack:
 // Called from a stub with the red zone skipped and eax = nr. Keeps every
 // register a syscall keeps. Returns rax = result and rcx = 1, or rcx = 0
 // (rax = nr again) to make the stub run the real syscall.
-    .globl lx_fp_common
-    .type lx_fp_common, @function
-lx_fp_common:
+    .globl lx_ig_common
+    .type lx_ig_common, @function
+lx_ig_common:
     pushfq
     push %rax
     push %rdi
@@ -69,7 +69,7 @@ lx_fp_common:
     and $-16, %rsp
     lea 8(%rbx), %rdi
     mov 56(%rbx), %esi
-    call lx_fp_handle
+    call lx_ig_handle
     mov %rbx, %rsp
     movabs $0x8000000000000000, %rcx
     cmp %rcx, %rax
@@ -90,12 +90,12 @@ lx_fp_common:
     ret
 
 // Guest memory is touched only in here. A fault inside makes the supervisor
-// resume at lx_fp_fault_ret, which the C side treats as "fall back".
+// resume at lx_ig_fault_ret, which the C side treats as "fall back".
 // Neither routine touches the stack before its ret.
-lx_fp_guard_start:
-// long lx_fp_copy(void* dst, const void* src, unsigned long n): 0
-    .globl lx_fp_copy
-lx_fp_copy:
+lx_ig_guard_start:
+// long lx_ig_copy(void* dst, const void* src, unsigned long n): 0
+    .globl lx_ig_copy
+lx_ig_copy:
     test %rdx, %rdx
     jz 2f
 1:  movb (%rsi), %al
@@ -106,10 +106,10 @@ lx_fp_copy:
     jnz 1b
 2:  xor %eax, %eax
     ret
-// long lx_fp_strcpy(char* dst, const char* src, unsigned long max):
+// long lx_ig_strcpy(char* dst, const char* src, unsigned long max):
 // the length without the NUL, or max if there is no NUL in max bytes
-    .globl lx_fp_strcpy
-lx_fp_strcpy:
+    .globl lx_ig_strcpy
+lx_ig_strcpy:
     xor %eax, %eax
 1:  cmp %rdx, %rax
     jae 2f
@@ -120,8 +120,8 @@ lx_fp_strcpy:
     inc %rax
     jmp 1b
 2:  ret
-lx_fp_guard_end:
-lx_fp_fault_ret:
+lx_ig_guard_end:
+lx_ig_fault_ret:
     mov $-14, %rax
     ret
 

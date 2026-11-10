@@ -597,7 +597,7 @@ public:
                 }
                 ++end;
             }
-            // every directory on the way is a real one: the fast path
+            // every directory on the way is a real one: the in-guest handler
             // may answer for names in the leaf's parent
             if (clean && on_clean_dir_ && depth == 0) {
                 const std::size_t cut = abs.rfind('/');
@@ -873,7 +873,7 @@ public:
         if (it == t->second.dirs.end()) return 0;
         return it->second.lazy.empty() ? 2 : 1;
     }
-    // The in-guest fast path was serving fd's merged listing and stopped at
+    // the in-guest handler was serving fd's merged listing and stopped at
     // byte cookie `cookie`: build the union here and stand at the same spot
     // (the first entry starting at or after it, as lseek does).
     void seek_dir_in(std::int32_t pid, int fd, std::uint64_t cookie) {
@@ -909,7 +909,7 @@ public:
         const Mount* m = deepest(abs);
         return !m || m->producer || !m->upper.empty();
     }
-    // The in-guest fast path opened, dup'd or closed `fd` in process `pid`:
+    // the in-guest handler opened, dup'd or closed `fd` in process `pid`:
     // make the table say what the fd is now, as note_opened_fd would have
     // for a read-only open of a host path. `path` null means closed.
     void apply_guest_fd(std::int32_t pid, int fd, const std::string* path, bool lazy_dir) {
@@ -2014,7 +2014,7 @@ private:
     struct DirProbe { Probe first; std::string second; bool third; };
     mutable std::unordered_map<std::string, DirProbe> dirlink_cache_;
 public:
-    // -- hooks for the in-guest fast path -----------------------------------
+    // -- hooks for the in-guest handler -----------------------------------
     // Called with a guest directory whose whole path the parent walk found
     // free of symlinks, and whether it may exist in the upper layer.
     void set_on_clean_dir(std::function<void(std::string_view, bool)> f) { on_clean_dir_ = std::move(f); }
@@ -2024,7 +2024,7 @@ public:
     void bump_layout() const noexcept { ++layout_version_; }
     // Bumped on every write: a directory may have become a symlink.
     [[nodiscard]] std::uint64_t dirs_version() const noexcept { return dirs_version_; }
-    // Paths whited out from now on (the fast path must leave them alone).
+    // Paths whited out from now on (the in-guest handler must leave them alone).
     void set_whiteout_log(std::vector<std::string>* log) { whiteout_log_ = log; }
     template <class F> void for_each_whiteout(F&& f) const { for (const auto& w : whiteouts_) f(w); }
     // The mounts every namespace sees: prefix, lower, upper, virtual.

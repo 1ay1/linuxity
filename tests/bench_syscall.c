@@ -15,7 +15,7 @@
 // wildly different numbers and an average across them is meaningless:
 //
 //   FORWARDED  -- the kernel runs it (read/write on a real fd). One stop or
-//                 none, depending on the seccomp fast path.
+//                 none, depending on the seccomp filter.
 //   VIRTUAL    -- linuxity answers from its own state (getpid, uname). The
 //                 syscall never reaches the kernel at all.
 //   REDIRECTED -- a path is translated and the kernel runs the rewritten
@@ -111,8 +111,8 @@ int main(int argc, char** argv) {
         report("openat+close", "REDIRECTED", now_ns() - t0, n / 10);
     }
     {
-        // stat: a path in, a struct out. linuxity has a fast path that
-        // answers it in ONE stop rather than forwarding.
+        // stat: a path in, a struct out. linuxity answers it
+        // in ONE stop rather than forwarding.
         struct stat st;
         uint64_t t0 = now_ns();
         for (long i = 0; i < n / 10; ++i)

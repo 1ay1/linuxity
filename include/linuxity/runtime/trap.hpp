@@ -114,8 +114,8 @@ public:
         // an instance can sit idle for minutes; apply exits as they happen
         if constexpr (requires { trap_.set_flush_events(std::function<void()>{}); })
             trap_.set_flush_events([&] { locked([&] { apply_proc_events(); }); });
-        if constexpr (requires { trap_.fp_setup(kernel_, sys); })
-            locked([&] { trap_.fp_setup(kernel_, sys); });
+        if constexpr (requires { trap_.ig_setup(kernel_, sys); })
+            locked([&] { trap_.ig_setup(kernel_, sys); });
         for (;;) {
             TrapFrame f;
             const auto t_wait = prof_.on ? prof_clock() : 0;
@@ -125,28 +125,28 @@ public:
             locked([&] { apply_proc_events(); });
             if (!still_running) {
                 cleanup_temps();
-                if constexpr (requires { trap_.fp_report(); }) if (prof_.on) trap_.fp_report();
+                if constexpr (requires { trap_.ig_report(); }) if (prof_.on) trap_.ig_report();
                 prof_.report();
                 return ok(trap_.exit_code());
             }
 
             // A hot read-only path query: maybe patch its site so the guest
-            // answers the next ones itself (runtime/linux/fastpath.hpp).
+            // answers the next ones itself (runtime/linux/inguest.hpp).
             // First, apply any fd changes the guest made on its own.
-            if constexpr (requires { trap_.fp_before_dispatch(kernel_); })
-                locked([&] { trap_.fp_before_dispatch(kernel_); });
-            if constexpr (requires { trap_.fp_before_call(f.regs, kernel_); })
-                locked([&] { trap_.fp_before_call(f.regs, kernel_); });
-            if constexpr (requires { trap_.fp_maybe_patch(f.regs, f.pc, kernel_, sys); }) {
-                if (locked([&] { return trap_.fp_maybe_patch(f.regs, f.pc, kernel_, sys); })) continue;
+            if constexpr (requires { trap_.ig_before_dispatch(kernel_); })
+                locked([&] { trap_.ig_before_dispatch(kernel_); });
+            if constexpr (requires { trap_.ig_before_call(f.regs, kernel_); })
+                locked([&] { trap_.ig_before_call(f.regs, kernel_); });
+            if constexpr (requires { trap_.ig_maybe_patch(f.regs, f.pc, kernel_, sys); }) {
+                if (locked([&] { return trap_.ig_maybe_patch(f.regs, f.pc, kernel_, sys); })) continue;
             }
 
             // The dispatcher classifies the trapped syscall: service it from
             // our subsystems, forward it to the host kernel, or exit.
             abi::Outcome o = locked([&] { return sys.dispatch(f.regs); });
-            // publish what the call changed to the in-guest fast path
-            if constexpr (requires { trap_.fp_after_dispatch(f.regs, kernel_, sys); })
-                locked([&] { trap_.fp_after_dispatch(f.regs, kernel_, sys); });
+            // publish what the call changed to the in-guest handler
+            if constexpr (requires { trap_.ig_after_dispatch(f.regs, kernel_, sys); })
+                locked([&] { trap_.ig_after_dispatch(f.regs, kernel_, sys); });
             // the host already refused this call, so it can't be forwarded or
             // redirected; anything but a virtualized answer is ENOSYS
             if constexpr (requires { trap_.refused_call(); })
@@ -261,7 +261,7 @@ public:
                     // exist first (the overlay upper starts empty), and may
                     // carry a SECOND path to translate (rename/link/symlink).
 
-                    // FAST PATH: when the translation is an identity and there
+                    // When the translation is an identity and there
                     // is nothing else to do, the guest's registers already say
                     // what we would write. Forwarding costs one stop and no
                     // guest-memory traffic; redirecting costs two stops plus a
@@ -320,13 +320,13 @@ public:
                                 locked([&] { sys.note_linked(rd.linked->first, rd.linked->second); });
                             if constexpr (requires { trap_.set_ret_now(std::int64_t{0}); })
                                 if (rd.force_ret) trap_.set_ret_now(*rd.force_ret);
-                            // a new fd: tell the in-guest fast path what it is
+                            // a new fd: tell the in-guest handler what it is
                             // now, before the task runs on and uses it
-                            if constexpr (requires { trap_.fp_note_fd(kernel_, 0, std::string{}); })
+                            if constexpr (requires { trap_.ig_note_fd(kernel_, 0, std::string{}); })
                                 if (rc >= 0 && !rd.force_ret)
                                     locked([&] {
                                         if (!sys.pending_open_path().empty())
-                                            trap_.fp_note_fd(kernel_, static_cast<int>(rc), sys.pending_open_path());
+                                            trap_.ig_note_fd(kernel_, static_cast<int>(rc), sys.pending_open_path());
                                     });
                         },
                         arg2, hp2_fit);
@@ -446,9 +446,9 @@ public:
                                         sys.on_fd_closed(closed);
                                     sys.on_fd_dup(from, static_cast<int>(ret));
                                 });
-                                if constexpr (requires { trap_.fp_note_fd(kernel_, 0, std::string{}); })
+                                if constexpr (requires { trap_.ig_note_fd(kernel_, 0, std::string{}); })
                                     locked([&] {
-                                        trap_.fp_note_fd(kernel_, static_cast<int>(ret),
+                                        trap_.ig_note_fd(kernel_, static_cast<int>(ret),
                                                          std::string{kernel_.files().path_of_fd(static_cast<int>(ret))});
                                     });
                             });
@@ -685,7 +685,7 @@ private:
             [&](const abi::Redirect& rd) {
                 // Say when the rewrite is an identity and the loop will just
                 // forward: otherwise the trace reports INTENT and hides the
-                // fast path, which made a profile look unchanged after it
+                // plain forward, which made a profile look unchanged after it
                 // landed.
                 if (rd.is_noop()) {
                     std::fprintf(out, "[lx] nr=%llu -> FORWARD (identity %s)\n",

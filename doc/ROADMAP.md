@@ -108,13 +108,13 @@ every `syscall` into a VM exit.
       alone is ~0.9 us. The exit itself is the floor, so going faster means
       taking fewer exits, not cheaper ones. Two mechanisms do that:
         * **A vDSO** for clocks: clock_gettime is ~19 ns, fully in-guest.
-        * **An identity fast path.** A 15-instruction handler installed in
+        * **In-guest identity answers.** A 15-instruction handler installed in
           an EL1 vector slot answers getpid/gettid/getppid/getuid/geteuid/
           getgid/getegid/sched_yield from a table in EL1-only memory and
           `eret`s without ever leaving the VM: ~30 ns instead of ~1050 ns.
           (The earlier conclusion that HCR_EL2.TGE made this impossible was
           wrong -- it was a mis-encoded `add` in the probe. EL0 exceptions
-          CAN be taken at a guest EL1 vector.) `LINUXITY_FASTCALL=0`
+          CAN be taken at a guest EL1 vector.) `LINUXITY_INGUEST=0`
           disables it. The table is revoked for calls that stop being
           constant, e.g. gettid once the process is threaded.
       Offloading rt_sigprocmask the same way is PARKED, not shipped: the

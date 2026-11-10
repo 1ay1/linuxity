@@ -25,8 +25,8 @@ int main(){
   bad+=probe(0x0,     "vectors / EL1 handler");
   bad+=probe(0x1000,  "L1 page table");
   bad+=probe(0x2000,  "L2 page table");
-  bad+=probe(0x3000,  "fastcall table");
-  bad+=wprobe(0x3000, "fastcall table");
+  bad+=probe(0x3000,  "in-guest answer table");
+  bad+=wprobe(0x3000, "in-guest answer table");
   bad+=wprobe(0x400,  "EL1 handler code");
   // Can a guest fake an entry for a syscall we do NOT publish?
   long r = syscall(SYS_close, -1);

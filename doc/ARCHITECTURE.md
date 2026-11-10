@@ -15,7 +15,7 @@ This is the *why* and the *how it works*; for the *how to use it* see
 5. [The trap backend (native execution)](#5-the-trap-backend-native-execution)
 5a. [The kernel-less backends (macOS, Windows)](#5a-the-kernel-less-backends-macos-windows)
 6. [Syscall fates: virtualize / forward / redirect / inject / signal](#6-syscall-fates)
-7. [The seccomp fast path](#7-the-seccomp-fast-path)
+7. [The seccomp filter](#7-the-seccomp-filter)
 8. [The filesystem namespace](#8-the-filesystem-namespace)
 9. [The overlay (copy-on-write)](#9-the-overlay-copy-on-write)
 10. [Shadow metadata (fake-root)](#10-shadow-metadata-fake-root)
@@ -238,7 +238,7 @@ canonical `Sysno`, and the switch is on that identity.
 
 ---
 
-## 7. The seccomp fast path
+## 7. the seccomp filter
 
 Trapping *every* syscall via `PTRACE_SYSCALL` is slow. Instead
 (`runtime/linux/seccomp_filter.hpp`), linuxity installs a classic-BPF seccomp filter
@@ -260,8 +260,8 @@ the window between the child installing the filter and the tracer arming
 via `PTRACE_EVENT_EXEC`, and guest binaries load through the (filtered,
 path-translated) `openat`.
 
-**Correctness.** The `run_seccomp` test proves the fast path is byte-for-byte
-equivalent to the `PTRACE_SYSCALL` fallback. `LINUXITY_NO_SECCOMP=1` forces the
+**Correctness.** The `run_seccomp` test proves running under the filter is byte-for-byte
+equivalent to the `PTRACE_SYSCALL` fallback. `LINUXITY_TEST_NO_SECCOMP=1` forces the
 fallback (also auto-selected when the host lacks `CONFIG_SECCOMP_FILTER`).
 
 > **Maintenance rule:** keep `kTrappedX86_64` in lock-step with the non-default
