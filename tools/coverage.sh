@@ -51,7 +51,7 @@ done
 
 cd "$BUILD"
 gcov -b -o ./CMakeFiles/linuxity.dir/src/ \
-        ./CMakeFiles/linuxity.dir/src/main.cpp.gcda >/tmp/lx-gcov-summary.txt 2>&1
+        ./CMakeFiles/linuxity.dir/src/run_linux.cpp.gcda >/tmp/lx-gcov-summary.txt 2>&1
 
 # BRANCH coverage is the number that says something about handler
 # correctness. Line coverage asks "did this line run"; branch coverage asks

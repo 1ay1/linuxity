@@ -67,6 +67,18 @@ set_target_properties(linuxity_vibe PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED
 target_compile_options(linuxity_vibe PRIVATE -w)
 target_link_libraries(linuxity_core INTERFACE linuxity_vibe)
 
+# ---- The one entry point -------------------------------------------------
+# One linuxity, one main(): src/main.cpp is the command line on every host
+# (flags, usage, verbs), src/cli.cpp the environment verbs on the POSIX ones,
+# and src/run_<host>.cpp the ONLY per-host part -- how a guest runs
+# (src/host_run.hpp is the seam).
+set(LX_MAIN_SOURCES src/main.cpp)
+set(LX_MAIN_LIBS linuxity_core)
+if(NOT WIN32)
+    list(APPEND LX_MAIN_SOURCES src/cli.cpp)
+    list(APPEND LX_MAIN_LIBS z)          # env import/export (archive.hpp)
+endif()
+
 # ---- Host backends -------------------------------------------------------
 # The core above is header-only and host-agnostic. The executable needs a
 # trap backend; today those are ptrace (Linux), Hypervisor.framework
@@ -133,9 +145,9 @@ if(CMAKE_SYSTEM_NAME IN_LIST LX_PTRACE_HOSTS)
         ".section .note.GNU-stack,\"\",%progbits\n")
     set_source_files_properties(${CMAKE_BINARY_DIR}/inguest_blob.S PROPERTIES OBJECT_DEPENDS ${LX_IG_BIN})
 
-    add_executable(linuxity src/main.cpp src/cli.cpp ${CMAKE_BINARY_DIR}/bridge_blob.S
-                            ${CMAKE_BINARY_DIR}/inguest_blob.S)
-    target_link_libraries(linuxity PRIVATE linuxity_core linuxity_host z)
+    add_executable(linuxity ${LX_MAIN_SOURCES} src/run_linux.cpp
+                            ${CMAKE_BINARY_DIR}/bridge_blob.S ${CMAKE_BINARY_DIR}/inguest_blob.S)
+    target_link_libraries(linuxity PRIVATE ${LX_MAIN_LIBS} linuxity_host)
     # Every guest exec re-runs nothing of ours, but every linuxity run does:
     # resolving symbols against a shared libstdc++ was 0.7ms of a 0.9ms
     # start. Linked in, it is a few hundred relative relocations.
@@ -146,8 +158,8 @@ if(CMAKE_SYSTEM_NAME IN_LIST LX_PTRACE_HOSTS)
 elseif(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
     # macOS: the Hypervisor.framework backend. hv_vm_create is entitlement-
     # gated, so sign ad-hoc with com.apple.security.hypervisor after linking.
-    add_executable(linuxity src/main_macos.cpp)
-    target_link_libraries(linuxity PRIVATE linuxity_core "-framework Hypervisor")
+    add_executable(linuxity ${LX_MAIN_SOURCES} src/run_darwin.cpp)
+    target_link_libraries(linuxity PRIVATE ${LX_MAIN_LIBS} "-framework Hypervisor")
     add_custom_command(TARGET linuxity POST_BUILD
         COMMAND codesign -s - --entitlements
                 ${CMAKE_SOURCE_DIR}/tests/hypervisor.entitlements
@@ -163,8 +175,8 @@ elseif(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
     # linked, so the binary still starts on a machine where the "Windows
     # Hypervisor Platform" feature is off and can print a real diagnostic
     # instead of dying in the loader with 0xC0000135.
-    add_executable(linuxity src/main_windows.cpp)
-    target_link_libraries(linuxity PRIVATE linuxity_core)
+    add_executable(linuxity ${LX_MAIN_SOURCES} src/run_windows.cpp)
+    target_link_libraries(linuxity PRIVATE ${LX_MAIN_LIBS})
     message(STATUS "linuxity: WHP backend (Windows x86-64); "
                    "WinHvPlatform.dll is loaded on demand at runtime")
 else()

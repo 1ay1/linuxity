@@ -338,7 +338,7 @@ inline bool copy_fd(int in, int out) {
                 if (!src.read_exact(pad, padded - size)) { if (fd >= 0) ::close(fd); ::close(dir); r.error = "the archive ends early"; goto done; }
             }
             if (fd >= 0) {
-                (void)::fchmod(fd, mode);
+                (void)::fchmod(fd, static_cast<mode_t>(mode));
                 const ::timespec ts[2] = {{mtime, 0}, {mtime, 0}};
                 (void)::futimens(fd, ts);
                 ::close(fd);
@@ -381,7 +381,7 @@ done:
     // directory modes last, deepest first, so a 0555 dir didn't block its
     // own children
     for (auto it = dirs.rbegin(); it != dirs.rend(); ++it) {
-        (void)::fchmodat(root, it->rel.c_str(), it->mode | 0700, 0);
+        (void)::fchmodat(root, it->rel.c_str(), static_cast<mode_t>(it->mode | 0700), 0);
         const ::timespec ts[2] = {{it->mtime, 0}, {it->mtime, 0}};
         (void)::utimensat(root, it->rel.c_str(), ts, AT_SYMLINK_NOFOLLOW);
     }

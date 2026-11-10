@@ -66,9 +66,12 @@ Consequences of this design:
 
 ## 2. High-level flow
 
-`src/main.cpp` wires everything and starts the guest:
+`src/main.cpp` is the one entry point on every host: it parses the flags
+(once, for every host), dispatches the verbs, and hands the resulting
+`Options` to the host's `host_run()` (`src/run_<host>.cpp`, behind
+`src/host_run.hpp`). On Linux that wires everything and starts the guest:
 
-1. **Parse flags** (`--root`, `--bind`, resource limits).
+1. **Parse flags** (`--root`, `--bind`, resource limits) — `src/main.cpp`.
 2. **Build the `MachineSpec`** — one source of truth for the virtual machine
    (CPU count, RAM, kernel release). Resource limits *derive* it, so belief ==
    enforced reality.
@@ -114,7 +117,9 @@ Consequences of this design:
 | `runtime/darwin/`, `runtime/windows/` | The kernel-less hypervisor backends. See `runtime/README.md`. |
 | `runtime/resource_governor.hpp` | cgroup v2 / setrlimit enforcement. |
 | `host/{host,posix_host}.hpp` | The `Host` concept and its POSIX backend. |
-| `src/main.cpp` | The wiring / entry point. |
+| `src/main.cpp` | The one entry point: flags, usage, verbs, on every host. |
+| `src/guest_env.hpp` | The guest's login environment (user, PATH, locale), for every host. |
+| `src/run_<host>.cpp` | Each host's `host_run()`: how a guest runs there (`src/host_run.hpp`). |
 
 ---
 

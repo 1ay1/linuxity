@@ -1,4 +1,4 @@
-// src/main_macos.cpp
+// src/run_darwin.cpp -- the macOS host's host_run() (Hypervisor.framework).
 //
 // linuxity on macOS: run a Linux aarch64 distro's programs natively on Apple
 // Silicon, with no VM kernel, no Docker, and no root.
@@ -8,8 +8,9 @@
 // The program's instructions execute bare on the M-series CPU inside a
 // kernel-less Hypervisor.framework VM; every syscall traps back here and is
 // serviced by the SAME portable core (kernel/, vfs/, abi/) that the Linux
-// ptrace build uses. This file is wiring: options, the namespace, exec, and
-// the process-tree plumbing that guest fork() needs on this OS.
+// ptrace build uses. This file is wiring: the namespace, exec, and the
+// process-tree plumbing that guest fork() needs on this OS. The command line
+// is src/main.cpp's, shared with every host (see host_run.hpp).
 #include "linuxity/host/posix_host.hpp"
 #include "linuxity/kernel/kernel.hpp"
 #include "linuxity/runtime/darwin/exec.hpp"
@@ -42,31 +43,22 @@
 #include <string_view>
 #include <vector>
 
-extern char** environ;
+#include "linuxity/host/environ.hpp"
+#include "linuxity/host/self_exe.hpp"
+
+#include "guest_env.hpp"
+#include "host_run.hpp"
+#include "options.hpp"
 
 using namespace lx;
 
 namespace {
 
-void usage() {
-    std::fputs(
-        "usage: linuxity [--root DIR] [--persist DIR] [--bind HOST[:GUEST]]...\n"
-        "                [--memory MiB] PROGRAM [ARGS...]\n"
-        "\n"
-        "Run a Linux aarch64 program natively on this Mac.\n"
-        "\n"
-        "  --root DIR     an extracted distro rootfs to use as the guest '/'\n"
-        "  --persist DIR  keep guest writes here across runs (installs, config).\n"
-        "                 Without it, writes go to a per-run scratch dir and\n"
-        "                 are discarded. Either way the rootfs stays pristine.\n"
-        "  --bind H[:G]   expose host directory H at guest path G (default H)\n"
-        "  --memory MiB   guest RAM (default 2048)\n"
-        "\n"
-        "Get a rootfs:\n"
-        "  mkdir ~/arch && curl -L \\\n"
-        "    http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz \\\n"
-        "    | tar xz -C ~/arch\n",
-        stderr);
+using cli::Options;
+
+// The guest's RAM: --memory, else 2 GiB. A VM needs a size up front.
+[[nodiscard]] std::uint64_t vm_bytes(const Options& o) {
+    return o.res.mem_max.value_or(std::uint64_t{2048} << 20);
 }
 
 [[nodiscard]] bool is_dir(const std::string& p) {
@@ -83,49 +75,6 @@ void crash_handler(int sig) {
     ::raise(sig);
 }
 
-// -- Options -----------------------------------------------------------------
-// Parsed once by the root process and forwarded VERBATIM to every fork
-// child, which rebuilds an identical namespace from them. Keeping the
-// configuration as "the argv that produced it" is what makes that trivially
-// correct: there is no second representation to keep in sync.
-struct Options {
-    std::string root;
-    std::string persist;             // --persist DIR: a durable upper layer
-    std::vector<std::pair<std::string, std::string>> binds;
-    std::uint64_t mem_mib = 2048;
-    std::vector<std::string> raw;     // exactly the option tokens we consumed
-};
-
-[[nodiscard]] int parse(int argc, char** argv, Options& o) {
-    int i = 1;
-    for (; i < argc; ++i) {
-        std::string_view a = argv[i];
-        auto need = [&]() -> const char* {
-            if (i + 1 >= argc) { usage(); std::exit(2); }
-            o.raw.emplace_back(argv[i]);
-            o.raw.emplace_back(argv[i + 1]);
-            return argv[++i];
-        };
-        if (a == "--root") o.root = need();
-        else if (a == "--persist") o.persist = need();
-        else if (a == "--bind") {
-            std::string spec = need();
-            auto colon = spec.find(':');
-            o.binds.emplace_back(spec.substr(0, colon),
-                                 colon == std::string::npos ? spec : spec.substr(colon + 1));
-        }
-        else if (a == "--memory") o.mem_mib = std::strtoull(need(), nullptr, 10);
-        else if (a == "-h" || a == "--help") { usage(); std::exit(0); }
-        else if (a == "--fork-child" || a == "--zygote") break;   // internal: see main()
-        else if (a.starts_with("--")) {
-            std::fprintf(stderr, "linuxity: unknown option %s\n", argv[i]);
-            usage();
-            std::exit(2);
-        }
-        else break;
-    }
-    return i;
-}
 
 // -- The guest "machine": kernel + namespace ----------------------------------
 struct Machine {
@@ -141,9 +90,9 @@ struct Machine {
         kernel::MachineSpec spec;
         const long n = ::sysconf(_SC_NPROCESSORS_ONLN);
         spec.ncpu = n > 0 ? n : 1;
-        spec.mem_total = o.mem_mib << 20;
-        spec.release = "6.6.0-linuxity";
-        spec.nodename = "linuxity";
+        spec.mem_total = vm_bytes(o);
+        spec.release = o.release;
+        spec.nodename = o.hostname;
         spec.machine_arch = "aarch64";
         {
             // The real CPU: "Apple M3 Pro", not a made-up name, for
@@ -193,8 +142,8 @@ struct Machine {
         // and then requires stat(that path) to be the same device as
         // fstat(0). Binding the device at its own name makes that true.
         for (int fd = 0; fd < 3; ++fd)
-            if (const char* n = ::isatty(fd) ? ::ttyname(fd) : nullptr)
-                k.files().mount_host(n, n);
+            if (const char* tty = ::isatty(fd) ? ::ttyname(fd) : nullptr)
+                k.files().mount_host(tty, tty);
         k.files().mount_host("/dev/tty", "/dev/tty");
         root_ = o.root;
         real_root_ = canonical(root_);
@@ -317,11 +266,7 @@ struct Machine {
     return {};
 }
 
-[[nodiscard]] std::string self_exe() {
-    char buf[4096];
-    std::uint32_t n = sizeof buf;
-    return ::_NSGetExecutablePath(buf, &n) == 0 ? std::string{buf} : std::string{};
-}
+using host::self_exe;   // host/self_exe.hpp
 
 // -- Fork, parent side ---------------------------------------------------------
 // Spawn a fresh linuxity in --fork-child mode and hand it the guest. The
@@ -438,7 +383,7 @@ public:
         }
 
         std::vector<std::string> args{self_exe()};
-        args.insert(args.end(), opts_.raw.begin(), opts_.raw.end());
+        args.insert(args.end(), opts_.flags.begin(), opts_.flags.end());
         args.emplace_back("--fork-child");
         args.emplace_back(svc_name);
         args.emplace_back(std::to_string(pid_fd_child));
@@ -451,7 +396,7 @@ public:
         av.push_back(nullptr);
 
         pid_t pid = -1;
-        const int rc = ::posix_spawn(&pid, args[0].c_str(), &fa, &attr, av.data(), environ);
+        const int rc = ::posix_spawn(&pid, args[0].c_str(), &fa, &attr, av.data(), host::host_environ());
         ::posix_spawn_file_actions_destroy(&fa);
         ::posix_spawnattr_destroy(&attr);
         mark("spawned");
@@ -557,7 +502,7 @@ private:
             return {};
         }
         std::vector<std::string> args{self_exe()};
-        args.insert(args.end(), opts_.raw.begin(), opts_.raw.end());
+        args.insert(args.end(), opts_.flags.begin(), opts_.flags.end());
         args.emplace_back("--zygote");
         args.emplace_back(svc_name);
         std::vector<char*> av;
@@ -576,7 +521,7 @@ private:
         ::posix_spawnattr_init(&attr);
         ::posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
         pid_t pid = -1;
-        const int rc = ::posix_spawn(&pid, args[0].c_str(), &fa, &attr, av.data(), environ);
+        const int rc = ::posix_spawn(&pid, args[0].c_str(), &fa, &attr, av.data(), host::host_environ());
         ::posix_spawn_file_actions_destroy(&fa);
         ::posix_spawnattr_destroy(&attr);
         if (rc != 0) {
@@ -756,6 +701,7 @@ void run_guest_thread(ThreadContext& ctx, runtime::HvfTrap::ThreadStart start) {
     // closes, the parent's wait sees our status. Guest RAM is a mapping the
     // kernel reclaims; nothing in it needs unwinding.
     proc.request_group_exit(rc ? *rc : 1);
+    trap.sync_all_shared();      // MAP_SHARED stores reach their files
     std::fflush(nullptr);
     if (!rc) {
         std::fprintf(stderr, "linuxity: runtime error %d\n", static_cast<int>(rc.error()));
@@ -793,13 +739,22 @@ void attach_live_procs(Machine& m, runtime::PidSpace& pids) {
     static Live live{pids};
     m.k.procs().set_live_source(&live);
 }
-}  // namespace
+// Startup stage timer (LINUXITY_PROFILE_START=1): where a fresh linuxity
+// spends its first milliseconds. Every guest fork pays this.
+bool start_profiling() {
+    static const bool on = std::getenv("LINUXITY_PROFILE_START") != nullptr;
+    return on;
+}
+void smark(const char* w) {
+    static const auto s0 = std::chrono::steady_clock::now();
+    if (start_profiling()) std::fprintf(stderr, "[start %d] %-12s %7lld us\n", ::getpid(), w,
+        static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - s0).count()));
+}
 
-int main(int argc, char** argv) {
-    // Startup stage timer (LINUXITY_PROFILE_START=1): where a fresh linuxity
-    // spends its first milliseconds. Every guest fork pays this.
-    static const bool sprof = std::getenv("LINUXITY_PROFILE_START") != nullptr;
-    if (sprof) {
+// Once per process, whichever way in: the start timer and crash handler.
+void process_start() {
+    if (start_profiling()) {
         // Time from exec (kernel's process start) to main: dyld + static init.
         struct kinfo_proc kp{};
         std::size_t len = sizeof kp;
@@ -811,20 +766,22 @@ int main(int argc, char** argv) {
                 static_cast<long long>((now.tv_sec - st.tv_sec) * 1000000LL + (now.tv_usec - st.tv_usec)));
         }
     }
-    static const auto s0 = std::chrono::steady_clock::now();
-    auto smark = [](const char* w) {
-        if (sprof) std::fprintf(stderr, "[start %d] %-12s %7lld us\n", ::getpid(), w,
-            static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - s0).count()));
-    };
     smark("main");
     if (std::getenv("LINUXITY_DEBUG")) {
         ::signal(SIGSEGV, crash_handler);
         ::signal(SIGBUS, crash_handler);
     }
+}
 
-    Options o;
-    int i = parse(argc, argv, o);
+}  // namespace
+
+const char* cli::host_name() noexcept { return "macos (Hypervisor.framework)"; }
+
+// The private ways linuxity starts itself: a fork child (`--fork-child
+// SERVICE PIDFD GROUPFDS`) or a pre-spawned zygote (`--zygote SERVICE`).
+// Both follow the parent's flags, replayed through the one parser.
+int cli::host_internal(const Options& o, int argc, char** argv, int i) {
+    process_start();
 
     // -- Fork child: `--fork-child SERVICE PIDFD GROUPFDS` follows the options.
     if (i + 3 < argc && std::string_view{argv[i]} == "--fork-child") {
@@ -915,16 +872,21 @@ int main(int argc, char** argv) {
         // receive below simply fails when the parent's port set is torn
         // down with it. Either way: never run guest code without a handoff.
         // If our creator exits without forking (the guest session ended), a
-        // parked zygote must not linger. Watch the parent pid; exit with it.
+        // parked zygote must not linger. Watch the creator pid; exit with it.
+        // The creator comes from the service name: getppid() is already 1
+        // if it died while we were starting, and launchd never exits.
         {
-            const pid_t creator = ::getppid();
+            pid_t creator = runtime::fork_ipc::service_creator(argv[i + 1]);
+            if (creator <= 0) creator = ::getppid();
+            if (creator <= 1 || ::getppid() != creator) ::_exit(0);   // orphaned already
             std::thread([creator] {
                 const int kq = ::kqueue();
                 struct ::kevent ev{};
                 EV_SET(&ev, static_cast<uintptr_t>(creator), EVFILT_PROC, EV_ADD,
                        NOTE_EXIT, 0, nullptr);
+                // ESRCH: it exited between the check above and here.
                 if (kq < 0 || ::kevent(kq, &ev, 1, nullptr, 0, nullptr) < 0) {
-                    if (::kill(creator, 0) != 0) ::_exit(0);
+                    if (!zygote_claimed().load()) ::_exit(0);
                     return;
                 }
                 struct ::kevent out{};
@@ -974,19 +936,28 @@ int main(int argc, char** argv) {
         return run(o, m, machine, cpu, proc, task, pids, trap);
     }
 
-    if (i >= argc) { usage(); return 2; }
+    return -1;
+}
+
+int cli::host_run(Options& o, int, char**) {
+    process_start();
+    if (o.instance) {
+        std::fputs("linuxity: background environments need a Linux host for now;\n"
+                   "          use `linuxity run` on this Mac\n", stderr);
+        return 2;
+    }
     if (o.root.empty() || !is_dir(o.root)) {
         std::fputs("linuxity: --root must name an extracted aarch64 rootfs\n", stderr);
         return 2;
     }
 
     runtime::HvfMachine machine;
-    if (auto st = machine.init(o.mem_mib << 20); !st) {
+    if (auto st = machine.init(vm_bytes(o)); !st) {
         std::fprintf(stderr,
             "linuxity: cannot create a hypervisor VM. This binary must be signed\n"
             "with the com.apple.security.hypervisor entitlement:\n"
             "  codesign -s - --entitlements hypervisor.entitlements -f %s\n",
-            argv[0]);
+            self_exe().c_str());
         return 1;
     }
     // The initial guest thread's vCPU, created on THIS thread because
@@ -997,36 +968,56 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Who runs, with what environment: the same policy as every host
+    // (src/guest_env.hpp) -- the guest's /etc/passwd, --user, -e, its PATH
+    // and a locale its libc can load -- not the Mac user's HOME and USER.
+    auto ge = cli::guest_env(o);
+    if (ge.error.empty() && ge.login.uid != 0) {
+        // This backend answers identity from abi/identity.hpp: the guest is
+        // root and set*id only accepts 0. Running a 'nobody' environment on
+        // root syscalls would be a guest that disagrees with itself (HOME=/
+        // but id -u = 0), so keep it coherent and say why.
+        std::fprintf(stderr, "linuxity: --user %s: the macOS backend runs guests as root for now\n",
+                     o.user.c_str());
+        Options as_root = o;
+        as_root.user = "root";
+        ge = cli::guest_env(as_root);
+    }
+    if (!ge.error.empty()) {
+        std::fprintf(stderr, "linuxity: %s\n", ge.error.c_str());
+        return 2;
+    }
+    if (!ge.notice.empty() && !o.quiet) std::fprintf(stderr, "linuxity: %s\n", ge.notice.c_str());
+    std::vector<std::string> env = std::move(ge.vars);
+    // Only on macOS: the host's terminfo for this terminal, compiled into a
+    // guest-visible directory (see host_terminfo_bridge).
+    if (const char* t = std::getenv("TERM"))
+        if (auto dir = host_terminfo_bridge(o.root, t); !dir.empty())
+            env.push_back("TERMINFO_DIRS=" + dir + ":/usr/share/terminfo");
+    (void)::umask(static_cast<mode_t>(o.umask));
+
     Machine m{o};
     {
         kernel::ProcInfo init;
         init.pid = 1;
         init.ppid = 0;
-        const std::string prog = argv[i];
+        const std::string& prog = o.argv[0];
         init.comm = prog.substr(prog.find_last_of('/') + 1);
-        for (int j = i; j < argc; ++j) {
-            init.cmdline += argv[j];
-            if (j + 1 < argc) init.cmdline.push_back('\0');   // ProcInfo: NUL-joined
+        for (std::size_t j = 0; j < o.argv.size(); ++j) {
+            init.cmdline += o.argv[j];
+            if (j + 1 < o.argv.size()) init.cmdline.push_back('\0');   // ProcInfo: NUL-joined
         }
         m.k.procs().upsert(init);
     }
-
-    // A root login in the guest's own world, not the Mac user's (whose
-    // HOME/USER don't exist in the rootfs).
-    std::vector<std::string> env = {
-        "PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin",
-        "HOME=/root", "USER=root", "LOGNAME=root", "SHELL=/bin/bash",
-        "LANG=C.UTF-8",
-    };
-    if (const char* t = std::getenv("TERM")) {
-        env.push_back(std::string{"TERM="} + t);
-        if (auto dir = host_terminfo_bridge(o.root, t); !dir.empty())
-            env.push_back("TERMINFO_DIRS=" + dir + ":/usr/share/terminfo");
+    // --cwd / login.cwd: where pid 1 starts (a missing one falls back to /)
+    if (!o.cwd.empty()) {
+        struct ::stat cst{};
+        const std::string h = m.resolve(o.cwd);
+        if (!h.empty() && ::stat(h.c_str(), &cst) == 0 && S_ISDIR(cst.st_mode))
+            m.k.files().set_cwd(o.cwd);
     }
-    for (const char* keep : {"COLORTERM", "TERM_PROGRAM", "KITTY_WINDOW_ID"})
-        if (const char* v = std::getenv(keep)) env.push_back(std::string{keep} + "=" + v);
 
-    std::vector<std::string> gargv(argv + i, argv + argc);
+    const std::vector<std::string>& gargv = o.argv;
     auto ex = runtime::hvf_exec(machine, [&m](const std::string& g) { return m.resolve(g); },
                                 gargv[0], gargv, env);
     if (!ex) {

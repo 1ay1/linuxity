@@ -307,7 +307,7 @@ private:
 
 // Compare an fd-returning call by WHETHER it succeeded, not by which number
 // it got. Allocation-dependent values are not comparable between two
-// processes -- and linuxity deliberately differs here: src/main.cpp holds
+// processes -- and linuxity deliberately differs here: src/run_linux.cpp holds
 // /dev/null on fds 3..8 (commit ea99143) so pacman's parallel libcurl workers
 // cannot race for fd 3, which corrupted core.db. So the guest's first new fd
 // is 4 where native gets 3, by design.
@@ -326,7 +326,7 @@ public:
     }
     [[nodiscard]] static constexpr std::string_view reason() noexcept {
         return "fd numbers are allocation-dependent; linuxity reserves 3..8 "
-               "so guests start allocating at 4 (see src/main.cpp)";
+               "so guests start allocating at 4 (see src/run_linux.cpp)";
     }
 
 private:

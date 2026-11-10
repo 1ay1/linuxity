@@ -1,8 +1,10 @@
 # Parked experiment: rt_sigprocmask on the in-guest fast path
 
-The identity fast path (`include/linuxity/runtime/hvf_fastcall.hpp`) is
-live and works: getpid/gettid/getuid/sched_yield answer inside the guest
-in ~30 ns instead of ~1050 ns for a VM exit.
+The identity answers in the guest (today `include/linuxity/runtime/darwin/inguest.hpp`,
+once `hvf_fastcall.hpp`) are
+live and work: getpid/gettid/getuid/sched_yield answer inside the guest
+in ~30 ns instead of ~1050 ns for a VM exit. (The files below still name
+their original `tools/fastcall/` paths; that is where they lived when parked.)
 
 Extending it to `rt_sigprocmask` — worth ~7% of all syscalls in a real
 workload — is **parked**. The files here are that attempt, kept because

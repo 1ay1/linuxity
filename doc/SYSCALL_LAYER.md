@@ -370,7 +370,7 @@ I spent several rounds describing "three syscall dispatchers" with 30
 syscalls implemented three times. That framing was wrong, and tracing the
 actual control flow is what corrected it.
 
-**darwin drives the portable dispatcher.** `src/main_macos.cpp` constructs
+**darwin drives the portable dispatcher.** `src/run_darwin.cpp` constructs
 `runtime::Cpu loop{trap, ...}`, so `abi::Syscalls::dispatch()` decides every
 fate and hands `HvfTrap` an already-translated path via `redirect()`. Its 277
 `case S::` labels live in `service()`, reached only through `forward()` /
@@ -378,7 +378,7 @@ fate and hands `HvfTrap` an already-translated path via `redirect()`. Its 277
 gets free from its kernel and macOS has to emulate. That is not duplication,
 it is the thing the `Outcome` sum type was built to express.
 
-**windows is the real duplicate.** `src/main_windows.cpp` runs its own
+**windows is the real duplicate.** `src/run_windows.cpp` runs its own
 hand-rolled loop (`sys.service(f)` at line 400), bypassing `runtime::Cpu` and
 `abi::Syscalls` entirely. Its 72 cases *are* a second dispatcher.
 

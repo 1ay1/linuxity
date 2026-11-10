@@ -14,7 +14,7 @@ jobs:
 
   macos:
     # macos-15 runners are arm64, so this builds the FULL macOS target:
-    # src/main_macos.cpp and all of runtime/darwin/ (see the APPLE branch in
+    # src/run_darwin.cpp and all of runtime/darwin/ (see the APPLE branch in
     # CMakeLists.txt). That matters -- it is the only automated check that the
     # HVF backend still compiles, since hv_vm_create is entitlement-gated and
     # cannot actually run a partition on a hosted runner. The live hypervisor

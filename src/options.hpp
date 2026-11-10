@@ -61,6 +61,15 @@ struct Options {
     int ready_fd{-1};               // a daemon tells its launcher it is up
 
     std::vector<std::string> argv;  // the program; empty in instance mode
+
+    // Report each syscall the backend cannot serve yet (--verbose).
+    bool verbose{false};
+
+    // The flag tokens that produced this Options, in order (--env NAME
+    // included), so a host that starts helper processes of itself (macOS
+    // fork children) hands them the SAME configuration by replaying these
+    // through the one parser -- never a second encoding to keep in sync.
+    std::vector<std::string> flags;
 };
 
 // Fill `o` from a loaded env config. Flags given after it still override.

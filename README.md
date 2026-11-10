@@ -98,8 +98,10 @@ JIT-backed kernel — with no virtual dispatch in the hot path.
 - `include/linuxity/vfs/`    — `inode.hpp` (FileSystem concept), `tmpfs.hpp` (in-memory backend), `hostfs.hpp` (on-disk rootfs backend), `procfs.hpp` (synthesized /proc), `vfs.hpp` (mount table + path resolution)
 - `include/linuxity/host/`   — `host.hpp` (the concept), `posix_host.hpp` (Linux/Darwin backend), `win_posix.hpp` (the POSIX corners the Win32 CRT lacks)
 - `include/linuxity/runtime/` — `trap.hpp` (the backend-agnostic loop), `ptrace_trap.hpp` (Linux), `hvf_*.hpp` (macOS/arm64), `whp_*.hpp` (Windows/x86-64)
-- `src/main.cpp`             — wires host → kernel → ABI, issues guest syscalls
-- `src/main_macos.cpp`, `src/main_windows.cpp` — the kernel-less hosts
+- `src/main.cpp`             — the one entry point: flags, usage, verbs, on every host
+- `src/cli.cpp`              — the environment verbs (new, list, shell, ...)
+- `src/guest_env.hpp`        — the guest's login environment, shared by every host
+- `src/run_linux.cpp`, `src/run_darwin.cpp`, `src/run_windows.cpp` — each host's `host_run()` (`src/host_run.hpp`)
 - `tests/`                   — host-free type-algebra, authority, and VFS tests
 
 ## Build

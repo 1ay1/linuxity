@@ -1,7 +1,8 @@
-// src/main_windows.cpp
+// src/run_windows.cpp -- the Windows host's host_run() (WHP).
 //
 // linuxity on Windows: run a Linux x86-64 distro's programs natively, with no
-// VM kernel, no WSL, no Docker, and no administrator rights.
+// VM kernel, no WSL, no Docker, and no administrator rights. The command line
+// is src/main.cpp's, shared with every host (see host_run.hpp).
 //
 //     linuxity --root C:\arch /usr/bin/bash
 //
@@ -54,30 +55,14 @@
 #include <string_view>
 #include <vector>
 
+#include "host_run.hpp"
+#include "options.hpp"
+
 using namespace lx;
 using namespace lx::runtime;
+using lx::cli::Options;
 
 namespace {
-
-void usage() {
-    std::fputs(
-        "usage: linuxity [--root DIR] [--memory MiB] [--check] PROGRAM [ARGS...]\n"
-        "\n"
-        "Run a Linux x86-64 program natively on this PC (no VM kernel, no WSL).\n"
-        "\n"
-        "  --root DIR     an extracted distro rootfs to use as the guest '/'\n"
-        "  --memory MiB   guest RAM (default 2048)\n"
-        "  --verbose      report every syscall this backend cannot serve yet\n"
-        "  --check        report whether this machine can host the backend,\n"
-        "                 and what the hypervisor supports, then exit\n"
-        "\n"
-        "Requirements:\n"
-        "  * 64-bit x86 with virtualization enabled in firmware\n"
-        "  * the \"Windows Hypervisor Platform\" optional feature:\n"
-        "      dism /online /Enable-Feature /FeatureName:HypervisorPlatform /All\n"
-        "    (or: Settings -> Optional Features -> More Windows features)\n",
-        stderr);
-}
 
 // Report what this machine can actually do. Worth its own flag: every
 // failure mode here is an environment problem with a specific fix, and a
@@ -171,34 +156,26 @@ int check() {
 
 } // namespace
 
-int main(int argc, char** argv) {
-    std::vector<std::string_view> args(argv + 1, argv + argc);
+const char* lx::cli::host_name() noexcept { return "windows (WHP)"; }
 
-    std::string root;
-    unsigned memory_mib = 2048;
-    bool verbose = false;
-    std::size_t i = 0;
-    for (; i < args.size(); ++i) {
-        auto a = args[i];
-        if (a == "--check") return check();
-        if (a == "--help" || a == "-h") { usage(); return 0; }
-        if (a == "--verbose" || a == "-v") { verbose = true; continue; }
-        if (a == "--root" && i + 1 < args.size()) { root = args[++i]; continue; }
-        if (a == "--memory" && i + 1 < args.size()) {
-            memory_mib = unsigned(std::strtoul(std::string{args[++i]}.c_str(),
-                                               nullptr, 10));
-            continue;
-        }
-        if (!a.empty() && a[0] == '-') {
-            std::fprintf(stderr, "linuxity: unknown option '%.*s'\n",
-                         int(a.size()), a.data());
-            usage();
-            return 2;
-        }
-        break;  // PROGRAM
+// --check: report whether this machine can host the backend.
+int lx::cli::host_internal(const Options&, int, char** argv, int i) {
+    return std::string_view{argv[i]} == "--check" ? check() : -1;
+}
+
+int lx::cli::host_run(Options& o, int, char**) {
+    // The requirements, which on Windows are the part people get wrong.
+    if (o.argv.empty()) {
+        std::fputs("Requirements:\n"
+                   "  * 64-bit x86 with virtualization enabled in firmware\n"
+                   "  * the \"Windows Hypervisor Platform\" optional feature:\n"
+                   "      dism /online /Enable-Feature /FeatureName:HypervisorPlatform /All\n"
+                   "  linuxity --check reports what this machine supports.\n", stderr);
+        return 2;
     }
-
-    if (i >= args.size()) { usage(); return 2; }
+    const std::string root = o.root;
+    const bool verbose = o.verbose;
+    const std::uint64_t memory_mib = o.res.mem_max.value_or(std::uint64_t{2048} << 20) >> 20;
 
     // Refuse early and precisely if the host cannot do this at all, rather
     // than failing deep inside partition setup.
@@ -212,7 +189,7 @@ int main(int argc, char** argv) {
     // This is the minimal stand-in for the file namespace: enough to load an
     // image out of a rootfs, but NOT the full path-translation the syscall
     // layer needs (that is the fd-table work still outstanding).
-    const std::string program{args[i]};
+    const std::string program = o.argv[0];
     std::string host_path = program;
     if (!root.empty()) {
         host_path = root;
@@ -222,24 +199,22 @@ int main(int argc, char** argv) {
         host_path += program.front() == '/' ? program.substr(1) : program;
     }
 
-    std::vector<std::string> argv_guest{program};
-    for (std::size_t a = i + 1; a < args.size(); ++a)
-        argv_guest.emplace_back(args[a]);
+    const std::vector<std::string>& argv_guest = o.argv;
 
-    std::uint64_t ram = std::uint64_t(memory_mib) << 20;
+    std::uint64_t ram = memory_mib << 20;
     if (ram < WhpLayout::min_ram) {
         std::fprintf(stderr,
-            "linuxity: --memory %u MiB is below the %llu MiB minimum this\n"
+            "linuxity: --memory %llu MiB is below the %llu MiB minimum this\n"
             "          backend's address-space layout needs\n",
-            memory_mib,
-            (unsigned long long)(WhpLayout::min_ram >> 20));
+            static_cast<unsigned long long>(memory_mib),
+            static_cast<unsigned long long>(WhpLayout::min_ram >> 20));
         return 2;
     }
 
     WhpMachine vm;
     if (auto st = vm.create(ram, 1); !st) {
-        std::fprintf(stderr, "linuxity: could not create a %u MiB partition\n",
-                     memory_mib);
+        std::fprintf(stderr, "linuxity: could not create a %llu MiB partition\n",
+                     static_cast<unsigned long long>(memory_mib));
         return 1;
     }
 

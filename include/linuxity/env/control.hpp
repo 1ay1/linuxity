@@ -32,6 +32,37 @@
 
 namespace lx::env::control {
 
+// An AF_UNIX stream socket, close-on-exec (and non-blocking if asked):
+// atomically where the host has SOCK_CLOEXEC, else right after creation.
+// The only window is a fork in another thread between the two calls, and
+// this process doesn't fork from threads.
+[[nodiscard]] inline int unix_socket(bool nonblock) {
+#if defined(SOCK_CLOEXEC) && defined(SOCK_NONBLOCK)
+    return ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | (nonblock ? SOCK_NONBLOCK : 0), 0);
+#else
+    const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    (void)::fcntl(fd, F_SETFD, FD_CLOEXEC);
+    if (nonblock) (void)::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL) | O_NONBLOCK);
+#if defined(SO_NOSIGPIPE)
+    const int one = 1;   // Darwin has no MSG_NOSIGNAL: say it once per socket
+    (void)::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+#endif
+    return fd;
+#endif
+}
+
+#if defined(MSG_NOSIGNAL)
+inline constexpr int kSendFlags = MSG_NOSIGNAL;
+#else
+inline constexpr int kSendFlags = 0;   // SO_NOSIGPIPE, set in unix_socket
+#endif
+#if defined(MSG_CMSG_CLOEXEC)
+inline constexpr int kRecvFlags = MSG_CMSG_CLOEXEC;
+#else
+inline constexpr int kRecvFlags = 0;   // received fds get FD_CLOEXEC below
+#endif
+
 inline constexpr int kMaxFds = 8;
 
 [[nodiscard]] inline std::string abstract_name_for(std::string_view path) {
@@ -63,7 +94,7 @@ struct Listener {
 [[nodiscard]] inline Listener listen_at(const std::string& path, std::string& why) {
     Listener l;
     l.path = path;
-    l.fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    l.fd = unix_socket(/*nonblock=*/true);
     if (l.fd < 0) { why = std::strerror(errno); return l; }
     ::sockaddr_un sa{};
     ::unlink(path.c_str());
@@ -91,7 +122,7 @@ struct Listener {
 // Connect to the instance whose control socket is `path`. -1 if none.
 [[nodiscard]] inline int connect_to(const std::string& path) {
     for (const bool abstract : {false, true}) {
-        const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        const int fd = unix_socket(/*nonblock=*/false);
         if (fd < 0) return -1;
         ::sockaddr_un sa{};
         const socklen_t len = make_addr(sa, abstract ? abstract_name_for(path) : path, abstract);
@@ -117,14 +148,14 @@ inline bool send_line(int fd, std::string_view line, const std::vector<int>& fds
             const std::size_t n = std::min<std::size_t>(fds.size(), kMaxFds);
             std::memset(ctl, 0, sizeof ctl);
             m.msg_control = ctl;
-            m.msg_controllen = CMSG_SPACE(sizeof(int) * n);
+            m.msg_controllen = static_cast<socklen_t>(CMSG_SPACE(sizeof(int) * n));
             ::cmsghdr* c = CMSG_FIRSTHDR(&m);
             c->cmsg_level = SOL_SOCKET;
             c->cmsg_type = SCM_RIGHTS;
-            c->cmsg_len = CMSG_LEN(sizeof(int) * n);
+            c->cmsg_len = static_cast<socklen_t>(CMSG_LEN(sizeof(int) * n));
             std::memcpy(CMSG_DATA(c), fds.data(), sizeof(int) * n);
         }
-        const ::ssize_t w = ::sendmsg(fd, &m, MSG_NOSIGNAL);
+        const ::ssize_t w = ::sendmsg(fd, &m, kSendFlags);
         if (w < 0) {
             if (errno == EINTR) continue;
             return false;
@@ -161,7 +192,7 @@ public:
         m.msg_control = ctl;
         m.msg_controllen = sizeof ctl;
         ::ssize_t n;
-        do { n = ::recvmsg(fd_, &m, MSG_CMSG_CLOEXEC); } while (n < 0 && errno == EINTR);
+        do { n = ::recvmsg(fd_, &m, kRecvFlags); } while (n < 0 && errno == EINTR);
         if (n < 0) return errno == EAGAIN || errno == EWOULDBLOCK;
         for (::cmsghdr* c = CMSG_FIRSTHDR(&m); c; c = CMSG_NXTHDR(&m, c)) {
             if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS) continue;
@@ -169,6 +200,7 @@ public:
             for (std::size_t i = 0; i < k; ++i) {
                 int f;
                 std::memcpy(&f, CMSG_DATA(c) + i * sizeof(int), sizeof f);
+                if constexpr (kRecvFlags == 0) (void)::fcntl(f, F_SETFD, FD_CLOEXEC);
                 fds_.push_back(f);
             }
         }

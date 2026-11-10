@@ -18,17 +18,21 @@
 #include "linuxity/env/passwd.hpp"
 #include "linuxity/env/store.hpp"
 #include "linuxity/env/vibe_edit.hpp"
+#include "linuxity/host/self_exe.hpp"
 #include "linuxity/kernel/meta_store.hpp"
 
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
-#include <sys/inotify.h>
 #include <sys/ioctl.h>
-#include <sys/signalfd.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/inotify.h>
+#else
+#include <sys/event.h>
+#endif
 
 #include <cerrno>
 #include <cstdio>
@@ -40,8 +44,6 @@
 #include <string>
 #include <string_view>
 #include <vector>
-
-extern char** environ;
 
 namespace {
 
@@ -57,13 +59,7 @@ bool has_flag(int argc, char** argv, std::string_view f) {
     return false;
 }
 
-std::string self_exe() {
-    char buf[4096];
-    const ::ssize_t n = ::readlink("/proc/self/exe", buf, sizeof buf - 1);
-    if (n <= 0) return "linuxity";
-    buf[n] = '\0';
-    return buf;
-}
+using lx::host::self_exe;
 
 void help() {
     std::puts(
@@ -220,11 +216,21 @@ int run_session(Conn& c, std::vector<std::string> argv, const std::string& user,
     // wait for {"event":"exit"}; relay the terminal meanwhile
     RawTty raw;
     if (tty) raw.enter();
-    ::sigset_t s;
-    ::sigemptyset(&s);
-    ::sigaddset(&s, SIGWINCH);
-    ::sigprocmask(SIG_BLOCK, &s, nullptr);
-    const int sfd = tty ? ::signalfd(-1, &s, SFD_CLOEXEC) : -1;
+    // SIGWINCH -> a byte on a pipe, so poll() sees it with the rest. (The
+    // portable self-pipe; signalfd is Linux-only.)
+    static int winch_pipe[2] = {-1, -1};
+    int sfd = -1;
+    if (tty && ::pipe(winch_pipe) == 0) {
+        for (const int fd : winch_pipe) {
+            (void)::fcntl(fd, F_SETFD, FD_CLOEXEC);
+            (void)::fcntl(fd, F_SETFL, O_NONBLOCK);
+        }
+        struct ::sigaction sa{};
+        sa.sa_handler = [](int) { const char b = 0; (void)!::write(winch_pipe[1], &b, 1); };
+        sa.sa_flags = SA_RESTART;
+        ::sigaction(SIGWINCH, &sa, nullptr);
+        sfd = winch_pipe[0];
+    }
     bool stdin_open = tty;
     int code = 255;
     for (;;) {
@@ -254,8 +260,8 @@ int run_session(Conn& c, std::vector<std::string> argv, const std::string& user,
             else if (n <= 0) stdin_open = false;
         }
         if (sfd >= 0 && p[3].revents) {
-            ::signalfd_siginfo si{};
-            (void)!::read(sfd, &si, sizeof si);
+            char drain[64];
+            while (::read(sfd, drain, sizeof drain) > 0) {}
             ::winsize ws{};
             if (master >= 0 && ::ioctl(0, TIOCGWINSZ, &ws) == 0) (void)::ioctl(master, TIOCSWINSZ, &ws);
         }
@@ -483,12 +489,24 @@ int cmd_logs(int argc, char** argv) {
     ::ssize_t n;
     while ((n = ::read(fd, buf, sizeof buf)) > 0) write_all(1, buf, static_cast<std::size_t>(n));
     if (!follow) { ::close(fd); return 0; }
-    // follow: inotify on the file, no polling loop
+    // follow: woken by the kernel when the file grows, no polling loop
+#if defined(__linux__)
     const int in = ::inotify_init1(IN_CLOEXEC);
     if (in < 0 || ::inotify_add_watch(in, file.c_str(), IN_MODIFY) < 0) { ::close(fd); return fail("cannot watch " + file); }
+#else
+    const int in = ::kqueue();
+    struct ::kevent kev{};
+    EV_SET(&kev, static_cast<uintptr_t>(fd), EVFILT_VNODE, EV_ADD | EV_CLEAR, NOTE_WRITE | NOTE_EXTEND, 0, nullptr);
+    if (in < 0 || ::kevent(in, &kev, 1, nullptr, 0, nullptr) < 0) { ::close(fd); return fail("cannot watch " + file); }
+#endif
     for (;;) {
+#if defined(__linux__)
         char ev[4096];
         if (::read(in, ev, sizeof ev) < 0 && errno != EINTR) break;
+#else
+        struct ::kevent out{};
+        if (::kevent(in, nullptr, 0, &out, 1, nullptr) < 0 && errno != EINTR) break;
+#endif
         while ((n = ::read(fd, buf, sizeof buf)) > 0) write_all(1, buf, static_cast<std::size_t>(n));
     }
     return 0;
