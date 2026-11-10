@@ -77,6 +77,7 @@
 
 #include <Hypervisor/Hypervisor.h>
 #include <libkern/OSCacheControl.h>
+#include <sys/clonefile.h>
 #include <sys/mman.h>
 #include <time.h>
 #include <stdlib.h>
@@ -171,6 +172,15 @@ public:
     [[nodiscard]] std::string exe_of_pid(std::int32_t pid) const {
         return pids_.exe_of(pid);
     }
+    // A new task starts with its creator's nice, policy and affinity.
+    void inherit_sched(std::int32_t from, std::int32_t to) noexcept {
+        pids_.set_nice(to, pids_.nice_of(from));
+        pids_.set_policy(to, pids_.policy_of(from));
+        pids_.set_affinity(to, pids_.affinity_of(from));
+    }
+    [[nodiscard]] PidSpace& pid_space() const noexcept { return pids_; }
+    [[nodiscard]] std::int32_t tgid() const noexcept { return tgid_; }
+    [[nodiscard]] std::int32_t tid() const noexcept { return task_.tid; }
 
     // The loader has already written the image and stack into guest RAM, so
     // starting is just placing the entry state. `image_end` seeds the heap.
@@ -294,6 +304,17 @@ public:
         proc_.with_space([&](AddressSpace& t) { return t.adopt({AddressSpace::page_down(sp) - kStackReserve,
                    AddressSpace::page_down(mem_top),
                    GuestProt::read | GuestProt::write, /*anonymous=*/true}); });
+        proc_.name(AddressSpace::page_down(sp) - kStackReserve, AddressSpace::page_down(mem_top), "[stack]");
+    }
+    // A fresh image: what /proc/<pid>/maps names its ranges, and environ.
+    void note_image(const ExecResult& ex) {
+        proc_.with_names([](auto& v) { v.clear(); return 0; });
+        for (std::size_t i = 0; i < ex.segments.size(); ++i) {
+            const auto& sg = ex.segments[i];
+            proc_.name(AddressSpace::page_down(sg.begin), AddressSpace::page_up(sg.end),
+                       i < ex.program_segments ? ex.program : ex.interp);
+        }
+        proc_.set_environ(ex.environ);
     }
     // Room below the initial sp for the stack to grow (Linux's default
     // RLIMIT_STACK, which is what prlimit64 reports).
@@ -583,10 +604,50 @@ private:
             }
             std::fprintf(stderr, "      \"%s\"\n", shown.c_str());
         }
+        account_io(rc);
         LX_TRY(resume(rc));
         return ok(rc);
     }
-
+    // getrlimit/setrlimit/prlimit64 on this process's table: `set` and
+    // `old` are guest addresses of struct rlimit64 (either may be 0).
+    [[nodiscard]] std::int64_t rlimit(std::uint64_t res, std::uint64_t set, std::uint64_t old) {
+        if (res >= proc_.rlimits.size()) return -22;
+        struct L { std::uint64_t cur, max; };
+        const GuestRam ram = machine_.ram();
+        auto& slot = proc_.rlimits[res];
+        const L prev{slot.cur, slot.max};
+        if (set) {
+            L n{};
+            if (!ram.get(set, n)) return -14;
+            if (n.cur > n.max) return -22;
+            // NOFILE can't exceed what the fd table holds (Linux: nr_open)
+            if (res == 7 && n.max > static_cast<std::uint64_t>(FdTable::kMaxFds)) return -1;
+            const auto ids = proc_.ids();
+            const bool root = !ids || ids->euid == 0;
+            if (n.max > slot.max && !root) return -1;             // EPERM
+            slot = {n.cur, n.max};
+        }
+        if (old && !ram.put(old, prev)) return -14;
+        return 0;
+    }
+    // /proc/<pid>/io: rchar/wchar are bytes moved by read- and write-class
+    // calls (files, pipes, sockets alike), syscr/syscw the calls made.
+    void account_io(std::int64_t rc) noexcept {
+        using S = abi::Sysno;
+        switch (abi::decode(abi::Arch::aarch64, regs_.nr())) {
+            case S::read: case S::pread64: case S::readv: case S::preadv:
+            case S::preadv2: case S::recvfrom: case S::recvmsg:
+                proc_.syscr.fetch_add(1, std::memory_order_relaxed);
+                if (rc > 0) proc_.rchar.fetch_add(static_cast<std::uint64_t>(rc), std::memory_order_relaxed);
+                break;
+            case S::write: case S::pwrite64: case S::writev: case S::pwritev:
+            case S::pwritev2: case S::sendto: case S::sendmsg:
+                proc_.syscw.fetch_add(1, std::memory_order_relaxed);
+                if (rc > 0) proc_.wchar.fetch_add(static_cast<std::uint64_t>(rc), std::memory_order_relaxed);
+                break;
+            default: break;
+        }
+    }
     // A non-SVC exception is a genuine guest fault. Linux turns these into a
     // SYNCHRONOUS signal at the faulting instruction -- SIGSEGV for a bad
     // address, SIGBUS for misalignment, SIGILL for a bad opcode -- and a
@@ -1864,6 +1925,7 @@ private:
         // `pacman -Sy` was killed by a SIGTERM no guest had sent.
         const std::int32_t tid = pids_.allocate(::getpid());
         if (tid < 0) return -11;                         // EAGAIN: namespace full
+        inherit_sched(task_.tid, tid);
 
         // The child resumes at the same PC as the parent (right after the
         // svc) with x0 = 0 and its own stack/TLS -- exactly what the kernel
@@ -1902,6 +1964,7 @@ private:
         const auto fstart = std::chrono::steady_clock::now();
         const std::int32_t child = pids_.allocate(0);   // placeholder host pid
         if (child < 0) return -11;                       // EAGAIN
+        inherit_sched(task_.tid, child);
 
         ForkImage img;
         img.cpu = cpu_.save();
@@ -1919,6 +1982,14 @@ private:
         img.umask = proc_.umask.load(std::memory_order_relaxed);
         img.sig_mask = task_.sig_mask;
         img.altstack = task_.alt_stack;
+        img.rlimits = proc_.rlimits;
+        img.environ = proc_.environ();
+        proc_.with_names([&](auto& v) {
+            for (const auto& r : v)
+                img.range_names += std::to_string(r.begin) + " " + std::to_string(r.end) + " " +
+                                   r.name + "\n";
+            return 0;
+        });
         proc_.with_space([&](AddressSpace& sp) {
             img.vmas = sp.vmas();
             img.brk = sp.brk();
@@ -1974,6 +2045,9 @@ public:
         std::uint64_t sig_mask{};
         LinuxStack altstack{};
         std::string namespace_state;    // Kernel::export_fork: creds, cwd, fd paths
+        std::array<ProcessState::Rlim, 16> rlimits{};
+        std::string environ;            // /proc/<pid>/environ, until exec
+        std::string range_names;        // "begin end name\n"..., for maps
     };
     using SpawnFork = std::function<pid_t(ForkImage&)>;
     void set_fork_spawner(SpawnFork f) { spawn_ = std::move(f); }
@@ -2029,8 +2103,20 @@ public:
             if (const pid_t g = ::getpgid(*hp); g > 0 && g != ::getpgrp()) (void)::setpgid(0, g);
         refresh_guest_answers();          // new pid/ppid for this process
         proc_.umask = img.umask;
+        ::umask(static_cast<mode_t>(img.umask));
         proc_.with_space([&](AddressSpace& t) { return t.restore(img.vmas, img.brk, img.arena); });
         proc_.with_fds([&](FdTable& t) { return t.import_table(img.fds, host_fds); });
+        proc_.rlimits = img.rlimits;
+        proc_.set_environ(img.environ);
+        for (std::size_t at = 0; at < img.range_names.size();) {
+            const std::size_t nl = std::min(img.range_names.find('\n', at), img.range_names.size());
+            unsigned long long b = 0, e = 0;
+            int used = 0;
+            const std::string line = img.range_names.substr(at, nl - at);
+            if (std::sscanf(line.c_str(), "%llu %llu %n", &b, &e, &used) == 2)
+                proc_.name(b, e, line.substr(static_cast<std::size_t>(used)));
+            at = nl + 1;
+        }
         // fork(2): the child inherits handlers, mask and alt stack verbatim.
         proc_.with_signals([&](SignalDispositions& d) {
             d.set_table(img.sig_actions);
@@ -2267,6 +2353,7 @@ private:
         set_arena(ex->brk_base, ExecArena::mmap_top(machine_.mem_size()));
         for (const auto& sg : ex->segments)
             adopt(sg.begin, sg.end, prot_from_elf(sg.flags));
+        note_image(*ex);                          // before the stack names itself
         adopt_stack(ex->sp, machine_.mem_size());
         proc_.with_fds([&](FdTable& t) { return t.on_exec(); });
         dirs_.clear();
@@ -2388,19 +2475,15 @@ private:
                 return ram.put(a1, out) ? 0 : -14;
             }
 
-            // -- prlimit64(pid, res, new*, old*). Report the host's limit
-            //    for the one that matters (RLIMIT_STACK/NOFILE drive libc's
-            //    buffer sizing); setting is accepted as a no-op.
+            // -- prlimit64(pid, res, new*, old*). The limits are this
+            //    process's own table (inherited across fork and exec): a set
+            //    reads back, a raise past the hard limit is EPERM only for
+            //    the unprivileged, and NOFILE's hard cap is the fd table's.
             case S::prlimit64: {
-                if (a2) return 0;                 // a set: accept silently
-                struct LinuxRlimit { std::uint64_t cur, max; };
-                LinuxRlimit out{~std::uint64_t{0}, ~std::uint64_t{0}};
-                if (a1 == 3) {                    // RLIMIT_STACK
-                    out.cur = 8ull << 20;
-                } else if (a1 == 7) {             // RLIMIT_NOFILE
-                    out.cur = out.max = 1024;
+                if (a0 != 0 && static_cast<std::int32_t>(a0) != tgid_) {
+                    if (!pids_.host_of(static_cast<std::int32_t>(a0))) return -3;   // ESRCH
                 }
-                return ram.put(regs_.arg(3), out) ? 0 : -14;
+                return rlimit(a1, a2, regs_.arg(3));
             }
 
             // -- futex(uaddr, op, val, timeout/val2, uaddr2, val3).
@@ -2813,19 +2896,17 @@ private:
             }
 
             case S::umask: {
-                return proc_.umask.exchange(static_cast<std::uint32_t>(a0 & 0777),
-                                           std::memory_order_relaxed);
+                // Every create below is a HOST create, so the guest's mask has
+                // to be the host's: tracking it alone left files made under
+                // umask 027 at 0755 (the host's 022 applied instead).
+                const auto m = static_cast<std::uint32_t>(a0 & 0777);
+                ::umask(static_cast<mode_t>(m));
+                return proc_.umask.exchange(m, std::memory_order_relaxed);
             }
             // -- Resource limits and accounting -----------------------------
             case S::getrlimit: case S::setrlimit: {
-                // The legacy 2-arg forms; prlimit64 is the modern one and is
-                // already handled. Both report the same limits.
-                struct LinuxRlimit { std::uint64_t cur, max; };
-                if (sc == S::setrlimit) return 0;          // accepted, not enforced
-                LinuxRlimit out{~0ull, ~0ull};
-                if (a0 == 3) out.cur = ExecArena::stack_reserve;      // RLIMIT_STACK
-                else if (a0 == 7) out = {FdTable::kMaxFds, FdTable::kMaxFds};  // NOFILE
-                return ram.put(a1, out) ? 0 : -14;
+                // The legacy 2-arg forms of prlimit64, on the same table.
+                return sc == S::setrlimit ? rlimit(a0, a1, 0) : rlimit(a0, 0, a1);
             }
             case S::times: {
                 // times(struct tms*) -> clock ticks since an arbitrary epoch.
@@ -3037,19 +3118,64 @@ private:
 
             // -- Scheduling. Guest threads are host threads, so the honest
             //    answer for every query comes from the host.
-            case S::sched_setaffinity:
+            case S::sched_setaffinity: {
                 // Darwin has no hard CPU pinning; XNU places threads itself.
-                // Accepting is correct (affinity is a hint on Linux too when
-                // the mask covers every CPU, which is what runtimes request).
+                // The mask is still the guest's: kept per task in the shared
+                // table, it reads back, is inherited, and applies by pid.
+                const auto pid = static_cast<std::int32_t>(a0);
+                const std::int32_t t = pid ? pid : task_.tid;
+                if (pid && !pids_.host_of(t)) return -3;              // ESRCH
+                std::uint64_t m = 0;
+                auto win = ram.at(a2, std::min<std::uint64_t>(a1, 8));
+                if (win.empty() && a1) return -14;
+                std::memcpy(&m, win.data(), win.size());
+                const long ncpu = std::max(1L, ::sysconf(_SC_NPROCESSORS_ONLN));
+                const std::uint64_t all = ncpu >= 64 ? ~0ull : (1ull << ncpu) - 1;
+                m &= all;
+                if (!m) return -22;                                   // EINVAL: no CPU
+                pids_.set_affinity(t, m == all ? 0 : m);
                 return 0;
-            case S::sched_getscheduler:
-                return 0;                                        // SCHED_OTHER
-            case S::sched_setscheduler: case S::sched_setparam:
-                // Only SCHED_OTHER with priority 0 is meaningful unprivileged;
-                // realtime classes need host privileges we don't take.
-                return a1 == 0 ? 0 : -1;                         // EPERM
-            case S::sched_getparam:
-                return ram.put(a1, std::int32_t{0}) ? 0 : -14;   // sched_priority
+            }
+            // Policies: SCHED_OTHER(0), BATCH(3) and IDLE(5) take priority 0
+            // and are the guest's to choose; FIFO(1)/RR(2) take 1..99 and
+            // need CAP_SYS_NICE, which root has -- XNU won't run them, but
+            // the guest sees what it set. Kept per task, tree-wide.
+            case S::sched_getscheduler: {
+                const auto pid = static_cast<std::int32_t>(a0);
+                if (static_cast<std::int64_t>(a0) < 0) return -22;
+                const std::int32_t t = pid ? pid : task_.tid;
+                if (pid && !pids_.host_of(t)) return -3;
+                return pids_.policy_of(t) & 0x7f;
+            }
+            case S::sched_setscheduler: case S::sched_setparam: {
+                const auto pid = static_cast<std::int32_t>(a0);
+                if (static_cast<std::int64_t>(a0) < 0) return -22;
+                const std::int32_t t = pid ? pid : task_.tid;
+                if (pid && !pids_.host_of(t)) return -3;
+                const std::uint64_t pp = sc == S::sched_setscheduler ? a2 : a1;
+                std::int32_t prio = 0;
+                if (!pp || !ram.get(pp, prio)) return pp ? -14 : -22;
+                const int pol = sc == S::sched_setscheduler
+                    ? static_cast<int>(a1 & ~0x40000000ull)            // minus SCHED_RESET_ON_FORK
+                    : (pids_.policy_of(t) & 0x7f);
+                const bool rt = pol == 1 || pol == 2;
+                if (pol != 0 && pol != 1 && pol != 2 && pol != 3 && pol != 5) return -22;
+                if (rt ? (prio < 1 || prio > 99) : prio != 0) return -22;
+                if (rt) {
+                    const auto ids = proc_.ids();
+                    if (ids && ids->euid != 0) return -1;              // EPERM
+                }
+                pids_.set_policy(t, pol);
+                rt_prio_[t] = rt ? prio : 0;
+                return 0;
+            }
+            case S::sched_getparam: {
+                const auto pid = static_cast<std::int32_t>(a0);
+                const std::int32_t t = pid ? pid : task_.tid;
+                if (pid && !pids_.host_of(t)) return -3;
+                const auto it = rt_prio_.find(t);
+                return ram.put(a1, std::int32_t{it == rt_prio_.end() ? 0 : it->second}) ? 0 : -14;
+            }
             case S::sched_get_priority_max: case S::sched_get_priority_min:
                 // SCHED_FIFO/RR (1/2) span 1..99 on Linux; SCHED_OTHER is 0.
                 return (a0 == 1 || a0 == 2) ? (sc == S::sched_get_priority_max ? 99 : 1) : 0;
@@ -3329,12 +3455,24 @@ private:
                 // which is how a constant ends up with no single place to fix.
                 const bool anon = abi::wire::is_anonymous(a3);
                 const std::uint64_t len = AddressSpace::page_up(a1);
+                // MAP_FIXED_NOREPLACE: the address is pinned, but an overlap
+                // is EEXIST -- it must never replace what is there.
+                if (abi::wire::fixed_must_not_replace(a3)) {
+                    if (a0 & (AddressSpace::kPageSize - 1)) return -22;
+                    const bool used = proc_.with_space([&](AddressSpace& t) {
+                        for (const Vma& v : t.vmas())
+                            if (v.begin < a0 + len && v.end > a0) return true;
+                        return false;
+                    });
+                    if (used) return -17;                          // EEXIST
+                }
                 // A MAP_FIXED map replaces whatever was there: a shared file
                 // map it covers must reach its file first.
                 if (abi::wire::wants_fixed(a3)) sync_shared(a0, len, /*drop=*/true);
                 std::uint64_t at = proc_.with_space([&](AddressSpace& t) { return t.map(a0, a1, prot_from_linux(a2),
                                            abi::wire::wants_fixed(a3), anon); });
                 if (at == AddressSpace::kFail) return -12;          // ENOMEM
+                proc_.unname(at, at + len);
                 auto win = machine_.ram().at(at, len);
                 if (win.empty()) return -12;
 
@@ -3368,6 +3506,8 @@ private:
                 // covers, so rounding up here would wipe a neighbour.
                 const int ffd = proc_.with_fds([&](FdTable& t) { return t.host(static_cast<int>(regs_.arg(4))); }).value_or(-1);
                 if (ffd < 0) return -9;                              // EBADF
+                if (char fp[PATH_MAX]; ::fcntl(ffd, F_GETPATH, fp) == 0)
+                    proc_.name(at, at + len, unresolve_ ? unresolve_(fp) : std::string{fp});
                 const auto foff = static_cast<off_t>(regs_.arg(5));
                 auto n = ::pread(ffd, win.data(), a1, foff);
                 if (n < 0) return darwin::fail();
@@ -3396,6 +3536,7 @@ private:
             case S::munmap:
                 sync_shared(a0, AddressSpace::page_up(a1), /*drop=*/true);
                 proc_.with_space([&](AddressSpace& t) { return t.unmap(a0, a1); });
+                proc_.unname(a0, a0 + AddressSpace::page_up(a1));
                 return 0;
             case S::mprotect:
                 // Tracked in the VMA map but NOT enforced in the page tables:
@@ -3902,7 +4043,10 @@ private:
                 if (!need_fd()) return -9;
                 struct ::stat st{};
                 if (::fstat(*hfd, &st) < 0) return darwin::fail();
-                return ram.put(a1, darwin::to_linux(st)) ? 0 : -14;
+                auto ls = darwin::to_linux(st);
+                if (S_ISSOCK(st.st_mode))
+                    ls.st_ino = net::socket_inode(*hfd, static_cast<std::uint64_t>(st.st_ino));
+                return ram.put(a1, ls) ? 0 : -14;
             }
             case S::ftruncate:
                 if (!need_fd()) return -9;
@@ -4550,11 +4694,16 @@ private:
         struct ::stat st{};
         if (::fstat(hfd, &st) == 0) {
             if (S_ISFIFO(st.st_mode)) return "pipe:[" + std::to_string(st.st_ino) + "]";
-            if (S_ISSOCK(st.st_mode)) return "socket:[" + std::to_string(st.st_ino) + "]";
+            if (S_ISSOCK(st.st_mode))
+                return "socket:[" + std::to_string(net::socket_inode(hfd, static_cast<std::uint64_t>(st.st_ino))) + "]";
         }
         char buf[PATH_MAX];
-        if (::fcntl(hfd, F_GETPATH, buf) == 0)
-            return unresolve_ ? unresolve_(buf) : std::string{buf};
+        if (::fcntl(hfd, F_GETPATH, buf) == 0) {
+            std::string g = unresolve_ ? unresolve_(buf) : std::string{buf};
+            // An unlinked file keeps its last name; Linux marks it.
+            if (st.st_nlink == 0 && S_ISREG(st.st_mode)) g += " (deleted)";
+            return g;
+        }
         return "anon_inode:[unknown]";
     }
 
@@ -4576,9 +4725,38 @@ private:
                     std::memcpy(win.data(), target.data(), n);
                     return static_cast<std::int64_t>(n);             // no NUL, like Linux
                 }
-                // open/stat of /proc/self/fd/N reopen the SAME file: Darwin's
-                // /dev/fd/K does exactly that for host fd K.
+                // open/stat of /proc/self/fd/N reopen the SAME file. Linux
+                // makes a NEW open file description (its own offset and
+                // flags); Darwin's /dev/fd/K dups K instead, sharing the
+                // offset -- so a regular file that still has a name reopens
+                // by that name, and only the nameless (unlinked, pipes,
+                // sockets) fall back to /dev/fd.
                 fd_path_storage_ = "/dev/fd/" + std::to_string(*h);
+                {
+                    struct ::stat st{};
+                    char p[PATH_MAX];
+                    const bool reg = ::fstat(*h, &st) == 0 && S_ISREG(st.st_mode);
+                    if (reg && st.st_nlink > 0 && ::fcntl(*h, F_GETPATH, p) == 0) {
+                        fd_path_storage_ = p;
+                    } else if (reg && (sc == S::openat || sc == S::open)) {
+                        // Unlinked: no name to reopen. A READ-ONLY reopen
+                        // (the common one: read what a deleted temp held)
+                        // gets a copy-on-write clone of the content, opened
+                        // and unlinked at once -- its own offset, as Linux.
+                        const std::uint64_t fl = sc == S::openat ? regs_.arg(2) : regs_.arg(1);
+                        if ((fl & 3) == 0) {
+                            char tmpl[] = "/tmp/linuxity-reopen-XXXXXX";
+                            if (const int t = ::mkstemp(tmpl); t >= 0) {
+                                ::close(t);
+                                ::unlink(tmpl);
+                                if (::fclonefileat(*h, AT_FDCWD, tmpl, 0) == 0) {
+                                    fd_path_storage_ = tmpl;
+                                    unlink_after_open_ = true;
+                                }
+                            }
+                        }
+                    }
+                }
                 path = &fd_path_storage_;
             }
         }
@@ -4596,6 +4774,7 @@ private:
                 int fd = ::open(path->c_str(),
                                 darwin::open_flags(lflags) | O_CLOEXEC,
                                 static_cast<mode_t>(lmode));
+                if (std::exchange(unlink_after_open_, false)) ::unlink(path->c_str());
                 if (fd < 0) return darwin::fail();
                 return proc_.with_fds([&](FdTable& t) { return t.install(fd, (lflags & abi::wire::kOCloexec) != 0); });
             }
@@ -4860,6 +5039,8 @@ private:
     Resolver resolve_;
     Resolver unresolve_;
     std::string fd_path_storage_;
+    bool unlink_after_open_{false};   // fd_path_storage_ is a reopen clone
+    std::unordered_map<std::int32_t, std::int32_t> rt_prio_;   // sched_param of FIFO/RR tasks
     SpawnFork spawn_;
     SpawnThread spawn_thread_;
     std::vector<std::string> env_;
@@ -4923,6 +5104,30 @@ public:
     }
     [[nodiscard]] std::string exe_of_pid(std::int32_t pid) const {
         return trap_ ? trap_->exe_of_pid(pid) : std::string{};
+    }
+    // The HOST process behind guest pid `pid` (0 = the caller), or -1. Every
+    // guest process is its own host process here, so per-process scheduler
+    // state (nice, affinity) lives with it, and only it can answer.
+    [[nodiscard]] int host_pid_of(std::int32_t pid) const {
+        if (!trap_) return -1;
+        if (pid == 0) return ::getpid();
+        const auto h = trap_->host_pid_of(pid);
+        return h ? static_cast<int>(*h) : -1;
+    }
+    // Per-process nice, in the tree-wide table (see PidSpace::set_nice).
+    [[nodiscard]] int nice_of(std::int32_t pid) const {
+        return trap_ ? trap_->pid_space().nice_of(pid ? pid : trap_->tgid()) : 0;
+    }
+    void set_nice(std::int32_t pid, int n) const {
+        if (trap_) trap_->pid_space().set_nice(pid ? pid : trap_->tgid(), n);
+    }
+    // A task's affinity mask (0 = every CPU), or nullopt if no such task.
+    // pid 0 is the CALLING thread: each thread has its own mask.
+    [[nodiscard]] std::optional<std::uint64_t> affinity_of(std::int32_t pid) const {
+        if (!trap_) return std::nullopt;
+        const std::int32_t t = pid ? pid : trap_->tid();
+        if (pid && !trap_->pid_space().host_of(t)) return std::nullopt;
+        return trap_->pid_space().affinity_of(t);
     }
 
     // Tells the portable core this backend keeps REAL process groups and

@@ -56,6 +56,11 @@ struct ExecResult {
     std::uint64_t sp{};          // initial stack pointer
     std::uint64_t brk_base{};    // where the program's heap begins
     std::vector<HvfImage::Segment> segments;   // for the VMA map
+    // For /proc/<pid>/maps: the first `program_segments` of `segments` are
+    // the program's (guest path `program`), the rest the loader's.
+    std::size_t program_segments{0};
+    std::string program, interp;
+    std::string environ;        // envp, NUL-separated, as /proc/<pid>/environ
 };
 
 // Load `path` into a FRESH address space (execve replaces the image). Handles
@@ -88,6 +93,9 @@ struct ExecResult {
     ExecResult out;
     out.brk_base = prog->image_end;
     out.segments = prog->segments;
+    out.program_segments = out.segments.size();
+    out.program = guest_path;
+    for (const auto& e : envp) { out.environ += e; out.environ.push_back('\0'); }
     std::uint64_t entry = prog->entry;
     std::uint64_t at_base = 0;
 
@@ -100,6 +108,7 @@ struct ExecResult {
         if (!ld) return err<ExecResult>(ld.error());
         entry = ld->entry;
         at_base = ld->load_bias;
+        out.interp = interp;
         out.segments.insert(out.segments.end(), ld->segments.begin(),
                             ld->segments.end());
     }

@@ -33,11 +33,13 @@
 #include "linuxity/runtime/darwin/signal.hpp"
 #include "linuxity/runtime/shared/address_space.hpp"
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace lx::runtime {
@@ -162,6 +164,59 @@ public:
         std::lock_guard g{mu_};
         return threads_.size();
     }
+    [[nodiscard]] std::vector<std::int32_t> thread_ids() const {
+        std::lock_guard g{mu_};
+        std::vector<std::int32_t> v;
+        for (const Thread& t : threads_) v.push_back(t.tid);
+        return v;
+    }
+
+    // -- What /proc reports that only this process knows (macOS has no host
+    //    /proc to ask). The initial environment of the current image, as
+    //    NUL-separated bytes; the read/write counters of /proc/<pid>/io; and
+    //    the names of file-backed and special ranges for /proc/<pid>/maps.
+    void set_environ(std::string blob) {
+        std::lock_guard g{mu_};
+        environ_ = std::move(blob);
+    }
+    [[nodiscard]] std::string environ() const {
+        std::lock_guard g{mu_};
+        return environ_;
+    }
+    std::atomic<std::uint64_t> rchar{0}, wchar{0}, syscr{0}, syscw{0};
+    // RLIMIT_* as the guest set them (Linux numbering, 16 resources), kept
+    // per process and inherited across fork and exec. Only NOFILE and STACK
+    // shape this backend; the rest round-trip so a guest sees what it set.
+    struct Rlim { std::uint64_t cur, max; };
+    static constexpr std::uint64_t kInf = ~std::uint64_t{0};
+    std::array<Rlim, 16> rlimits{{
+        {kInf, kInf}, {kInf, kInf}, {kInf, kInf}, {8ull << 20, kInf},   // CPU FSIZE DATA STACK
+        {0, kInf}, {kInf, kInf}, {63432, 63432}, {1024, 1024},          // CORE RSS NPROC NOFILE
+        {8ull << 20, 8ull << 20}, {kInf, kInf}, {kInf, kInf},           // MEMLOCK AS LOCKS
+        {63432, 63432}, {819200, 819200}, {0, 0}, {0, 0}, {kInf, kInf}, // SIGPENDING MSGQUEUE NICE RTPRIO RTTIME
+    }};
+    struct NamedRange { std::uint64_t begin, end; std::string name; };
+    template <class Fn>
+    decltype(auto) with_names(Fn&& fn) {
+        std::lock_guard g{mu_};
+        return fn(names_);
+    }
+    // Forget names under [b, e): the range was unmapped or remapped.
+    void unname(std::uint64_t b, std::uint64_t e) {
+        std::lock_guard g{mu_};
+        std::vector<NamedRange> keep;
+        for (auto& r : names_) {
+            if (r.end <= b || r.begin >= e) { keep.push_back(std::move(r)); continue; }
+            if (r.begin < b) keep.push_back({r.begin, b, r.name});
+            if (r.end > e) keep.push_back({e, r.end, r.name});
+        }
+        names_ = std::move(keep);
+    }
+    void name(std::uint64_t b, std::uint64_t e, std::string n) {
+        unname(b, e);
+        std::lock_guard g{mu_};
+        names_.push_back({b, e, std::move(n)});
+    }
     // exit_group(2): every thread in the process dies. Mark it, then kick
     // the others so they leave the guest and notice promptly even if they
     // are blocked in a long-running guest loop.
@@ -239,6 +294,8 @@ private:
     std::vector<Thread> threads_;
     std::vector<SharedMap> shared_maps_;
     std::optional<Ids> ids_;
+    std::string environ_;
+    std::vector<NamedRange> names_;
     std::atomic<bool> group_exiting_{false};
     int group_status_{0};
 };

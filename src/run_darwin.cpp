@@ -15,6 +15,7 @@
 #include "linuxity/kernel/kernel.hpp"
 #include "linuxity/runtime/darwin/exec.hpp"
 #include "linuxity/runtime/darwin/fork.hpp"
+#include "linuxity/runtime/darwin/procinfo.hpp"
 #include "linuxity/runtime/darwin/trap.hpp"
 #include "linuxity/runtime/darwin/wire.hpp"
 #include "linuxity/runtime/trap.hpp"
@@ -757,6 +758,18 @@ void run_guest_thread(ThreadContext& ctx, runtime::HvfTrap::ThreadStart start) {
     std::mutex threads_mu;
     ThreadContext ctx{o, m, machine, proc, pids, forker, threads, threads_mu};
     wire_spawners(trap, ctx);
+    // /proc's per-task facts: macOS has no host /proc, so this process
+    // answers for itself (and its threads), Darwin for the others.
+    m.k.procs().set_host_facts([&proc, &pids](std::int32_t g, std::string_view leaf)
+                                   -> std::optional<std::string> {
+        const auto h = pids.host_of(g);
+        if (!h || *h <= 0) return std::nullopt;
+        if (*h == ::getpid()) {
+            const runtime::procinfo::Self self{proc, g};
+            return runtime::procinfo::fact(leaf, *h, &self, pids.nice_of(g));
+        }
+        return runtime::procinfo::fact(leaf, *h, nullptr, pids.nice_of(g));
+    });
 
     proc.add_thread(task.tid, &cpu);
     runtime::g_pending.register_cpu(cpu.handle());
@@ -1144,6 +1157,7 @@ int cli::host_run(Options& o, int, char**) {
     trap.set_arena(ex->brk_base, runtime::ExecArena::mmap_top(machine.mem_size()));
     for (const auto& sg : ex->segments)
         trap.adopt(sg.begin, sg.end, runtime::prot_from_elf(sg.flags));
+    trap.note_image(*ex);
     trap.adopt_stack(ex->sp, machine.mem_size());
     cpu.set_entry(ex->entry, ex->sp);
     run(o, m, machine, cpu, proc, task, pids, trap);

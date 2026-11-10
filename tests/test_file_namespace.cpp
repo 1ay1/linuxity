@@ -172,7 +172,10 @@ int main() {
         auto vf = f.produce("/proc/mounts");
         assert(vf.has_value());
         std::string s = bytes_to_string(vf->bytes);
-        assert(s.find("rootfs / rootfs") != std::string::npos);
+        // the root is a REAL filesystem (the one the rootfs lives on), never
+        // the initramfs placeholder "rootfs" -- tools read that as no root
+        assert(s.find(" / ") != std::string::npos);
+        assert(s.find(" / rootfs ") == std::string::npos);
     }
     {
         // System-wide /proc/stat + /proc/meminfo (htop / free / top read these).
@@ -377,7 +380,7 @@ int main() {
         // And producing THAT path yields the synthesized mount table bytes.
         auto vf = xf.produce(pc.virtual_path);
         assert(vf.has_value());
-        assert(bytes_to_string(vf->bytes).find("rootfs / rootfs") != std::string::npos);
+        assert(bytes_to_string(vf->bytes).find(" / ") != std::string::npos);
 
         // follow=false (lstat): the LINK node itself is kept, host-backed.
         auto lc = xf.classify("/etc/mtab", false, false);

@@ -41,8 +41,11 @@ namespace lx::runtime::darwin {
 using LinuxOpen = abi::wire::OpenFlag;
 
 [[nodiscard]] inline int open_flags(std::uint64_t lf) noexcept {
+    // This backend's guest is aarch64, where O_DIRECTORY/O_NOFOLLOW are NOT
+    // the enum's (x86-64) values: reading them off the enum made O_DIRECTORY
+    // a no-op (open of a file succeeded) and turned O_DIRECT into it.
     auto bit = [lf](LinuxOpen f) {
-        return (lf & static_cast<std::uint64_t>(f)) != 0;
+        return abi::wire::has_for(abi::Arch::aarch64, lf, f);
     };
     int df = 0;
     switch (lf & 3) {

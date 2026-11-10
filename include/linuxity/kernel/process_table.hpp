@@ -69,6 +69,7 @@ struct Creds {
 struct ProcInfo : Creds {
     std::int32_t pid{1};
     std::int32_t ppid{0};
+    std::int32_t oom_score_adj{0};   // /proc/<pid>/oom_score_adj, inherited
     // Process GROUP. 0 means "not set yet, so it is my own pid" -- resolved
     // through ProcessTable::pgid_of rather than stored eagerly, because a
     // fork-time snapshot does not always know the parent's group yet.
@@ -226,6 +227,17 @@ public:
     void set_comm(std::int32_t pid, std::string comm) {
         auto& p = procs_[pid]; p.pid = pid; p.comm = comm;
         if (p.cmdline.empty()) p.cmdline = std::move(comm);
+        // find() refreshes identity from the live table when the exe there
+        // differs from ours (an exec we didn't see). Pin the CURRENT exe, so
+        // a rename sticks until the next exec instead of being overwritten
+        // by the exe's basename on the very next read.
+        if (live_ && live_->alive(pid)) {
+            const ProcInfo l = live_->info(pid);
+            if (!l.exe.empty() && p.exe != l.exe) {
+                p.exe = l.exe;
+                if (p.cmdline == p.comm || p.cmdline.empty()) p.cmdline = l.cmdline;
+            }
+        }
     }
     // PR_SET_NAME / a comm write: names one thread, not the process
     void set_thread_comm(std::int32_t pid, std::int32_t tid, std::string comm) {
@@ -517,6 +529,17 @@ public:
     using HostOf = std::function<int(std::int32_t)>;
     void set_host_resolver(HostOf f) { host_of_ = std::move(f); }
     [[nodiscard]] int host_of(std::int32_t gpid) const { return host_of_ ? host_of_(gpid) : -1; }
+    // A backend with no host /proc to read (macOS) answers the per-task
+    // files only the host kernel keeps itself, IN LINUX'S FORMAT: "stat",
+    // "status", "io", "environ", "statm", "fd" (one number per line),
+    // "fdinfo/N", "task" (one tid per line). nullopt = "ask the host's
+    // /proc as before".
+    using HostFacts = std::function<std::optional<std::string>(std::int32_t, std::string_view)>;
+    void set_host_facts(HostFacts f) { host_facts_ = std::move(f); }
+    [[nodiscard]] bool has_host_facts() const noexcept { return static_cast<bool>(host_facts_); }
+    [[nodiscard]] std::optional<std::string> host_fact(std::int32_t gpid, std::string_view leaf) const {
+        return host_facts_ ? host_facts_(gpid, leaf) : std::nullopt;
+    }
     // and the reverse: the guest pid a host pid had, even after it exited
     // (0 if it was never one of ours)
     void set_guest_resolver(HostOf f) { guest_of_ = std::move(f); }
@@ -690,6 +713,7 @@ public:
     }
 private:
     const LiveSource* live_{nullptr};
+    HostFacts host_facts_;
     mutable std::map<std::int32_t, ProcInfo> scratch_;
 };
 

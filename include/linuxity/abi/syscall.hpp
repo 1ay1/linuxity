@@ -1385,6 +1385,7 @@ private:
     // threads through the file rather than the prctl.
     [[nodiscard]] static bool virtual_is_writable(std::string_view p) noexcept {
         return p.ends_with("/comm") || p == "/proc/sys/vm/drop_caches" || p == "/dev/kmsg" ||
+               p.ends_with("/oom_score_adj") ||
                p.ends_with("/uid_map") || p.ends_with("/gid_map") || p.ends_with("/setgroups") ||
                p == "/proc/sys/kernel/hostname" || p == "/proc/sys/kernel/domainname";
     }
@@ -2303,7 +2304,7 @@ private:
                                                                : std::pair<std::int32_t, std::int32_t>{0, 0};
             pending_map_ = {};
             if (for_write)
-                for (const char* leaf : {"/uid_map", "/gid_map", "/setgroups"})
+                for (const char* leaf : {"/uid_map", "/gid_map", "/setgroups", "/oom_score_adj"})
                     if (vp.ends_with(leaf)) {
                         std::int32_t pid = 0;
                         if (std::sscanf(vp.c_str(), "/proc/%d/", &pid) == 1 && pid > 0)
@@ -2900,7 +2901,12 @@ private:
 
     // Does the host say the file behind the tracee's fd was unlinked?
     [[nodiscard]] bool host_fd_deleted(int fd) {
-        if constexpr (!requires { mem_.host_tid(); }) {
+        if constexpr (requires { mem_.host_fd_of(fd); } && !requires { mem_.host_tid(); }) {
+            // The guest's fd is OUR host fd: an unlinked file has no links left.
+            struct ::stat st{};
+            const int h = mem_.host_fd_of(fd);
+            return h >= 0 && ::fstat(h, &st) == 0 && S_ISREG(st.st_mode) && st.st_nlink == 0;
+        } else if constexpr (!requires { mem_.host_tid(); }) {
             return false;
         } else {
             char link[64], tgt[4096];
@@ -3391,7 +3397,11 @@ private:
             auto& reg = k_.procs().ns();
             if (p) {
                 const auto un = p->ns[kernel::NsKind::user];
-                if (it->which == "hostname" || it->which == "domainname") {
+                if (it->which == "oom_score_adj") {
+                    // -1000..1000; lowering it needs CAP_SYS_RESOURCE (root has it)
+                    const long v = std::strtol(text.c_str(), nullptr, 10);
+                    if (v >= -1000 && v <= 1000) p->oom_score_adj = static_cast<std::int32_t>(v);
+                } else if (it->which == "hostname" || it->which == "domainname") {
                     while (!text.empty() && text.back() == '\n') text.pop_back();
                     if (text.size() > 64) text.resize(64);
                     const auto uid = p->ns[kernel::NsKind::uts];
@@ -5196,6 +5206,19 @@ private:
             }
         }
 #endif
+        // A backend that keeps affinity itself (HVF: XNU has no pinning).
+        if constexpr (requires { mem_.affinity_of(0); }) {
+            const auto pid = static_cast<std::int32_t>(r.arg[0]);
+            const auto m = mem_.affinity_of(pid);
+            if (!m) return eno(Errno::esrch);
+            if (*m) {
+                std::fill(buf.begin(), buf.end(), std::byte{0});
+                for (long c = 0; c < ncpu && c < 64; ++c)
+                    if (*m & (1ull << c))
+                        buf[static_cast<std::size_t>(c) / 8] |=
+                            static_cast<std::byte>(1u << (static_cast<unsigned>(c) & 7u));
+            }
+        }
         if (!mem_.copy_out(mask, buf)) return eno(Errno::efault);
         return val(static_cast<std::int64_t>(bytes));
     }
@@ -5568,21 +5591,42 @@ private:
             }
             if (targets.empty()) return eno(Errno::esrch);
         }
+        // A backend whose every guest process is a host process (HVF) keeps
+        // nice in its SHARED table: fork inherits it there and every process
+        // in the tree reads the same answer (this table is per-process). The
+        // host process can't hold it -- unprivileged, it may never go back
+        // down, which a root guest may.
+        auto host_nice = [&](std::int32_t p) -> std::optional<int> {
+            if constexpr (requires { mem_.nice_of(p); }) {
+                return mem_.nice_of(p);
+            }
+            return std::nullopt;
+        };
         if (!set) {
             int best = 19;
             for (std::int32_t p : targets)
-                if (const auto* pi = k_.procs().find(p)) best = std::min(best, static_cast<int>(pi->nice));
-            if (targets.size() == 1 && targets[0] == self) best = me().nice;
+                if (const auto hn = host_nice(p)) best = std::min(best, *hn);
+                else if (const auto* pi = k_.procs().find(p)) best = std::min(best, static_cast<int>(p == self ? me().nice : pi->nice));
             return val(20 - best);
         }
         int nv = static_cast<int>(static_cast<std::int32_t>(r.arg[2]));
         nv = std::clamp(nv, -20, 19);
         for (std::int32_t p : targets) {
             auto* pi = p == self ? &me() : k_.procs().find_mut(p);
+            if constexpr (requires { mem_.set_nice(p, nv); }) {
+                // the backend's tree-wide table is the authority; our own
+                // record of another process may be absent or a stale copy
+                const int cur = host_nice(p).value_or(pi ? pi->nice : 0);
+                if (!creds::capable(me(), creds::kCapSysNice) && nv < cur) return eno(Errno::eacces);
+                mem_.set_nice(p, nv);
+                if (pi) pi->nice = nv;
+                continue;
+            }
             if (!pi) continue;
+            const int cur = host_nice(p).value_or(pi->nice);
             if (!creds::capable(me(), creds::kCapSysNice)) {
                 if (pi->uids[0] != me().uids[1] && pi->uids[1] != me().uids[1]) return eno(Errno::eperm);
-                if (nv < pi->nice) return eno(Errno::eacces);
+                if (nv < cur) return eno(Errno::eacces);
             }
             pi->nice = nv;
             if constexpr (requires { mem_.host_tid_of(0); }) {
@@ -7082,6 +7126,14 @@ public:
 
     // The host path the tracee's fd points at, or "".
     [[nodiscard]] std::string tracee_fd_target(int fd) {
+        if constexpr (requires { mem_.host_fd_of(fd); }) {
+#if defined(F_GETPATH)
+            // A backend whose guest fds are OUR host fds (HVF): ask the fd.
+            const int h = mem_.host_fd_of(fd);
+            char p[PATH_MAX];
+            if (h >= 0 && ::fcntl(h, F_GETPATH, p) == 0) return p;
+#endif
+        }
         if constexpr (!requires { mem_.host_tid(); }) {
             return {};
         } else {
@@ -7173,7 +7225,10 @@ public:
     //
     // Returns -1 when the backend exposes no host tid, or the open fails.
     [[nodiscard]] int open_tracee_fd(int fd) {
-        if constexpr (!requires { mem_.host_tid(); }) {
+        if constexpr (requires { mem_.host_fd_of(fd); } && !requires { mem_.host_tid(); }) {
+            const int h = mem_.host_fd_of(fd);
+            return h >= 0 ? ::fcntl(h, F_DUPFD_CLOEXEC, 0) : -1;
+        } else if constexpr (!requires { mem_.host_tid(); }) {
             return -1;
         } else {
             char link[64];
@@ -7188,7 +7243,7 @@ public:
     // it again and rewrite the temp behind the guest's fd. Monitors keep
     // /proc/<pid>/stat open and pread it every tick.
     void refresh_virtual_fd(int fd) {
-        if constexpr (requires { mem_.host_tid(); }) {
+        if constexpr (requires { mem_.host_tid(); } || requires { mem_.host_fd_of(fd); }) {
             const std::string gp{k_.files().path_of_fd(fd)};
             if (gp.empty() || k_.files().is_virtual_dir_fd(fd)) return;
             const auto pc = k_.files().classify(gp);
@@ -7197,9 +7252,15 @@ public:
             auto vf = k_.files().produce(vp);
             if (!vf || vf->is_dir || !vf->redirect_host.empty() || !vf->symlink_target.empty())
                 return;
-            char link[64];
-            std::snprintf(link, sizeof link, "/proc/%d/fd/%d", mem_.host_tid(), fd);
-            const int w = ::open(link, O_WRONLY | O_CLOEXEC);
+            int w = -1;
+            if constexpr (requires { mem_.host_tid(); }) {
+                char link[64];
+                std::snprintf(link, sizeof link, "/proc/%d/fd/%d", mem_.host_tid(), fd);
+                w = ::open(link, O_WRONLY | O_CLOEXEC);
+            } else {
+                // the guest's fd is OUR host fd: write the temp behind it
+                if (const std::string t = tracee_fd_target(fd); !t.empty()) w = ::open(t.c_str(), O_WRONLY | O_CLOEXEC);
+            }
             if (w < 0) return;
             std::size_t off = 0;
             while (off < vf->bytes.size()) {

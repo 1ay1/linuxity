@@ -239,6 +239,30 @@ public:
         return -1;
     }
 
+    // -- Scheduler state per TASK (pid or tid), tree-wide. XNU has no CPU
+    //    pinning and an unprivileged process can never lower its nice, so
+    //    the guest's view lives here: what it set reads back from any
+    //    process, and a fork (which copies the parent's) inherits it.
+    void set_nice(std::int32_t g, int n) noexcept {
+        if (g > 0 && g < kMax && shared_) shared_->nice[g].store(static_cast<std::int8_t>(n));
+    }
+    [[nodiscard]] int nice_of(std::int32_t g) const noexcept {
+        return (g > 0 && g < kMax && shared_) ? shared_->nice[g].load() : 0;
+    }
+    void set_policy(std::int32_t g, int pol) noexcept {
+        if (g > 0 && g < kMax && shared_) shared_->policy[g].store(static_cast<std::int8_t>(pol));
+    }
+    [[nodiscard]] int policy_of(std::int32_t g) const noexcept {
+        return (g > 0 && g < kMax && shared_) ? shared_->policy[g].load() : 0;
+    }
+    // 0 = every CPU (the default); else the mask's bits.
+    void set_affinity(std::int32_t g, std::uint64_t mask) noexcept {
+        if (g > 0 && g < kMax && shared_) shared_->affinity[g].store(mask);
+    }
+    [[nodiscard]] std::uint64_t affinity_of(std::int32_t g) const noexcept {
+        return (g > 0 && g < kMax && shared_) ? shared_->affinity[g].load() : 0;
+    }
+
 private:
     void map() {
         void* p = ::mmap(nullptr, sizeof(Shared), PROT_READ | PROT_WRITE,
@@ -273,6 +297,10 @@ private:
         std::atomic<bool> ready[kMax]{};
         // Hypervisor.framework VMs held by PARKED zygotes, tree-wide.
         std::atomic<int> warm_vms{0};
+        // See set_nice/set_policy/set_affinity.
+        std::atomic<std::int8_t> nice[kMax]{};
+        std::atomic<std::int8_t> policy[kMax]{};
+        std::atomic<std::uint64_t> affinity[kMax]{};
     };
     Shared* shared_{nullptr};
     int fd_{-1};

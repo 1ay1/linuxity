@@ -20,6 +20,7 @@
 #include "linuxity/kernel/process_table.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -32,6 +33,9 @@
 #if !defined(_WIN32)
 #include <dirent.h>
 #include <sys/stat.h>
+#if defined(__APPLE__)
+#include <sys/mount.h>
+#endif
 #include <unistd.h>
 #endif
 
@@ -258,6 +262,10 @@ guest_mounts(const std::vector<std::pair<std::string, std::string>>& views) {
 // The run state of a guest process as the host scheduler sees it ('R', 'S',
 // 'D', ...), or `fallback` when its host task can't be read.
 inline char host_state(const kernel::ProcessTable& procs, std::int32_t pid, char fallback) {
+    if (const auto f = procs.host_fact(pid, "stat")) {          // no host /proc
+        const auto rp = f->rfind(')');
+        if (rp != std::string::npos && rp + 2 < f->size()) return (*f)[rp + 2];
+    }
     const int h = procs.host_of(pid);
     if (h <= 0) return fallback;
     const std::string s = host_file(("/proc/" + std::to_string(h) + "/stat").c_str());
@@ -536,9 +544,14 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
             auto host_dir = [&](std::string_view d) {
                 return q == d || (q.starts_with(d) && q.size() > d.size() && q[d.size()] == '/');
             };
-            if (host_dir("/proc/self/fd") || host_dir("/proc/thread-self/fd") ||
-                host_dir("/proc/self/fdinfo") || host_dir("/proc/thread-self/fdinfo") ||
-                host_dir("/proc/self/ns")) {
+            // A host with no /proc of its own answers the directories and
+            // fdinfo per task below; only an fd LINK goes to the backend,
+            // which resolves /proc/self/fd/N against its own fd table.
+            const bool own = procs.has_host_facts();
+            if (own ? (q.starts_with("/proc/self/fd/") || q.starts_with("/proc/thread-self/fd/"))
+                    : (host_dir("/proc/self/fd") || host_dir("/proc/thread-self/fd") ||
+                       host_dir("/proc/self/fdinfo") || host_dir("/proc/thread-self/fdinfo") ||
+                       host_dir("/proc/self/ns"))) {
                 kernel::VirtualFile vf; vf.redirect_host = std::move(q);
                 return ok(std::move(vf));
             }
@@ -566,10 +579,13 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
 
         // ---- /proc/self -> /proc/<pid 1> canonicalization ---------------
         std::string p{abs};
-        // Our "self" is always pid 1 (the traced root / init).
-        if (p == "/proc/self" || p.starts_with("/proc/self/"))
-            p = "/proc/" + std::to_string(procs.init_pid()) +
+        // Our "self" is the reader (the dispatcher folds a caller's own fd
+        // and fdinfo back to /proc/self for the host to answer), else pid 1.
+        if (p == "/proc/self" || p.starts_with("/proc/self/")) {
+            const auto me = procs.reader() > 0 ? procs.view_pid(procs.reader()) : 0;
+            p = "/proc/" + std::to_string(me > 0 ? me : procs.init_pid()) +
                 p.substr(std::string_view{"/proc/self"}.size());
+        }
 
         // ---- --host-pids: a host process that isn't ours is the host's own
         //      /proc entry, read-only as the kernel lets us read it
@@ -1033,15 +1049,26 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                         gm[i].source);
                 return ok(text_file(std::move(s)));
             }
+            // No host mount table to translate (macOS): the root is still a
+            // REAL filesystem -- the one the rootfs directory lives on -- not
+            // the initramfs placeholder "rootfs", which tools take to mean
+            // "no real root" (and statvfs then disagrees with them).
+            std::string rfs = "ext4", rdev = "/dev/root";
+#if defined(__APPLE__)
+            if (struct ::statfs sf{}; ::statfs(mach.root_host.c_str(), &sf) == 0) {
+                rfs = sf.f_fstypename;
+                rdev = sf.f_mntfromname;
+            }
+#endif
             if (mountinfo)
                 return ok(text_file(
-                    "1 1 0:1 / / rw - rootfs rootfs rw\n"
+                    "1 1 0:1 / / rw,relatime - " + rfs + " " + rdev + " rw\n"
                     "2 1 0:2 / /proc rw,nosuid,nodev,noexec - proc proc rw\n"
                     "3 1 0:3 / /sys rw,nosuid,nodev,noexec - sysfs sysfs rw\n"
                     "4 1 0:4 / /dev rw,nosuid - devtmpfs devtmpfs rw\n"
                     "5 1 0:5 / /tmp rw,nosuid,nodev - tmpfs tmpfs rw\n"));
             return ok(text_file(
-                "rootfs / rootfs rw 0 0\nproc /proc proc rw,nosuid,nodev,noexec 0 0\n"
+                rdev + " / " + rfs + " rw,relatime 0 0\nproc /proc proc rw,nosuid,nodev,noexec 0 0\n"
                 "sysfs /sys sysfs rw,nosuid,nodev,noexec 0 0\n"
                 "devtmpfs /dev devtmpfs rw,nosuid 0 0\n"
                 "tmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n"));
@@ -1267,6 +1294,15 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
             // thread's files mirror the process's own.
             if (tail == "task") {
                 std::vector<kernel::VirtualDirent> ents{{std::to_string(procs.view_pid(I.pid)), true}};
+                if (const auto f = procs.host_fact(I.pid, "task")) {
+                    // the backend's own thread list (no host /proc to ask)
+                    ents.clear();
+                    for (std::size_t at = 0; at < f->size();) {
+                        const std::size_t nl = std::min(f->find('\n', at), f->size());
+                        if (nl > at) ents.push_back({f->substr(at, nl - at), true});
+                        at = nl + 1;
+                    }
+                } else
                 for (auto t : I.threads)
                     if (const auto v = procs.view_pid(t); v > 0)
                         if (!procs.host_pids() ||
@@ -1285,6 +1321,15 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                 for (const auto t : I.threads)
                     if (tid == std::to_string(procs.view_pid(t))) global_tid = t;
                 if (!global_tid)
+                    if (const auto f = procs.host_fact(I.pid, "task")) {
+                        const std::string want = std::string{tid} + "\n";
+                        if (("\n" + *f).find("\n" + want) != std::string::npos) {
+                            std::int32_t t = 0;
+                            std::from_chars(tid.data(), tid.data() + tid.size(), t);
+                            global_tid = t;
+                        }
+                    }
+                if (!global_tid)
                     return err<kernel::VirtualFile>(Errno::enoent);
                 if (slash == std::string_view::npos)  // /proc/<pid>/task/<tid>
                     return ok(dir_file({
@@ -1302,6 +1347,8 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
             const int host = procs.host_of(self_tid);
             auto host_file = [&](const char* leaf) {
                 std::string out;
+                // a host with no /proc (macOS): the backend answers itself
+                if (auto f = procs.host_fact(self_tid, leaf)) return std::move(*f);
                 if (host <= 0) return out;
                 const std::string p = "/proc/" + std::to_string(host) + "/" + leaf;
                 if (std::FILE* f = std::fopen(p.c_str(), "re")) {
@@ -1382,8 +1429,11 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                 s += hf(9, "4194304") + " ";            // flags
                 for (std::size_t i = 10; i <= 17; ++i)   // faults, utime stime cutime cstime
                     s += hf(i, "0") + " ";
-                s += std::to_string(20 + I.nice) + " " + std::to_string(I.nice) + " ";  // priority nice
-                s += std::to_string(1 + I.threads.size()) + " 0 ";  // num_threads itrealvalue
+                if (procs.has_host_facts())         // the backend's table is the authority
+                    s += hf(18, std::to_string(20 + I.nice).c_str()) + " " + hf(19, std::to_string(I.nice).c_str()) + " ";
+                else
+                    s += std::to_string(20 + I.nice) + " " + std::to_string(I.nice) + " ";  // priority nice
+                s += hf(20, std::to_string(1 + I.threads.size()).c_str()) + " 0 ";  // num_threads itrealvalue
                 s += hf(22, "100") + " ";               // starttime
                 s += hf(23, std::to_string(I.vsize_bytes).c_str()) + " ";
                 s += hf(24, std::to_string(I.rss_pages).c_str()) + " ";
@@ -1434,6 +1484,8 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
             // the guest's cgroup root, which /sys/fs/cgroup describes
             if (tail == "cgroup") return ok(text_file("0::/\n"));
             if (tail == "statm") {
+                if (auto f = procs.host_fact(self_tid, "statm"))
+                    return ok(text_file(std::move(*f)));
                 std::uint64_t sz = I.vsize_bytes / 4096;
                 std::string s = std::to_string(sz) + " " +
                                 std::to_string(I.rss_pages) + " " +
@@ -1495,7 +1547,10 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                     }
                     s += std::string{k} + ":" + v + "\n";
                 }
-                s += "Threads:\t" + std::to_string(1 + I.threads.size()) + "\n";
+                {
+                    const std::string t = host_status("Threads");
+                    s += "Threads:" + (t.empty() ? "\t" + std::to_string(1 + I.threads.size()) : t) + "\n";
+                }
                 // signal state, which only the kernel holds
                 for (const char* k : {"SigQ", "SigPnd", "ShdPnd", "SigBlk", "SigIgn", "SigCgt"}) {
                     std::string v = host_status(k);
@@ -1534,11 +1589,39 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                 return ok(text_file(std::move(s)));
             }
             if (tail == "oom_score") return ok(text_file("0\n"));
-            if (tail == "maps")      return ok(text_file(""));
+            if (tail == "oom_score_adj" || tail == "oom_adj") {
+                // no host file to forward to: the value the guest wrote
+                const int v = tail == "oom_adj" ? I.oom_score_adj * 17 / 1000 : I.oom_score_adj;
+                return ok(text_file(std::to_string(v) + "\n"));
+            }
+            if (tail == "maps") {
+                if (auto f = procs.host_fact(self_tid, "maps")) return ok(text_file(std::move(*f)));
+                return ok(text_file(""));
+            }
+            if (tail.starts_with("fdinfo/"))
+                if (auto f = procs.host_fact(self_tid, tail)) return ok(text_file(std::move(*f)));
+            if (tail == "fdinfo")
+                if (const auto f = procs.host_fact(self_tid, "fd")) {
+                    std::vector<kernel::VirtualDirent> e;
+                    for (std::size_t at = 0; at < f->size();) {
+                        const std::size_t nl = std::min(f->find('\n', at), f->size());
+                        if (nl > at) e.push_back({f->substr(at, nl - at), kernel::DType::regular});
+                        at = nl + 1;
+                    }
+                    return ok(dir_file(std::move(e)));
+                }
             if (tail == "fd") {
                 // the host task's real fd numbers; links resolve through the
                 // dispatcher (own fds) or the fd/N arm below (sockets, pipes)
                 std::vector<kernel::VirtualDirent> e;
+                if (const auto f = procs.host_fact(self_tid, "fd")) {
+                    for (std::size_t at = 0; at < f->size();) {
+                        const std::size_t nl = std::min(f->find('\n', at), f->size());
+                        if (nl > at) e.push_back({f->substr(at, nl - at), kernel::DType::symlink});
+                        at = nl + 1;
+                    }
+                    return ok(dir_file(std::move(e)));
+                }
                 if (host > 0)
                     if (DIR* d = ::opendir(("/proc/" + std::to_string(host) + "/fd").c_str())) {
                         while (const dirent* de = ::readdir(d))
@@ -1548,6 +1631,12 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                     }
                 if (e.empty()) e = {{"0",false},{"1",false},{"2",false}};
                 return ok(dir_file(std::move(e)));
+            }
+            if (tail.starts_with("fd/") && procs.has_host_facts() && procs.host_fact(self_tid, "fd")) {
+                // our own fd (the backend answered "fd"): its table resolves it
+                kernel::VirtualFile vf;
+                vf.redirect_host = "/proc/self/" + tail;
+                return ok(std::move(vf));
             }
             if (tail.starts_with("fd/") && host > 0) {
                 // A socket or pipe has no path; its link text is the host's.

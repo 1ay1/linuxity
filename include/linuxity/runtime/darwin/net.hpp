@@ -29,6 +29,8 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <libproc.h>
+#include <sys/proc_info.h>
 #include <unistd.h>
 
 #include <cstdint>
@@ -67,6 +69,18 @@ enum class LinuxAf : std::uint16_t {
 // -- socket(2) type flags --------------------------------------------------
 inline constexpr std::uint64_t kSockNonblock = 0x800;
 inline constexpr std::uint64_t kSockCloexec  = 0x80000;
+
+// A socket's inode number. Darwin reports st_ino 0 for every AF_INET/INET6
+// socket, so /proc/<pid>/fd's "socket:[N]" and fstat's st_ino named no
+// socket in particular; the kernel's socket id (soi_so) is unique per socket
+// and stable for its life, and AF_UNIX sockets keep the real inode they have.
+[[nodiscard]] inline std::uint64_t socket_inode(int h, std::uint64_t st_ino) noexcept {
+    if (st_ino) return st_ino;
+    ::socket_fdinfo si{};
+    if (::proc_pidfdinfo(::getpid(), h, PROC_PIDFDSOCKETINFO, &si, sizeof si) == sizeof si)
+        return (si.psi.soi_so & 0x7fffffffffffull) | (1ull << 47);
+    return 0;
+}
 
 // -- The abstract AF_UNIX namespace ----------------------------------------
 // Linux names a socket by a leading NUL and the bytes after it (its LENGTH
