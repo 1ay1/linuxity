@@ -13,6 +13,7 @@
 // is src/main.cpp's, shared with every host (see host_run.hpp).
 #include "linuxity/host/posix_host.hpp"
 #include "linuxity/kernel/kernel.hpp"
+#include "linuxity/host/tmpdir.hpp"
 #include "linuxity/runtime/darwin/exec.hpp"
 #include "linuxity/runtime/darwin/fork.hpp"
 #include "linuxity/runtime/darwin/procinfo.hpp"
@@ -137,7 +138,18 @@ struct Machine {
         k.files().mount_host("/", o.root, upper_);
         k.files().mount_virtual("/proc", vfs::make_procfs(k.procs(), k.machine()));
         k.files().mount_virtual("/sys", vfs::make_sysfs(k.machine()));
-        k.files().mount_virtual("/dev", vfs::make_devfs());
+        // macOS has no /dev/shm (POSIX shm is a name space without files),
+        // but sem_open, shm_open and multiprocessing need one: a directory
+        // of our own, named from the upper layer so every guest process of
+        // the tree -- each a fresh linuxity -- lands in the SAME one.
+        std::string shm_dir = "/dev/shm";
+        if (struct ::stat sst{}; ::stat("/dev/shm", &sst) != 0 || !S_ISDIR(sst.st_mode)) {
+            // BESIDE the upper, not in it (that would show at /.linuxity-shm)
+            shm_dir = host::tmp_path("linuxity-shm-" + std::to_string(std::hash<std::string>{}(upper_)));
+            (void)::mkdir(shm_dir.c_str(), 01777);
+            (void)::chmod(shm_dir.c_str(), 01777);
+        }
+        k.files().mount_virtual("/dev", vfs::make_devfs(nullptr, shm_dir));
         for (auto& [host_dir, guest_at] : o.binds)
             k.files().mount_host(kernel::FileNamespace::normalize(guest_at), host_dir);
         // The terminal we were started on, at its real device name (e.g.

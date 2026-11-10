@@ -55,6 +55,8 @@
 #include "linuxity/abi/wire/dirent64.hpp"
 #include "linuxity/abi/wire/stat.hpp"
 #include "linuxity/abi/wire/mmap.hpp"
+#include "linuxity/abi/wire/open_flags.hpp"
+#include "linuxity/host/long_path.hpp"
 #include "linuxity/runtime/backend.hpp"
 #include "linuxity/runtime/darwin/darwin.hpp"
 #include "linuxity/runtime/darwin/epoll.hpp"
@@ -3524,6 +3526,29 @@ private:
         machine_.protect(at, len, true, true, true);
         cpu_.flush_tlb_on_entry();
     }
+    // -- memfd seals ---------------------------------------------------------
+    // A write a seal forbids is EPERM. Only memfds carry seals, and checking
+    // is a host xattr read, so it runs only once this process has seen one
+    // (created, inherited or received: an unlinked regular file is the
+    // cheap tell, and a memfd is always unlinked).
+    [[nodiscard]] std::int64_t seal_denies(int h, std::int64_t at, std::size_t n) {
+        if (!memfds_) {
+            struct ::stat st{};
+            if (::fstat(h, &st) != 0 || st.st_nlink != 0 || !S_ISREG(st.st_mode)) return 0;
+            memfds_ = true;
+        }
+        const auto s = memfd_seals(h);
+        if (!s) return 0;
+        if (*s & (kSealWrite | kSealFutureWrite)) return -1;          // EPERM
+        if ((*s & kSealGrow) && n) {
+            struct ::stat st{};
+            (void)::fstat(h, &st);
+            const std::int64_t from = at >= 0 ? at : ::lseek(h, 0, SEEK_CUR);
+            if (from + static_cast<std::int64_t>(n) > st.st_size) return -1;
+        }
+        return 0;
+    }
+
     // -- Real shared pages ---------------------------------------------------
     // Drop the shared backings inside [at, at+len): the guest range goes back
     // to private zero memory (munmap, MAP_FIXED over it, exec). A backing
@@ -3664,10 +3689,14 @@ private:
                 if (ffd < 0) return -9;                              // EBADF
                 const auto foff = static_cast<off_t>(regs_.arg(5));
                 if (shared) {
-                    // A shared WRITABLE map needs a writable file (EACCES).
+                    // A shared WRITABLE map needs a writable file (EACCES),
+                    // and a memfd sealed against writing refuses it (EPERM).
                     const int fl = ::fcntl(ffd, F_GETFL);
                     if (abi::wire::has_prot(a2, abi::wire::Prot::write) && fl >= 0 &&
                         (fl & O_ACCMODE) == O_RDONLY) return -13;
+                    if (abi::wire::has_prot(a2, abi::wire::Prot::write) && memfds_)
+                        if (const auto s = memfd_seals(ffd); s && (*s & (kSealWrite | kSealFutureWrite)))
+                            return -1;
                 }
                 if (char fp[PATH_MAX]; ::fcntl(ffd, F_GETPATH, fp) == 0)
                     proc_.name(at, at + len, unresolve_ ? unresolve_(fp) : std::string{fp});
@@ -3923,8 +3952,11 @@ private:
             case S::memfd_create: {
                 // An anonymous, growable, mappable file. Used for shared
                 // buffers and for passing an fd instead of a path.
-                const std::string name = ram.cstr(a0, 249);
-                const int h = make_memfd(name);
+                const std::string name = ram.cstr(a0, 251);
+                if (name.size() > 249) return -22;                    // EINVAL: name too long
+                if (a1 & ~0x7ull) return -22;                         // CLOEXEC|ALLOW_SEALING|HUGETLB
+                const int h = make_memfd(name, (a1 & 2) != 0);       // MFD_ALLOW_SEALING
+                memfds_ = true;
                 if (h < 0) return darwin::fail();
                 // MFD_CLOEXEC is 1, NOT O_CLOEXEC's 0x80000. memfd_create has
                 // its own tiny flag space; using the open-flag bit here
@@ -4115,6 +4147,7 @@ private:
                 if (!need_fd()) return -9;
                 auto win = ram.clamp(a1, a2);
                 if (win.empty() && a2) return -14;
+                if (const auto e = seal_denies(*hfd, 0, win.size())) return e;
                 auto n = ::write(*wfd, win.data(), win.size());
                 return n < 0 ? darwin::fail() : n;
             }
@@ -4129,6 +4162,7 @@ private:
                 if (!need_fd()) return -9;
                 auto win = ram.clamp(a1, a2);
                 if (win.empty() && a2) return -14;
+                if (const auto e = seal_denies(*hfd, static_cast<std::int64_t>(a3), win.size())) return e;
                 auto n = ::pwrite(*wfd, win.data(), win.size(), static_cast<off_t>(a3));
                 return n < 0 ? darwin::fail() : n;
             }
@@ -4234,9 +4268,18 @@ private:
                 return 0;                                  // advisory
             case S::lseek: {
                 if (!need_fd()) return -9;
-                auto off = ::lseek(*hfd, static_cast<off_t>(a1), static_cast<int>(a2));
+                // SEEK_DATA/SEEK_HOLE: Linux 3/4, Darwin 4/3 -- swapped.
+                int wh = static_cast<int>(a2);
+                if (wh == 3) wh = SEEK_DATA;
+                else if (wh == 4) wh = SEEK_HOLE;
+                else if (wh > 4 || wh < 0) return -22;
+                auto off = ::lseek(*hfd, static_cast<off_t>(a1), wh);
                 return off < 0 ? darwin::fail() : off;
             }
+            case S::fsetxattr: case S::fgetxattr:
+            case S::flistxattr: case S::fremovexattr:
+                if (!need_fd()) return -9;
+                return xattr_op(sc, *hfd, nullptr, false, 1);
             case S::fstat: {
                 if (!need_fd()) return -9;
                 struct ::stat st{};
@@ -4248,6 +4291,15 @@ private:
             }
             case S::ftruncate:
                 if (!need_fd()) return -9;
+                if (memfds_) {
+                    if (const auto s = memfd_seals(*hfd)) {
+                        struct ::stat st{};
+                        (void)::fstat(*hfd, &st);
+                        const auto want = static_cast<off_t>(a1);
+                        if ((*s & kSealShrink) && want < st.st_size) return -1;   // EPERM
+                        if ((*s & kSealGrow) && want > st.st_size) return -1;
+                    }
+                }
                 return ::ftruncate(*hfd, static_cast<off_t>(a1)) < 0
                            ? darwin::fail() : 0;
             case S::fsync: case S::fdatasync:
@@ -4480,23 +4532,62 @@ private:
             if (!ram.get(arg, lf)) return -14;
             auto df = darwin::flock_to_darwin(lf);
             if (!df) return -22;
-            // Darwin has no OFD locks; its POSIX locks are per-process, which
-            // is the same scope a single-threaded locker observes. Mapping
-            // them is strictly better than refusing: the alternative is
-            // `useradd`, git and sqlite all failing to lock at all.
+            // Darwin has OFD locks too (F_OFD_*: owned by the open file
+            // description, so two opens of one file conflict even in one
+            // process, and closing another fd doesn't drop them).
             const bool get = cmd == kGetlk || cmd == kOfdGetlk;
             const bool wait = cmd == kSetlkw || cmd == kOfdSetlkw;
-            const int dcmd = get ? F_GETLK : (wait ? F_SETLKW : F_SETLK);
+            const bool ofd = cmd == kOfdGetlk || cmd == kOfdSetlk || cmd == kOfdSetlkw;
+            int dcmd = get ? F_GETLK : (wait ? F_SETLKW : F_SETLK);
+#if defined(F_OFD_SETLK)
+            if (ofd) dcmd = get ? F_OFD_GETLK : (wait ? F_OFD_SETLKW : F_OFD_SETLK);
+#endif
+            if (ofd && lf.l_pid != 0) return -22;                     // Linux: must be 0
             if (::fcntl(h, dcmd, &*df) < 0) return darwin::fail();
             if (get) {
                 // F_GETLK reports the CONFLICTING lock, or l_type=F_UNLCK if
-                // the range is free.
-                return ram.put(arg, darwin::flock_to_linux(*df)) ? 0 : -14;
+                // the range is free -- with the holder's pid as the GUEST
+                // numbers it (the host gives its own), and -1 for an OFD
+                // query, which Linux reports for open-file-description locks.
+                auto out = darwin::flock_to_linux(*df);
+                if (df->l_type != F_UNLCK) {
+                    const std::int32_t g = df->l_pid == ::getpid() ? tgid_ : pids_.guest_of(df->l_pid);
+                    out.l_pid = (cmd == kOfdGetlk) ? -1 : (g > 0 ? g : 0);
+                }
+                return ram.put(arg, out) ? 0 : -14;
             }
             return 0;
         }
 
         switch (cmd) {
+            case 1033: {                         // F_ADD_SEALS
+                const auto s = memfd_seals(h);
+                if (!s) return -22;              // EINVAL: not a memfd
+                if (*s & kSealSeal) return -1;   // EPERM: sealing is sealed
+                const auto add = static_cast<std::uint32_t>(arg);
+                if (add & ~0x1fu) return -22;
+                // F_SEAL_WRITE needs no writable shared mapping to exist
+                // (EBUSY); a mapping of it here is a backing on this inode.
+                if (add & kSealWrite) {
+                    struct ::stat st{};
+                    (void)::fstat(h, &st);
+                    const bool mapped = proc_.with_backings([&](auto& v) {
+                        for (const auto& b : v) {
+                            struct ::stat bs{};
+                            if (::fstat(b.fd, &bs) == 0 && bs.st_ino == st.st_ino && bs.st_dev == st.st_dev)
+                                return true;
+                        }
+                        return false;
+                    });
+                    if (mapped) return -16;      // EBUSY
+                }
+                memfds_ = true;
+                return set_memfd_seals(h, *s | add) ? 0 : darwin::fail();
+            }
+            case 1034: {                         // F_GET_SEALS
+                const auto s = memfd_seals(h);
+                return s ? static_cast<std::int64_t>(*s) : -22;
+            }
             case kGetfl: {
                 const int fl = ::fcntl(h, F_GETFL);
                 return fl < 0 ? darwin::fail() : darwin::open_flags_to_linux(fl);
@@ -4896,6 +4987,7 @@ private:
                 return "socket:[" + std::to_string(net::socket_inode(hfd, static_cast<std::uint64_t>(st.st_ino))) + "]";
         }
         char buf[PATH_MAX];
+        if (const auto mn = memfd_name(hfd)) return "/memfd:" + *mn + " (deleted)";
         if (::fcntl(hfd, F_GETPATH, buf) == 0) {
             std::string g = unresolve_ ? unresolve_(buf) : std::string{buf};
             // An unlinked file keeps its last name; Linux marks it.
@@ -4905,8 +4997,117 @@ private:
         return "anon_inode:[unknown]";
     }
 
+    // One xattr call, Linux arguments (from argument `first` on: name, value,
+    // size, flags -- or buf, size for list), on a path (fd < 0) or an fd.
+    [[nodiscard]] std::int64_t xattr_op(abi::Sysno sc, int fd, const char* path,
+                                        bool nofollow, int first) {
+        using S = abi::Sysno;
+        const GuestRam ram = machine_.ram();
+        const auto arg = [&](int i) { return regs_.arg(static_cast<std::size_t>(first + i)); };
+        int opt = nofollow ? XATTR_NOFOLLOW : 0;
+        auto fail = [] {
+            const int e = errno;
+            if (e == ENOATTR) return std::int64_t{-61};                   // ENODATA
+            if (e == ENOTSUP) return std::int64_t{-95};                   // EOPNOTSUPP
+            return darwin::fail();
+        };
+        switch (sc) {
+            case S::listxattr: case S::llistxattr: case S::flistxattr: {
+                auto buf = ram.clamp(arg(0), arg(1));
+                if (buf.empty() && arg(1)) return -14;
+                const ssize_t n = fd >= 0
+                    ? ::flistxattr(fd, buf.empty() ? nullptr : reinterpret_cast<char*>(buf.data()), buf.size(), opt)
+                    : ::listxattr(path, buf.empty() ? nullptr : reinterpret_cast<char*>(buf.data()), buf.size(), opt);
+                if (n < 0) return errno == ERANGE ? -34 : fail();
+                return n;
+            }
+            case S::getxattr: case S::lgetxattr: case S::fgetxattr: {
+                const std::string name = ram.cstr(arg(0), 256);
+                auto buf = ram.clamp(arg(1), arg(2));
+                if (buf.empty() && arg(2)) return -14;
+                const ssize_t n = fd >= 0
+                    ? ::fgetxattr(fd, name.c_str(), buf.empty() ? nullptr : buf.data(), buf.size(), 0, opt)
+                    : ::getxattr(path, name.c_str(), buf.empty() ? nullptr : buf.data(), buf.size(), 0, opt);
+                if (n < 0) return errno == ERANGE ? -34 : fail();
+                return n;
+            }
+            case S::setxattr: case S::lsetxattr: case S::fsetxattr: {
+                const std::string name = ram.cstr(arg(0), 256);
+                auto val = ram.at(arg(1), arg(2));
+                if (val.empty() && arg(2)) return -14;
+                const std::uint64_t lf = arg(3);           // XATTR_CREATE 1, XATTR_REPLACE 2
+                if (lf & ~3ull) return -22;
+                if (lf & 1) opt |= XATTR_CREATE;
+                if (lf & 2) opt |= XATTR_REPLACE;
+                const int rc = fd >= 0
+                    ? ::fsetxattr(fd, name.c_str(), val.data(), val.size(), 0, opt)
+                    : ::setxattr(path, name.c_str(), val.data(), val.size(), 0, opt);
+                return rc < 0 ? fail() : 0;
+            }
+            case S::removexattr: case S::lremovexattr: case S::fremovexattr: {
+                const std::string name = ram.cstr(arg(0), 256);
+                const int rc = fd >= 0 ? ::fremovexattr(fd, name.c_str(), opt)
+                                       : ::removexattr(path, name.c_str(), opt);
+                return rc < 0 ? fail() : 0;
+            }
+            default: return -38;
+        }
+    }
+
     [[nodiscard]] Maybe do_path(abi::Sysno sc, const std::string* path,
                                 const std::string* path2) {
+        if (auto r = do_path_inner(sc, path, path2); r && *r == -36 && path &&
+            path->size() >= host::kHostPathMax && (!path2 || path2->size() < host::kHostPathMax))
+            return long_path_retry(sc, *path);
+        else
+            return r;
+    }
+    // A guest path deeper than Darwin's 1024-byte PATH_MAX (Linux: 4096):
+    // the same call relative to the parent directory, reached a component at
+    // a time. Covers what deep trees are made and taken apart with.
+    [[nodiscard]] std::int64_t long_path_retry(abi::Sysno sc, const std::string& p) {
+        using S = abi::Sysno;
+        const std::uint64_t a2 = regs_.arg(2), a3 = regs_.arg(3);
+        std::int64_t rc = -36;
+        const bool walked = host::at_long_parent(p, [&](int dfd, const char* leaf) {
+            int r = -1;
+            struct ::stat st{};
+            switch (sc) {
+                case S::mkdirat:   r = ::mkdirat(dfd, leaf, static_cast<mode_t>(a2)); break;
+                case S::unlinkat:  r = ::unlinkat(dfd, leaf, (a2 & 0x200) ? AT_REMOVEDIR : 0); break;
+                case S::newfstatat: case S::statx: {
+                    const std::uint64_t fl = sc == S::statx ? a2 : a3;
+                    r = ::fstatat(dfd, leaf, &st, abi::wire::has_at(fl, abi::wire::AtFlag::symlink_nofollow)
+                                                       ? AT_SYMLINK_NOFOLLOW : 0);
+                    if (r == 0) {
+                        const bool ok = sc == S::statx
+                            ? machine_.ram().put(regs_.arg(4), darwin::statx_from_darwin(st))
+                            : machine_.ram().put(a2, darwin::to_linux(st));
+                        rc = ok ? 0 : -14;
+                        return true;
+                    }
+                    break;
+                }
+                case S::faccessat: case S::faccessat2:
+                    r = ::faccessat(dfd, leaf, static_cast<int>(a2), 0); break;
+                case S::openat: {
+                    const int fd = ::openat(dfd, leaf, darwin::open_flags(a2) | O_CLOEXEC,
+                                            static_cast<mode_t>(a3));
+                    if (fd < 0) break;
+                    rc = proc_.with_fds([&](FdTable& t) { return t.install(fd, (a2 & abi::wire::kOCloexec) != 0); });
+                    return true;
+                }
+                default: errno = ENAMETOOLONG; return false;
+            }
+            if (r == 0) { rc = 0; return true; }
+            return false;
+        });
+        if (!walked && rc == -36) rc = errno == ENAMETOOLONG ? -36 : darwin::fail();
+        return rc;
+    }
+
+    [[nodiscard]] Maybe do_path_inner(abi::Sysno sc, const std::string* path,
+                                      const std::string* path2) {
         using S = abi::Sysno;
         // /proc/self/fd/N: the portable procfs forwards these to the HOST's
         // /proc (on Linux the guest is a real process, so that is exact).
@@ -4969,9 +5170,50 @@ private:
                 // Open CLOEXEC on the host side unconditionally: the host fd
                 // belongs to linuxity, and must never leak into a process we
                 // spawn. The GUEST's O_CLOEXEC is tracked in the fd table.
-                int fd = ::open(path->c_str(),
-                                darwin::open_flags(lflags) | O_CLOEXEC,
-                                static_cast<mode_t>(lmode));
+                using OF = abi::wire::OpenFlag;
+                constexpr auto A = abi::Arch::aarch64;
+                int hflags = darwin::open_flags(lflags) | O_CLOEXEC;
+                // O_TMPFILE: an unnamed file IN the directory named. Darwin
+                // has no such open, so make one there and unlink it at once;
+                // linkat("/proc/self/fd/N") later can still name it (a
+                // clone of its content).
+                const std::uint64_t tmpf = abi::wire::open_flag_for(A, OF::tmpfile);
+                if ((lflags & tmpf) == tmpf) {
+                    if ((lflags & 3) == 0) return -22;                // needs O_WRONLY/O_RDWR
+                    std::string tmpl = *path + "/.lx-tmpfile-XXXXXX";
+                    const int fd = ::mkstemp(tmpl.data());
+                    if (fd < 0) return darwin::fail();
+                    ::unlink(tmpl.c_str());
+                    ::fchmod(fd, static_cast<mode_t>(lmode & 07777 & ~proc_.umask.load()));
+                    ::fcntl(fd, F_SETFD, FD_CLOEXEC);
+                    return proc_.with_fds([&](FdTable& t) { return t.install(fd, (lflags & abi::wire::kOCloexec) != 0); });
+                }
+                // O_PATH: a handle on the NAME, no I/O. With O_NOFOLLOW on a
+                // symlink it is the link itself (Darwin: O_SYMLINK); on a
+                // file or directory, open for lookup only.
+                if (abi::wire::has_for(A, lflags, OF::path)) {
+                    struct ::stat lst{};
+                    const bool link = ::lstat(path->c_str(), &lst) == 0 && S_ISLNK(lst.st_mode);
+                    if (link && abi::wire::has_for(A, lflags, OF::nofollow)) {
+                        hflags = O_SYMLINK | O_RDONLY | O_CLOEXEC;
+                    } else {
+                        struct ::stat st{};
+                        if (::stat(path->c_str(), &st) != 0) return darwin::fail();
+                        hflags = (S_ISDIR(st.st_mode) ? O_SEARCH | O_DIRECTORY : O_RDONLY) | O_CLOEXEC;
+                        if (!S_ISDIR(st.st_mode) && ::access(path->c_str(), R_OK) != 0)
+                            hflags = O_EXEC | O_CLOEXEC;
+                        if (abi::wire::has_for(A, lflags, OF::directory) && !S_ISDIR(st.st_mode)) return -20;
+                    }
+                }
+                int fd = ::open(path->c_str(), hflags, static_cast<mode_t>(lmode));
+                if (fd < 0 && errno == ENAMETOOLONG && path->size() >= host::kHostPathMax) {
+                    // a guest path deeper than Darwin's 1024-byte PATH_MAX
+                    // (Linux allows 4096): walk to the parent a step at a time
+                    (void)host::at_long_parent(*path, [&](int dfd, const char* leaf) {
+                        fd = ::openat(dfd, leaf, hflags, static_cast<mode_t>(lmode));
+                        return fd >= 0;
+                    });
+                }
                 if (std::exchange(unlink_after_open_, false)) ::unlink(path->c_str());
                 if (fd < 0) return darwin::fail();
                 return proc_.with_fds([&](FdTable& t) { return t.install(fd, (lflags & abi::wire::kOCloexec) != 0); });
@@ -5146,6 +5388,19 @@ private:
                 if (!path) return -2;
                 return ::truncate(path->c_str(), static_cast<off_t>(regs_.arg(1))) < 0
                            ? darwin::fail() : 0;
+            // -- Extended attributes, on the translated path. Darwin has the
+            //    same four calls with an extra `position` and its own flag
+            //    bits (XATTR_NOFOLLOW is an option, not a separate l* call),
+            //    and says ENOATTR where Linux says ENODATA.
+            case S::setxattr: case S::lsetxattr:
+            case S::getxattr: case S::lgetxattr:
+            case S::listxattr: case S::llistxattr:
+            case S::removexattr: case S::lremovexattr: {
+                if (!path) return -2;
+                const bool nf = sc == S::lsetxattr || sc == S::lgetxattr ||
+                                sc == S::llistxattr || sc == S::lremovexattr;
+                return xattr_op(sc, -1, path->c_str(), nf, 1);
+            }
             case S::bind: case S::connect: {
                 // The CORE decides these: for AF_UNIX it translates the
                 // sockaddr_un path into the rootfs (so a guest's
@@ -5238,6 +5493,7 @@ private:
     Resolver unresolve_;
     std::string fd_path_storage_;
     bool unlink_after_open_{false};   // fd_path_storage_ is a reopen clone
+    bool memfds_{false};              // a memfd has been seen: check seals
     std::unordered_map<std::int32_t, std::int32_t> rt_prio_;   // sched_param of FIFO/RR tasks
     SpawnFork spawn_;
     SpawnThread spawn_thread_;

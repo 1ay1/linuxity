@@ -30,10 +30,12 @@
 #include <fcntl.h>
 #include <sys/event.h>
 #include <sys/stat.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -228,15 +230,41 @@ private:
 // -- memfd ----------------------------------------------------------------
 // An unlinked temp file. Anonymous (no name in the namespace), growable with
 // ftruncate, mappable, and passable as an fd -- which is the whole point of
-// memfd_create. F_SEAL_* has no Darwin equivalent; sealing is recorded so
-// F_GET_SEALS reports back what was set.
-[[nodiscard]] inline int make_memfd(const std::string& name) {
+// memfd_create. Its guest name ("/memfd:NAME (deleted)") and its seals live
+// in extended attributes ON THE INODE, so every fd for it -- dup'd, forked,
+// passed over SCM_RIGHTS -- agrees, with no table to keep in sync.
+inline constexpr const char* kMemfdNameXattr = "org.linuxity.memfd";
+inline constexpr const char* kMemfdSealXattr = "org.linuxity.seals";
+inline constexpr std::uint32_t kSealSeal = 1, kSealShrink = 2, kSealGrow = 4,
+                               kSealWrite = 8, kSealFutureWrite = 16;
+[[nodiscard]] inline int make_memfd(const std::string& name, bool allow_sealing) {
     std::string tmpl = "/tmp/linuxity-memfd-" + name + "-XXXXXX";
     const int fd = ::mkstemp(tmpl.data());
     if (fd < 0) return -1;
     ::unlink(tmpl.c_str());
     ::fcntl(fd, F_SETFD, FD_CLOEXEC);
+    (void)::fsetxattr(fd, kMemfdNameXattr, name.data(), name.size(), 0, 0);
+    // Without MFD_ALLOW_SEALING a memfd starts with F_SEAL_SEAL: no seal
+    // may ever be added.
+    const std::uint32_t s = allow_sealing ? 0 : kSealSeal;
+    (void)::fsetxattr(fd, kMemfdSealXattr, &s, sizeof s, 0, 0);
     return fd;
+}
+// The memfd's name, if `fd` is one.
+[[nodiscard]] inline std::optional<std::string> memfd_name(int fd) {
+    char b[256];
+    const ssize_t n = ::fgetxattr(fd, kMemfdNameXattr, b, sizeof b, 0, 0);
+    if (n < 0) return std::nullopt;
+    return std::string(b, static_cast<std::size_t>(n));
+}
+// Its seals; nullopt if not a memfd.
+[[nodiscard]] inline std::optional<std::uint32_t> memfd_seals(int fd) {
+    std::uint32_t s = 0;
+    if (::fgetxattr(fd, kMemfdSealXattr, &s, sizeof s, 0, 0) != sizeof s) return std::nullopt;
+    return s;
+}
+inline bool set_memfd_seals(int fd, std::uint32_t s) {
+    return ::fsetxattr(fd, kMemfdSealXattr, &s, sizeof s, 0, 0) == 0;
 }
 
 // -- pidfd ----------------------------------------------------------------
