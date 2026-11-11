@@ -498,6 +498,12 @@ images: `linuxity new alpine` does.
 
 Things that are different on a Mac:
 
+- A Mac's disk is case-insensitive and Linux's aren't (`_exit.2` and
+  `_Exit.2` are two files to dpkg). So environments live on a case-sensitive
+  APFS volume, `$LINUXITY_HOME/envs.sparsebundle`, made by the first `new`
+  (no root, a few seconds, grows as needed) and attached at
+  `$LINUXITY_HOME/envs` whenever it isn't -- invisible in Finder. Existing
+  environments are moved onto it the first time.
 - An environment runs while a `shell`, `exec` or `run` is open; there's no
   background instance, so `start`, `ps`, `svc` and `logs` don't apply and
   `list` shows it as `ready`. Files and settings persist exactly the same.

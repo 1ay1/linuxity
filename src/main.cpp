@@ -101,6 +101,8 @@ void usage(const char* argv0) {
 // Load an environment's config into `o`. Returns false (having printed why).
 bool load_env(const std::string& name, Options& o) {
     lx::env::Store store;
+    if (std::string why; !store.ensure_storage(false, why))
+        std::fprintf(stderr, "linuxity: %s\n", why.c_str());
     if (!store.has(name)) {
         std::fprintf(stderr, "linuxity: no environment '%s' (see `linuxity list`)\n", name.c_str());
         return false;

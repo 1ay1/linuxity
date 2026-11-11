@@ -1817,6 +1817,15 @@ int cmd_completion(std::string_view shell) {
 
 int lx_cli_main(int argc, char** argv) {
     Store s;
+    {
+        // case-sensitive storage (host/case_volume.hpp): made by the first
+        // `new`/`import`, attached for everything else
+        const std::string_view v = argc > 1 ? std::string_view{argv[1]} : std::string_view{};
+        std::string why;
+        if (!s.ensure_storage(v == "new" || v == "import", why))
+            std::fprintf(stderr, "linuxity: %s; environments stay case-insensitive "
+                                 "(some packages won't install)\n", why.c_str());
+    }
     // `linuxity` alone: a shell in the default environment
     if (argc < 2) {
         const std::string d = s.default_env();

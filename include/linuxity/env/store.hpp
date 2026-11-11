@@ -19,6 +19,7 @@
 
 #include "linuxity/env/config.hpp"
 #include "linuxity/env/vibe_edit.hpp"
+#include "linuxity/host/case_volume.hpp"
 #include "linuxity/host/tmpdir.hpp"
 
 #include <dirent.h>
@@ -218,6 +219,21 @@ public:
     [[nodiscard]] std::string pid_path(std::string_view n) const { return run_dir(n) + "/pid"; }
 
     [[nodiscard]] bool has(std::string_view n) const { return valid_name(n) && exists(config_path(n)); }
+
+    // Environments need a case-sensitive filesystem (host/case_volume.hpp):
+    // on a host whose isn't, <home>/envs is a case-sensitive volume, made on
+    // first use and attached whenever it isn't. One pathconf once it is.
+    // `create` = we're about to make an environment (else only attach an
+    // existing volume, never create one just to list nothing).
+    bool ensure_storage(bool create, std::string& why) const {
+        const std::string image = home_ + "/envs.sparsebundle";
+        if (!create && !exists(image) && names().empty()) return true;   // nothing to keep yet
+        if (!mkdirs(home_)) { why = "cannot create " + home_; return false; }
+        return lx::host::ensure_case_sensitive(envs_dir(), image, why);
+    }
+    // Scratch for guest runs (/tmp, --fresh layers): on the same volume, so
+    // the guest's /tmp is case-sensitive too.
+    [[nodiscard]] std::string scratch_dir() const { return envs_dir() + "/.tmp"; }
 
     // Downloaded images, kept so a second `new` of the same image is instant.
     [[nodiscard]] std::string cache_dir() const { return home_ + "/cache"; }
