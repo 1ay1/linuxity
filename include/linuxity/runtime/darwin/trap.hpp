@@ -152,7 +152,15 @@ public:
     //    and /proc/self answer with this process's GUEST pid.
     struct TaskIds { std::int32_t pid, tid, ppid; };
     [[nodiscard]] TaskIds current_ids() const noexcept {
-        return {task_.tid, task_.tid, parent_};
+        return {task_.tid, task_.tid, current_parent()};
+    }
+    // Our parent as it is NOW: a parent that ended handed us to its adopter
+    // (PidSpace::reparent_children_of) or posted its exit; both are a shared
+    // load, so this stays cheap on every identity question.
+    [[nodiscard]] std::int32_t current_parent() const noexcept {
+        if (parent_ > 1 && (pids_.ppid_of(tgid_) != parent_ || pids_.exit_of(parent_)))
+            parent_ = pids_.live_parent_of(tgid_);
+        return parent_;
     }
     // The host pid of guest pid `g` (this process included), or nullopt.
     // And back: a host pid -- or a host group/session id, which is its
@@ -176,7 +184,7 @@ public:
     // be used by this backend's own service routine too (not just through
     // the portable dispatcher's current_ids() probe).
     [[nodiscard]] abi::TaskIdentity task_identity() const noexcept {
-        return {task_.tid, task_.tid, parent_};
+        return {task_.tid, task_.tid, current_parent()};
     }
     // /proc/<pid>/exe for ANY pid in the tree (shared table, set on exec).
     [[nodiscard]] std::string exe_of_pid(std::int32_t pid) const {
@@ -221,7 +229,7 @@ public:
         // gettid is not, so a second thread revokes it for good.
         machine_.set_guest_answer(172, static_cast<std::uint64_t>(tgid_));          // getpid
         if (!threaded_) machine_.set_guest_answer(178, static_cast<std::uint64_t>(task_.tid));  // gettid
-        machine_.set_guest_answer(173, static_cast<std::uint64_t>(parent_));         // getppid
+        machine_.clear_guest_answer(173);   // getppid: the parent can end (see PidSpace)
         machine_.set_guest_answer(124, 0);                                          // sched_yield
         publish_ids();
     }
@@ -1969,6 +1977,8 @@ private:
             sigaddset(&one, signal_from_linux(linux_sig));
             ::pthread_sigmask(SIG_UNBLOCK, &one, nullptr);
         }
+        pids_.reparent_children_of(tgid_);
+        pids_.post_exit(tgid_, linux_sig & 0x7f);
         ::raise(signal_from_linux(linux_sig));
         exited_ = true;
         code_ = 128 + linux_sig;
@@ -2429,7 +2439,22 @@ private:
                 std::vector<pid_t> hs;
                 for (const Child& c : children_)
                     if (!want_pgid || pids_.pgid_of(c.guest) == *want_pgid) hs.push_back(c.host);
-                if (hs.empty()) return -10;                     // ECHILD
+                // Orphans adopted by us (we're their subreaper, or init):
+                // not our HOST children, so they're reaped from the status
+                // they posted when they ended (PidSpace::post_exit).
+                std::vector<std::int32_t> adopted;
+                for (const std::int32_t g : pids_.children_of(tgid_)) {
+                    if (std::any_of(children_.begin(), children_.end(),
+                                    [g](const Child& c) { return c.guest == g; })) continue;
+                    if (want_pgid && pids_.pgid_of(g) != *want_pgid) continue;
+                    if (const auto ws = pids_.exit_of(g)) {
+                        if (status) (void)machine_.ram().put(status, std::int32_t{*ws});
+                        pids_.release(g);
+                        return g;
+                    }
+                    adopted.push_back(g);
+                }
+                if (hs.empty() && adopted.empty()) return -10;  // ECHILD
                 for (pid_t h : hs) {
                     got = ::waitpid(h, &st, WNOHANG | (hopts & (WUNTRACED | WCONTINUED)));
                     if (got > 0) break;
@@ -2446,10 +2471,18 @@ private:
                 for (std::size_t i = 0; i < hs.size(); ++i)
                     EV_SET(&evs[i], static_cast<uintptr_t>(hs[i]), EVFILT_PROC,
                            EV_ADD | EV_ONESHOT, NOTE_EXIT, 0, nullptr);
+                for (const std::int32_t g : adopted)
+                    if (const auto h = pids_.host_of(g)) {
+                        struct ::kevent ev{};
+                        EV_SET(&ev, static_cast<uintptr_t>(*h), EVFILT_PROC, EV_ADD | EV_ONESHOT, NOTE_EXIT, 0, nullptr);
+                        evs.push_back(ev);
+                    }
                 struct ::kevent out{};
                 const struct ::timespec tick{0, 50'000'000};
+                // an adopted orphan posts its status a moment before its host
+                // process ends: re-poll on a tick rather than trust one event
                 const int n = ::kevent(kq, evs.data(), static_cast<int>(evs.size()), &out, 1,
-                                       (hopts & (WUNTRACED | WCONTINUED)) ? &tick : nullptr);
+                                       (hopts & (WUNTRACED | WCONTINUED)) || !adopted.empty() ? &tick : nullptr);
                 const int e = errno;
                 ::close(kq);
                 if (n < 0 && e == EINTR) return -4;             // EINTR, as Linux
@@ -3580,7 +3613,12 @@ private:
                     case kCapbsetRead:
                         return 1;               // uid 0: every bound capability
                     case kSetChildSubreaper:
+                        pids_.set_subreaper(tgid_, a1 != 0);   // see PidSpace: orphans
                         return 0;
+                    case 37: {                                   // PR_GET_CHILD_SUBREAPER
+                        const std::int32_t v = pids_.is_subreaper(tgid_) ? 1 : 0;
+                        return ram.put(a1, v) ? 0 : -14;
+                    }
                     default:
                         // An unknown prctl is EINVAL, not ENOSYS: the
                         // SYSCALL exists, the option doesn't. libc branches
@@ -3726,6 +3764,8 @@ public:
     using ExitHook = std::function<void()>;
     void on_exit(ExitHook h) { exit_hooks_.push_back(std::move(h)); }
     [[noreturn]] void end_process(int status) {
+        pids_.reparent_children_of(tgid_);
+        pids_.post_exit(tgid_, (status & 0xff) << 8);
         proc_.request_group_exit(status);
         sync_all_shared();
         for (auto& h : exit_hooks_) h();
@@ -4992,9 +5032,23 @@ private:
                     ::cfsetispeed(&t, l2.c_ispeed);
                     ::cfsetospeed(&t, l2.c_ospeed);
                 }
-                const int when = (req == L_TCSETS || req == L_TCSETS2)   ? TCSANOW
-                               : (req == L_TCSETSW || req == L_TCSETSW2) ? TCSADRAIN
-                                                                         : TCSAFLUSH;
+                int when = (req == L_TCSETS || req == L_TCSETS2)   ? TCSANOW
+                         : (req == L_TCSETSW || req == L_TCSETSW2) ? TCSADRAIN
+                                                                   : TCSAFLUSH;
+                // On a PTY, Linux's "drain" is done once output is in the line
+                // discipline; Darwin's waits until the MASTER has read it all
+                // (see TCSBRK below). readline restores its modes with
+                // TCSADRAIN after echoing a command line, so a shell whose
+                // terminal reader wasn't reading at that instant -- a test, a
+                // script(1), an expect -- froze before running the command.
+                // Drop the drain on a pty; TCSAFLUSH keeps its input flush.
+                if (when != TCSANOW) {
+                    char name[128];
+                    if (::ttyname_r(hfd, name, sizeof name) == 0 && lx::vfs::pty_slave_number(name) >= 0) {
+                        if (when == TCSAFLUSH) (void)::tcflush(hfd, TCIFLUSH);
+                        when = TCSANOW;
+                    }
+                }
                 return ::tcsetattr(hfd, when, &t) < 0 ? darwin::fail() : 0;
             }
             // TCSBRK(0) is tcsendbreak, TCSBRK(nonzero) is tcdrain; TCSBRKP is
@@ -5871,7 +5925,7 @@ private:
     ProcessState& proc_;
     TaskState& task_;
     PidSpace& pids_;
-    std::int32_t parent_{0};
+    mutable std::int32_t parent_{0};      // current_parent() refreshes it
     // The thread-group id: this process's pid, i.e. its MAIN thread's tid.
     // A cloned thread keeps it while task_.tid becomes its own.
     std::int32_t tgid_{1};

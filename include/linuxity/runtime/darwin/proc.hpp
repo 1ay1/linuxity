@@ -191,6 +191,8 @@ public:
     void release(std::int32_t g) noexcept {
         if (g > 1 && g < kMax) {
             shared_->exe[g][0] = '\0';
+            shared_->exited[g].store(false, std::memory_order_relaxed);
+            shared_->subreaper[g].store(false, std::memory_order_relaxed);
             shared_->host[g].store(0, std::memory_order_relaxed);
         }
     }
@@ -229,6 +231,76 @@ public:
     }
     [[nodiscard]] std::int32_t ppid_of(std::int32_t g) const noexcept {
         return (g > 0 && g < kMax && shared_) ? shared_->ppid[g].load(std::memory_order_relaxed) : 0;
+    }
+
+    // -- Orphans, subreapers -----------------------------------------------
+    // Every guest process is its own HOST process whose host parent is the
+    // linuxity that forked it, so when a guest parent dies the HOST hands
+    // the orphan to launchd -- nothing a guest can see. The guest's view is
+    // kept here instead: PR_SET_CHILD_SUBREAPER marks a pid, a process
+    // exiting posts its status, and a parent that has gone is replaced by
+    // its nearest living subreaper ancestor, else init (1), as Linux does.
+    void set_subreaper(std::int32_t g, bool on) noexcept {
+        if (g > 0 && g < kMax && shared_) shared_->subreaper[g].store(on, std::memory_order_relaxed);
+    }
+    [[nodiscard]] bool is_subreaper(std::int32_t g) const noexcept {
+        return g > 0 && g < kMax && shared_ && shared_->subreaper[g].load(std::memory_order_relaxed);
+    }
+    // A process records how it ended (a Linux wait status), so a guest
+    // parent that isn't its HOST parent (a subreaper that adopted it) can
+    // still reap it.
+    void post_exit(std::int32_t g, int linux_wstatus) noexcept {
+        if (g <= 0 || g >= kMax || !shared_) return;
+        shared_->exit_status[g].store(linux_wstatus, std::memory_order_relaxed);
+        shared_->exited[g].store(true, std::memory_order_release);
+    }
+    [[nodiscard]] std::optional<int> exit_of(std::int32_t g) const noexcept {
+        if (g <= 0 || g >= kMax || !shared_ || !shared_->exited[g].load(std::memory_order_acquire))
+            return std::nullopt;
+        return shared_->exit_status[g].load(std::memory_order_relaxed);
+    }
+    // Has guest process g ended (exited, or its host process is gone)?
+    [[nodiscard]] bool gone(std::int32_t g) const noexcept {
+        if (g == 1) return false;                       // init outlives the tree
+        if (exit_of(g)) return true;
+        const auto h = host_of(g);
+        return !h || *h <= 0 || ::kill(*h, 0) != 0;
+    }
+    // Who adopts the children of g when g ends: its nearest living
+    // subreaper ancestor, else init (1). The ONE rule, for exit and getppid.
+    [[nodiscard]] std::int32_t adopter_for(std::int32_t g) const noexcept {
+        std::int32_t a = g;
+        for (int hops = 0; hops < kMax; ++hops) {
+            a = ppid_of(a);
+            if (a <= 1) return 1;
+            if (is_subreaper(a) && !gone(a)) return a;
+        }
+        return 1;
+    }
+    // g is ending: its live children get their adopter now, as Linux does at
+    // exit, so a subreaper's wait sees them without them asking first.
+    void reparent_children_of(std::int32_t g) noexcept {
+        const std::int32_t to = adopter_for(g);
+        for (const std::int32_t c : children_of(g)) set_ppid(c, to);
+    }
+    // The parent g should report now: its recorded parent while that lives,
+    // else the adopter (a parent killed before it could reparent us).
+    [[nodiscard]] std::int32_t live_parent_of(std::int32_t g) noexcept {
+        const std::int32_t p = ppid_of(g);
+        if (p <= 1 || !gone(p)) return p;
+        const std::int32_t to = adopter_for(p);
+        set_ppid(g, to);
+        return to;
+    }
+    // Live processes whose guest parent is now `parent` though it didn't
+    // fork them (adopted orphans), or that are ended and posted a status.
+    [[nodiscard]] std::vector<std::int32_t> children_of(std::int32_t parent) const {
+        std::vector<std::int32_t> out;
+        if (!shared_) return out;
+        for (int g = 2; g < kMax; ++g)
+            if (shared_->host[g].load(std::memory_order_relaxed) > 0 && ppid_of(g) == parent)
+                out.push_back(g);
+        return out;
     }
 
     [[nodiscard]] std::optional<pid_t> host_of(std::int32_t g) const noexcept {
@@ -333,6 +405,10 @@ private:
         // buffer is always NUL-terminated at kExe-1).
         char exe[kMax][kExe]{};
         std::atomic<std::int32_t> ppid[kMax]{};
+        // See set_subreaper / post_exit.
+        std::atomic<bool> subreaper[kMax]{};
+        std::atomic<bool> exited[kMax]{};
+        std::atomic<int> exit_status[kMax]{};
         // setpgid(child, g) the PARENT asked for. Darwin refuses setpgid on
         // a child that has exec'd (EACCES), and every HVF child has exec'd
         // on the host from its first instruction -- though the GUEST child
