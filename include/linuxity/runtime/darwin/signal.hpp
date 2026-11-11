@@ -218,33 +218,52 @@ struct PendingSignals {
     }
     // Up to 64 live vCPUs to kick. Written under ProcessState's lock when
     // threads start/stop; read from a signal handler, hence atomic.
+    //
+    // A slot holds handle+1, 0 meaning empty: hv_vcpu_t is a small index
+    // and the process's FIRST vCPU is handle 0. Storing it raw made the
+    // empty-slot test skip the main thread -- so no kick ever reached it,
+    // and a signal for a guest spinning in user code (SIGXCPU, a timer's
+    // SIGALRM, kill from another process) waited for a syscall that never
+    // came.
     static constexpr int kMaxCpus = 64;
-    std::atomic<hv_vcpu_t> cpus[kMaxCpus]{};
+    std::atomic<std::uint64_t> cpus[kMaxCpus]{};
     std::atomic<int> cpu_count{0};
     std::mutex wait_mu_;
     std::condition_variable wait_cv_;
 
     void register_cpu(hv_vcpu_t v) noexcept {
+        const std::uint64_t slot = static_cast<std::uint64_t>(v) + 1;
         const int n = cpu_count.load(std::memory_order_relaxed);
         for (int i = 0; i < n; ++i)
-            if (cpus[i].load(std::memory_order_relaxed) == v) return;
+            if (cpus[i].load(std::memory_order_relaxed) == slot) return;
+        for (int i = 0; i < n; ++i) {                    // reuse a freed slot
+            std::uint64_t empty = 0;
+            if (cpus[i].compare_exchange_strong(empty, slot)) return;
+        }
         if (n < kMaxCpus) {
-            cpus[n].store(v, std::memory_order_relaxed);
+            cpus[n].store(slot, std::memory_order_relaxed);
             cpu_count.store(n + 1, std::memory_order_release);
         }
     }
     void unregister_cpu(hv_vcpu_t v) noexcept {
+        const std::uint64_t slot = static_cast<std::uint64_t>(v) + 1;
         const int n = cpu_count.load(std::memory_order_acquire);
         for (int i = 0; i < n; ++i)
-            if (cpus[i].load(std::memory_order_relaxed) == v)
+            if (cpus[i].load(std::memory_order_relaxed) == slot)
                 cpus[i].store(0, std::memory_order_relaxed);
     }
+    // A guest signal became pending: get every thread to look. A thread
+    // running guest code is in hv_vcpu_run (kick it out); one blocked in a
+    // host wait on our behalf (poll, sleep) is woken through the pipe. Both
+    // always: a raiser can't know which state each thread is in.
     void kick_all() noexcept {
+        poke();
         const int n = cpu_count.load(std::memory_order_acquire);
-        for (int i = 0; i < n; ++i) {
-            hv_vcpu_t v = cpus[i].load(std::memory_order_relaxed);
-            if (v) ::hv_vcpus_exit(&v, 1);
-        }
+        for (int i = 0; i < n; ++i)
+            if (const std::uint64_t s = cpus[i].load(std::memory_order_relaxed)) {
+                hv_vcpu_t v = static_cast<hv_vcpu_t>(s - 1);
+                ::hv_vcpus_exit(&v, 1);
+            }
     }
 
     // Block until one of `interesting` is pending, then return. Used by
@@ -354,6 +373,7 @@ namespace sicode {
 inline constexpr std::int32_t kSegvMaperr = 1;   // address not mapped
 inline constexpr std::int32_t kSegvAccerr = 2;   // no permission for access
 inline constexpr std::int32_t kBusAdraln  = 1;   // invalid alignment
+inline constexpr std::int32_t kBusAdrerr  = 2;   // nonexistent physical address (past a file's end)
 inline constexpr std::int32_t kIllIllopc  = 1;   // illegal opcode
 }
 

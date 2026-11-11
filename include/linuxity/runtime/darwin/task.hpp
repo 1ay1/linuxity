@@ -39,6 +39,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -285,6 +286,22 @@ public:
         ids_.reset();
     }
 
+    // mlock'd guest pages, for /proc/<pid>/status VmLck. A set of page
+    // numbers: locking twice counts once, munlock of part of a range
+    // unlocks exactly that part, as the kernel's VM_LOCKED does.
+    void lock_pages(std::uint64_t at, std::uint64_t len, bool on) {
+        std::lock_guard g{mu_};
+        const std::uint64_t first = at / 4096, end = (at + len + 4095) / 4096;
+        for (std::uint64_t p = first; p < end; ++p) {
+            if (on) locked_.insert(p);
+            else locked_.erase(p);
+        }
+    }
+    [[nodiscard]] std::uint64_t locked_bytes() const {
+        std::lock_guard g{mu_};
+        return locked_.size() * 4096;
+    }
+
     // (No tid allocator here on purpose: tids share ONE namespace with pids
     // across the whole guest tree, so they come from the shared PidSpace.
     // A per-process counter collides with other processes' pids.)
@@ -311,6 +328,7 @@ public:
 private:
     std::vector<Backing> backings_;
     std::optional<Ids> ids_;
+    std::set<std::uint64_t> locked_;
     std::string environ_;
     std::vector<NamedRange> names_;
     std::atomic<bool> group_exiting_{false};

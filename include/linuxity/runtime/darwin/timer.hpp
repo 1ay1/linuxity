@@ -151,6 +151,20 @@ public:
         return std::exchange(it->second.overrun, 0);
     }
 
+    // -- RLIMIT_CPU --------------------------------------------------------
+    // The host can't enforce it: macOS charges vCPU time to the process but
+    // never raises SIGXCPU while a thread is inside hv_vcpu_run. So the
+    // wheel measures the process CPU clock itself and does what Linux does:
+    // SIGXCPU at the soft limit and once a second after, SIGKILL at the
+    // hard one. Seconds, as setrlimit gives them; ~0 = unlimited.
+    void set_cpu_limit(std::uint64_t soft, std::uint64_t hard) {
+        std::lock_guard g{mu_};
+        cpu_soft_ = soft;
+        cpu_hard_ = hard;
+        cpu_next_ = soft;
+        cv_.notify_all();
+    }
+
 private:
     struct Entry {
         Clock::time_point deadline{};     // zero = disarmed
@@ -199,6 +213,16 @@ private:
         };
         for (Entry& e : itimer_) visit(e);
         for (auto& [id, e] : posix_) visit(e);
+        // the CPU limit: a deadline on the CPU clock, so poll it at 100 ms
+        if (cpu_soft_ != kUnlimited) {
+            struct ::timespec ts{};
+            ::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
+            const auto used = static_cast<std::uint64_t>(ts.tv_sec);
+            if (cpu_hard_ != kUnlimited && used >= cpu_hard_) signals.push_back(9);   // SIGKILL
+            else if (used >= cpu_next_) { signals.push_back(24); cpu_next_ = used + 1; }  // SIGXCPU
+            const auto poll = now + std::chrono::milliseconds{100};
+            if (!next || poll < *next) next = poll;
+        }
         return next;
     }
 
@@ -223,6 +247,8 @@ private:
     std::thread worker_;
     std::atomic<bool> running_{false};
     std::function<void(int)> raise_;
+    static constexpr std::uint64_t kUnlimited = ~std::uint64_t{0};
+    std::uint64_t cpu_soft_{kUnlimited}, cpu_hard_{kUnlimited}, cpu_next_{kUnlimited};
     Entry itimer_[3]{};
     std::map<int, Entry> posix_;
     int next_id_{1};

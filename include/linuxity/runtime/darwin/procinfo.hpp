@@ -214,6 +214,7 @@ fact(std::string_view leaf, pid_t host, const Self* self, std::optional<int> nic
         };
         const std::uint64_t vs = std::max(ht->rss, self ? guest_vsize(self->proc) : ht->rss);
         kb("VmPeak", vs); kb("VmSize", vs);
+        kb("VmLck", self ? self->proc.locked_bytes() : 0);
         kb("VmHWM", ht->peak_rss); kb("VmRSS", ht->rss);
         kb("RssAnon", ht->rss); kb("RssFile", 0); kb("RssShmem", 0);
         s += "Threads:\t" + std::to_string(self ? std::max<std::size_t>(1, self->proc.thread_count())

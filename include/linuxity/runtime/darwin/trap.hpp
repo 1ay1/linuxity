@@ -645,6 +645,22 @@ public:
         return proc_.with_space([&](AddressSpace& t) { return t.vmas(); });
     }
 
+    // Is guest address `a` in a file-backed mapping, on a page that starts
+    // at or past the file's current end?
+    [[nodiscard]] bool past_file_end(std::uint64_t a) {
+        return proc_.with_backings([&](auto& v) {
+            for (const auto& b : v) {
+                if (a < b.at || a >= b.at + b.len) continue;
+                struct ::stat st{};
+                if (::fstat(b.fd, &st) != 0) return false;
+                const std::uint64_t page_off = static_cast<std::uint64_t>(b.off) + ((a - b.at) & ~std::uint64_t{4095});
+                return page_off >= static_cast<std::uint64_t>(st.st_size);
+            }
+            return false;
+        });
+    }
+
+
 private:
     [[nodiscard]] Result<std::int64_t> complete(std::int64_t rc) {
         // strace-style line with the REAL result. The core's LINUXITY_TRACE
@@ -698,6 +714,17 @@ private:
             const bool root = !ids || ids->euid == 0;
             if (n.max > slot.max && !root) return -1;             // EPERM
             slot = {n.cur, n.max};
+            // Every guest process is its own host process, so a limit on
+            // what the process itself consumes is enforced for it here:
+            // CPU time by the timer wheel (the host never raises SIGXCPU
+            // inside hv_vcpu_run), file size by the host (SIGXFSZ/EFBIG).
+            if (res == 0 /*RLIMIT_CPU*/) timers_.set_cpu_limit(n.cur, n.max);
+            if (res == 1 /*RLIMIT_FSIZE*/) {
+                struct ::rlimit hl{};
+                hl.rlim_cur = n.cur == ~0ull ? RLIM_INFINITY : static_cast<rlim_t>(n.cur);
+                hl.rlim_max = n.max == ~0ull ? RLIM_INFINITY : static_cast<rlim_t>(n.max);
+                (void)::setrlimit(RLIMIT_FSIZE, &hl);
+            }
         }
         if (old && !ram.put(old, prev)) return -14;
         return 0;
@@ -753,6 +780,10 @@ private:
         const std::uint64_t far = cpu_.fault_address();
         const Vma* v = proc_.with_space([&](AddressSpace& t) { return t.find(far); });
         if (sig == 11 && v) code = sicode::kSegvAccerr;
+        // A page of a file mapping that lies wholly past the file's end (it
+        // was truncated after the map): Linux has no page to give, and that
+        // is SIGBUS/BUS_ADRERR, not SIGSEGV.
+        if (sig == 11 && v && past_file_end(far)) { sig = 7; code = sicode::kBusAdrerr; }
 
         // If the guest installed a handler, deliver the fault to it. The
         // frame must capture the FAULTING instruction (pc unchanged, not
@@ -3071,7 +3102,31 @@ private:
                     ts = {static_cast<time_t>(d / 1'000'000'000LL),
                           static_cast<long>(d % 1'000'000'000LL)};
                 }
-                return ::nanosleep(&ts, nullptr) < 0 ? darwin::fail() : 0;
+                // Sleep until the deadline or a deliverable guest signal --
+                // whichever is first. Linux's nanosleep is interruptible
+                // (never restarted, even under SA_RESTART): EINTR, with the
+                // time left in `rem`, and the handler runs before the guest
+                // sees it. A plain host nanosleep held every signal until
+                // the whole sleep ended (100s of SIGALRMs became 4).
+                const auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::seconds{ts.tv_sec} + std::chrono::nanoseconds{ts.tv_nsec};
+                for (;;) {
+                    const auto left = deadline - std::chrono::steady_clock::now();
+                    if (left <= std::chrono::nanoseconds::zero()) return 0;
+                    const auto ms = std::chrono::ceil<std::chrono::milliseconds>(left).count();
+                    std::vector<struct ::pollfd> none;
+                    const int rc = signal_aware_poll(none, static_cast<int>(std::min<std::int64_t>(ms, INT32_MAX)));
+                    if (rc != -4) continue;                        // timed out (or spurious): recheck
+                    const std::uint64_t remp = clk ? regs_.arg(3) : a1;
+                    const auto rem = std::max(std::chrono::nanoseconds::zero(),
+                                              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                  deadline - std::chrono::steady_clock::now()));
+                    if (remp && !(clk && (a1 & kTimerAbstime))) {
+                        const LinuxTimespec r{rem.count() / 1'000'000'000LL, rem.count() % 1'000'000'000LL};
+                        if (!ram.put(remp, r)) return -14;
+                    }
+                    return -4;                                     // EINTR
+                }
             }
 
             case S::umask: {
@@ -3673,6 +3728,37 @@ private:
         // syscall returns drops them for every vCPU of the VM.
         cpu_.flush_tlb_on_entry();
     }
+    // A file this process maps shared changed size (truncate/ftruncate).
+    // The host maps whole 16 KiB pages, so a page of the file that is now
+    // past EOF but shares a host page with one that isn't still reads as
+    // zeros on the host -- where Linux, with 4 KiB pages, raises SIGBUS. So
+    // the GUEST's page tables say what the file can back: no access past
+    // EOF (the abort becomes SIGBUS in report_fault, see past_file_end),
+    // the mapping's own protection where it grew back.
+    void file_resized(int fd) {
+        struct ::stat fs{};
+        if (::fstat(fd, &fs) != 0) return;
+        const auto size = static_cast<std::uint64_t>(fs.st_size);
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> dead, live;
+        proc_.with_backings([&](auto& v) {
+            for (const auto& b : v) {
+                struct ::stat bs{};
+                if (::fstat(b.fd, &bs) != 0 || bs.st_ino != fs.st_ino || bs.st_dev != fs.st_dev) continue;
+                const auto off = static_cast<std::uint64_t>(b.off);
+                // first guest page of the mapping that starts at or past EOF
+                const std::uint64_t cut = size <= off ? 0
+                    : std::min<std::uint64_t>(b.len, AddressSpace::page_up(size - off));
+                if (cut < b.len) dead.emplace_back(b.at + cut, b.len - cut);
+                if (cut) live.emplace_back(b.at, cut);
+            }
+            return 0;
+        });
+        for (const auto& [at, n] : dead) set_pte_prot(at, n, GuestProt::none);
+        for (const auto& [at, n] : live) {
+            const Vma* v = proc_.with_space([&](AddressSpace& t) { return t.find(at); });
+            if (v) set_pte_prot(at, n, v->prot);
+        }
+    }
     void reset_pte_prot(std::uint64_t at, std::uint64_t len) {
         if (!len || proc_.pte_hi <= proc_.pte_lo) return;      // nothing narrowed yet
         machine_.protect(at, len, true, true, true);
@@ -3904,6 +3990,7 @@ private:
             }
             case S::munmap: {
                 std::uint64_t len = AddressSpace::page_up(a1);
+                proc_.lock_pages(a0, len, false);        // unmapped memory isn't locked
                 // A shared map's VMA spans whole host pages; unmapping the
                 // part the guest asked for (its own length) releases them all.
                 proc_.with_backings([&](auto& v) {
@@ -3943,7 +4030,9 @@ private:
                 if (win.empty() && a1) return -12;               // ENOMEM: unmapped
                 const int rc = sc == S::munlock ? ::munlock(win.data(), win.size())
                                                 : ::mlock(win.data(), win.size());
-                return rc < 0 ? darwin::fail() : 0;
+                if (rc < 0) return darwin::fail();
+                proc_.lock_pages(a0, a1, sc != S::munlock);
+                return 0;
             }
             case S::mlockall: case S::munlockall:
                 // The whole guest is one mapping; locking all of it would pin
@@ -4466,8 +4555,9 @@ private:
                         if ((*s & kSealGrow) && want > st.st_size) return -1;
                     }
                 }
-                return ::ftruncate(*hfd, static_cast<off_t>(a1)) < 0
-                           ? darwin::fail() : 0;
+                if (::ftruncate(*hfd, static_cast<off_t>(a1)) < 0) return darwin::fail();
+                file_resized(*hfd);
+                return 0;
             case S::fsync: case S::fdatasync:
                 if (!need_fd()) return -9;
                 return ::fsync(*hfd) < 0 ? darwin::fail() : 0;
@@ -5594,10 +5684,15 @@ private:
                                                 : ::chmod(path->c_str(), mode);
                 return rc < 0 ? darwin::fail() : 0;
             }
-            case S::truncate:
+            case S::truncate: {
                 if (!path) return -2;
-                return ::truncate(path->c_str(), static_cast<off_t>(regs_.arg(1))) < 0
-                           ? darwin::fail() : 0;
+                if (::truncate(path->c_str(), static_cast<off_t>(regs_.arg(1))) < 0) return darwin::fail();
+                if (const int h = ::open(path->c_str(), O_RDONLY | O_CLOEXEC); h >= 0) {
+                    file_resized(h);
+                    ::close(h);
+                }
+                return 0;
+            }
             // -- Extended attributes, on the translated path. Darwin has the
             //    same four calls with an extra `position` and its own flag
             //    bits (XATTR_NOFOLLOW is an option, not a separate l* call),

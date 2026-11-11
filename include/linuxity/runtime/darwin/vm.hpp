@@ -34,6 +34,7 @@
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
+#include <optional>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -591,6 +592,7 @@ public:
     // reasons other than EXCEPTION (vtimer, hv_vcpus_exit) are not guest
     // events, so they surface as EINTR for the caller to retry.
     [[nodiscard]] Result<GuestRegs> run() {
+        const bool detour = flush_pending_;
         if (flush_pending_) {
             // Enter at EL1 on the flush stub, which erets to the guest's
             // real PC/PSTATE (parked in ELR_EL1/SPSR_EL1): its translations
@@ -605,8 +607,27 @@ public:
             ::hv_vcpu_set_reg(cpu_, HV_REG_CPSR, 0x3c5);       // EL1h, DAIF masked
         }
         if (::hv_vcpu_run(cpu_) != HV_SUCCESS) return err<GuestRegs>(Errno::eio);
-        if (exit_->reason != HV_EXIT_REASON_EXCEPTION)
+        if (exit_->reason != HV_EXIT_REASON_EXCEPTION) {
+            unwind_el1(detour);
             return err<GuestRegs>(Errno::eintr);
+        }
+        // Most exits arrive through the guest's EL1 vectors, which `hvc` out
+        // with ESR_EL1/ELR_EL1 describing the EL0 event. A STAGE-2 abort does
+        // not: the host refused the page behind guest RAM (a shared file
+        // mapping touched past the file's end -- SIGBUS on Linux), and the
+        // exception came straight to us with its own syndrome. Present it
+        // as the guest data abort it is, so the trap reports a fault with a
+        // real address instead of reading stale EL1 state (pc=0, "undefined
+        // instruction").
+        if (const std::uint64_t ec = exit_->exception.syndrome >> 26; ec == 0x24 || ec == 0x20) {
+            GuestRegs r = read_regs(cpu_);
+            ::hv_vcpu_get_reg(cpu_, HV_REG_PC, &r.elr);
+            ::hv_vcpu_get_reg(cpu_, HV_REG_CPSR, &r.spsr);
+            r.esr = exit_->exception.syndrome;
+            stage2_far_ = exit_->exception.virtual_address;
+            return ok(r);
+        }
+        stage2_far_.reset();
         return ok(read_regs(cpu_));
     }
 
@@ -617,6 +638,7 @@ public:
     // FAR_EL1, fetched only when a caller actually needs it -- see the note
     // on read_regs(). Valid only for an abort.
     [[nodiscard]] std::uint64_t fault_address() const noexcept {
+        if (stage2_far_) return *stage2_far_;
         return ::lx::runtime::fault_address(cpu_);
     }
 
@@ -681,6 +703,40 @@ public:
     }
 
 private:
+    // A kick (hv_vcpus_exit) can cancel the run while the vCPU is inside
+    // one of OUR EL1 detours on the vectors page: the TLB-flush stub, the
+    // in-guest syscall handler at VBAR+0x400, or a vector's `hvc` not yet
+    // taken. Whoever handles the interruption -- a signal frame, a fork's
+    // register snapshot, the next run's own flush detour -- reads PC/CPSR
+    // as the GUEST's, so leave the vCPU there instead of mid-detour.
+    // Otherwise a SIGALRM landing mid-handler saved pc=0x400 as the
+    // interrupted context and sigreturn resumed EL0 at the vectors page
+    // (SIGILL, "undefined instruction at pc=0x400"), and a second flush
+    // detour parked the stub's own address in ELR_EL1 (pc=0x800).
+    // Every unwind re-runs or completes work that has no side effect yet.
+    void unwind_el1(bool detour) noexcept {
+        std::uint64_t pc = 0, cpsr = 0;
+        ::hv_vcpu_get_reg(cpu_, HV_REG_PC, &pc);
+        ::hv_vcpu_get_reg(cpu_, HV_REG_CPSR, &cpsr);
+        if ((cpsr & 0xc) == 0 || pc >= HvfLayout::page) return;   // at EL0
+        std::uint64_t elr = sys(HV_SYS_REG_ELR_EL1);
+        const std::uint64_t spsr = sys(HV_SYS_REG_SPSR_EL1);
+        if (pc >= HvfLayout::tlb_flush_stub) {
+            flush_pending_ = detour || flush_pending_;   // may not have run
+        } else if (pc >= HvfLayout::vectors + 8 * 0x80 &&
+                   pc < HvfLayout::vectors + 9 * 0x80 &&
+                   (sys(HV_SYS_REG_ESR_EL1) >> 26) == 0x15) {
+            // An svc in the in-guest handler. Past `mov x0, x16` (0x34:
+            // the eret) the answer is in x0 -- finish it; before, x0 is
+            // untouched and the svc simply runs again (x16/x17 are
+            // scratch by the ABI).
+            if (pc != HvfLayout::vectors + 8 * 0x80 + 0x34) elr -= 4;
+        }
+        // Any other vector: ELR is the faulting/next instruction already.
+        ::hv_vcpu_set_reg(cpu_, HV_REG_PC, elr);
+        ::hv_vcpu_set_reg(cpu_, HV_REG_CPSR, spsr);
+    }
+
     [[nodiscard]] std::uint64_t sys(hv_sys_reg_t r) const noexcept {
         std::uint64_t v = 0;
         ::hv_vcpu_get_sys_reg(cpu_, r, &v);
@@ -691,6 +747,8 @@ private:
     hv_vcpu_exit_t* exit_{nullptr};
     bool live_{false};
     bool flush_pending_{false};
+    // FAR of the last stage-2 abort (run()); FAR_EL1 is stale for those.
+    std::optional<std::uint64_t> stage2_far_;
 };
 
 } // namespace lx::runtime
