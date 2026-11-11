@@ -100,24 +100,43 @@ public:
                 return -22;                              // EINVAL
         }
         const std::uint32_t old = known ? regs_[guest_fd].mask : 0;
+        bool fifo = known && regs_[guest_fd].fifo;
         if (!known) {
             // epoll refuses what can never block: regular files and
             // directories (EPERM). kqueue would take them.
             struct ::stat st{};
             if (::fstat(host_fd, &st) == 0 && (S_ISREG(st.st_mode) || S_ISDIR(st.st_mode)))
                 return -1;                               // EPERM
+            fifo = S_ISFIFO(st.st_mode);
         }
         // EPOLLEXCLUSIVE may only be ADDed; MOD of (or to) it is EINVAL.
         if (op == kEpollCtlMod &&
             ((mask | regs_[guest_fd].armed) & epoll_bit::exclusive)) return -22;
         if (const std::int64_t rc = apply(guest_fd, host_fd, mask, old); rc < 0) return rc;
-        regs_[guest_fd] = {host_fd, mask, token, mask};
+        regs_[guest_fd] = {host_fd, mask, token, mask, fifo};
         return 0;
     }
 
-    // wait(out, max, timeout_ms) -> number of ready events, or -errno.
+    // The kqueue itself: readable when any armed event is pending, so a
+    // caller can block on it in poll()/select() alongside other fds (a
+    // signal wake pipe) and then collect with wait(..., 0).
+    [[nodiscard]] int fd() const noexcept { return kq_; }
+
+    // Host fds of FIFOs armed for input. kqueue never reports a FIFO's
+    // writer leaving (macOS), so the caller must also wait on these where
+    // the hangup is visible -- select() -- and pass the hung-up ones back.
+    [[nodiscard]] std::vector<std::pair<int, int>> input_fifos() const {
+        std::vector<std::pair<int, int>> out;     // guest fd, host fd
+        for (const auto& [g, r] : regs_)
+            if (r.fifo && (r.mask & (epoll_bit::in | epoll_bit::rdnorm))) out.emplace_back(g, r.host_fd);
+        return out;
+    }
+
+    // wait(out, max, timeout_ms, hups) -> number of ready events, or -errno.
+    // `hups`: guest fds of FIFOs the caller saw hang up (input_fifos);
+    // each is reported EPOLLHUP.
     [[nodiscard]] std::int64_t wait(std::vector<LinuxEpollEvent>& out, int max,
-                                    int timeout_ms) {
+                                    int timeout_ms, const std::vector<int>& hups = {}) {
         if (max <= 0) return -22;
         std::vector<struct ::kevent> evs(static_cast<std::size_t>(max));
         struct ::timespec ts{};
@@ -169,13 +188,35 @@ public:
                 it->second.mask = 0;
             }
         }
+        // The FIFO hangups the caller found: EPOLLHUP, which is always
+        // reportable (merged into an EPOLLIN for the same fd, if any).
+        for (const int gfd : hups) {
+            if (static_cast<int>(out.size()) >= max) break;
+            auto it = regs_.find(gfd);
+            if (it == regs_.end() || !it->second.mask) continue;
+            auto same = std::find(out_fd.begin(), out_fd.end(), gfd);
+            if (same != out_fd.end()) {
+                out[static_cast<std::size_t>(same - out_fd.begin())].events |= epoll_bit::hup;
+                continue;
+            }
+            out.push_back({epoll_bit::hup, 0, it->second.token});
+            out_fd.push_back(gfd);
+            if (it->second.mask & epoll_bit::oneshot) {
+                (void)apply(gfd, it->second.host_fd, 0, it->second.mask);
+                it->second.mask = 0;
+            }
+        }
         return static_cast<std::int64_t>(out.size());
     }
 
 private:
     // mask: what is armed in the kqueue now (0 once a ONESHOT fired);
-    // armed: what the guest last asked for.
-    struct Reg { int host_fd; std::uint32_t mask; std::uint64_t token; std::uint32_t armed; };
+    // armed: what the guest last asked for. fifo: a FIFO, whose hangup
+    // only select() can see (input_fifos).
+    struct Reg {
+        int host_fd; std::uint32_t mask; std::uint64_t token; std::uint32_t armed;
+        bool fifo{false};
+    };
 
     // Add/remove the kevent pair for one fd so the kqueue matches `want`.
     // The GUEST fd rides in each kevent's udata, which is how wait() maps a

@@ -3203,7 +3203,7 @@ private:
                     timeout_ms = static_cast<int>(ts.sec * 1000 + ts.nsec / 1'000'000);
                 }
                 std::vector<LinuxEpollEvent> ready;
-                const auto n = it->second->wait(ready, static_cast<int>(a2), timeout_ms);
+                const auto n = epoll_wait_guest(*it->second, ready, static_cast<int>(a2), timeout_ms);
                 if (n < 0) return n;
                 for (std::size_t i = 0; i < ready.size(); ++i)
                     if (!ram.put(a1 + i * sizeof(LinuxEpollEvent), ready[i])) return -14;
@@ -4805,7 +4805,7 @@ private:
                 auto it = epolls_.find(gfd);
                 if (it == epolls_.end()) return -22;
                 std::vector<LinuxEpollEvent> ready;
-                const auto n = it->second->wait(ready, static_cast<int>(a2),
+                const auto n = epoll_wait_guest(*it->second, ready, static_cast<int>(a2),
                                                 static_cast<int>(static_cast<std::int32_t>(a3)));
                 if (n < 0) return n;
                 for (std::size_t i = 0; i < ready.size(); ++i)
@@ -5303,16 +5303,8 @@ private:
         // fails at once with EBADF; poll would wait for it forever.
         const int acc = fl & O_ACCMODE;
         if ((events & POLLOUT) ? acc == O_RDONLY : acc == O_WRONLY) return 0;
-        // macOS poll() and kqueue never report a FIFO's last writer going
-        // away (no POLLHUP, no EV_EOF): a reader blocked there waited
-        // forever for the EOF read() returns at once. select() sees it.
-        struct ::stat st{};
-        if (::fstat(h, &st) == 0 && S_ISFIFO(st.st_mode)) {
-            if (signal_aware_select(h, events) != -4) return 0;
-        } else {
-            std::vector<struct ::pollfd> p{{h, events, 0}};
-            if (signal_aware_poll(p, -1) != -4) return 0;
-        }
+        std::vector<struct ::pollfd> p{{h, events, 0}};
+        if (signal_aware_poll(p, -1) != -4) return 0;
         const std::uint64_t ready = (g_pending.bits.load(std::memory_order_relaxed)
                                      | task_.pending.load(std::memory_order_relaxed)) & ~task_.sig_mask;
         bool eintr = false;
@@ -5329,32 +5321,104 @@ private:
     // resume(kRestartSys): re-execute the svc after the signal is handled.
     static constexpr std::int64_t kRestartSys = -512;   // the kernel's ERESTARTSYS
 
-    // signal_aware_poll for ONE fd, by select(): see wait_ready. -4 when a
-    // deliverable signal came first; otherwise the fd is ready (or select
-    // failed, and the syscall itself will say why).
-    [[nodiscard]] int signal_aware_select(int h, short events) {
-        g_pending.drain_wake();
-        drain_mail();
-        auto deliverable = [&] {
-            return ((g_pending.bits.load(std::memory_order_relaxed)
-                     | task_.pending.load(std::memory_order_relaxed)) & ~task_.sig_mask) != 0;
-        };
-        if (deliverable()) return -4;
-        const int wfd = g_pending.wake_rd;
-        if (h >= FD_SETSIZE || wfd >= FD_SETSIZE) {              // fd_set can't hold it
-            std::vector<struct ::pollfd> p{{h, events, 0}};
-            return signal_aware_poll(p, -1);
+    // epoll_wait as the guest sees it. The wait happens in
+    // signal_aware_poll on the kqueue's own fd (readable while an event
+    // is pending) plus every FIFO armed for input, so (1) a guest signal
+    // interrupts it with EINTR -- epoll_wait is never restarted, even under
+    // SA_RESTART -- where a bare kevent() slept through it, and (2) a
+    // FIFO's hangup, which kqueue never reports on macOS, comes back as the
+    // POLLHUP signal_aware_poll derives from select(). Then the events are
+    // collected without blocking.
+    [[nodiscard]] std::int64_t epoll_wait_guest(EpollSet& set, std::vector<LinuxEpollEvent>& out,
+                                                int max, int timeout_ms) {
+        if (max <= 0) return -22;
+        // A wake with nothing to report (a signal blocked or ignored, a
+        // kevent filtered out after the kqueue fd turned readable) must not
+        // surface as 0 events before the timeout: Linux never does that,
+        // and libuv asserts it (uv__io_poll: timeout != -1).
+        using clock = std::chrono::steady_clock;
+        const auto deadline = clock::now() + std::chrono::milliseconds{std::max(timeout_ms, 0)};
+        for (;;) {
+            int left = timeout_ms;
+            if (timeout_ms > 0) {
+                const auto ms = std::chrono::ceil<std::chrono::milliseconds>(deadline - clock::now()).count();
+                left = static_cast<int>(std::max<std::int64_t>(ms, 0));
+            }
+            const auto fifos = set.input_fifos();
+            std::vector<struct ::pollfd> p{{set.fd(), POLLIN, 0}};
+            for (const auto& f : fifos) p.push_back({f.second, POLLIN, 0});
+            const int rc = signal_aware_poll(p, left);
+            if (rc == -4) return -4;                             // EINTR
+            std::vector<int> hups;
+            for (std::size_t i = 0; i < fifos.size(); ++i)
+                if (p[i + 1].revents & POLLHUP) hups.push_back(fifos[i].first);
+            const std::int64_t n = set.wait(out, max, 0, hups);
+            if (n != 0 || timeout_ms == 0) return n;
+            if (timeout_ms > 0 && clock::now() >= deadline) return 0;
         }
+    }
+
+    // macOS poll() and kqueue never report a FIFO's last writer going away:
+    // no POLLHUP, no EV_EOF, where a pipe gets both. A reader waiting there
+    // (cat on a FIFO, a shell's `read < fifo`, an event loop) slept forever
+    // through the EOF read() would return at once. select() DOES see it --
+    // it calls the FIFO readable -- so a wait that includes a FIFO opened
+    // for input blocks in select(), then a zero-timeout poll() supplies the
+    // exact revents, and a FIFO select calls readable that poll says holds
+    // no data has hung up: POLLHUP, as Linux's pipe_poll reports it.
+    [[nodiscard]] static bool is_fifo(int h) noexcept {
+        struct ::stat st{};
+        return ::fstat(h, &st) == 0 && S_ISFIFO(st.st_mode);
+    }
+    [[nodiscard]] int fifo_aware_poll(std::vector<struct ::pollfd>& p, int timeout,
+                                      const std::vector<bool>& fifo, int wfd,
+                                      const auto& deliverable) {
+        using clock = std::chrono::steady_clock;
+        const auto deadline = clock::now() + std::chrono::milliseconds{timeout < 0 ? 0 : timeout};
         for (;;) {
             ::fd_set rd, wr;
             FD_ZERO(&rd); FD_ZERO(&wr);
-            if (events & POLLOUT) FD_SET(h, &wr); else FD_SET(h, &rd);
+            int top = wfd;
+            for (const auto& e : p) {
+                if (e.fd < 0) continue;
+                if (e.events & (POLLIN | POLLPRI | POLLRDNORM)) FD_SET(e.fd, &rd);
+                if (e.events & (POLLOUT | POLLWRNORM)) FD_SET(e.fd, &wr);
+                top = std::max(top, e.fd);
+            }
             if (wfd >= 0) FD_SET(wfd, &rd);
-            const int rc = ::select(std::max(h, wfd) + 1, &rd, &wr, nullptr, nullptr);
-            if (rc < 0) return errno == EINTR ? -4 : 1;
-            if (FD_ISSET(h, &rd) || FD_ISSET(h, &wr)) return 1;
-            if (deliverable()) return -4;
-            g_pending.drain_wake();                              // a wake for nothing we take
+            ::timeval tv{}, *tvp = nullptr;
+            if (timeout >= 0) {
+                const auto left = std::max(clock::duration::zero(), deadline - clock::now());
+                const auto us = std::chrono::duration_cast<std::chrono::microseconds>(left).count();
+                tv = {static_cast<time_t>(us / 1'000'000), static_cast<suseconds_t>(us % 1'000'000)};
+                tvp = &tv;
+            }
+            const int rc = ::select(top + 1, &rd, &wr, nullptr, tvp);
+            if (rc < 0 && errno == EINTR) return -4;
+            // rc < 0 otherwise is EBADF: poll() names the bad fd (POLLNVAL)
+            for (auto& e : p) e.revents = 0;
+            if (::poll(p.data(), static_cast<nfds_t>(p.size()), 0) < 0)
+                return static_cast<int>(darwin::fail());
+            int n = 0;
+            for (std::size_t i = 0; i < p.size(); ++i) {
+                auto& e = p[i];
+                // select said ready but poll found nothing: for a FIFO that
+                // is the hangup; for anything else, believe select (rather
+                // than spin on a disagreement).
+                if (rc > 0 && e.fd >= 0 && !e.revents) {
+                    if (FD_ISSET(e.fd, &rd)) e.revents |= fifo[i] ? POLLHUP : (e.events & (POLLIN | POLLRDNORM | POLLPRI));
+                    if (FD_ISSET(e.fd, &wr)) e.revents |= e.events & (POLLOUT | POLLWRNORM);
+                } else if (rc > 0 && fifo[i] && FD_ISSET(e.fd, &rd) && !(e.revents & POLLIN)) {
+                    e.revents |= POLLHUP;
+                }
+                if (e.revents) ++n;
+            }
+            if (n || rc < 0) return n;
+            if (rc == 0) return 0;                               // timed out
+            if (wfd >= 0 && FD_ISSET(wfd, &rd)) {
+                if (deliverable()) return -4;
+                g_pending.drain_wake();                          // a wake for nothing we take
+            }
         }
     }
 
@@ -5367,6 +5431,16 @@ private:
         };
         if (deliverable()) return -4;
         const int wfd = g_pending.wake_rd;
+        {
+            std::vector<bool> fifo(p.size(), false);
+            bool any = false, fits = wfd < FD_SETSIZE;
+            for (std::size_t i = 0; i < p.size(); ++i) {
+                if (p[i].fd >= FD_SETSIZE) fits = false;
+                if (p[i].fd >= 0 && (p[i].events & (POLLIN | POLLRDNORM)) && is_fifo(p[i].fd))
+                    fifo[i] = any = true;
+            }
+            if (any && fits) return fifo_aware_poll(p, timeout, fifo, wfd, deliverable);
+        }
         if (wfd >= 0) p.push_back({wfd, POLLIN, 0});
         const int rc = ::poll(p.data(), static_cast<nfds_t>(p.size()), timeout);
         const bool woke = wfd >= 0 && (p.back().revents & POLLIN);

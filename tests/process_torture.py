@@ -21,6 +21,7 @@ import select
 import signal
 import struct
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -430,6 +431,69 @@ def interrupted_syscall_eintr_vs_restart():
             return 0
     eq(status(child(body, False)), 0, "read interrupted with EINTR")
     eq(status(child(body, True)), 0, "read restarted by SA_RESTART")
+
+
+@check
+def waits_interrupted_even_under_sa_restart():
+    # epoll_wait / poll / select are never restarted (signal(7)): EINTR
+    # even with SA_RESTART. Called raw, so Python's PEP 475 retry can't hide it.
+    def body():
+        signal.signal(signal.SIGALRM, lambda s, f: None)
+        signal.siginterrupt(signal.SIGALRM, False)
+        e = select.epoll()
+        r, w = os.pipe()
+        e.register(r, select.EPOLLIN)
+        buf = ctypes.create_string_buffer(64)
+        pfd = (ctypes.c_int * 2)(r, select.POLLIN)
+        for name, call in (
+                ("epoll_pwait", lambda: libc.epoll_pwait(e.fileno(), buf, 4, 3000, None)),
+                ("poll", lambda: libc.poll(pfd, 1, 3000))):
+            signal.setitimer(signal.ITIMER_REAL, 0.1)
+            t = time.monotonic()
+            rc = call()
+            if rc != -1 or ctypes.get_errno() != errno.EINTR or time.monotonic() - t > 2:
+                os.write(2, f"{name}: rc={rc} errno={ctypes.get_errno()}".encode())
+                return 1
+        return 0
+    eq(status(child(body)), 0, "EINTR from epoll_pwait and poll")
+
+
+@check
+def fifo_hangup_wakes_poll_select_epoll():
+    # The last writer closing a FIFO is POLLHUP / readable / EPOLLHUP --
+    # and read() then gives EOF. (macOS hosts never report it natively.)
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, "f")
+    os.mkfifo(path)
+    def writer():
+        w = os.open(path, os.O_WRONLY)
+        time.sleep(0.1)
+        os.close(w)
+        return 0
+    def waiter(kind):
+        pid = child(writer)
+        r = os.open(path, os.O_RDONLY)
+        t = time.monotonic()
+        if kind == "poll":
+            p = select.poll(); p.register(r, select.POLLIN)
+            got = p.poll(3000)
+            ok(got and got[0][1] & select.POLLHUP, f"poll: {got}")
+        elif kind == "select":
+            ok(select.select([r], [], [], 3)[0], "select says readable")
+        else:
+            e = select.epoll(); e.register(r, select.EPOLLIN)
+            got = e.poll(3)
+            ok(got and got[0][1] & select.EPOLLHUP, f"epoll: {got}")
+            e.close()
+        ok(time.monotonic() - t < 2, f"{kind} woke promptly")
+        eq(os.read(r, 10), b"", f"{kind}: EOF")
+        os.close(r)
+        eq(status(pid), 0, "writer")
+    try:
+        for kind in ("poll", "select", "epoll"):
+            waiter(kind)
+    finally:
+        os.unlink(path); os.rmdir(d)
 
 
 @check
