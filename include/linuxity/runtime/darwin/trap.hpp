@@ -372,6 +372,7 @@ public:
             // return into a context whose x0 is the syscall's first ARGUMENT,
             // and the interrupted code then dereferences garbage.
             (void)deliver_pending();
+            if (task_.tid == tgid_) proc_.leader_sigmask.store(task_.sig_mask, std::memory_order_relaxed);
             if (exited_) return ok(false);
             auto regs = cpu_.run();
             if (!regs) {
@@ -406,6 +407,15 @@ public:
         // into x0 would hand the new program's _start a garbage argument.
         if (std::exchange(execed_, false)) {
             cpu_.set_entry(regs_.elr, cpu_.sp());
+            return ok();
+        }
+        if (ret == kRestartSys) {
+            // Interrupted before it did anything: back onto the svc with the
+            // original x0, so the next delivery's frame resumes INTO the call
+            // and it runs again (handler first, if there is one).
+            GuestRegs again = regs_;
+            again.elr -= 4;
+            cpu_.set_result(again, static_cast<std::int64_t>(regs_.x[0]));
             return ok();
         }
         cpu_.set_result(regs_, ret);
@@ -727,6 +737,8 @@ private:
             // CPU time by the timer wheel (the host never raises SIGXCPU
             // inside hv_vcpu_run), file size by the host (SIGXFSZ/EFBIG).
             if (res == 0 /*RLIMIT_CPU*/) timers_.set_cpu_limit(n.cur, n.max);
+            // NOFILE: the fd table enforces the soft limit (EMFILE)
+            if (res == 7) proc_.with_fds([&](FdTable& t) { t.set_limit(static_cast<std::size_t>(n.cur)); return 0; });
             if (res == 1 /*RLIMIT_FSIZE*/) {
                 struct ::rlimit hl{};
                 hl.rlim_cur = n.cur == ~0ull ? RLIM_INFINITY : static_cast<rlim_t>(n.cur);
@@ -1860,9 +1872,26 @@ private:
         if (act.handler == 0) {                                  // SIG_DFL
             switch (default_action(s)) {
                 case Default::ignore: case Default::cont: return false;
-                case Default::stop:
-                    ::raise(signal_from_linux(s) == SIGTSTP ? SIGSTOP : SIGSTOP);
+                case Default::stop: {
+                    // Stop BY the signal (SIGTSTP/SIGTTIN/SIGTTOU, not a
+                    // stand-in SIGSTOP), so the parent's WSTOPSIG names it --
+                    // shells print "Stopped (tty input)" from exactly that.
+                    // Our host handler would catch it, so drop to SIG_DFL
+                    // and unblock it just for the raise.
+                    const int hs = signal_from_linux(s);
+                    if (hs == SIGSTOP || hs <= 0) { ::raise(SIGSTOP); return false; }
+                    struct ::sigaction dfl{}, old{};
+                    dfl.sa_handler = SIG_DFL;
+                    sigemptyset(&dfl.sa_mask);
+                    ::sigaction(hs, &dfl, &old);
+                    sigset_t m, om;
+                    sigemptyset(&m); sigaddset(&m, hs);
+                    ::pthread_sigmask(SIG_UNBLOCK, &m, &om);
+                    ::raise(hs);                                 // stops here until SIGCONT
+                    ::pthread_sigmask(SIG_SETMASK, &om, nullptr);
+                    ::sigaction(hs, &old, nullptr);
                     return false;
+                }
                 case Default::term: case Default::core:
                     // Die BY the signal so the parent's wait sees WIFSIGNALED.
                     route_host_signal(s, false);
@@ -2268,6 +2297,7 @@ private:
         pids_.set_pgid(child, pids_.pgid_of(task_.tid));
         pids_.set_sid(child, pids_.sid_of(task_.tid));
         pids_.set_exe(child, pids_.exe_of(task_.tid));   // same image until it execs
+        pids_.set_comm(child, pids_.comm_of(task_.tid));
         pids_.set_ppid(child, task_.tid);
         if (req.flags & clone_flag::parent_settid)
             (void)machine_.ram().put(req.parent_tid_addr, std::int32_t{child});
@@ -2369,6 +2399,7 @@ public:
         for (const auto& b : img.backings)
             if (static_cast<std::size_t>(b.group) < host_fds.size()) ::close(host_fds[static_cast<std::size_t>(b.group)]);
         proc_.rlimits = img.rlimits;
+        proc_.with_fds([&](FdTable& t) { t.set_limit(static_cast<std::size_t>(proc_.rlimits[7].cur)); return 0; });
         proc_.pte_lo = img.pte_lo;              // the tables came in the snapshot
         proc_.pte_hi = img.pte_hi;
         proc_.set_environ(img.environ);
@@ -2689,6 +2720,11 @@ private:
         threaded_ = false;            // ...and kills every other thread
         refresh_guest_answers();          // same pid, but a fresh image
         pids_.set_exe(task_.tid, exe_path_of(host_path, guest_path));
+        // Linux's comm is the basename of the path execve was GIVEN, not of
+        // the image it resolved to: `/bin/sh` running busybox is "sh".
+        const std::string comm = guest_path.substr(guest_path.find_last_of('/') + 1).substr(0, 15);
+        pids_.set_comm(task_.tid, comm);
+        ::pthread_setname_np(comm.c_str());
         pids_.mark_execed(task_.tid);           // releases a vfork parent
         // The kernel side of execve (set-ID credentials, SysV detach) is the
         // shared loop's: report the exec like any backend would.
@@ -3574,6 +3610,7 @@ private:
                         // The thread name; /proc/self/comm reads it back.
                         auto name = ram.cstr(a1, 16);
                         ::pthread_setname_np(name.c_str());
+                        if (task_.tid == tgid_) pids_.set_comm(tgid_, name);
                         return 0;
                     }
                     case kGetName: {
@@ -3597,13 +3634,38 @@ private:
                         return no_new_privs_ ? 1 : 0;
                     case kSetDumpable: case kGetDumpable:
                         return a0 == kGetDumpable ? 1 : 0;
-                    case kSetPdeathsig:
+                    case kSetPdeathsig: {
                         // The signal to send this process when its parent
-                        // dies. Recorded; nothing to arm on Darwin, and a
-                        // guest that relies on it for cleanup is no worse
-                        // off than on a kernel that delivered it late.
+                        // dies. The parent is another host process (each
+                        // guest process is one), so watch it: a thread
+                        // sleeps in one kevent(EVFILT_PROC, NOTE_EXIT) and
+                        // raises the signal for us, at most once. Clearing
+                        // (0) disarms it; the generation drops a stale one.
+                        if (a1 > static_cast<std::uint64_t>(kLinuxNsig)) return -22;
                         pdeathsig_ = static_cast<int>(a1);
+                        const auto gen = ++pdeath_gen_;
+                        const auto ph = parent_ > 0 ? pids_.host_of(parent_) : std::nullopt;
+                        if (pdeathsig_ && ph && *ph > 0) {
+                            const int sig = pdeathsig_;
+                            const pid_t watch = *ph;
+                            std::thread([this, sig, watch, gen] {
+                                const int kq = ::kqueue();
+                                struct ::kevent ev{};
+                                EV_SET(&ev, static_cast<uintptr_t>(watch), EVFILT_PROC, EV_ADD | EV_ONESHOT, NOTE_EXIT, 0, nullptr);
+                                struct ::kevent out{};
+                                // ESRCH from registering: it already died
+                                const bool gone = kq < 0 || ::kevent(kq, &ev, 1, nullptr, 0, nullptr) < 0 ||
+                                                  ::kevent(kq, nullptr, 0, &out, 1, nullptr) >= 0;
+                                if (kq >= 0) ::close(kq);
+                                if (gone && pdeath_gen_.load() == gen) {
+                                    g_pending.enqueue({sig, 0, 0 /*SI_USER*/, 0});
+                                    g_pending.kick_all();
+                                    g_pending.notify_waiters();
+                                }
+                            }).detach();
+                        }
                         return 0;
+                    }
                     case kGetPdeathsig:
                         return ram.put(a1, std::int32_t{pdeathsig_}) ? 0 : -14;
                     case kSetSeccomp:
@@ -4516,6 +4578,8 @@ private:
                         if (::poll(&p, 1, -1) < 0 && errno == EINTR) return -4;
                     }
                 }
+                if (const auto j = tty_job_control(*hfd, false)) return j;  // background reader
+                if (const auto w = wait_ready(*hfd, POLLIN)) return w;    // a signal came first
                 auto n = ::read(*hfd, win.data(), win.size());
                 return n < 0 ? darwin::fail() : n;
             }
@@ -4524,6 +4588,8 @@ private:
                 auto win = ram.clamp(a1, a2);
                 if (win.empty() && a2) return -14;
                 if (const auto e = seal_denies(*hfd, 0, win.size())) return e;
+                if (const auto j = tty_job_control(*wfd, true)) return j;   // background writer, TOSTOP
+                if (const auto w = wait_ready(*wfd, POLLOUT)) return w;
                 auto n = ::write(*wfd, win.data(), win.size());
                 return n < 0 ? darwin::fail() : n;
             }
@@ -5192,6 +5258,106 @@ private:
     // the handler's self-pipe rides along in the set, so a signal landing
     // after the check still wakes it. Returns poll's answer with the wake
     // fd's own readiness removed, or -EINTR.
+    // Linux's tty job control (n_tty's job_control / tty_check_change): a
+    // read from our controlling terminal by a BACKGROUND process group
+    // signals the whole group SIGTTIN and restarts once it is continued; a
+    // write does the same with SIGTTOU when the terminal has TOSTOP. If the
+    // guest blocks or ignores the signal, a read is EIO and a write simply
+    // proceeds. The host kernel would do this inside read(2), but
+    // wait_ready's poll comes first and a poll never stops anyone -- so a
+    // background `read` blocked forever instead of stopping. 0 = go ahead.
+    [[nodiscard]] std::int64_t tty_job_control(int h, bool write) {
+        if (!::isatty(h)) return 0;
+        const pid_t fg = ::tcgetpgrp(h);
+        const pid_t me = ::getpgrp();
+        if (fg <= 0 || fg == me) return 0;
+        if (::tcgetsid(h) != ::getsid(0)) return 0;          // not OUR controlling tty
+        const int sig = write ? 22 : 21;                     // SIGTTOU : SIGTTIN
+        if (write) {
+            struct ::termios t{};
+            if (::tcgetattr(h, &t) != 0 || !(t.c_lflag & TOSTOP)) return 0;
+        }
+        const LinuxSigaction a =
+            proc_.with_signals([&](SignalDispositions& d) { return d.get(sig); });
+        if ((task_.sig_mask & sigbit(sig)) || a.handler == 1)
+            return write ? 0 : -5;                           // EIO
+        if (pids_.pgrp_orphaned(guest_pid_of(me)))           // nobody could resume it
+            return -5;
+        (void)deliver_signal(-guest_pid_of(me), sig);
+        // -ERESTARTSYS: a handler without SA_RESTART turns it into EINTR
+        return a.handler > 1 && !(a.flags & sigflag::kRestart) ? -4 : kRestartSys;
+    }
+
+    // Before a call that may BLOCK on host fd `h` (read on an empty pipe,
+    // write to a full one): wait until it's ready or a guest signal comes,
+    // as Linux's would. A plain host read() slept through every signal the
+    // guest's own timers raised -- `alarm(1); read(pipe)` never returned.
+    // 0 = go ahead. A signal with a handler lacking SA_RESTART makes it
+    // EINTR; any other (SA_RESTART, or ignored / default) is a RESTART: the
+    // guest re-issues the call once the signal has been dealt with, as the
+    // kernel's -ERESTARTSYS does. A non-blocking fd never waits here.
+    [[nodiscard]] std::int64_t wait_ready(int h, short events) {
+        const int fl = ::fcntl(h, F_GETFL);
+        if (fl < 0 || (fl & O_NONBLOCK)) return 0;
+        // An fd not open for this direction (write to a pipe's read end)
+        // fails at once with EBADF; poll would wait for it forever.
+        const int acc = fl & O_ACCMODE;
+        if ((events & POLLOUT) ? acc == O_RDONLY : acc == O_WRONLY) return 0;
+        // macOS poll() and kqueue never report a FIFO's last writer going
+        // away (no POLLHUP, no EV_EOF): a reader blocked there waited
+        // forever for the EOF read() returns at once. select() sees it.
+        struct ::stat st{};
+        if (::fstat(h, &st) == 0 && S_ISFIFO(st.st_mode)) {
+            if (signal_aware_select(h, events) != -4) return 0;
+        } else {
+            std::vector<struct ::pollfd> p{{h, events, 0}};
+            if (signal_aware_poll(p, -1) != -4) return 0;
+        }
+        const std::uint64_t ready = (g_pending.bits.load(std::memory_order_relaxed)
+                                     | task_.pending.load(std::memory_order_relaxed)) & ~task_.sig_mask;
+        bool eintr = false;
+        proc_.with_signals([&](const SignalDispositions& d) {
+            for (int s = 1; s <= kLinuxNsig; ++s)
+                if (ready & sigbit(s)) {
+                    const auto a = d.get(s);
+                    if (a.handler > 1 && !(a.flags & sigflag::kRestart)) eintr = true;
+                }
+            return 0;
+        });
+        return eintr ? -4 : kRestartSys;
+    }
+    // resume(kRestartSys): re-execute the svc after the signal is handled.
+    static constexpr std::int64_t kRestartSys = -512;   // the kernel's ERESTARTSYS
+
+    // signal_aware_poll for ONE fd, by select(): see wait_ready. -4 when a
+    // deliverable signal came first; otherwise the fd is ready (or select
+    // failed, and the syscall itself will say why).
+    [[nodiscard]] int signal_aware_select(int h, short events) {
+        g_pending.drain_wake();
+        drain_mail();
+        auto deliverable = [&] {
+            return ((g_pending.bits.load(std::memory_order_relaxed)
+                     | task_.pending.load(std::memory_order_relaxed)) & ~task_.sig_mask) != 0;
+        };
+        if (deliverable()) return -4;
+        const int wfd = g_pending.wake_rd;
+        if (h >= FD_SETSIZE || wfd >= FD_SETSIZE) {              // fd_set can't hold it
+            std::vector<struct ::pollfd> p{{h, events, 0}};
+            return signal_aware_poll(p, -1);
+        }
+        for (;;) {
+            ::fd_set rd, wr;
+            FD_ZERO(&rd); FD_ZERO(&wr);
+            if (events & POLLOUT) FD_SET(h, &wr); else FD_SET(h, &rd);
+            if (wfd >= 0) FD_SET(wfd, &rd);
+            const int rc = ::select(std::max(h, wfd) + 1, &rd, &wr, nullptr, nullptr);
+            if (rc < 0) return errno == EINTR ? -4 : 1;
+            if (FD_ISSET(h, &rd) || FD_ISSET(h, &wr)) return 1;
+            if (deliverable()) return -4;
+            g_pending.drain_wake();                              // a wake for nothing we take
+        }
+    }
+
     [[nodiscard]] int signal_aware_poll(std::vector<struct ::pollfd>& p, int timeout) {
         g_pending.drain_wake();
         drain_mail();
@@ -5956,6 +6122,7 @@ private:
     bool thread_exited_{false};
     bool no_new_privs_{false};
     int pdeathsig_{0};
+    std::atomic<std::uint64_t> pdeath_gen_{0};   // see kSetPdeathsig
     std::int64_t seccomp_mode_{0};
     TimerSet timers_;
     // epoll sets, keyed by the guest fd that names them.

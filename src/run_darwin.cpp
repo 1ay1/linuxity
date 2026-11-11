@@ -868,7 +868,8 @@ void attach_live_procs(Machine& m, runtime::PidSpace& pids) {
         kernel::ProcInfo info(std::int32_t pid) const override {
             kernel::ProcInfo pi;
             const std::string exe = ps.exe_of(pid);
-            pi.comm = exe.substr(exe.find_last_of('/') + 1).substr(0, 15);
+            pi.comm = ps.comm_of(pid);
+            if (pi.comm.empty()) pi.comm = exe.substr(exe.find_last_of('/') + 1).substr(0, 15);
             pi.cmdline = exe;
             pi.ppid = ps.ppid_of(pid);
             pi.state = 'S';
@@ -881,6 +882,7 @@ void attach_live_procs(Machine& m, runtime::PidSpace& pids) {
         std::int32_t sid(std::int32_t pid) const override {
             return ps.is_process(pid) ? ps.sid_of(pid) : 0;
         }
+        void set_comm(std::int32_t pid, const std::string& c) const override { ps.set_comm(pid, c); }
     };
     static Live live{pids};
     m.k.procs().set_live_source(&live);
@@ -1221,6 +1223,7 @@ int cli::host_run(Options& o, int, char**) {
         if (const std::string h = m.resolve(gargv[0]); !h.empty() && ::realpath(h.c_str(), real))
             exe = m.unresolve(real);
         pids.set_exe(1, exe);
+        pids.set_comm(1, std::string_view{gargv[0]}.substr(gargv[0].find_last_of('/') + 1));
     }
     attach_live_procs(m, pids);
     // Only the ROOT process reserves the low fds: a fork child inherits its

@@ -241,6 +241,10 @@ public:
     // that doesn't block the signal may take it).
     std::atomic<std::uint64_t> pending{0};
     std::atomic<std::uint32_t> umask{022};
+    // The thread-group leader's blocked-signal mask, published at each trap
+    // boundary, so /proc/<pid>/status's SigBlk shows it (it lives in the
+    // leader's TaskState, which nothing else can see).
+    std::atomic<std::uint64_t> leader_sigmask{0};
 
     // -- Writable MAP_SHARED file mappings ---------------------------------
     // Guest RAM is one flat allocation, so a file mapping here is a pread

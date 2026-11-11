@@ -55,6 +55,11 @@ class FdTable {
 public:
     static constexpr int kMaxFds = 1024;   // matches the RLIMIT_NOFILE we report
 
+    // RLIMIT_NOFILE's soft limit: a new fd must be below it (EMFILE), as
+    // Linux checks at every allocation. Lowering it leaves open fds alone.
+    void set_limit(std::size_t soft) noexcept { limit_ = std::min<std::size_t>(soft, kMaxFds); }
+    [[nodiscard]] std::size_t limit() const noexcept { return limit_; }
+
     // Seed 0/1/2 from DUPLICATES of the host's stdio, so the guest owns its
     // copies and can close or redirect them freely.
     FdTable() {
@@ -98,9 +103,9 @@ public:
     // Returns the guest fd, or -24 (EMFILE).
     [[nodiscard]] int install(int host_fd, bool cloexec) {
         auto file = std::make_shared<HostFd>(host_fd);
-        for (std::size_t g = 0; g < slots_.size(); ++g)
+        for (std::size_t g = 0; g < slots_.size() && g < limit_; ++g)
             if (!slots_[g].file) { slots_[g] = {std::move(file), cloexec, {}}; return static_cast<int>(g); }
-        if (slots_.size() >= kMaxFds) return -24;
+        if (slots_.size() >= limit_) return -24;
         slots_.push_back({std::move(file), cloexec, {}});
         return static_cast<int>(slots_.size() - 1);
     }
@@ -120,12 +125,12 @@ public:
         auto file = src.file;
         auto peer = src.peer;
         if (!to) {
-            for (std::size_t i = 0; i < slots_.size(); ++i)
+            for (std::size_t i = 0; i < slots_.size() && i < limit_; ++i)
                 if (!slots_[i].file) {
                     slots_[i] = {std::move(file), cloexec, std::move(peer)};
                     return static_cast<int>(i);
                 }
-            if (slots_.size() >= kMaxFds) return -24;
+            if (slots_.size() >= limit_) return -24;
             slots_.push_back({std::move(file), cloexec, std::move(peer)});
             return static_cast<int>(slots_.size() - 1);
         }
@@ -151,12 +156,12 @@ public:
         auto file = std::make_shared<HostFd>(read_end);
         file->kind = kind;
         auto peer = std::make_shared<HostFd>(write_end);
-        for (std::size_t g = 0; g < slots_.size(); ++g)
+        for (std::size_t g = 0; g < slots_.size() && g < limit_; ++g)
             if (!slots_[g].file) {
                 slots_[g] = {std::move(file), cloexec, std::move(peer)};
                 return static_cast<int>(g);
             }
-        if (slots_.size() >= kMaxFds) return -24;
+        if (slots_.size() >= limit_) return -24;
         slots_.push_back({std::move(file), cloexec, std::move(peer)});
         return static_cast<int>(slots_.size() - 1);
     }
@@ -264,6 +269,7 @@ private:
     }
 
     std::vector<Slot> slots_;
+    std::size_t limit_{kMaxFds};      // RLIMIT_NOFILE soft (set_limit)
 };
 
 } // namespace lx::runtime

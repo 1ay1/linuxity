@@ -142,6 +142,18 @@ public:
         const std::int32_t g = shared_->pgid[pid].load(std::memory_order_acquire);
         return g ? g : pid;                 // unset => its own leader
     }
+    // POSIX's orphaned process group: no member has a parent in a
+    // DIFFERENT group of the SAME session (nobody left to resume it after
+    // a stop). Job-control stops aimed at one are discarded; a background
+    // tty read from one is EIO.
+    [[nodiscard]] bool pgrp_orphaned(std::int32_t pgid) const {
+        for (const std::int32_t m : members_of(pgid)) {
+            const std::int32_t p = ppid_of(m);
+            if (p <= 0 || !shared_->host[p < kMax ? p : 0].load(std::memory_order_relaxed)) continue;
+            if (pgid_of(p) != pgid && sid_of(p) == sid_of(m)) return false;
+        }
+        return true;
+    }
     // Every live member of a group, for kill(-pgid) and kill(0).
     [[nodiscard]] std::vector<std::int32_t> members_of(std::int32_t pgid) const {
         std::vector<std::int32_t> out;
@@ -191,6 +203,7 @@ public:
     void release(std::int32_t g) noexcept {
         if (g > 1 && g < kMax) {
             shared_->exe[g][0] = '\0';
+            shared_->comm[g][0] = '\0';
             shared_->exited[g].store(false, std::memory_order_relaxed);
             shared_->subreaper[g].store(false, std::memory_order_relaxed);
             shared_->host[g].store(0, std::memory_order_relaxed);
@@ -203,6 +216,21 @@ public:
         const std::size_t n = std::min(path.size(), kExe - 1);
         std::memcpy(shared_->exe[g], path.data(), n);
         shared_->exe[g][n] = '\0';
+    }
+    // /proc/<pid>/comm for any guest pid; empty until the first exec
+    // records one (then the exe's basename stands in).
+    void set_comm(std::int32_t g, std::string_view name) noexcept {
+        if (g <= 0 || g >= kMax || !shared_) return;
+        const std::size_t n = std::min(name.size(), kComm - 1);
+        std::memcpy(shared_->comm[g], name.data(), n);
+        shared_->comm[g][n] = '\0';
+    }
+    [[nodiscard]] std::string comm_of(std::int32_t g) const {
+        if (g <= 0 || g >= kMax || !shared_) return {};
+        char buf[kComm];
+        std::memcpy(buf, shared_->comm[g], kComm);
+        buf[kComm - 1] = '\0';
+        return buf;
     }
     [[nodiscard]] std::string exe_of(std::int32_t g) const {
         if (g <= 0 || g >= kMax || !shared_) return {};
@@ -390,6 +418,7 @@ private:
     }
     static constexpr pid_t kReserved = -1;
     static constexpr std::size_t kExe = 256;
+    static constexpr std::size_t kComm = 16;   // TASK_COMM_LEN
     struct Shared {
         std::atomic<int> next{2};
         std::atomic<pid_t> host[kMax]{};
@@ -404,6 +433,10 @@ private:
         // (a torn read can only produce a wrong name, never a crash: the
         // buffer is always NUL-terminated at kExe-1).
         char exe[kMax][kExe]{};
+        // /proc/<pid>/comm: the basename of the path given to execve (NOT
+        // the resolved image: `/bin/sh` -> busybox is still "sh"), or what
+        // PR_SET_NAME set on the leader. Same best-effort rules as exe.
+        char comm[kMax][kComm]{};
         std::atomic<std::int32_t> ppid[kMax]{};
         // See set_subreaper / post_exit.
         std::atomic<bool> subreaper[kMax]{};

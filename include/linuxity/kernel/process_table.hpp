@@ -232,6 +232,7 @@ public:
         // a rename sticks until the next exec instead of being overwritten
         // by the exe's basename on the very next read.
         if (live_ && live_->alive(pid)) {
+            live_->set_comm(pid, p.comm);      // every process sees the rename
             const ProcInfo l = live_->info(pid);
             if (!l.exe.empty() && p.exe != l.exe) {
                 p.exe = l.exe;
@@ -451,6 +452,8 @@ public:
                 const ProcInfo l = live_->info(pid);
                 if (!l.exe.empty() && l.exe != p.exe) {
                     p.comm = l.comm; p.cmdline = l.cmdline; p.exe = l.exe;
+                } else if (!l.comm.empty()) {
+                    p.comm = l.comm;         // same image, renamed (exec of a link, PR_SET_NAME)
                 }
                 if (l.ppid) p.ppid = l.ppid;
                 return &(scratch_[pid] = std::move(p));
@@ -520,6 +523,9 @@ public:
         // that made the change would see. 0 = "not mine to say".
         [[nodiscard]] virtual std::int32_t pgid(std::int32_t) const { return 0; }
         [[nodiscard]] virtual std::int32_t sid(std::int32_t) const { return 0; }
+        // A rename (a /proc/<pid>/comm write) for the backend's shared copy
+        // of the name, which info() then reports.
+        virtual void set_comm(std::int32_t, const std::string&) const {}
     };
     void set_live_source(const LiveSource* s) noexcept { live_ = s; }
 

@@ -85,7 +85,21 @@ struct HostTask {
 [[nodiscard]] inline std::optional<HostTask> host_task(pid_t pid) {
     HostTask t;
     ::proc_taskinfo ti{};
-    if (::proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &ti, sizeof ti) != sizeof ti) return std::nullopt;
+    if (::proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &ti, sizeof ti) != sizeof ti) {
+        // A ZOMBIE has no task left (TASKINFO fails), but it is still a
+        // process, and `ps`, `wait_until(state == Z)` and every supervisor
+        // ask exactly then. proc_pidinfo answers nothing for one at all, so
+        // ask sysctl's process record; without it /proc fell back to 'S'
+        // and a dead child looked alive.
+        struct ::kinfo_proc kp{};
+        std::size_t len = sizeof kp;
+        int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, pid};
+        if (::sysctl(mib, 4, &kp, &len, nullptr, 0) != 0 || len == 0 || kp.kp_proc.p_stat != SZOMB)
+            return std::nullopt;
+        t.state = 'Z';
+        t.threads = 1;
+        return t;
+    }
     t.utime = mach_to_ticks(ti.pti_total_user);
     t.stime = mach_to_ticks(ti.pti_total_system);
     t.rss = ti.pti_resident_size;
@@ -232,6 +246,7 @@ fact(std::string_view leaf, pid_t host, const Self* self, std::optional<int> nic
             s += "SigQ:\t0/63432\n";
             s += "SigPnd:\t" + hex16(0) + "\n";
             s += "ShdPnd:\t" + hex16(g_pending.bits.load(std::memory_order_relaxed)) + "\n";
+            s += "SigBlk:\t" + hex16(self->proc.leader_sigmask.load(std::memory_order_relaxed)) + "\n";
             s += "SigIgn:\t" + hex16(ign) + "\n";
             s += "SigCgt:\t" + hex16(cgt) + "\n";
         }
