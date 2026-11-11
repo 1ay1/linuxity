@@ -89,6 +89,24 @@ def render(arm: dict[int, str], x86: dict[int, str], existing_order: list[str]) 
 
 #include <cstdint>
 
+// musl's headers #define the LFS64 names to their plain ones (prlimit64 ->
+// prlimit, pread64 -> pread, getdents64 -> getdents), which silently renamed
+// Sysno::prlimit64 and broke every build on a musl host (Alpine). Include
+// them HERE first, so their guards are set, then drop the macros: a later
+// include of the same header is then a no-op and the enum keeps its names.
+#if defined(__linux__) && !defined(__GLIBC__) && !defined(__BIONIC__)
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/resource.h>
+#include <sys/sendfile.h>
+#include <unistd.h>
+#undef prlimit64
+#undef pread64
+#undef pwrite64
+#undef getdents64
+#undef fadvise64
+#endif
+
 namespace lx::abi {{
 
 // The host/guest instruction set (they are equal in the native-speed model).

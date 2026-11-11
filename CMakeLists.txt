@@ -135,6 +135,9 @@ if(CMAKE_SYSTEM_NAME IN_LIST LX_PTRACE_HOSTS)
         COMMAND ${CMAKE_C_COMPILER} ${LX_IG_TARGET} -nostdlib -static -fno-sanitize=all
             -Wl,-T,${CMAKE_SOURCE_DIR}/src/inguest/blob.ld -Wl,--no-dynamic-linker -Wl,--no-undefined
             -Wl,--build-id=none -o ${LX_IG_ELF} $<TARGET_OBJECTS:linuxity_ig_objs>
+        # No object may address anything through a GOT: that needs a runtime
+        # relocation the flat blob never gets (see src/inguest/blob.ld).
+        COMMAND sh ${CMAKE_SOURCE_DIR}/src/inguest/no_got.sh ${CMAKE_OBJDUMP} $<TARGET_OBJECTS:linuxity_ig_objs>
         COMMAND ${CMAKE_OBJCOPY} -O binary ${LX_IG_ELF} ${LX_IG_BIN}
         DEPENDS linuxity_ig_objs $<TARGET_OBJECTS:linuxity_ig_objs> ${CMAKE_SOURCE_DIR}/src/inguest/blob.ld
         COMMAND_EXPAND_LISTS VERBATIM)

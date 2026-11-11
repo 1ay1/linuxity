@@ -1052,14 +1052,18 @@ struct kdirent {   /* struct linux_dirent64 */
 static uint32_t reclen_of(uint32_t namelen) { return (19u + namelen + 1u + 7u) & ~7u; }
 
 static int hidden_name(const char* n) {
-    static const char a[] = ".linuxity-meta", b[] = ".linuxity-links", c[] = ".linuxity-whiteout",
-                      d[] = ".linuxity-meta.ok";
-    const char* s[4] = {a, b, c, d};
-    for (int k = 0; k < 4; ++k) {
-        const char* x = s[k];
+    /* One flat NUL-separated table, no pointers: an array of pointers to
+       the names needs a runtime relocation, and GCC on aarch64 hoisted
+       exactly that into .data -- which this blob has no room for (the
+       Linux/aarch64 build failed to link). */
+    static const char names[] =
+        ".linuxity-meta\0.linuxity-links\0.linuxity-whiteout\0.linuxity-meta.ok\0";
+    for (const char* x = names; *x; ) {
         const char* y = n;
         while (*x && *x == *y) { ++x; ++y; }
         if (!*x && !*y) return 1;
+        while (*x) ++x;
+        ++x;                                   /* the next name */
     }
     return 0;
 }

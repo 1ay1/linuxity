@@ -12,6 +12,7 @@
 // socket ("@name"), one JSON line each way. Static and libc-only so it runs
 // in any distro the guest has.
 #include <errno.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

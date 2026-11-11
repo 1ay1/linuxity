@@ -132,6 +132,17 @@ ctest --test-dir build
 #   -> Linux version 6.6.0-linuxity (linuxity@linuxity) ...  (SYNTHESIZED)
 ```
 
+### Compile-checking Linux from a Mac
+
+From a Mac (or any host linuxity runs on), the Linux build can be compiled
+without a Linux machine -- inside a linuxity Alpine environment:
+
+```sh
+tools/linux-build-check.sh            # first run sets the environment up
+```
+
+That is GCC + musl on aarch64, which CI's x86-64/glibc job never sees.
+
 ### Verifying on Android / arm64
 
 `ctest` proves linuxity agrees with the kernel it was built on. Android is a
