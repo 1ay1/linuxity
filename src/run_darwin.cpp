@@ -443,7 +443,7 @@ public:
             return -1;
         }
 
-        std::vector<std::string> args{self_exe()};
+        std::vector<std::string> args{host::pinned_self_exe()};   // not the build output: see pinned_self_exe
         args.insert(args.end(), opts_.flags.begin(), opts_.flags.end());
         args.emplace_back("--fork-child");
         args.emplace_back(svc_name);
@@ -599,7 +599,7 @@ private:
             ::mach_port_mod_refs(::mach_task_self(), svc, MACH_PORT_RIGHT_RECEIVE, -1);
             return {};
         }
-        std::vector<std::string> args{self_exe()};
+        std::vector<std::string> args{host::pinned_self_exe()};   // not the build output: see pinned_self_exe
         args.insert(args.end(), opts_.flags.begin(), opts_.flags.end());
         args.emplace_back("--zygote");
         args.emplace_back(svc_name);
