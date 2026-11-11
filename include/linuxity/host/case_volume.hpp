@@ -75,6 +75,14 @@ inline bool is_empty_dir(const std::string& d) {
     // our own listing: no <dirent> dependency on the hot path
     return run_tool({"/bin/sh", "-c", "[ -z \"$(ls -A \"$1\" 2>/dev/null)\" ]", "sh", d}) == 0;
 }
+// Is another linuxity running (a session that may have environments open)?
+// Moving its files out from under it would delete them mid-use.
+inline bool other_linuxity_running() {
+    const std::string me = std::to_string(::getpid()), parent = std::to_string(::getppid());
+    return run_tool({"/bin/sh", "-c",
+                     "pgrep -x linuxity | grep -vx -e \"$1\" -e \"$2\" | grep -q .",
+                     "sh", me, parent}) == 0;
+}
 }  // namespace detail
 #endif
 
@@ -93,6 +101,11 @@ inline bool is_empty_dir(const std::string& d) {
     struct ::stat st{};
     const bool have_image = ::stat(image.c_str(), &st) == 0;
     (void)::mkdir(dir.c_str(), 0755);
+    if (!have_image && !detail::is_empty_dir(dir) && detail::other_linuxity_running()) {
+        why = "environments need moving onto case-sensitive storage, but another linuxity "
+              "is running; close it and run linuxity again";
+        return false;
+    }
     if (!have_image) {
         if (announce)
             std::fputs("linuxity: setting up case-sensitive storage for environments "
