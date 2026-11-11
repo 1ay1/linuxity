@@ -7035,9 +7035,11 @@ public:
             const int sfd = open_tracee_fd(fd);
             if (sfd < 0) return -1;
             unsigned n = 0;
-            constexpr unsigned long kTIOCGPTN = 0x80045430;   // same on x86-64 and aarch64
-#if !defined(_WIN32)
-            const bool is_master = ::ioctl(sfd, kTIOCGPTN, &n) == 0;
+            // The libc's own TIOCGPTN: its type is whatever this libc's
+            // ioctl takes (glibc unsigned long, musl int), which a spelled-out
+            // 0x80045430 overflowed on musl.
+#if defined(TIOCGPTN)
+            const bool is_master = ::ioctl(sfd, TIOCGPTN, &n) == 0;
 #else
             const bool is_master = false;
 #endif

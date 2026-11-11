@@ -107,8 +107,8 @@ constexpr std::uint16_t kNested = 0x8000;
 
 using Bytes = std::vector<std::uint8_t>;
 
-inline void put16(Bytes& b, std::uint16_t v) { b.push_back(v & 0xff); b.push_back(v >> 8); }
-inline void put32(Bytes& b, std::uint32_t v) { for (int i = 0; i < 4; ++i) b.push_back((v >> (8 * i)) & 0xff); }
+inline void put16(Bytes& b, std::uint16_t v) { b.push_back(static_cast<std::uint8_t>(v & 0xff)); b.push_back(static_cast<std::uint8_t>(v >> 8)); }
+inline void put32(Bytes& b, std::uint32_t v) { for (int i = 0; i < 4; ++i) b.push_back(static_cast<std::uint8_t>((v >> (8 * i)) & 0xff)); }
 inline void pad4(Bytes& b) { while (b.size() % 4) b.push_back(0); }
 
 inline void attr(Bytes& b, std::uint16_t type, const void* data, std::size_t len) {
@@ -129,8 +129,8 @@ inline std::size_t nest_open(Bytes& b, std::uint16_t type) {
 }
 inline void nest_close(Bytes& b, std::size_t at) {
     const auto len = static_cast<std::uint16_t>(b.size() - at);
-    b[at] = len & 0xff;
-    b[at + 1] = len >> 8;
+    b[at] = static_cast<std::uint8_t>(len & 0xff);
+    b[at + 1] = static_cast<std::uint8_t>(len >> 8);
 }
 
 // One netlink message: header, genl header (when cmd >= 0), payload.

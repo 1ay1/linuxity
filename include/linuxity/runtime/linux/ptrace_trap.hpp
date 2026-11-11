@@ -736,7 +736,7 @@ public:
         if (!path || !*path) return;
         std::FILE* out = std::fopen(path, "ae");
         if (!out) return;
-        std::fprintf(out, "[lx] KILLED host_tid=%d sig=%d\n", (int)w, sig);
+        std::fprintf(out, "[lx] KILLED host_tid=%d sig=%d\n", static_cast<int>(w), sig);
         std::fclose(out);
     }
 
@@ -779,14 +779,14 @@ public:
         std::FILE* out = std::fopen(path, "ae");
         if (!out) return;
         std::fprintf(out, "[lx] FAULT sig=%d code=%d pc=%#llx addr=%p %s\n",
-                     sig, si.si_code, (unsigned long long)pc, si.si_addr,
+                     sig, si.si_code, static_cast<unsigned long long>(pc), si.si_addr,
                      where.c_str());
         std::fclose(out);
     }
 
     static std::string hex_of(std::uint64_t v) {
         char b[32];
-        std::snprintf(b, sizeof b, "%#llx", (unsigned long long)v);
+        std::snprintf(b, sizeof b, "%#llx", static_cast<unsigned long long>(v));
         return b;
     }
 

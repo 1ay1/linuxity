@@ -1142,11 +1142,11 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                 std::set<std::string> seen;
                 const std::string pre = std::string{d} + "/";
                 for (const Knob& k : kKnobs) {
-                    std::string_view p{k.path};
-                    if (!p.starts_with(pre)) continue;
-                    p.remove_prefix(pre.size());
-                    const std::size_t s = p.find('/');
-                    std::string name{p.substr(0, s)};
+                    std::string_view rel{k.path};
+                    if (!rel.starts_with(pre)) continue;
+                    rel.remove_prefix(pre.size());
+                    const std::size_t s = rel.find('/');
+                    std::string name{rel.substr(0, s)};
                     if (seen.insert(name).second) e.push_back({name, s != std::string_view::npos});
                 }
                 return e;
@@ -1350,8 +1350,8 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                 // a host with no /proc (macOS): the backend answers itself
                 if (auto f = procs.host_fact(self_tid, leaf)) return std::move(*f);
                 if (host <= 0) return out;
-                const std::string p = "/proc/" + std::to_string(host) + "/" + leaf;
-                if (std::FILE* f = std::fopen(p.c_str(), "re")) {
+                const std::string path = "/proc/" + std::to_string(host) + "/" + leaf;
+                if (std::FILE* f = std::fopen(path.c_str(), "re")) {
                     char buf[8192];
                     while (std::size_t n = std::fread(buf, 1, sizeof buf, f)) out.append(buf, n);
                     std::fclose(f);

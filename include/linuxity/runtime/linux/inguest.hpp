@@ -99,18 +99,18 @@ struct Layout {
 };
 inline const Layout& layout() {
     static const Layout l = [] {
-        Layout l;
+        Layout out;
         const auto b = blob();
-        if (b.size() < sizeof(lx_ig_header) || b.size() > LX_IG_CODE_MAX) return l;
+        if (b.size() < sizeof(lx_ig_header) || b.size() > LX_IG_CODE_MAX) return out;
         lx_ig_header h;
         std::memcpy(&h, b.data(), sizeof h);
-        if (h.magic != LX_IG_MAGIC || h.version != LX_IG_VERSION) return l;
-        l.common = h.common;
-        l.guard_start = h.guard_start;
-        l.guard_end = h.guard_end;
-        l.fault_ret = h.fault_ret;
-        l.ok = h.common < b.size() && h.guard_end <= b.size();
-        return l;
+        if (h.magic != LX_IG_MAGIC || h.version != LX_IG_VERSION) return out;
+        out.common = h.common;
+        out.guard_start = h.guard_start;
+        out.guard_end = h.guard_end;
+        out.fault_ret = h.fault_ret;
+        out.ok = h.common < b.size() && h.guard_end <= b.size();
+        return out;
     }();
     return l;
 }
