@@ -960,14 +960,43 @@ private:
             case S::listen: {
                 const int h = host_fd(gfd);
                 if (h < 0) return -9;
-                return ::listen(h, static_cast<int>(a1)) < 0 ? darwin::fail() : 0;
+                const int backlog = static_cast<int>(a1);
+                if (::listen(h, backlog) < 0) return darwin::fail();
+                // Deeper than Darwin queues (it resets the overflow, Linux
+                // holds it): pump the difference (darwin/accept_pump.hpp).
+                if (backlog > AcceptPump::host_cap() || proc_.has_pumps())
+                    proc_.with_pumps([&](ProcessState::Pumps& m) {
+                        auto it = m.find(h);
+                        if (it != m.end() && it->second->serves(h)) {
+                            it->second->set_backlog(backlog);
+                        } else if (backlog > AcceptPump::host_cap()) {
+                            auto p = std::make_unique<AcceptPump>(h, backlog);
+                            if (p->valid()) m[h] = std::move(p);
+                            else m.erase(h);
+                        }
+                        proc_.note_pumps(!m.empty());
+                        return 0;
+                    });
+                return 0;
             }
             case S::accept: case S::accept4: {
                 const int h = host_fd(gfd);
                 if (h < 0) return -9;
                 ::sockaddr_storage ss{};
                 socklen_t len = sizeof ss;
-                const int c = ::accept(h, reinterpret_cast<::sockaddr*>(&ss), &len);
+                int c = -1;
+                if (proc_.has_pumps())
+                    proc_.with_pumps([&](ProcessState::Pumps& m) {
+                        if (auto it = m.find(h); it != m.end() && it->second->serves(h))
+                            c = it->second->take();
+                        return 0;
+                    });
+                if (c >= 0) {
+                    if (::getpeername(c, reinterpret_cast<::sockaddr*>(&ss), &len) < 0)
+                        len = 0;
+                } else {
+                    c = ::accept(h, reinterpret_cast<::sockaddr*>(&ss), &len);
+                }
                 if (c < 0) return darwin::fail();
                 if (a1 && !write_sockaddr(ss, a1, a2)) { ::close(c); return -14; }
                 const std::uint64_t flags = sc == S::accept4 ? a3 : 0;
@@ -4194,10 +4223,21 @@ private:
 
         // fd-table operations first: they don't need a resolved host fd.
         switch (sc) {
-            case S::close:
+            case S::close: {
                 dirs_.erase(gfd);                  // drop any directory stream
                 epolls_.erase(gfd);                // and any epoll set
-                return proc_.with_fds([&](FdTable& t) { return t.close(gfd); });
+                const int rc = proc_.with_fds([&](FdTable& t) { return t.close(gfd); });
+                // A pumped listener whose last guest fd just went: stop the
+                // pump, refusing what it still holds (as Linux would).
+                if (proc_.has_pumps())
+                    proc_.with_pumps([&](ProcessState::Pumps& m) {
+                        for (auto it = m.begin(); it != m.end();)
+                            it = it->second->serves(it->first) ? std::next(it) : m.erase(it);
+                        proc_.note_pumps(!m.empty());
+                        return 0;
+                    });
+                return rc;
+            }
             case S::dup:   return proc_.with_fds([&](FdTable& t) { return t.dup(gfd, std::nullopt, false); });
             case S::dup3: {
                 if (static_cast<int>(a1) == gfd) return -22;          // EINVAL

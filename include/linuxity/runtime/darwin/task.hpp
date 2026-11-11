@@ -29,6 +29,7 @@
 
 #if defined(__APPLE__) && defined(__aarch64__)
 
+#include "linuxity/runtime/darwin/accept_pump.hpp"
 #include "linuxity/runtime/darwin/fd.hpp"
 #include "linuxity/runtime/darwin/signal.hpp"
 #include "linuxity/runtime/shared/address_space.hpp"
@@ -36,6 +37,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -325,6 +327,21 @@ public:
         std::lock_guard g{mu_};
         return fn(backings_);
     }
+    // Listeners whose guest backlog is deeper than the host allows, by
+    // host fd (darwin/accept_pump.hpp). Every thread's accept takes from
+    // the same pump, so the map is the process's, not a thread's.
+    using Pumps = std::map<int, std::unique_ptr<AcceptPump>>;
+    template <class Fn>
+    decltype(auto) with_pumps(Fn&& fn) {
+        std::lock_guard g{pumps_mu_};
+        return fn(pumps_);
+    }
+    [[nodiscard]] bool has_pumps() const noexcept { return any_pump_.load(std::memory_order_relaxed); }
+    void note_pumps(bool any) noexcept { any_pump_.store(any, std::memory_order_relaxed); }
+private:
+    std::mutex pumps_mu_;
+    Pumps pumps_;
+    std::atomic<bool> any_pump_{false};
 private:
     std::vector<Backing> backings_;
     std::optional<Ids> ids_;
