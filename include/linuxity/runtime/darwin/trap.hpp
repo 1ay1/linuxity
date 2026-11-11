@@ -408,6 +408,22 @@ public:
     [[nodiscard]] std::int64_t deliver_signal(std::int32_t gpid, std::int32_t sig) {
         if (sig < 0 || sig > kLinuxNsig) return -22;
         const int hs = signal_from_linux(sig);
+        // Send `sig` to guest process `g` (host pid `h`). A signal with a
+        // host twin goes by kill(2): the host merges and delivers it, and
+        // job control (SIGSTOP/SIGCONT) is the host's. A real-time signal
+        // (it must queue, one per send, with its sender) or one with no
+        // twin goes through the target's mailbox, and a kick wakes it.
+        auto send_to = [&](std::int32_t g, pid_t h) -> bool {
+            if (sig == 0) return ::kill(h, 0) == 0;
+            if (hs > 0 && sig < 32) {
+                // the host delivers it; the record says who sent it (si_pid)
+                (void)pids_.post_signal(g, {sig, tgid_, 0 /*SI_USER*/, 0});
+                return ::kill(h, hs) == 0;
+            }
+            if (!pids_.post_signal(g, {sig, tgid_, 0 /*SI_USER*/, 0})) { errno = EAGAIN; return false; }
+            if (pids_.ready(g)) (void)::kill(h, kKickSignal);
+            return true;
+        };
 
         // A GROUP or broadcast signal must stay INSIDE the guest's process
         // tree. Passing 0 or -1 to the host kill(2) would signal linuxity's
@@ -426,14 +442,14 @@ public:
             const auto members = pids_.members_of(pgid ? pgid : own);
             for (std::int32_t member : members) {
                 if (member == task_.tid) { mark_self_pending(sig); ++delivered; continue; }
-                if (auto h = pids_.host_of(member); h && (sig == 0 || ::kill(*h, hs) == 0))
+                if (auto h = pids_.host_of(member); h && send_to(member, *h))
                     ++delivered;
             }
             // kill(-1) means "every process we may signal", which for a
             // guest is its whole tree, not just its group.
             if (gpid == -1)
                 for (const Child& c : children_)
-                    if (auto h = pids_.host_of(c.guest); h && ::kill(*h, hs) == 0)
+                    if (auto h = pids_.host_of(c.guest); h && send_to(c.guest, *h))
                         ++delivered;
             return delivered ? 0 : -3;                               // ESRCH
         }
@@ -442,10 +458,52 @@ public:
 
         auto h = pids_.host_of(gpid);
         if (!h) return -3;
-        if (sig == 0) return ::kill(*h, 0) < 0 ? darwin::fail() : 0;
-        return ::kill(*h, hs) < 0 ? darwin::fail() : 0;
+        return send_to(gpid, *h) ? 0 : darwin::fail();
     }
 
+    // signalfd: a pending signal in a signalfd's mask -- and blocked, which
+    // is how signalfd is meant to be used -- becomes a 128-byte record in
+    // that fd's pipe instead of being delivered. One pipe write per signal,
+    // so a read sees whole records, each with its sender and code.
+    void feed_signalfds() {
+        if (signalfds_.empty()) return;
+        for (auto& [gfd, sf] : signalfds_) {
+            const std::uint64_t want = sf.mask & task_.sig_mask;
+            if (!want) continue;
+            for (int n = 0; n < 64; ++n) {
+                const auto got = g_pending.take(want);
+                if (!got) break;
+                LinuxSignalfdSiginfo r{};
+                r.ssi_signo = static_cast<std::uint32_t>(got->signo);
+                r.ssi_code = static_cast<std::uint32_t>(got->code);
+                r.ssi_pid = static_cast<std::uint32_t>(got->pid);
+                r.ssi_uid = proc_.ids() ? proc_.ids()->uid : 0;
+                r.ssi_int = got->value;
+                if (::write(sf.write_end, &r, sizeof r) != static_cast<ssize_t>(sizeof r)) {
+                    g_pending.enqueue(*got);                     // full: keep it pending
+                    break;
+                }
+            }
+        }
+    }
+
+    // drain_mail: what other guest processes posted for us (see
+    // PidSpace::post_signal) joins the pending queue. A classic signal's
+    // record only names its sender -- the host signal itself is what makes
+    // it pending -- so it merges; a real-time one IS the signal, and queues.
+    void drain_mail() {
+        for (int n = 0; n < PidSpace::kSigRing; ++n) {
+            const auto r = pids_.take_signal(tgid_);
+            if (!r.signo) break;
+            if (r.signo < 32 && signal_from_linux(r.signo) > 0) {
+                // the host signal may not have landed yet: record the sender
+                // without making it pending on its own
+                g_pending.note_sender({r.signo, r.sender, r.code, r.value});
+            } else {
+                g_pending.enqueue({r.signo, r.sender, r.code, r.value});
+            }
+        }
+    }
     // A signal to OURSELVES is marked pending directly rather than sent
     // through the host: Linux delivers it before kill(2) returns to user
     // space, and our trap boundary is that point.
@@ -458,7 +516,7 @@ public:
             kill_with(sig);
             return;
         }
-        g_pending.bits.fetch_or(sigbit(sig), std::memory_order_relaxed);
+        g_pending.enqueue({sig, tgid_, 0 /*SI_USER*/, 0});
         g_pending.notify_waiters();
     }
 
@@ -1552,10 +1610,11 @@ private:
                 LinuxSigaction act{};
                 if (!ram.get(a1, act)) return -14;
                 if (!proc_.with_signals([&](SignalDispositions& t) { return t.set(s, act); })) return -22;
-                // Catch the host signal only while the guest has a handler
-                // (or ignores it); otherwise leave the host default so a
-                // terminal Ctrl-C kills us exactly like it kills a process.
-                route_host_signal(s, act.handler != 0);
+                // Catch the host signal only while the guest has a handler,
+                // ignores it, or BLOCKS it (then it must wait as pending);
+                // otherwise leave the host default so a terminal Ctrl-C
+                // kills us exactly like it kills a process.
+                route_host_signal(s, act.handler != 0 || (task_.sig_mask & sigbit(s)));
                 if (act.handler == 1) {                          // SIG_IGN
                     const int hs = signal_from_linux(s);
                     if (hs > 0 && hs != SIGKILL && hs != SIGSTOP) ::signal(hs, SIG_IGN);
@@ -1570,11 +1629,32 @@ private:
                 std::uint64_t set = 0;
                 if (!ram.get(a1, set)) return -14;
                 set &= ~(sigbit(9) | sigbit(19));               // never blockable
+                const std::uint64_t before = task_.sig_mask;
                 switch (a0) {
                     case 0: task_.sig_mask |= set;  break;               // SIG_BLOCK
                     case 1: task_.sig_mask &= ~set; break;               // SIG_UNBLOCK
                     case 2: task_.sig_mask = set;   break;               // SIG_SETMASK
                     default: return -22;
+                }
+                // A BLOCKED signal must become pending, not act: with a
+                // SIG_DFL disposition the host default would kill (or stop)
+                // us the moment one arrived -- sigwait/sigtimedwait/signalfd
+                // never saw it. So the host catches every signal the guest
+                // blocks, and gets its default back when unblocked with no
+                // handler (delivery then applies the guest's default).
+                if (const std::uint64_t changed = before ^ task_.sig_mask) {
+                    for (int s = 1; s <= kLinuxNsig; ++s) {
+                        if (!(changed & sigbit(s)) || s == 9 || s == 19) continue;
+                        const auto act = proc_.with_signals([&](SignalDispositions& t) { return t.get(s); });
+                        if (act.handler != 0) continue;                  // caught or ignored already
+                        const bool blocked = (task_.sig_mask & sigbit(s)) != 0;
+                        // unblocked SIG_DFL: back to the host default -- but
+                        // a default-IGNORED one (SIGCHLD, SIGWINCH...) stays
+                        // caught: the host default would just drop it, and
+                        // catching it costs nothing
+                        if (!blocked && default_action(s) == Default::ignore) continue;
+                        route_host_signal(s, blocked);
+                    }
                 }
                 return 0;
             }
@@ -1620,6 +1700,8 @@ private:
     // on the guest stack and redirecting the vCPU into the handler. Returns
     // true if the guest's state changed (a handler was entered, or it died).
     [[nodiscard]] bool deliver_pending() {
+        drain_mail();
+        feed_signalfds();
         // Signals pending for this thread specifically (tgkill) plus the
         // process-wide set (kill).
         const std::uint64_t pending = g_pending.bits.load(std::memory_order_relaxed)
@@ -1637,9 +1719,14 @@ private:
             }
             return false;
         }
-        const int s = std::countr_zero(ready) + 1;
-        g_pending.bits.fetch_and(~sigbit(s), std::memory_order_relaxed);
-        task_.pending.fetch_and(~sigbit(s), std::memory_order_relaxed);
+        int s = std::countr_zero(ready) + 1;
+        PendingSignals::Info info{s, 0, 0, 0};
+        if (task_.pending.load(std::memory_order_relaxed) & sigbit(s)) {
+            task_.pending.fetch_and(~sigbit(s), std::memory_order_relaxed);   // thread-directed
+        } else if (auto t = g_pending.take(sigbit(s))) {
+            info = *t;
+        }
+        s = info.signo;
         // The sigsuspend mask covered exactly this delivery; the handler
         // runs with it, and the saved mask is what sigreturn restores.
         if (task_.suspend_restore) {
@@ -1693,7 +1780,9 @@ private:
 
         RtSigframe frame{};
         frame.info.si_signo = s;
-        frame.info.si_code = 0;                                  // SI_USER
+        frame.info.si_code = info.code;                          // SI_USER / SI_QUEUE / ...
+        frame.info.si_pid = info.pid;
+        frame.info.si_uid = static_cast<std::int32_t>(proc_.ids() ? proc_.ids()->uid : 0);
         frame.uc.uc_stack = task_.alt_stack;
         frame.uc.uc_sigmask = task_.sig_mask;
         auto& mc = frame.uc.uc_mcontext;
@@ -2181,6 +2270,9 @@ public:
             if (h == 1) { const int hs = signal_from_linux(s);
                           if (hs > 0 && hs != SIGKILL && hs != SIGSTOP) ::signal(hs, SIG_IGN); }
             else if (h) route_host_signal(s, true);
+            // blocked with SIG_DFL: caught, so it waits as pending (see
+            // rt_sigprocmask) instead of acting on the host
+            else if (task_.sig_mask & sigbit(s)) route_host_signal(s, true);
         }
         if (img.child_settid) (void)machine_.ram().put(img.child_settid, std::int32_t{task_.tid});
         task_.clear_child_tid = img.clear_child_tid;
@@ -2191,9 +2283,10 @@ public:
 
 private:
 
-    // wait4(pid, status*, options, rusage*). Linux and Darwin share the wait
-    // option bits we accept (WNOHANG=1, WUNTRACED=2); the STATUS is
-    // re-encoded so signal numbers match the guest's.
+    // wait4(pid, status*, options, rusage*). Linux and Darwin share WNOHANG=1
+    // and WUNTRACED=2, but Linux's WCONTINUED is 8 and Darwin's 0x10 --
+    // dropping it made waitpid(pid, WCONTINUED) sleep until the child EXITED.
+    // The STATUS is re-encoded so signal numbers match the guest's.
     //
     // "Any child" (-1) and "any in my group" (0, -pgid) mean the GUEST's
     // children. The host process also parents its warm zygotes, which never
@@ -2207,7 +2300,9 @@ private:
                                         int options, std::uint64_t rusage) {
         int st = 0;
         pid_t got = 0;
-        const int hopts = options & (WNOHANG | WUNTRACED);
+        if (options & ~(1 | 2 | 8 | 0x01000000 | 0x20000000 | 0x40000000 | static_cast<int>(0x80000000u)))
+            return -22;                                   // EINVAL: unknown option
+        const int hopts = (options & (WNOHANG | WUNTRACED)) | ((options & 8) ? WCONTINUED : 0);
         if (gpid > 0) {
             auto h = pids_.host_of(gpid);
             if (!h) return -10;
@@ -2224,7 +2319,7 @@ private:
                     if (!want_pgid || pids_.pgid_of(c.guest) == *want_pgid) hs.push_back(c.host);
                 if (hs.empty()) return -10;                     // ECHILD
                 for (pid_t h : hs) {
-                    got = ::waitpid(h, &st, WNOHANG | (hopts & WUNTRACED));
+                    got = ::waitpid(h, &st, WNOHANG | (hopts & (WUNTRACED | WCONTINUED)));
                     if (got > 0) break;
                     if (got < 0 && errno == ECHILD)            // reaped elsewhere
                         std::erase_if(children_, [h](const Child& c) { return c.host == h; });
@@ -2242,7 +2337,7 @@ private:
                 struct ::kevent out{};
                 const struct ::timespec tick{0, 50'000'000};
                 const int n = ::kevent(kq, evs.data(), static_cast<int>(evs.size()), &out, 1,
-                                       (hopts & WUNTRACED) ? &tick : nullptr);
+                                       (hopts & (WUNTRACED | WCONTINUED)) ? &tick : nullptr);
                 const int e = errno;
                 ::close(kq);
                 if (n < 0 && e == EINTR) return -4;             // EINTR, as Linux
@@ -2254,8 +2349,17 @@ private:
         std::int32_t g = pids_.guest_of(got);
         if (status) (void)machine_.ram().put(status, std::int32_t{wstatus_to_linux(st)});
         if (rusage) {
-            std::byte zero[144]{};                                // struct rusage
-            (void)machine_.ram().put(rusage, zero);
+            // struct rusage: utime, stime (timevals), then 14 longs. Reaped
+            // children's totals are what the host accounts after the wait.
+            struct ::rusage ru{};
+            (void)::getrusage(RUSAGE_CHILDREN, &ru);
+            std::int64_t lr[18]{};
+            lr[0] = ru.ru_utime.tv_sec; lr[1] = ru.ru_utime.tv_usec;
+            lr[2] = ru.ru_stime.tv_sec; lr[3] = ru.ru_stime.tv_usec;
+            lr[4] = ru.ru_maxrss / 1024;                          // Darwin: bytes; Linux: KiB
+            lr[9] = ru.ru_minflt; lr[10] = ru.ru_majflt;
+            lr[16] = ru.ru_nvcsw; lr[17] = ru.ru_nivcsw;
+            (void)machine_.ram().put(rusage, lr);
         }
         if (WIFEXITED(st) || WIFSIGNALED(st)) {
             pids_.release(g);
@@ -2424,7 +2528,8 @@ private:
         // gone); ignored stay ignored; the blocked mask is preserved; the
         // alt stack is cleared.
         for (int s = 1; s <= kLinuxNsig; ++s)
-            if (proc_.with_signals([&](SignalDispositions& t) { return t.get(s); }).handler > 1) route_host_signal(s, false);
+            if (proc_.with_signals([&](SignalDispositions& t) { return t.get(s); }).handler > 1)
+                route_host_signal(s, (task_.sig_mask & sigbit(s)) != 0);   // blocked: still pending-able
         proc_.with_signals([&](SignalDispositions& t) { return t.on_exec(); });
         task_.alt_stack = {};
         // The new image starts fresh: clear every GPR (no state may leak from
@@ -3080,16 +3185,30 @@ private:
                 return 0;
             }
 
-            // -- Queued signals. rt_sigqueueinfo carries a value with the
-            //    signal; we deliver the signal itself (the queued data needs
-            //    a per-signal queue the guest can only observe through a
-            //    SA_SIGINFO handler, which gets si_code = SI_USER either way).
-            case S::rt_sigqueueinfo:
-                return deliver_signal(static_cast<std::int32_t>(a0),
-                                      static_cast<std::int32_t>(a1));
-            case S::rt_tgsigqueueinfo:
-                return deliver_signal(static_cast<std::int32_t>(a1),
-                                      static_cast<std::int32_t>(a2));
+            // -- Queued signals. rt_sigqueueinfo(pid, sig, info*) carries
+            //    si_code (SI_QUEUE, -1) and a value; they travel in the
+            //    target's mailbox with the signal, so the receiver's
+            //    siginfo (sigwaitinfo, SA_SIGINFO, signalfd) shows them.
+            case S::rt_sigqueueinfo: case S::rt_tgsigqueueinfo: {
+                const bool tg = sc == S::rt_tgsigqueueinfo;
+                const auto pid = static_cast<std::int32_t>(a0);       // tgid for the tg form
+                const auto sig = static_cast<std::int32_t>(tg ? a2 : a1);
+                const std::uint64_t ip = tg ? a3 : a2;
+                struct { std::int32_t signo, errno_, code, pad_; std::int32_t pid, uid, value; } li{};
+                if (!ram.get(ip, li)) return -14;
+                if (li.code >= 0 && pid != tgid_) return -1;        // EPERM: only negative codes
+                if (sig < 1 || sig > kLinuxNsig) return -22;
+                if (pid == tgid_) {
+                    g_pending.enqueue({sig, tgid_, li.code, li.value});
+                    g_pending.kick_all(); g_pending.notify_waiters();
+                    return 0;
+                }
+                const auto h = pids_.host_of(pid);
+                if (!h) return -3;
+                if (!pids_.post_signal(pid, {sig, tgid_, li.code, li.value})) return -11;
+                if (pids_.ready(pid)) (void)::kill(*h, kKickSignal);
+                return 0;
+            }
 
             // -- rt_sigtimedwait(set, info, timeout, size): synchronous
             //    signal reception, how a program waits for SIGCHLD or a
@@ -3098,6 +3217,7 @@ private:
                 std::uint64_t set = 0;
                 if (!ram.get(a0, set)) return -14;
                 std::uint64_t deadline_ns = 0;
+                const bool timed = a2 != 0;          // a {0,0} timeout POLLS: EAGAIN at once
                 if (a2) {
                     struct { std::int64_t sec, nsec; } ts{};
                     if (!ram.get(a2, ts)) return -14;
@@ -3106,25 +3226,46 @@ private:
                 }
                 const auto start = std::chrono::steady_clock::now();
                 for (;;) {
-                    const std::uint64_t ready =
-                        (g_pending.bits.load(std::memory_order_relaxed)
-                         | task_.pending.load(std::memory_order_relaxed)) & set;
-                    if (ready) {
-                        const int s = std::countr_zero(ready) + 1;
-                        g_pending.bits.fetch_and(~sigbit(s), std::memory_order_relaxed);
+                    drain_mail();
+                    std::optional<PendingSignals::Info> got;
+                    if (const std::uint64_t mine = task_.pending.load(std::memory_order_relaxed) & set) {
+                        const int s = std::countr_zero(mine) + 1;
                         task_.pending.fetch_and(~sigbit(s), std::memory_order_relaxed);
+                        got = PendingSignals::Info{s, 0, -6 /*SI_TKILL*/, 0};
+                    } else {
+                        got = g_pending.take(set);
+                    }
+                    if (got) {
                         if (a1) {
-                            struct { std::int32_t signo, errno_, code, pad_; } si{s, 0, 0, 0};
+                            LinuxSiginfo si{};
+                            si.si_signo = got->signo;
+                            si.si_code = got->code;
+                            si.si_pid = got->pid;
+                            si.si_uid = static_cast<std::int32_t>(proc_.ids() ? proc_.ids()->uid : 0);
+                            std::memcpy(si.rest, &got->value, sizeof got->value);   // si_value
                             if (!ram.put(a1, si)) return -14;
                         }
-                        return s;
+                        return got->signo;
                     }
-                    if (deadline_ns) {
+                    if (timed) {
                         const auto spent = std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now() - start).count();
                         if (static_cast<std::uint64_t>(spent) >= deadline_ns) return -11;  // EAGAIN
                     }
-                    g_pending.wait_for_signal(set);
+                    // Sleep until one of `set` -- or any signal the guest
+                    // would take, which interrupts the wait (EINTR).
+                    const std::uint64_t wake = set | ~task_.sig_mask;
+                    if (timed) {
+                        const auto spent = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - start).count());
+                        g_pending.wait_for_signal(wake, deadline_ns > spent ? deadline_ns - spent : 0);
+                    } else {
+                        g_pending.wait_for_signal(wake);
+                    }
+                    drain_mail();
+                    if ((g_pending.bits.load(std::memory_order_relaxed) & set) == 0 &&
+                        (g_pending.bits.load(std::memory_order_relaxed) & ~task_.sig_mask) != 0)
+                        return -4;                                                       // EINTR
                 }
             }
             case S::get_robust_list:
@@ -3597,8 +3738,24 @@ private:
         const std::uint64_t a0 = regs_.arg(0), a1 = regs_.arg(1),
                             a2 = regs_.arg(2), a3 = regs_.arg(3);
         switch (sc) {
-            case S::brk:
-                return static_cast<std::int64_t>(proc_.with_space([&](AddressSpace& t) { return t.set_brk(a0); }));
+            case S::brk: {
+                // Pages the break newly covers must read as zero, as fresh
+                // kernel pages do: glibc's calloc skips clearing memory that
+                // just came from sbrk. Guest RAM here is one flat region that
+                // outlives exec and is copied on fork, so the bytes above the
+                // old break were the PREVIOUS image's heap -- apt's http method
+                // built libtasn1 trees out of apt-get's leftover strings and
+                // crashed on every download.
+                std::uint64_t before = 0, now = 0;
+                proc_.with_space([&](AddressSpace& t) {
+                    before = t.set_brk(0);
+                    now = t.set_brk(a0);
+                    return 0;
+                });
+                const std::uint64_t lo = AddressSpace::page_up(before), hi = AddressSpace::page_up(now);
+                if (hi > lo) machine_.zero(lo, hi - lo);
+                return static_cast<std::int64_t>(now);
+            }
             case S::mmap: {
                 // Guest MAP_* bits come from abi/wire/mmap.hpp. These used to be
                 // redeclared inline right here (`kFixed = 0x10, kAnon = 0x20`),
@@ -4778,6 +4935,30 @@ private:
         }
     }
 
+    // A blocking host poll that a guest SIGNAL must interrupt: the guest's
+    // deliverable signals are checked first (EINTR without sleeping), and
+    // the handler's self-pipe rides along in the set, so a signal landing
+    // after the check still wakes it. Returns poll's answer with the wake
+    // fd's own readiness removed, or -EINTR.
+    [[nodiscard]] int signal_aware_poll(std::vector<struct ::pollfd>& p, int timeout) {
+        g_pending.drain_wake();
+        drain_mail();
+        auto deliverable = [&] {
+            return ((g_pending.bits.load(std::memory_order_relaxed)
+                     | task_.pending.load(std::memory_order_relaxed)) & ~task_.sig_mask) != 0;
+        };
+        if (deliverable()) return -4;
+        const int wfd = g_pending.wake_rd;
+        if (wfd >= 0) p.push_back({wfd, POLLIN, 0});
+        const int rc = ::poll(p.data(), static_cast<nfds_t>(p.size()), timeout);
+        const bool woke = wfd >= 0 && (p.back().revents & POLLIN);
+        if (wfd >= 0) p.pop_back();
+        if (rc < 0) return errno == EINTR ? -4 : static_cast<int>(darwin::fail());
+        const int n = rc - (woke ? 1 : 0);
+        if (n == 0 && woke && deliverable()) return -4;          // a signal, nothing else
+        return n;
+    }
+
     // ppoll(fds, nfds, timeout*, sigmask*) / pselect6: block on real Darwin
     // fds. struct pollfd and the POLL* bits agree between the two kernels for
     // everything but POLLRDHUP, which Darwin lacks and we drop. Guest fds are
@@ -4804,8 +4985,10 @@ private:
             if (!ram.get(ts_at, ts)) return -14;
             timeout = static_cast<int>(ts.sec * 1000 + ts.nsec / 1'000'000);
         }
-        const int rc = ::poll(h.data(), static_cast<nfds_t>(n), timeout);
-        if (rc < 0) return darwin::fail();
+        std::vector<struct ::pollfd> hv(h.begin(), h.end());
+        const int rc = signal_aware_poll(hv, timeout);
+        if (rc < 0) return rc;
+        std::copy(hv.begin(), hv.end(), h.begin());
         for (std::uint64_t i = 0; i < n; ++i) {
             // An fd the guest named that we don't know is POLLNVAL, per POSIX.
             g[i].revents = h[i].fd < 0 && g[i].fd >= 0 ? 0x20 : h[i].revents;
@@ -4851,8 +5034,8 @@ private:
             if (!ram.get(ts_at, ts)) return -14;
             timeout = static_cast<int>(ts.sec * 1000 + ts.nsec / 1'000'000);
         }
-        const int rc = ::poll(p.data(), static_cast<nfds_t>(p.size()), timeout);
-        if (rc < 0) return darwin::fail();
+        const int rc = signal_aware_poll(p, timeout);
+        if (rc < 0) return rc;
         for (auto& s : sets) std::fill(s.begin(), s.end(), 0);
         int ready = 0;
         for (std::size_t i = 0; i < p.size(); ++i) {

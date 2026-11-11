@@ -398,7 +398,12 @@ public:
         // the exec flag past its end.)
         posix_spawnattr_t attr;
         ::posix_spawnattr_init(&attr);
-        ::posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
+        ::posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGMASK);
+        // Born with every host signal BLOCKED: until the child has installed
+        // the guest's dispositions (resume_fork_child), a signal the guest
+        // parent sends at once -- a ping-pong's first SIGUSR1 -- would meet
+        // the host DEFAULT and kill it. Blocked, it waits; run() unblocks.
+        { sigset_t all; sigfillset(&all); ::posix_spawnattr_setsigmask(&attr, &all); }
         for (int fd = 0; fd < 3; ++fd) ::posix_spawn_file_actions_addinherit_np(&fa, fd);
 
         // The rendezvous: a uniquely named Mach service the child looks up.
@@ -589,7 +594,8 @@ private:
         ::posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
         posix_spawnattr_t attr;
         ::posix_spawnattr_init(&attr);
-        ::posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
+        ::posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGMASK);
+        { sigset_t all; sigfillset(&all); ::posix_spawnattr_setsigmask(&attr, &all); }   // see the fork spawn
         pid_t pid = -1;
         const int rc = ::posix_spawn(&pid, args[0].c_str(), &fa, &attr, av.data(), host::host_environ());
         ::posix_spawn_file_actions_destroy(&fa);
@@ -763,6 +769,11 @@ void run_guest_thread(ThreadContext& ctx, runtime::HvfTrap::ThreadStart start) {
                       runtime::HvfCpu& cpu, runtime::ProcessState& proc,
                       runtime::TaskState& task, runtime::PidSpace& pids,
                       runtime::HvfTrap& trap) {
+    // The guest's dispositions are in place (root: fresh; fork child: just
+    // restored), so the host signals a fork child was born blocking (see
+    // Forker) may now arrive -- the guest's own mask is virtual, kept by
+    // the trap, never the host thread's.
+    { sigset_t none; sigemptyset(&none); ::pthread_sigmask(SIG_SETMASK, &none, nullptr); }
     runtime::HvfMem mem{machine, &trap};
     Forker forker{o, m, machine, pids};
     trap.on_exit([&forker] { forker.release_unclaimed(); });

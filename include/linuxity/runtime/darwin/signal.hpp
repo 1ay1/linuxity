@@ -32,10 +32,13 @@
 #include "linuxity/runtime/darwin/vm.hpp"
 
 #include <Hypervisor/Hypervisor.h>
+#include <fcntl.h>
 #include <signal.h>
+#include <unistd.h>
 
 #include <array>
 #include <atomic>
+#include <bit>
 #include <condition_variable>
 #include <chrono>
 #include <cstdint>
@@ -44,6 +47,7 @@
 #include <cstring>
 #include <mutex>
 #include <optional>
+#include <vector>
 
 namespace lx::runtime {
 
@@ -131,6 +135,87 @@ private:
 // we own its registers -- the same "on return to user space" rule Linux uses.
 struct PendingSignals {
     std::atomic<std::uint64_t> bits{0};
+    // What Linux's siginfo says about each pending signal. Classic signals
+    // merge (one record, the latest sender); real-time ones QUEUE, one record
+    // per send, delivered in order. Touched only at trap boundaries and in
+    // the drain of the cross-process mailbox -- never from a host signal
+    // handler, which only sets `bits` -- so a plain mutex guards it.
+    struct Info { int signo; std::int32_t pid, code, value; };
+    std::mutex q_mu_;
+    std::vector<Info> queue_;
+    void enqueue(const Info& i) {
+        std::lock_guard g{q_mu_};
+        if (i.signo < 32)                                 // merges: replace
+            for (auto& q : queue_)
+                if (q.signo == i.signo) { q = i; return; }
+        queue_.push_back(i);
+        bits.fetch_or(1ull << (i.signo - 1), std::memory_order_relaxed);
+    }
+    // Take the lowest pending signal in `set`: its record if there is one
+    // (else a bare SI_USER from no one). The bit is CLAIMED atomically
+    // first -- a host handler may set it again at any moment, and clearing
+    // it after reading the queue would drop that next signal -- and set
+    // back if more queued records of a real-time signal remain.
+    [[nodiscard]] std::optional<Info> take(std::uint64_t set) {
+        std::lock_guard g{q_mu_};
+        for (;;) {
+            const std::uint64_t ready = bits.load(std::memory_order_acquire) & set;
+            if (!ready) return std::nullopt;
+            const int s = std::countr_zero(ready) + 1;
+            const std::uint64_t b = 1ull << (s - 1);
+            if (!(bits.fetch_and(~b, std::memory_order_acq_rel) & b)) continue;   // lost a race: retry
+            Info out{s, 0, 0, 0};
+            bool more = false;
+            for (auto it = queue_.begin(); it != queue_.end(); ++it)
+                if (it->signo == s) {
+                    out = *it;
+                    queue_.erase(it);
+                    if (s >= 32)
+                        for (const auto& q : queue_) if (q.signo == s) { more = true; break; }
+                    break;
+                }
+            if (more) bits.fetch_or(b, std::memory_order_release);
+            return out;
+        }
+    }
+    [[nodiscard]] std::size_t queued() {
+        std::lock_guard g{q_mu_};
+        return queue_.size();
+    }
+    // A self-pipe the host signal handler writes one byte into. Every
+    // blocking host poll/select a guest call turns into also polls its read
+    // end, so a signal landing between the guest's last check and the host
+    // call still wakes it -- the classic lost-wakeup race, which hung the
+    // test runner's select() when SIGCHLD arrived just before it slept.
+    int wake_rd{-1}, wake_wr{-1};
+    void open_wake_pipe() noexcept {
+        if (wake_rd >= 0) return;
+        int p[2];
+        if (::pipe(p) != 0) return;
+        for (int e : p) {
+            ::fcntl(e, F_SETFD, FD_CLOEXEC);
+            ::fcntl(e, F_SETFL, ::fcntl(e, F_GETFL) | O_NONBLOCK);
+        }
+        wake_rd = p[0];
+        wake_wr = p[1];
+    }
+    void poke() noexcept {
+        if (wake_wr >= 0) { const char c = 1; (void)::write(wake_wr, &c, 1); }
+    }
+    void drain_wake() noexcept {
+        if (wake_rd < 0) return;
+        char b[64];
+        while (::read(wake_rd, b, sizeof b) > 0) {}
+    }
+    // The sender of a classic signal whose delivery the HOST does (it arrives
+    // as a host signal and sets `bits`): remembered for its siginfo, never
+    // pending by itself.
+    void note_sender(const Info& i) {
+        std::lock_guard g{q_mu_};
+        for (auto& q : queue_)
+            if (q.signo == i.signo) { q = i; return; }
+        queue_.push_back(i);
+    }
     // Up to 64 live vCPUs to kick. Written under ProcessState's lock when
     // threads start/stop; read from a signal handler, hence atomic.
     static constexpr int kMaxCpus = 64;
@@ -180,6 +265,17 @@ struct PendingSignals {
                 }))
                 break;
     }
+    // The same, for at most `ns` nanoseconds.
+    void wait_for_signal(std::uint64_t interesting, std::uint64_t ns) {
+        std::unique_lock lk{wait_mu_};
+        const auto end = std::chrono::steady_clock::now() + std::chrono::nanoseconds{ns};
+        while (!(bits.load(std::memory_order_relaxed) & interesting)) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= end) return;
+            const auto step = std::min<std::chrono::nanoseconds>(end - now, std::chrono::milliseconds{50});
+            wait_cv_.wait_for(lk, step);
+        }
+    }
     void notify_waiters() noexcept { wait_cv_.notify_all(); }
 
     // A forked child inherits the PARENT's vCPU handles -- this table is a
@@ -190,6 +286,8 @@ struct PendingSignals {
         cpu_count.store(0, std::memory_order_release);
         for (auto& c : cpus) c.store(0, std::memory_order_relaxed);
         bits.store(0, std::memory_order_relaxed);
+        std::lock_guard g{q_mu_};
+        queue_.clear();
     }
 };
 inline PendingSignals g_pending;
@@ -198,6 +296,7 @@ extern "C" inline void hvf_host_signal(int host_sig) {
     const int ls = signal_to_linux(host_sig);
     if (ls > 0 && ls <= kLinuxNsig)
         g_pending.bits.fetch_or(sigbit(ls), std::memory_order_relaxed);
+    g_pending.poke();
     g_pending.kick_all();
     // notify_all() on a condvar is not formally async-signal-safe, but the
     // waiter also re-checks on a 50 ms timeout, so a missed wake costs
@@ -209,8 +308,9 @@ extern "C" inline void hvf_host_signal(int host_sig) {
 // raise nothing for the guest. No SA_RESTART, so a blocked read/pause/wait
 // returns EINTR, traps, and the trap loop reads the mailbox.
 inline void install_kick_handler() {
+    g_pending.open_wake_pipe();
     struct ::sigaction sa{};
-    sa.sa_handler = [](int) { g_pending.kick_all(); g_pending.notify_waiters(); };
+    sa.sa_handler = [](int) { g_pending.poke(); g_pending.kick_all(); g_pending.notify_waiters(); };
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
     ::sigaction(kKickSignal, &sa, nullptr);

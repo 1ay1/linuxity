@@ -49,7 +49,10 @@ public:
         if (::ftruncate(fd_, sizeof(Shared)) != 0) return;
         map();
         if (!shared_) return;
-        new (shared_) Shared{};
+        // A fresh ftruncate'd file IS the all-zero Shared (every member is
+        // an atomic or array whose zero is its initial value), and writing
+        // it out would touch every page -- the signal mailbox alone is
+        // 64 MiB of sparse file. So no placement-new: only what isn't zero.
         shared_->next.store(2, std::memory_order_relaxed);
         shared_->host[1].store(::getpid(), std::memory_order_relaxed);
     }
@@ -263,6 +266,50 @@ public:
         return (g > 0 && g < kMax && shared_) ? shared_->affinity[g].load() : 0;
     }
 
+    // -- The signal mailbox -------------------------------------------------
+    // A guest signal with no host twin (16, 30, real-time 32..64) cannot be
+    // sent with kill(2), and a real-time one must QUEUE (one per send, each
+    // with its sender) where a host signal merges. So the sender posts it
+    // here and kicks the target (kKickSignal); the target drains it at its
+    // next trap. Records are a fixed ring per process: a full ring is EAGAIN,
+    // which is what sigqueue says when RLIMIT_SIGPENDING is reached.
+    static constexpr int kSigRing = 1024;
+    struct SigRecord { std::int32_t signo, sender, code, value; };
+    [[nodiscard]] bool post_signal(std::int32_t g, SigRecord r) noexcept {
+        if (g <= 0 || g >= kMax || !shared_) return false;
+        auto& mb = shared_->mail[g];
+        const std::uint32_t h = mb.head.fetch_add(1, std::memory_order_acq_rel);
+        if (h - mb.tail.load(std::memory_order_acquire) >= kSigRing) {
+            mb.head.fetch_sub(1, std::memory_order_acq_rel);
+            return false;
+        }
+        auto& slot = mb.ring[h % kSigRing];
+        slot.sender.store(r.sender, std::memory_order_relaxed);
+        slot.code.store(r.code, std::memory_order_relaxed);
+        slot.value.store(r.value, std::memory_order_relaxed);
+        slot.signo.store(r.signo, std::memory_order_release);    // published last
+        return true;
+    }
+    // The next posted record, or signo 0.
+    [[nodiscard]] SigRecord take_signal(std::int32_t g) noexcept {
+        if (g <= 0 || g >= kMax || !shared_) return {};
+        auto& mb = shared_->mail[g];
+        const std::uint32_t t = mb.tail.load(std::memory_order_acquire);
+        if (t == mb.head.load(std::memory_order_acquire)) return {};
+        auto& slot = mb.ring[t % kSigRing];
+        const std::int32_t s = slot.signo.exchange(0, std::memory_order_acq_rel);
+        if (!s) return {};                                         // not yet published
+        SigRecord r{s, slot.sender.load(), slot.code.load(), slot.value.load()};
+        mb.tail.store(t + 1, std::memory_order_release);
+        return r;
+    }
+    void clear_mail(std::int32_t g) noexcept {
+        if (g <= 0 || g >= kMax || !shared_) return;
+        auto& mb = shared_->mail[g];
+        for (auto& s : mb.ring) s.signo.store(0, std::memory_order_relaxed);
+        mb.tail.store(mb.head.load());
+    }
+
 private:
     void map() {
         void* p = ::mmap(nullptr, sizeof(Shared), PROT_READ | PROT_WRITE,
@@ -301,6 +348,17 @@ private:
         std::atomic<std::int8_t> nice[kMax]{};
         std::atomic<std::int8_t> policy[kMax]{};
         std::atomic<std::uint64_t> affinity[kMax]{};
+        // See post_signal. Allocated lazily: kMax x 1024 records is 64 MiB
+        // of address space, but an anonymous shared map only costs the
+        // pages a process actually touches.
+        struct Slot {
+            std::atomic<std::int32_t> signo{0}, sender{0}, code{0}, value{0};
+        };
+        struct Mailbox {
+            std::atomic<std::uint32_t> head{0}, tail{0};
+            Slot ring[kSigRing];
+        };
+        Mailbox mail[kMax];
     };
     Shared* shared_{nullptr};
     int fd_{-1};
@@ -315,6 +373,15 @@ private:
 // exists on no Linux arch the guest runs, so no guest signal maps to it.
 inline constexpr int kKickSignal = SIGEMT;
 
+// The two numberings agree on 1-6, 8, 9, 11, 13-15 and nothing else. Every
+// other Linux signal either has a Darwin twin under ANOTHER number or none.
+// Mapping must be a bijection on what it maps: passing an unmatched Linux
+// number through unchanged lands on a DIFFERENT Darwin signal -- Linux 30
+// (SIGPWR) is Darwin's SIGUSR1, Linux 10 (SIGUSR1) Darwin's SIGBUS -- so a
+// guest that merely set SIGPWR to SIG_DFL (Python does, for every signal)
+// reset the host's SIGUSR1 and the next kill(SIGUSR1) killed the process.
+// Linux-only signals (16 SIGSTKFLT, 30 SIGPWR, 32..64 real-time) have no
+// host signal: 0, and the guest keeps them in its own pending set.
 [[nodiscard]] constexpr int signal_to_linux(int s) noexcept {
     switch (s) {
         case SIGEMT:  return 0;          // linuxity's own kick (kKickSignal)
@@ -325,9 +392,18 @@ inline constexpr int kKickSignal = SIGEMT;
         case SIGCONT: return 18;
         case SIGSTOP: return 19;
         case SIGTSTP: return 20;
+        case SIGTTIN: return 21;
+        case SIGTTOU: return 22;
         case SIGURG:  return 23;
+        case SIGXCPU: return 24;
+        case SIGXFSZ: return 25;
+        case SIGVTALRM: return 26;
+        case SIGPROF: return 27;
+        case SIGWINCH: return 28;
+        case SIGIO:   return 29;
         case SIGSYS:  return 31;
-        default:      return s;
+        case SIGINFO: return 0;          // Darwin-only
+        default:      return s >= 1 && s <= 15 && s != 7 && s != 10 && s != 12 ? s : 0;
     }
 }
 [[nodiscard]] constexpr int signal_from_linux(int s) noexcept {
@@ -339,14 +415,28 @@ inline constexpr int kKickSignal = SIGEMT;
         case 18: return SIGCONT;
         case 19: return SIGSTOP;
         case 20: return SIGTSTP;
+        case 21: return SIGTTIN;
+        case 22: return SIGTTOU;
         case 23: return SIGURG;
+        case 24: return SIGXCPU;
+        case 25: return SIGXFSZ;
+        case 26: return SIGVTALRM;
+        case 27: return SIGPROF;
+        case 28: return SIGWINCH;
+        case 29: return SIGIO;
         case 31: return SIGSYS;
-        default: return s;
+        default: return s >= 1 && s <= 15 ? s : 0;     // 16, 30, 32..64: none
     }
 }
+static_assert(signal_to_linux(signal_from_linux(10)) == 10);
+static_assert(signal_from_linux(30) == 0 && signal_from_linux(16) == 0 && signal_from_linux(40) == 0);
+static_assert(signal_to_linux(SIGUSR1) == 10 && signal_to_linux(SIGBUS) == 7);
 
 // A Darwin wait status -> the Linux encoding of the same event.
 [[nodiscard]] constexpr int wstatus_to_linux(int st) noexcept {
+    // Darwin's "continued" is a stop by SIGCONT (0x137f); Linux's is 0xffff.
+    // Test it FIRST: WIFSTOPPED is true of it too.
+    if (WIFCONTINUED(st)) return 0xffff;
     if (WIFEXITED(st))   return (WEXITSTATUS(st) & 0xff) << 8;
     if (WIFSIGNALED(st)) return (signal_to_linux(WTERMSIG(st)) & 0x7f) | (WCOREDUMP(st) ? 0x80 : 0);
     if (WIFSTOPPED(st))  return (signal_to_linux(WSTOPSIG(st)) << 8) | 0x7f;
