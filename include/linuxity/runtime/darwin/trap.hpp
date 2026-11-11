@@ -333,6 +333,7 @@ public:
                        i < ex.program_segments ? ex.program : ex.interp);
         }
         proc_.set_environ(ex.environ);
+        proc_.set_auxv(ex.auxv);
     }
     // Room below the initial sp for the stack to grow (Linux's default
     // RLIMIT_STACK, which is what prlimit64 reports).
@@ -2259,6 +2260,7 @@ private:
         img.pte_lo = proc_.pte_lo;
         img.pte_hi = proc_.pte_hi;
         img.environ = proc_.environ();
+        img.auxv = proc_.auxv();
         proc_.with_names([&](auto& v) {
             for (const auto& r : v)
                 img.range_names += std::to_string(r.begin) + " " + std::to_string(r.end) + " " +
@@ -2333,6 +2335,7 @@ public:
         std::string namespace_state;    // Kernel::export_fork: creds, cwd, fd paths
         std::array<ProcessState::Rlim, 16> rlimits{};
         std::string environ;            // /proc/<pid>/environ, until exec
+        std::string auxv;               // /proc/<pid>/auxv, until exec
         std::string range_names;        // "begin end name\n"..., for maps
         struct Backed { std::uint64_t at, len; std::int64_t off; std::int32_t group; };
         std::vector<Backed> backings;   // shared host pages; `group` indexes fd_hosts
@@ -2409,6 +2412,7 @@ public:
         proc_.pte_lo = img.pte_lo;              // the tables came in the snapshot
         proc_.pte_hi = img.pte_hi;
         proc_.set_environ(img.environ);
+        proc_.set_auxv(img.auxv);
         for (std::size_t at = 0; at < img.range_names.size();) {
             const std::size_t nl = std::min(img.range_names.find('\n', at), img.range_names.size());
             unsigned long long b = 0, e = 0;
@@ -5389,6 +5393,24 @@ private:
         });
         return eintr ? -4 : kRestartSys;
     }
+
+    // What a poll-family wait (poll, ppoll, pselect, epoll_wait) returns when
+    // a signal ended it: EINTR if a HANDLER will run (never restarted, even
+    // under SA_RESTART -- signal(7)), otherwise a transparent restart
+    // (-ERESTARTNOHAND): an ignored or handler-less signal, like a default
+    // SIGCHLD, must not surface. Returning EINTR for those failed ninja
+    // ("poll: Interrupted system call") every time a compiler exited.
+    [[nodiscard]] std::int64_t poll_interrupted() {
+        const std::uint64_t ready = (g_pending.bits.load(std::memory_order_relaxed)
+                                     | task_.pending.load(std::memory_order_relaxed)) & ~task_.sig_mask;
+        bool handler = false;
+        proc_.with_signals([&](const SignalDispositions& d) {
+            for (int s = 1; s <= kLinuxNsig; ++s)
+                if ((ready & sigbit(s)) && d.get(s).handler > 1) handler = true;
+            return 0;
+        });
+        return handler ? -4 : kRestartSys;
+    }
     // resume(kRestartSys): re-execute the svc after the signal is handled.
     static constexpr std::int64_t kRestartSys = -512;   // the kernel's ERESTARTSYS
 
@@ -5419,7 +5441,7 @@ private:
             std::vector<struct ::pollfd> p{{set.fd(), POLLIN, 0}};
             for (const auto& f : fifos) p.push_back({f.second, POLLIN, 0});
             const int rc = signal_aware_poll(p, left);
-            if (rc == -4) return -4;                             // EINTR
+            if (rc == -4) return poll_interrupted();                // EINTR, or restart
             std::vector<int> hups;
             for (std::size_t i = 0; i < fifos.size(); ++i)
                 if (p[i + 1].revents & POLLHUP) hups.push_back(fifos[i].first);
@@ -5550,6 +5572,7 @@ private:
         }
         std::vector<struct ::pollfd> hv(h.begin(), h.end());
         const int rc = signal_aware_poll(hv, timeout);
+        if (rc == -4) return poll_interrupted();
         if (rc < 0) return rc;
         std::copy(hv.begin(), hv.end(), h.begin());
         for (std::uint64_t i = 0; i < n; ++i) {
@@ -5598,6 +5621,7 @@ private:
             timeout = static_cast<int>(ts.sec * 1000 + ts.nsec / 1'000'000);
         }
         const int rc = signal_aware_poll(p, timeout);
+        if (rc == -4) return poll_interrupted();
         if (rc < 0) return rc;
         for (auto& s : sets) std::fill(s.begin(), s.end(), 0);
         int ready = 0;

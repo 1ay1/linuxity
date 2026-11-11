@@ -219,7 +219,34 @@ public:
     // On rename/link the metadata should travel with the file. Move any record
     // from `from` to `to` (overwriting `to`'s prior record if present).
     void rename(const std::string& from, const std::string& to) {
+        if (from == to) return;
         catch_up();
+        // A directory takes everything under it along: every record whose
+        // path is below `from` moves below `to`. Moving just the one path
+        // left `mv dir elsewhere` with a dir its owner still owned and
+        // contents that had reverted to root -- `rm -rf` then failed.
+        std::vector<std::pair<std::string, MetaRecord>> moved;
+        const std::string prefix = from + "/";
+        for (auto i = table_.begin(); i != table_.end();) {
+            if (i->first.size() > prefix.size() && i->first.compare(0, prefix.size(), prefix) == 0) {
+                moved.emplace_back(to + i->first.substr(from.size()), i->second);
+                append_tombstone(i->first);
+                i = table_.erase(i);
+            } else {
+                ++i;
+            }
+        }
+        // whatever was under the destination is gone (it was replaced)
+        const std::string to_prefix = to + "/";
+        for (auto i = table_.begin(); i != table_.end();) {
+            if (i->first.compare(0, to_prefix.size(), to_prefix) == 0) {
+                append_tombstone(i->first);
+                i = table_.erase(i);
+            } else {
+                ++i;
+            }
+        }
+        for (auto& [p, r] : moved) { table_[p] = r; append(p, r); }
         auto it = table_.find(from);
         // Always journal the removal of `to`'s and `from`'s old state so a
         // replay reconstructs the post-rename world exactly (even if `from`

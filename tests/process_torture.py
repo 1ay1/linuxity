@@ -239,7 +239,9 @@ def wait4_rusage_counts_child_cpu():
     _, st, ru = os.wait4(pid, 0)
     eq(os.waitstatus_to_exitcode(st), 0, "child")
     ok(ru.ru_utime + ru.ru_stime >= 0.1, f"rusage cpu {ru.ru_utime + ru.ru_stime:.3f}s")
-    ok(resource.getrusage(resource.RUSAGE_CHILDREN).ru_utime >= 0.1, "RUSAGE_CHILDREN")
+    cr = resource.getrusage(resource.RUSAGE_CHILDREN)
+    # the loop's clock reads are syscalls, so much of it is SYSTEM time
+    ok(cr.ru_utime + cr.ru_stime >= 0.1, f"RUSAGE_CHILDREN {cr.ru_utime:.3f}+{cr.ru_stime:.3f}s")
 
 
 @check

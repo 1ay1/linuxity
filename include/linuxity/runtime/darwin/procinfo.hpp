@@ -262,6 +262,30 @@ fact(std::string_view leaf, pid_t host, const Self* self, std::optional<int> nic
                "\nsyscw: " + n(p.syscw) + "\nread_bytes: 0\nwrite_bytes: 0\ncancelled_write_bytes: 0\n";
     }
     if (leaf == "environ") return p.environ();
+    if (leaf == "auxv") return p.auxv();
+    if (leaf == "limits") {
+        // fs/proc/base.c's proc_pid_limits, column for column
+        static constexpr struct { const char* name; const char* unit; } kRows[16] = {
+            {"Max cpu time", "seconds"}, {"Max file size", "bytes"}, {"Max data size", "bytes"},
+            {"Max stack size", "bytes"}, {"Max core file size", "bytes"}, {"Max resident set", "bytes"},
+            {"Max processes", "processes"}, {"Max open files", "files"}, {"Max locked memory", "bytes"},
+            {"Max address space", "bytes"}, {"Max file locks", "locks"}, {"Max pending signals", "signals"},
+            {"Max msgqueue size", "bytes"}, {"Max nice priority", ""}, {"Max realtime priority", ""},
+            {"Max realtime timeout", "us"}};
+        char b[128];
+        std::snprintf(b, sizeof b, "%-25s %-20s %-20s %-10s\n", "Limit", "Soft Limit", "Hard Limit", "Units");
+        std::string s = b;
+        auto v = [](std::uint64_t x) {
+            return x == ProcessState::kInf ? std::string{"unlimited"} : std::to_string(x);
+        };
+        for (int i = 0; i < 16; ++i) {
+            const auto& r = p.rlimits[static_cast<std::size_t>(i)];
+            std::snprintf(b, sizeof b, "%-25s %-20s %-20s %-10s\n", kRows[i].name,
+                          v(r.cur).c_str(), v(r.max).c_str(), kRows[i].unit);
+            s += b;
+        }
+        return s;
+    }
     if (leaf == "maps") return maps(p);
     if (leaf == "task") {
         std::string s;

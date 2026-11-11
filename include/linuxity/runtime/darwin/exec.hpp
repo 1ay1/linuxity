@@ -61,6 +61,7 @@ struct ExecResult {
     std::size_t program_segments{0};
     std::string program, interp;
     std::string environ;        // envp, NUL-separated, as /proc/<pid>/environ
+    std::string auxv;           // the aux vector's bytes, as /proc/<pid>/auxv
 };
 
 // Load `path` into a FRESH address space (execve replaces the image). Handles
@@ -114,7 +115,7 @@ struct ExecResult {
     }
 
     auto sp = hvf_build_stack(vm, *prog, argv, envp, at_base, guest_path,
-                              vdso::install(vm));
+                              vdso::install(vm), &out.auxv);
     if (!sp) return err<ExecResult>(sp.error());
     out.entry = entry;
     out.sp = *sp;

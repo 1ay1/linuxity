@@ -136,7 +136,8 @@ struct HvfImage {
         const std::vector<std::string>& envp,
         std::uint64_t at_base = 0,
         const std::string& execfn = {},
-        std::uint64_t sysinfo_ehdr = 0) {
+        std::uint64_t sysinfo_ehdr = 0,
+        std::string* auxv_out = nullptr) {
     std::uint64_t sp = vm.mem_size() - HvfLayout::stack_guard;
 
     auto push_bytes = [&](const void* data, std::size_t n) -> std::uint64_t {
@@ -194,6 +195,12 @@ struct HvfImage {
     // from it instead of trapping (a VM exit each, ~50x a native read).
     if (sysinfo_ehdr) aux(33, sysinfo_ehdr);
     aux(0,  0);                                // AT_NULL
+    if (auxv_out) {
+        // /proc/<pid>/auxv: the (type, value) pairs through AT_NULL, which
+        // follow argc, argv, NULL, envp, NULL
+        const std::size_t first = 1 + argp.size() + 1 + envp_addr.size() + 1;
+        auxv_out->assign(reinterpret_cast<const char*>(v.data() + first), (v.size() - first) * 8);
+    }
     if (v.size() % 2) v.push_back(0);          // keep sp 16-aligned
 
     sp -= v.size() * 8;

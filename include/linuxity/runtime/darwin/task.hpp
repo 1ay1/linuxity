@@ -186,6 +186,15 @@ public:
         std::lock_guard g{mu_};
         return environ_;
     }
+    // The aux vector the current image started with, as /proc/<pid>/auxv.
+    void set_auxv(std::string blob) {
+        std::lock_guard g{mu_};
+        auxv_ = std::move(blob);
+    }
+    [[nodiscard]] std::string auxv() const {
+        std::lock_guard g{mu_};
+        return auxv_;
+    }
     std::atomic<std::uint64_t> rchar{0}, wchar{0}, syscr{0}, syscw{0};
     // The guest-address window whose page-table permissions were narrowed
     // from the default RWX (mmap/mprotect); exec resets it. Empty: lo >= hi.
@@ -351,6 +360,7 @@ private:
     std::optional<Ids> ids_;
     std::set<std::uint64_t> locked_;
     std::string environ_;
+    std::string auxv_;
     std::vector<NamedRange> names_;
     std::atomic<bool> group_exiting_{false};
     int group_status_{0};

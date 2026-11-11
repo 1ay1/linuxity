@@ -1407,6 +1407,7 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
             // auxv as a direct exec shows it, even when linuxity started the
             // program through its loader (debuggers find the program by it)
             if (tail == "auxv") {
+                if (auto f = procs.host_fact(self_tid, "auxv")) return ok(text_file(std::move(*f)));
                 const int h = procs.host_of(self_tid);
                 if (h <= 0) return err<kernel::VirtualFile>(Errno::enoent);
                 return ok(text_file(detail::fixed_auxv(h)));
