@@ -22,6 +22,7 @@
 #include "linuxity/vfs/sysfs.hpp"
 
 #include "guest_env.hpp"
+#include "guest_files.hpp"
 #include "host_run.hpp"
 #include "options.hpp"
 #include "supervisor.hpp"
@@ -502,100 +503,10 @@ int lx::cli::host_run(lx::cli::Options& o, int argc, char** argv) {
                  [&](env::Json& j) { j.kv("at", norm).kv("host", host_dir); });
     }
 
-    // Guarantee working DNS in a real rootfs (the proot-distro lesson, done
-    // the modern way). proot-distro OVERWRITES the rootfs's /etc/resolv.conf on
-    // disk with hardcoded 8.8.8.8; linuxity never mutates the image.
-    //
-    // DNS. A pristine rootfs ships /etc/resolv.conf empty or absent, so the
-    // runtime supplies one: kernel/resolver.hpp picks the nameservers (env
-    // override > the image's own > the host's resolv.conf > public) and the
-    // namespace serves the result as a VIRTUAL file, like /proc and /dev.
-    //
-    // This used to BIND the host's /etc/resolv.conf, which is a glibc-ism:
-    // Android has no such file (DNS lives in netd), so the bind silently did
-    // nothing and every guest lookup failed while the host resolved fine.
-    // Serving a virtual file is one path for every host and never mutates
-    // the image. Opt out with LINUXITY_NO_DNS=1.
-    // The served body is shared so `linuxity reload` can change it live.
-    auto resolv = std::make_shared<std::string>();
-    if (!root.empty() && o.manage_dns && !std::getenv("LINUXITY_NO_DNS")) {
-        const auto gpc = k.files().classify("/etc/resolv.conf");
-        const std::string guest_resolv =
-            gpc.realm == kernel::Realm2::host_backed ? gpc.host_path : std::string{};
-
-        // network.dns (or --dns) is the explicit override, like LINUXITY_DNS
-        std::string dns_spec;
-        for (const auto& s : o.dns) dns_spec += (dns_spec.empty() ? "" : ",") + s;
-        const auto choice = kernel::choose_nameservers(
-            dns_spec.empty() ? std::getenv("LINUXITY_DNS") : dns_spec.c_str(),
-            "/etc/resolv.conf", guest_resolv);
-
-        // The image's own resolver needs no help: leave the file alone so the
-        // guest keeps whatever it shipped (and any options with it).
-        if (choice.origin != kernel::ResolverOrigin::guest_file &&
-            !choice.empty()) {
-            *resolv = kernel::render_resolv_conf(choice.servers);
-            k.files().mount_virtual(
-                "/etc/resolv.conf",
-                [resolv](std::string_view) -> Result<kernel::VirtualFile> {
-                    kernel::VirtualFile vf;
-                    const std::string& body = *resolv;
-                    vf.bytes.assign(
-                        reinterpret_cast<const std::byte*>(body.data()),
-                        reinterpret_cast<const std::byte*>(body.data() + body.size()));
-                    return vf;
-                });
-        }
-        const std::string origin{kernel::origin_name(choice.origin)};
-        st.event("dns", choice.empty() ? std::string{"no nameservers found"}
-                                       : "dns from " + origin + " (" + choice.servers.front() + ")",
-                 [&](env::Json& j) { j.kv("origin", origin).kv("servers", choice.servers); });
-    }
-
-    // /etc/hostname follows system.hostname (and a live reload). With an env
-    // the config owns the name; a bare --root run keeps the image's file if
-    // it has one. Read from the machine on every open, like uname.
-    if (!root.empty()) {
-        const auto hpc = k.files().classify("/etc/hostname");
-        if (hpc.realm != kernel::Realm2::host_backed || !o.env_name.empty()) {
-            k.files().mount_virtual("/etc/hostname", [&k](std::string_view) -> Result<kernel::VirtualFile> {
-                kernel::VirtualFile vf;
-                const std::string body = k.machine().nodename + "\n";
-                vf.bytes.assign(reinterpret_cast<const std::byte*>(body.data()),
-                                reinterpret_cast<const std::byte*>(body.data() + body.size()));
-                return vf;
-            });
-        }
-    }
-
-    // /etc/hosts: the image's own, plus the hostname when it lacks it, so
-    // sudo and friends can resolve it (WSL and Docker do the same). Live, so
-    // a hostname change shows up at once. network.manage-hosts=false turns
-    // it off and leaves the file editable.
-    if (!root.empty() && o.manage_hosts) {
-        const auto hpc = k.files().classify("/etc/hosts");
-        const std::string image_hosts = hpc.realm == kernel::Realm2::host_backed ? hpc.host_path : std::string{};
-        k.files().mount_virtual("/etc/hosts", [&k, image_hosts](std::string_view) -> Result<kernel::VirtualFile> {
-            std::string body = image_hosts.empty() ? std::string{} : env::slurp(image_hosts).value_or("");
-            if (body.empty()) body = "127.0.0.1\tlocalhost\n::1\t\tlocalhost ip6-localhost ip6-loopback\n";
-            if (!body.empty() && body.back() != '\n') body.push_back('\n');
-            const std::string& h = k.machine().nodename;
-            bool named = false;
-            std::size_t at = 0;
-            while (!named && (at = body.find(h, at)) != std::string::npos) {
-                const bool left = at == 0 || body[at - 1] == ' ' || body[at - 1] == '\t';
-                const std::size_t e = at + h.size();
-                const bool right = e == body.size() || body[e] == ' ' || body[e] == '\t' || body[e] == '\n' || body[e] == '.';
-                named = left && right;
-                at = e;
-            }
-            if (!named) body += "127.0.1.1\t" + h + "\n";
-            kernel::VirtualFile vf;
-            vf.bytes.assign(reinterpret_cast<const std::byte*>(body.data()),
-                            reinterpret_cast<const std::byte*>(body.data() + body.size()));
-            return vf;
-        });
-    }
+    // DNS, /etc/hostname and /etc/hosts, served as virtual files
+    // (src/guest_files.hpp, shared by every host). The resolv.conf body is
+    // shared so `linuxity reload` can change it live.
+    auto resolv = cli::mount_guest_files(k, o);
 
     // Which AF_UNIX namespace this host actually permits. Probed, not
     // assumed: Android's SELinux denies a filesystem bind in every directory

@@ -35,6 +35,17 @@ inline constexpr std::string_view kHostArch = "aarch64";
 inline constexpr std::string_view kHostArch = "x86_64";
 #endif
 
+// The minimal images ship WITHOUT a package index, so the first thing
+// anyone types -- `apk add git`, `apt install git` -- answered "no such
+// package" / "Unable to locate package". Fetch it while setting up; offline,
+// say how to do it later instead of failing the whole `new`.
+inline constexpr std::string_view kAlpineSetup =
+    "apk update -q >/dev/null 2>&1 || "
+    "echo 'linuxity: no network for the package index yet; run `apk update` when there is' >&2; true";
+inline constexpr std::string_view kUbuntuSetup =
+    "apt-get update -qq >/dev/null 2>&1 || "
+    "echo 'linuxity: no network for the package lists yet; run `apt update` when there is' >&2; true";
+
 // Arch needs a mirror and a keyring before pacman can do anything.
 inline constexpr std::string_view kArchSetup =
     "f=/etc/pacman.d/mirrorlist; "
@@ -47,19 +58,19 @@ inline constexpr std::string_view kAlarmSetup =
 inline constexpr Image kImages[] = {
     {"alpine", "3.24", "aarch64", "Alpine Linux 3.24",
      "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/aarch64/alpine-minirootfs-3.24.4-aarch64.tar.gz",
-     "sha256", "4b14c18f7e90a063b61462ea1462a5732c154bf6adad594974fe6487cd98a8de", "", "", "", 4,
+     "sha256", "4b14c18f7e90a063b61462ea1462a5732c154bf6adad594974fe6487cd98a8de", "", "", kAlpineSetup, 4,
      "tiny and fast; musl, apk"},
     {"alpine", "3.24", "x86_64", "Alpine Linux 3.24",
      "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/alpine-minirootfs-3.24.4-x86_64.tar.gz",
-     "sha256", "cdaa38cb8de3537967ee5b6c9b6cd00cc962da2b018e6eea48696bb274923012", "", "", "", 4,
+     "sha256", "cdaa38cb8de3537967ee5b6c9b6cd00cc962da2b018e6eea48696bb274923012", "", "", kAlpineSetup, 4,
      "tiny and fast; musl, apk"},
     {"ubuntu", "24.04", "aarch64", "Ubuntu 24.04 LTS",
      "https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.5-base-arm64.tar.gz",
-     "sha256", "a91d5a93010193712d346d761372b7c9db6dfcf093893161c64ca107f05914f2", "", "", "", 30,
+     "sha256", "a91d5a93010193712d346d761372b7c9db6dfcf093893161c64ca107f05914f2", "", "", kUbuntuSetup, 30,
      "the familiar one; glibc, apt"},
     {"ubuntu", "24.04", "x86_64", "Ubuntu 24.04 LTS",
      "https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.5-base-amd64.tar.gz",
-     "sha256", "e77b6f10c2590cef872b33ee9f635a0e3fd1f57fb074c0e52b5c7f56147a0c86", "", "", "", 30,
+     "sha256", "e77b6f10c2590cef872b33ee9f635a0e3fd1f57fb074c0e52b5c7f56147a0c86", "", "", kUbuntuSetup, 30,
      "the familiar one; glibc, apt"},
     {"arch", "latest", "aarch64", "Arch Linux ARM",
      "https://fl.us.mirror.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz",

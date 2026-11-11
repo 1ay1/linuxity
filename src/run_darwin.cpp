@@ -52,6 +52,7 @@
 #include "linuxity/host/self_exe.hpp"
 
 #include "guest_env.hpp"
+#include "guest_files.hpp"
 #include "host_run.hpp"
 #include "options.hpp"
 
@@ -161,6 +162,9 @@ struct Machine {
             if (const char* tty = ::isatty(fd) ? ::ttyname(fd) : nullptr)
                 k.files().mount_host(tty, tty);
         k.files().mount_host("/dev/tty", "/dev/tty");
+        // DNS, /etc/hostname, /etc/hosts -- the same as every host. A fork
+        // child rebuilds the same files from the same flags, silently.
+        resolv_ = cli::mount_guest_files(k, o, /*quiet_events=*/fork_child);
         root_ = o.root;
         real_root_ = canonical(root_);
         real_upper_ = canonical(upper_);
@@ -193,6 +197,7 @@ struct Machine {
         return (!p.empty() && ::realpath(p.c_str(), buf)) ? std::string{buf} : std::string{};
     }
     std::string root_;
+    std::shared_ptr<std::string> resolv_;   // the served /etc/resolv.conf
     std::string upper_;
     std::string real_root_;     // canonical(root_), e.g. /private/tmp/archarm
     std::string real_upper_;

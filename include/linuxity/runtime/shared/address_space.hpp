@@ -116,11 +116,16 @@ public:
     [[nodiscard]] std::uint64_t set_brk(std::uint64_t want) {
         if (want == 0) return brk_cur_;                 // query
         if (want < brk_base_) return brk_cur_;          // below the heap floor
-        // The heap may grow until the first mapping ABOVE its base. (Testing
-        // against the lowest mapping overall -- the program's own text and
-        // data, which sit BELOW the heap -- refuses every grow, and glibc's
-        // malloc silently falls back to mmap for everything.)
-        if (page_up(want) > ceiling_above(brk_base_)) return brk_cur_;
+        // The heap may grow until the first mapping above the CURRENT break,
+        // as on Linux (mm/mmap.c checks the range being added). Measuring
+        // from the heap's base instead counted anything mapped inside the
+        // heap: musl puts a PROT_NONE guard page just past its first brk
+        // pages (mmap MAP_FIXED at the break), and from then on every grow
+        // was refused. (Testing against the lowest mapping overall -- the
+        // program's own text and data, BELOW the heap -- refused every grow
+        // from the start.)
+        const std::uint64_t from = page_up(brk_cur_ > brk_base_ ? brk_cur_ : brk_base_);
+        if (page_up(want) > from && page_up(want) > ceiling_above(from)) return brk_cur_;
         // Linux returns the requested (unrounded) break, and libc compares
         // against exactly what it asked for.
         brk_cur_ = want;

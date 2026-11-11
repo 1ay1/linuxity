@@ -63,6 +63,7 @@
 #include <linux/rtnetlink.h>
 #endif
 #include <ctime>
+#include "linuxity/host/fd_link.hpp"
 #include "linuxity/host/long_path.hpp"
 #include "linuxity/host/real_netns.hpp"
 #include "linuxity/host/stat_fields.hpp"
@@ -4410,22 +4411,18 @@ private:
         struct ::stat dt{};
         if (::lstat(pd.host_path.c_str(), &dt) == 0) return eno(Errno::eexist);
         if (host_links_work(pd.host_path)) {
-            const std::string self = "/proc/self/fd/" + std::to_string(sfd);
-            if (::linkat(AT_FDCWD, self.c_str(), AT_FDCWD, pd.host_path.c_str(),
-                         AT_SYMLINK_FOLLOW) != 0)
-                return eno(static_cast<Errno>(errno));
-            return val(0);
+            const int e = host::link_fd(sfd, pd.host_path);
+            if (e == 0) return val(0);
+            // an unnamed file the host can't link (no /proc/self/fd): copy
+            if (!(e == ENOENT && st.st_nlink == 0)) return eno(wire::errno_from_host(e));
         }
         if (st.st_nlink == 0) {                           // O_TMPFILE: no name
             const Errno e = k_.files().emulate_link_from_fd(sfd, pd.host_path);
             return e == Errno::ok ? val(0) : eno(e);
         }
         // A named file: alias whatever host path the fd really refers to.
-        char link[64], tgt[4096];
-        std::snprintf(link, sizeof link, "/proc/self/fd/%d", sfd);
-        const ssize_t n = ::readlink(link, tgt, sizeof tgt - 1);
-        if (n <= 0) return eno(Errno::enoent);
-        tgt[n] = '\0';
+        const std::string tgt = host::fd_path(sfd);
+        if (tgt.empty()) return eno(Errno::enoent);
         const int out = ::open(pd.host_path.c_str(),
                                O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
         if (out < 0) return eno(static_cast<Errno>(errno));
