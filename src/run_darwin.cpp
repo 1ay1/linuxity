@@ -788,6 +788,12 @@ void run_guest_thread(ThreadContext& ctx, runtime::HvfTrap::ThreadStart start) {
     std::mutex threads_mu;
     ThreadContext ctx{o, m, machine, proc, pids, forker, threads, threads_mu};
     wire_spawners(trap, ctx);
+    // and back: a host pid Darwin reports (a SysV object's cpid/lspid) is
+    // the guest process that linuxity process runs
+    m.k.procs().set_guest_resolver([&pids](int h) {
+        const std::int32_t g = pids.guest_of(static_cast<pid_t>(h));
+        return g > 0 ? g : 0;
+    });
     // /proc's per-task facts: macOS has no host /proc, so this process
     // answers for itself (and its threads), Darwin for the others.
     m.k.procs().set_host_facts([&proc, &pids](std::int32_t g, std::string_view leaf)

@@ -15,6 +15,7 @@
 #pragma once
 
 #include "linuxity/host/entropy.hpp"
+#include "linuxity/host/sysv_table.hpp"
 #include "linuxity/kernel/file_namespace.hpp"
 #include "linuxity/kernel/machine.hpp"
 #include "linuxity/kernel/process_table.hpp"
@@ -565,9 +566,17 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
             // too, with its host pids and uids shown as the guest's. A guest's
             // own IPC namespace is linuxity's.
             const bool own_ipc_ns = procs.ns_of(procs.reader())[kernel::NsKind::ipc] != 0;
-            if (procs.ipc().host_backed() && !own_ipc_ns)
+            if (procs.ipc().host_backed() && !own_ipc_ns) {
                 if (std::string h = host_file(std::string{abs}.c_str()); !h.empty())
                     return ok(text_file(sysvipc_from_host(procs, h, abs.substr(14))));
+                // A host with SysV IPC but no /proc of its own (Darwin):
+                // its listing, in the same columns, behind our own header.
+                if (std::string h = host::sysvipc_table(abs.substr(14)); !h.empty()) {
+                    std::string t = sysvipc_text(procs, abs.substr(14));
+                    h.replace(0, h.find('\n'), t.substr(0, t.find('\n')));
+                    return ok(text_file(sysvipc_from_host(procs, h, abs.substr(14))));
+                }
+            }
             return ok(text_file(sysvipc_text(procs, abs.substr(14))));
         }
 

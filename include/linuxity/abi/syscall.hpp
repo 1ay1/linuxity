@@ -2796,11 +2796,41 @@ private:
     [[nodiscard]] Outcome do_readlink(const Regs& r, int path_arg, bool at) {
         // An empty path is ENOENT (readlink(2)); don't resolve "" to "/" and
         // redirect to the overlay root (a directory) — that faults the caller.
-        // (readlinkat with AT_EMPTY_PATH would read the dirfd's own link; we
-        // don't service that, so forward it.)
         std::string raw0 =
             read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)]));
-        if (raw0.empty()) return at ? fwd() : eno(Errno::enoent);
+        if (raw0.empty() && !at) return eno(Errno::enoent);
+        if (raw0.empty()) {
+#if defined(__linux__)
+            return fwd();   // the host kernel reads an O_PATH link fd itself
+#else
+            // readlinkat(fd, ""): the link the fd itself names (an O_PATH |
+            // O_NOFOLLOW handle). Forwarding handed the host an empty path,
+            // which a host that resolves names itself answers ENOENT.
+            const std::string p{dir_of(static_cast<std::int64_t>(r.arg[0]))};
+            if (p.empty()) return fwd();
+            const std::size_t bi0 = static_cast<std::size_t>(path_arg) + 1;
+            const UAddr buf0 = uaddr(r.arg[bi0]);
+            const std::size_t cap0 = static_cast<std::size_t>(r.arg[bi0 + 1]);
+            if (static_cast<std::int64_t>(r.arg[bi0 + 1]) <= 0) return eno(Errno::einval);
+            if (std::string tgt = proc_symlink_target(p); !tgt.empty())
+                return write_link(buf0, cap0, tgt);
+            auto pc = k_.files().classify(p, /*for_write=*/false, /*follow=*/false);
+            if (pc.realm == kernel::Realm2::host_backed) {
+                char tgt[4096];
+                const ::ssize_t n = ::readlink(pc.host_path.c_str(), tgt, sizeof tgt);
+                if (n < 0) return eno(errno == EINVAL ? Errno::enoent : wire::errno_from_host(errno));
+                const std::size_t len = std::min(static_cast<std::size_t>(n), cap0);
+                if (len && !mem_.copy_out(buf0, {reinterpret_cast<const std::byte*>(tgt), len}))
+                    return eno(Errno::efault);
+                return val(static_cast<std::int64_t>(len));
+            }
+            if (pc.realm == kernel::Realm2::virtual_file)
+                if (auto vf = k_.files().produce(p); vf && !vf->symlink_target.empty() &&
+                                                     vf->symlink_target != "(proc-link)")
+                    return write_link(buf0, cap0, vf->symlink_target);
+            return eno(Errno::enoent);   // the fd is not a symlink
+#endif
+        }
         // A non-positive bufsiz is EINVAL, and the kernel checks it BEFORE it
         // resolves the path -- so it outranks every lookup error, including
         // the EACCES an unsearchable component would give. (bufsiz is the

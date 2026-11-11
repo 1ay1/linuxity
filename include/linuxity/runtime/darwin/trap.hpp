@@ -1572,16 +1572,45 @@ private:
                 struct ::shmid_ds ds{};
                 if (::shmctl(static_cast<int>(a0), IPC_STAT, &ds) < 0)
                     return darwin::fail();
+                // The segment's CONTENTS live in a named host shm object
+                // (one per segment id) that every attach maps MAP_SHARED, so
+                // a fork child's or another process's attach really shares
+                // the parent's pages. (They used to be copied in at shmat and
+                // out at shmdt, so concurrent attaches never saw each other.)
+                // The Darwin segment stays the authority for ids, keys,
+                // permissions and IPC_STAT; holding a host attach for the
+                // guest's keeps its nattch/lpid/atime honest.
+                const std::uint64_t hp = HvfMachine::host_page();
+                const std::uint64_t span = (ds.shm_segsz + hp - 1) / hp * hp;
+                const bool rdonly = (a2 & 010000) != 0;         // SHM_RDONLY
+                const GuestProt prot = rdonly ? GuestProt::read : GuestProt::read | GuestProt::write;
+                if (a1 % hp) return -22;                        // (SHM_RND unsupported)
+                if (const int obj = sysv_shm_object(static_cast<int>(a0), span); obj >= 0) {
+                    const std::uint64_t at = proc_.with_space([&](AddressSpace& sp) {
+                        return sp.map(a1, span, prot, a1 != 0, /*anonymous=*/true, hp);
+                    });
+                    if (at == AddressSpace::kFail) { ::close(obj); return -12; }
+                    const bool ok = add_backing(at, span, obj, 0);
+                    ::close(obj);
+                    if (ok) {
+                        if (rdonly) set_pte_prot(at, span, prot);
+                        else reset_pte_prot(at, span);
+                        void* host = ::shmat(static_cast<int>(a0), nullptr, rdonly ? SHM_RDONLY : 0);
+                        shm_attached_[at] = {static_cast<int>(a0),
+                                             static_cast<std::uint64_t>(ds.shm_segsz), span,
+                                             host == reinterpret_cast<void*>(-1) ? nullptr : host};
+                        return static_cast<std::int64_t>(at);
+                    }
+                    proc_.with_space([&](AddressSpace& sp) { sp.unmap(at, span); return 0; });
+                }
                 const std::uint64_t len = AddressSpace::page_up(ds.shm_segsz);
                 const std::uint64_t at = proc_.with_space([&](AddressSpace& sp) {
                     return sp.map(a1, len, GuestProt::read | GuestProt::write,
                                   a1 != 0, /*anonymous=*/true);
                 });
                 if (at == AddressSpace::kFail) return -12;
-                // Copy the segment's current contents in, and remember the
-                // mapping so shmdt can write changes back. True shared
-                // memory across guest PROCESSES already works, because every
-                // guest process shares one RAM mapping.
+                // No host object (shm_open refused): copy the segment's
+                // current contents in, and write changes back at shmdt.
                 if (void* p = ::shmat(static_cast<int>(a0), nullptr, SHM_RDONLY);
                     p != reinterpret_cast<void*>(-1)) {
                     auto win = machine_.ram().at(at, ds.shm_segsz);
@@ -1589,12 +1618,19 @@ private:
                     ::shmdt(p);
                 }
                 shm_attached_[at] = {static_cast<int>(a0),
-                                     static_cast<std::uint64_t>(ds.shm_segsz)};
+                                     static_cast<std::uint64_t>(ds.shm_segsz), 0, nullptr};
                 return static_cast<std::int64_t>(at);
             }
             case S::shmdt: {
                 auto it = shm_attached_.find(a0);
                 if (it == shm_attached_.end()) return -22;
+                if (it->second.span) {                         // a shared backing
+                    drop_backings(a0, it->second.span);
+                    proc_.with_space([&](AddressSpace& sp) { sp.unmap(a0, it->second.span); return 0; });
+                    if (it->second.host) ::shmdt(it->second.host);
+                    shm_attached_.erase(it);
+                    return 0;
+                }
                 // Publish our changes before detaching.
                 if (void* p = ::shmat(it->second.id, nullptr, 0);
                     p != reinterpret_cast<void*>(-1)) {
@@ -1610,9 +1646,14 @@ private:
             }
             case S::shmctl: {
                 const int cmd = static_cast<int>(a1);
-                if (cmd == kIpcRmid)
-                    return ::shmctl(static_cast<int>(a0), IPC_RMID, nullptr) < 0
-                               ? darwin::fail() : 0;
+                if (cmd == kIpcRmid) {
+                    if (::shmctl(static_cast<int>(a0), IPC_RMID, nullptr) < 0)
+                        return darwin::fail();
+                    // Live attaches keep their mapping of the object; a new
+                    // segment that reuses the id must start from zeros.
+                    ::shm_unlink(sysv_shm_name(static_cast<int>(a0)).c_str());
+                    return 0;
+                }
                 if (cmd == kIpcStat || cmd == kShmStat) {
                     struct ::shmid_ds ds{};
                     if (::shmctl(static_cast<int>(a0), IPC_STAT, &ds) < 0)
@@ -5606,10 +5647,22 @@ private:
                                            : ::unlink(path->c_str());
                 return rc < 0 ? darwin::fail() : 0;
             }
-            case S::renameat: case S::renameat2:
+            case S::renameat: case S::renameat2: {
                 if (!path || !path2) return -2;
+                // renameat2's NOREPLACE (1) / EXCHANGE (2) are Darwin's
+                // renamex_np RENAME_EXCL / RENAME_SWAP. Ignoring them made
+                // NOREPLACE silently clobber the target. WHITEOUT (4) has
+                // no host equivalent.
+                const std::uint64_t fl = sc == S::renameat2 ? regs_.arg(4) : 0;
+                if (fl & ~std::uint64_t{3} || fl == 3) return -22;   // EINVAL
+                if (fl) {
+                    const unsigned hf = (fl & 1) ? RENAME_EXCL : RENAME_SWAP;
+                    return ::renamex_np(path->c_str(), path2->c_str(), hf) < 0
+                               ? darwin::fail() : 0;
+                }
                 return ::rename(path->c_str(), path2->c_str()) < 0
                            ? darwin::fail() : 0;
+            }
             case S::linkat:
                 if (!path || !path2) return -2;
                 return ::link(path->c_str(), path2->c_str()) < 0
@@ -5819,9 +5872,28 @@ private:
     std::map<int, SignalFd> signalfds_;
     std::map<int, std::shared_ptr<InotifyFd>> inotifies_;
     std::map<int, std::int32_t> pidfds_;          // guest fd -> guest pid
-    // SysV shared-memory attachments: guest address -> segment.
-    struct ShmSeg { int id; std::uint64_t size; };
+    // SysV shared-memory attachments: guest address -> segment. `span` is
+    // the host-page-rounded size of a shared backing (0: the copy fallback);
+    // `host` the Darwin attach held for nattch.
+    struct ShmSeg { int id; std::uint64_t size; std::uint64_t span; void* host; };
     std::map<std::uint64_t, ShmSeg> shm_attached_;
+    // The host shm object holding SysV segment `id`'s contents.
+    [[nodiscard]] static std::string sysv_shm_name(int id) {
+        return "/lxsv." + std::to_string(id);
+    }
+    [[nodiscard]] static int sysv_shm_object(int id, std::uint64_t span) {
+        const int fd = ::shm_open(sysv_shm_name(id).c_str(), O_RDWR | O_CREAT, 0600);
+        if (fd < 0) return -1;
+        struct ::stat st{};
+        // Darwin sizes a POSIX shm object once; the first attach does it.
+        if (::fstat(fd, &st) != 0 ||
+            (st.st_size == 0 && ::ftruncate(fd, static_cast<off_t>(span)) < 0) ||
+            (st.st_size != 0 && static_cast<std::uint64_t>(st.st_size) < span)) {
+            ::close(fd);
+            return -1;
+        }
+        return fd;
+    }
     // Open directory streams for getdents64, keyed by guest fd.
     struct Entry {
         std::uint64_t ino{};
