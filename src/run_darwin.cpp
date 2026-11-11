@@ -93,6 +93,8 @@ struct Machine {
         if (char cwd[4096]; ::getcwd(cwd, sizeof cwd) != nullptr)
             k.files().set_host_cwd(cwd);
         k.files().set_fork_child(fork_child);
+        // kqueue can't name directory entries: linuxity keeps inotify
+        k.files().set_fsnotify_emulated(true);
         kernel::MachineSpec spec;
         const long n = ::sysconf(_SC_NPROCESSORS_ONLN);
         spec.ncpu = n > 0 ? n : 1;

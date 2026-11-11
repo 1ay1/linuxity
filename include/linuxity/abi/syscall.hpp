@@ -30,6 +30,7 @@
 
 #include <array>
 #include "linuxity/abi/creds.hpp"
+#include "linuxity/abi/fsnotify_events.hpp"
 #include "linuxity/abi/wire/errno_map.hpp"
 #include <cstdint>
 #include <cstring>
@@ -223,6 +224,7 @@ public:
         if (ll_layers_ > 0)
             if (const Errno e = ll_gate(sc, r); e != Errno::ok) return eno(e);
         path_too_long_ = false;
+        plan_fsnotify(sc, r);           // before: a close unbinds its path
         Outcome o = dispatch_calls(sc, r);
         // The kernel's getname(): a path argument of PATH_MAX bytes or more
         // (NUL included) is ENAMETOOLONG before any lookup. A forwarding
@@ -237,6 +239,91 @@ public:
 private:
     // Set by read_cstr when a string ran past PATH_MAX (see dispatch).
     bool path_too_long_{false};
+
+    // -- inotify, where linuxity keeps it (kernel/fsnotify.hpp) -------------
+    // The events this call will cause if it succeeds, planned before it runs
+    // (while the guest paths are known: an unlink's name is gone after) and
+    // committed by the backend with the result, through fsnotify_commit.
+    // Nothing at all unless some process in the tree is watching.
+    std::vector<kernel::fsnotify::Event> fsn_plan_;
+
+    // O_ACCMODE of guest fd `fd` (0 read, 1 write, 2 read-write; 0 unknown).
+    [[nodiscard]] unsigned fd_access_mode(int fd) {
+        if constexpr (requires { mem_.host_fd_of(fd); } && !requires { mem_.host_tid(); }) {
+            const int h = mem_.host_fd_of(fd);
+            const int fl = h >= 0 ? ::fcntl(h, F_GETFL) : -1;
+            return fl < 0 ? 0u : static_cast<unsigned>(fl & O_ACCMODE);
+        } else if constexpr (requires { mem_.host_tid(); }) {
+            return fdinfo_flags(mem_.host_tid(), std::to_string(fd).c_str()) & 3u;
+        } else {
+            (void)fd;
+            return 0u;
+        }
+    }
+
+    // Evaluate abi/fsnotify_events.hpp's row for this call.
+    void plan_fsnotify(Sysno sc, const Regs& r) {
+        namespace fn = kernel::fsnotify;
+        namespace fe = fsnotify_events;
+        fsn_plan_.clear();
+        const auto row = fe::row_of(sc);
+        if (!row) return;
+        auto& hub = k_.files().fsnotify();
+        if (!hub.attached() || !hub.active()) return;
+        auto is_dir = [&](const std::string& g) {
+            const auto pc = k_.files().classify(g, false, false);
+            struct ::stat st{};
+            return pc.realm == kernel::Realm2::host_backed &&
+                   ::lstat(pc.host_path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+        };
+        auto ev = [&](std::uint32_t m, const std::string& p, std::uint32_t cookie = 0) {
+            if (!p.empty() && p.front() == '/') fsn_plan_.push_back({m, cookie, p});   // a pipe names nothing
+        };
+        const int fd0 = static_cast<int>(r.arg[0]);
+        auto object = [&](int arg) -> std::string {
+            switch (row->obj) {
+                case fe::Obj::fd: return std::string{k_.files().path_of_fd(fd0)};
+                case fe::Obj::path_or_fd:
+                    if (r.arg[static_cast<std::size_t>(arg)] == 0) return std::string{k_.files().path_of_fd(fd0)};
+                    [[fallthrough]];
+                case fe::Obj::path: return resolve_arg(r, arg, row->at, row->follow);
+            }
+            return {};
+        };
+        const std::string g = object(row->arg);
+        const std::uint32_t dir = row->isdir_from_object && is_dir(g) ? fn::kIsDir : 0u;
+        switch (row->kind) {
+            case fe::Kind::plain: ev(row->bit | dir, g); break;
+            case fe::Kind::open:
+                if (wire::has(r.arg[2], wire::OpenFlag::creat) && !guest_exists(g)) ev(fn::kCreate, g);
+                ev(fn::kOpen | dir, g);
+                if (wire::has(r.arg[2], wire::OpenFlag::trunc)) ev(fn::kModify, g);
+                break;
+            case fe::Kind::unlink: ev(fn::kDelete | ((r.arg[2] & 0x200) ? fn::kIsDir : 0u), g); break;
+            case fe::Kind::rename: {
+                const std::string to = resolve_arg(r, 3, true, false);
+                const std::uint32_t d = is_dir(g) ? fn::kIsDir : 0u, c = fn::new_cookie();
+                ev(fn::kMovedFrom | d, g, c);
+                ev(fn::kMovedTo | d, to, c);
+                break;
+            }
+            case fe::Kind::close:
+                ev(((fd_access_mode(fd0) & 3u) ? fn::kCloseWrite : fn::kCloseNowrite) | dir, g);
+                break;
+            case fe::Kind::access:
+                if (!is_dir(g)) ev(fn::kAccess, g);
+                break;
+        }
+    }
+
+public:
+    // The call finished with `rc`: what it did happens, for watchers.
+    void fsnotify_commit(std::int64_t rc) {
+        if (fsn_plan_.empty()) return;
+        if (rc >= 0) k_.files().fsnotify().emit_all(fsn_plan_);
+        fsn_plan_.clear();
+    }
+private:
 
     // Every syscall linuxity answers, by number (dispatch wraps it).
     [[nodiscard]] Outcome dispatch_calls(const Sysno sc, const Regs& r) {

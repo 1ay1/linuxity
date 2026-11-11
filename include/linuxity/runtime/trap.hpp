@@ -116,6 +116,13 @@ public:
             trap_.set_flush_events([&] { locked([&] { apply_proc_events(); }); });
         if constexpr (requires { trap_.ig_setup(kernel_, sys); })
             locked([&] { trap_.ig_setup(kernel_, sys); });
+        // A backend that answers inotify itself (kernel/fsnotify.hpp) hears
+        // every call's final result, so the dispatcher's planned events are
+        // emitted exactly when the call succeeded.
+        if constexpr (requires { trap_.set_result_observer(std::function<void(std::int64_t)>{}); })
+            trap_.set_result_observer([&](std::int64_t rc) { locked([&] { sys.fsnotify_commit(rc); }); });
+        if constexpr (requires { trap_.set_fsnotify_hub(nullptr); })
+            trap_.set_fsnotify_hub(&kernel_.files().fsnotify());
         for (;;) {
             TrapFrame f;
             const auto t_wait = prof_.on ? prof_clock() : 0;

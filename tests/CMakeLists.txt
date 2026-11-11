@@ -15,7 +15,7 @@ endif()
 set(LX_PORTABLE_TESTS
     core authority vfs interp file_namespace sysfs_proctree
     resources address_space sysno conformance outcome wire fd_slots
-    conform_law conform_hosts conform_coverage resolver landlock creds)
+    conform_law conform_hosts conform_coverage resolver landlock creds fsnotify)
 
 # The syscall-cost benchmark. NOT a ctest: it measures, it does not assert,
 # and a timing threshold in CI is a flake generator. Build it and run it by

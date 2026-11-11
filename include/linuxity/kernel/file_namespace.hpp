@@ -38,6 +38,7 @@
 #include "linuxity/host/dirent_type.hpp"
 #include "linuxity/host/long_path.hpp"
 #include "linuxity/kernel/fork_state.hpp"
+#include "linuxity/kernel/fsnotify.hpp"
 
 #include <cstdint>
 #include <algorithm>
@@ -179,6 +180,7 @@ public:
             meta_.attach(upper, /*compact=*/is_root_);
             links_.attach(upper);
             meta_attached_ = true;
+            if (fsnotify_emulated_) fsnotify_.attach(upper + "/" + std::string{fsnotify::kDirLeaf});
             whiteout_journal_ = upper + "/.linuxity-whiteout";
             const std::size_t wl = load_whiteouts();
             if (is_root_ && wl > 1024 && wl > whiteouts_.size() * 4) rewrite_whiteouts();
@@ -191,6 +193,26 @@ public:
     // A fork child (a guest process started by another guest process) must
     // not do root-only hygiene. Set before the first mount_host.
     void set_fork_child(bool child) noexcept { is_root_ = !child; }
+
+    // The files linuxity keeps at the top of an upper layer: never part of
+    // the guest's tree, neither in a listing nor by name. The ONE list.
+    [[nodiscard]] static constexpr std::array<std::string_view, 5> internal_leaves() noexcept {
+        return {MetaStore::journal_leaf(), LinkTable::journal_leaf(), fsnotify::kDirLeaf,
+                std::string_view{".linuxity-whiteout"}, std::string_view{".linuxity-meta.ok"}};
+    }
+    [[nodiscard]] bool is_internal_path(std::string_view abs) const noexcept {
+        if (abs.size() < 2 || abs[0] != '/') return false;
+        abs.remove_prefix(1);
+        const auto slash = abs.find('/');
+        const std::string_view first = abs.substr(0, slash);
+        for (std::string_view l : internal_leaves()) if (first == l) return meta_attached_;
+        return false;
+    }
+    // The host can't report named directory events (kqueue), so linuxity
+    // keeps inotify itself: the dispatcher writes every path event to one
+    // log per tree (kernel/fsnotify.hpp). Set before the first mount_host.
+    void set_fsnotify_emulated(bool on) noexcept { fsnotify_emulated_ = on; }
+    [[nodiscard]] fsnotify::Hub& fsnotify() const noexcept { return fsnotify_; }
 
     // The shadow permission/ownership store (per-path mode/uid/gid overlay).
     // The dispatcher records guest chmod/chown here and overlays it back onto
@@ -493,6 +515,9 @@ public:
                                      bool follow,
                                      WriteIntent wi,
                                      int depth) const {
+        // linuxity's own files at the top of the upper layer are not part of
+        // the guest's tree: absent by name, as in a listing
+        if (is_internal_path(abs)) return PathClass{Realm2::absent, {}, Errno::enoent, {}};
         const Mount* m = deepest(abs);
         if (!m) return PathClass{Realm2::absent, {}, Errno::enoent, {}};
         if (m->producer) {
@@ -730,10 +755,7 @@ public:
         // layer, not part of the guest tree — never let it show up in a listing.
         // Erase via find(): transparent erase(K&&) is C++23, but a transparent
         // find() plus erase(iterator) is C++20 and allocates nothing either.
-        for (std::string_view hide : {MetaStore::journal_leaf(),
-                                      LinkTable::journal_leaf(),
-                                      std::string_view{".linuxity-whiteout"},
-                                      std::string_view{".linuxity-meta.ok"}})
+        for (std::string_view hide : internal_leaves())
             if (auto it = seen.find(hide); it != seen.end()) it->second.hidden = true;
         // Drop names whited-out from the lower layer (removed in the overlay
         // view but still present on the pristine rootfs) unless the upper has
@@ -2029,6 +2051,8 @@ private:
     mutable bool    have_inherited_fds_{false};
     mutable std::int32_t last_pid_{0};
     mutable MetaStore meta_{};
+    mutable fsnotify::Hub fsnotify_{};
+    bool fsnotify_emulated_{false};
     LinkTable links_{};
     bool meta_attached_{false};
     bool is_root_{true};

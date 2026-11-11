@@ -143,6 +143,8 @@ public:
     void set_resolver(Resolver r) { resolve_ = std::move(r); }
     // host path -> guest path, for readlink("/proc/self/fd/N").
     void set_unresolver(Resolver r) { unresolve_ = std::move(r); }
+    // The tree's inotify hub (kernel/fsnotify.hpp), owned by the kernel.
+    void set_fsnotify_hub(kernel::fsnotify::Hub* h) noexcept { hub_ = h; }
     void set_env_fallback(std::vector<std::string> env) { env_ = std::move(env); }
 
     // -- Identity bridge to the portable core. abi::Syscalls asks the memory
@@ -399,8 +401,12 @@ public:
             return ok();
         }
         cpu_.set_result(regs_, ret);
+        if (on_result_) on_result_(ret);
         return ok();
     }
+    // Called with every syscall's final result (the dispatcher's fsnotify
+    // commit). Installed by the loop, which owns the dispatcher.
+    void set_result_observer(std::function<void(std::int64_t)> f) { on_result_ = std::move(f); }
 
     [[nodiscard]] bool exited() const noexcept { return exited_; }
     [[nodiscard]] int exit_code() const noexcept { return code_; }
@@ -4197,11 +4203,12 @@ private:
                 return g;
             }
             case S::inotify_init1: {
-                auto in = std::make_shared<InotifyFd>();
+                if (!hub_) return -38;
+                auto in = std::make_shared<InotifyFd>(*hub_);
                 if (!in->valid()) return darwin::fail();
-                const int dup_kq = ::dup(in->kq());          // the guest's pollable fd
-                if (dup_kq < 0) return darwin::fail();
-                const auto g = install_or_close(dup_kq, (a0 & 1) != 0);
+                const int rd = ::dup(in->read_end());        // the guest's pollable fd
+                if (rd < 0) return darwin::fail();
+                const auto g = install_or_close(rd, (a0 & 1) != 0);
                 if (g < 0) return g;
                 inotifies_[static_cast<int>(g)] = std::move(in);
                 return g;
@@ -4214,7 +4221,8 @@ private:
                 if (!resolve_) return -38;
                 const std::string host = resolve_(ram.cstr(a1));
                 if (host.empty()) return -2;
-                return it->second->add_watch(host, static_cast<std::uint32_t>(a2));
+                const std::string guest = unresolve_ ? unresolve_(host) : ram.cstr(a1);
+                return it->second->add_watch(guest, host, static_cast<std::uint32_t>(a2));
             }
             case S::inotify_rm_watch: {
                 auto it = inotifies_.find(gfd);
@@ -4285,18 +4293,14 @@ private:
                 if (!need_fd()) return -9;                          // EBADF
                 auto win = ram.clamp(a1, a2);
                 if (win.empty() && a2) return -14;                  // EFAULT
-                // An inotify fd is a kqueue on Darwin, and read(2) on a kqueue
-                // is ENXIO -- which gpg-agent (it watches its socket dir) took
-                // as fatal, so every `pacman-key` agent died and signing
-                // failed with "no secret key". Translate kevents into
-                // inotify_event records instead; block like Linux unless the
-                // fd is nonblocking.
+                // An inotify fd: records from linuxity's own fsnotify (see
+                // InotifyFd); block like Linux unless the fd is nonblocking.
+                // (A raw read on the kqueue would be ENXIO.)
                 if (auto it = inotifies_.find(gfd); it != inotifies_.end()) {
-                    if (win.size() < sizeof(LinuxInotifyEvent)) return -22;   // EINVAL
                     const bool nb = (::fcntl(*hfd, F_GETFL) & O_NONBLOCK) != 0;
                     for (;;) {
-                        const std::size_t n = it->second->drain(win);
-                        if (n) return static_cast<std::int64_t>(n);
+                        const long n = it->second->drain(win);
+                        if (n != 0) return n;                                  // records, or -EINVAL
                         if (nb) return -11;                                    // EAGAIN
                         pollfd p{*hfd, POLLIN, 0};
                         if (::poll(&p, 1, -1) < 0 && errno == EINTR) return -4;
@@ -5697,6 +5701,8 @@ private:
     bool ready_announced_{false};   // PidSpace::ready: the kick handler is in
     Resolver resolve_;
     Resolver unresolve_;
+    kernel::fsnotify::Hub* hub_{nullptr};
+    std::function<void(std::int64_t)> on_result_;
     std::string fd_path_storage_;
     bool unlink_after_open_{false};   // fd_path_storage_ is a reopen clone
     bool memfds_{false};              // a memfd has been seen: check seals

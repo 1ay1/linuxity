@@ -27,7 +27,13 @@
 
 #if defined(__APPLE__)
 
+#include <atomic>
+#include <mutex>
+#include <thread>
+#include <span>
 #include <fcntl.h>
+
+#include "linuxity/kernel/fsnotify.hpp"
 #include <sys/event.h>
 #include <sys/stat.h>
 #include <sys/xattr.h>
@@ -74,157 +80,125 @@ struct LinuxInotifyEvent {
 };
 static_assert(sizeof(LinuxInotifyEvent) == 16);
 
-namespace inotify_bit {
-inline constexpr std::uint32_t access      = 0x001;
-inline constexpr std::uint32_t modify      = 0x002;
-inline constexpr std::uint32_t attrib      = 0x004;
-inline constexpr std::uint32_t close_write = 0x008;
-inline constexpr std::uint32_t close_nowr  = 0x010;
-inline constexpr std::uint32_t open_       = 0x020;
-inline constexpr std::uint32_t moved_from  = 0x040;
-inline constexpr std::uint32_t moved_to    = 0x080;
-inline constexpr std::uint32_t create      = 0x100;
-inline constexpr std::uint32_t delete_     = 0x200;
-inline constexpr std::uint32_t delete_self = 0x400;
-inline constexpr std::uint32_t move_self   = 0x800;
-}  // namespace inotify_bit
 
-// One inotify instance: a kqueue plus its watch descriptors.
+// One inotify instance. The events are linuxity's own (kernel/fsnotify.hpp):
+// every guest process's dispatcher appends what it did to this instance's
+// log when it concerns one of its watches, so names, cookies, opens, reads
+// and changes made by other guest processes all arrive -- what kqueue on the
+// watched inodes could not say.
+//
+// The guest's fd is the read end of a PIPE: forkable (a kqueue can't cross
+// a fork, so a watcher's fork() failed with EAGAIN) and pollable. A thread
+// sleeps in kevent on the log and keeps ONE byte in the pipe while records
+// are pending, so poll/select/epoll say readable exactly when read() has
+// records; read() drains the records and the byte together.
 class InotifyFd {
 public:
-    InotifyFd() : kq_{::kqueue()} {}
+    explicit InotifyFd(kernel::fsnotify::Hub& hub) : hub_{hub} {
+        id_ = hub_.open_instance();
+        if (id_.empty() || ::pipe(pipe_) != 0) return;
+        for (const int fd : pipe_) {
+            (void)::fcntl(fd, F_SETFD, FD_CLOEXEC);
+            (void)::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL) | O_NONBLOCK);
+        }
+        kq_ = ::kqueue();
+        log_fd_ = ::open(hub_.log_path(id_).c_str(), O_RDONLY | O_EVTONLY | O_CLOEXEC);
+        if (kq_ < 0 || log_fd_ < 0) return;
+        struct ::kevent ev[2]{};
+        EV_SET(&ev[0], log_fd_, EVFILT_VNODE, EV_ADD | EV_CLEAR, NOTE_WRITE | NOTE_EXTEND, 0, nullptr);
+        EV_SET(&ev[1], 1, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, nullptr);   // wake to stop
+        if (::kevent(kq_, ev, 2, nullptr, 0, nullptr) != 0) return;
+        ok_ = true;
+        thread_ = std::thread([this] { watch(); });
+    }
     InotifyFd(const InotifyFd&) = delete;
     InotifyFd& operator=(const InotifyFd&) = delete;
     ~InotifyFd() {
-        for (const Watch& w : watches_) if (w.fd >= 0) ::close(w.fd);
-        if (kq_ >= 0) ::close(kq_);
+        if (thread_.joinable()) {
+            stop_ = true;
+            struct ::kevent ev{};
+            EV_SET(&ev, 1, EVFILT_USER, 0, NOTE_TRIGGER, 0, nullptr);
+            (void)::kevent(kq_, &ev, 1, nullptr, 0, nullptr);
+            thread_.join();
+        }
+        if (!id_.empty()) hub_.close_instance(id_);
+        for (const int fd : {log_fd_, kq_, pipe_[0], pipe_[1]}) if (fd >= 0) ::close(fd);
     }
 
-    [[nodiscard]] bool valid() const noexcept { return kq_ >= 0; }
-    [[nodiscard]] int kq() const noexcept { return kq_; }
+    [[nodiscard]] bool valid() const noexcept { return ok_; }
+    // The guest's fd (a dup of the pipe's read end, owned by the fd table).
+    [[nodiscard]] int read_end() const noexcept { return pipe_[0]; }
 
-    // add_watch(host_path, mask) -> wd, or -errno.
-    [[nodiscard]] std::int64_t add_watch(const std::string& path, std::uint32_t mask) {
-        // An existing watch on the same path is UPDATED and keeps its wd,
-        // which is what inotify_add_watch promises.
-        for (Watch& w : watches_)
-            if (w.path == path) {
-                w.mask = mask;
-                struct ::kevent ev{};
-                EV_SET(&ev, w.fd, EVFILT_VNODE, EV_ADD | EV_CLEAR,
-                       notes_for(mask, w.is_dir), 0,
-                       reinterpret_cast<void*>(static_cast<std::intptr_t>(w.wd)));
-                (void)::kevent(kq_, &ev, 1, nullptr, 0, nullptr);
-                return w.wd;
-            }
-        const int fd = ::open(path.c_str(), O_EVTONLY | O_CLOEXEC);
-        if (fd < 0) return -static_cast<std::int64_t>(errno == ENOENT ? 2 : 13);
+    // add_watch(guest path, host path, mask) -> wd, or -errno.
+    [[nodiscard]] std::int64_t add_watch(const std::string& guest, const std::string& host,
+                                         std::uint32_t mask) {
         struct ::stat st{};
-        const bool is_dir = ::fstat(fd, &st) == 0 && S_ISDIR(st.st_mode);
-        struct ::kevent ev{};
-        const std::uint32_t fflags = notes_for(mask, is_dir);
-        const int wd = next_wd_++;
-        EV_SET(&ev, fd, EVFILT_VNODE, EV_ADD | EV_CLEAR, fflags, 0,
-               reinterpret_cast<void*>(static_cast<std::intptr_t>(wd)));
-        if (::kevent(kq_, &ev, 1, nullptr, 0, nullptr) < 0) {
-            ::close(fd);
-            return -static_cast<std::int64_t>(errno);
-        }
-        watches_.push_back({wd, fd, mask, path, is_dir});
+        if (::stat(host.c_str(), &st) != 0) return -static_cast<std::int64_t>(errno == ENOENT ? 2 : 13);
+        const bool is_dir = S_ISDIR(st.st_mode);
+        if ((mask & 0x01000000u /*IN_ONLYDIR*/) && !is_dir) return -20;   // ENOTDIR
+        if ((mask & kernel::fsnotify::kAllEvents) == 0) return -22;       // EINVAL
+        std::lock_guard l{mu_};
+        catch_up_locked();           // events before the watch are not its own
+        const int wd = in_.add(guest, mask, is_dir);
+        hub_.publish(id_, in_.specs());
         return wd;
     }
-
     [[nodiscard]] std::int64_t rm_watch(int wd) {
-        for (auto it = watches_.begin(); it != watches_.end(); ++it)
-            if (it->wd == wd) {
-                ::close(it->fd);
-                watches_.erase(it);
-                return 0;
-            }
-        return -22;                          // EINVAL
+        std::lock_guard l{mu_};
+        catch_up_locked();
+        const int r = in_.remove(wd);
+        if (r == 0) hub_.publish(id_, in_.specs());
+        signal_locked();
+        return r;
     }
 
-    // Drain ready events into Linux inotify_event records. Returns the byte
-    // count written, 0 if nothing is ready (the caller reports EAGAIN).
-    [[nodiscard]] std::size_t drain(std::span<std::byte> out) {
-        struct ::kevent evs[32];
-        struct ::timespec zero{};
-        const int n = ::kevent(kq_, nullptr, 0, evs, 32, &zero);
-        std::size_t used = 0;
-        for (int i = 0; i < n; ++i) {
-            const int wd = static_cast<int>(reinterpret_cast<std::intptr_t>(evs[i].udata));
-            const Watch* w = nullptr;
-            for (const Watch& x : watches_) if (x.wd == wd) { w = &x; break; }
-            if (!w) continue;                        // removed since queued
-            std::uint32_t mask = 0;
-            const auto f = evs[i].fflags;
-            if (w->is_dir) {
-                // kqueue says only "this directory's contents changed". The
-                // honest inotify rendering is an event about the DIRECTORY
-                // with no name, which watchers treat as "rescan". Never turn
-                // it into DELETE_SELF/MOVE_SELF of a child: gpg-agent
-                // watches its homedir's parent and shuts down ("homedir has
-                // been removed") on any such event.
-                //
-                // Report it with whichever entry-level bits the watcher ASKED
-                // for: notes_for() only registered NOTE_WRITE because of
-                // them, so dropping it would leave a readable fd that
-                // read() blocks on forever. (gpg-agent watches its socket
-                // dir for IN_DELETE alone; filtering to modify|create here
-                // hung it inside read() and wedged `pacman-key --init`.)
-                // With len=0 there is no name, so name-matching watchers
-                // correctly conclude "not my file" and rescan.
-                constexpr std::uint32_t kEntry = inotify_bit::create | inotify_bit::delete_
-                    | inotify_bit::moved_from | inotify_bit::moved_to
-                    | inotify_bit::modify | inotify_bit::close_write;
-                if (f & (NOTE_WRITE | NOTE_EXTEND | NOTE_LINK))
-                    mask |= w->mask & kEntry;
-            } else {
-                if (f & (NOTE_WRITE | NOTE_EXTEND))
-                    mask |= w->mask & (inotify_bit::modify | inotify_bit::close_write);
-            }
-            if (f & NOTE_ATTRIB) mask |= w->mask & inotify_bit::attrib;
-            // These really are about the watched object itself.
-            if (f & (NOTE_DELETE | NOTE_REVOKE)) mask |= inotify_bit::delete_self;   // always reported
-            if (f & NOTE_RENAME) mask |= w->mask & inotify_bit::move_self;
-            if (!mask) continue;
-            if (used + sizeof(LinuxInotifyEvent) > out.size()) break;
-            const LinuxInotifyEvent e{wd, mask, 0, 0};
-            std::memcpy(out.data() + used, &e, sizeof e);
-            used += sizeof e;
-        }
-        return used;
-    }
-
-private:
-    // Ask kqueue ONLY for what the inotify mask can report. The inotify fd
-    // IS the kqueue, so any queued kevent makes it poll-readable -- even one
-    // drain() then filters away. gpg-agent watches its homedir for
-    // IN_DELETE_SELF alone and treats "select says readable" as "homedir
-    // removed": with every note registered, the agent's own socket creation
-    // and key writes woke it, and it shut down mid `pacman-key --init`
-    // ("can't connect to the gpg-agent: End of file").
-    [[nodiscard]] static std::uint32_t notes_for(std::uint32_t m, bool is_dir) noexcept {
-        using namespace inotify_bit;
-        std::uint32_t n = 0;
-        if (m & (delete_self | 0x2000 /*IN_UNMOUNT*/)) n |= NOTE_DELETE | NOTE_REVOKE;
-        if (m & move_self) n |= NOTE_RENAME;
-        if (m & attrib)    n |= NOTE_ATTRIB;
-        if (is_dir) {
-            // Entry-level events (create/delete/move inside) surface as a
-            // directory write; kqueue cannot name the entry.
-            if (m & (create | delete_ | moved_from | moved_to | modify | close_write))
-                n |= NOTE_WRITE | NOTE_LINK;
-        } else if (m & (modify | close_write)) {
-            n |= NOTE_WRITE | NOTE_EXTEND;
-        }
+    // Records into `out`: the byte count, 0 if none are ready (the caller
+    // blocks or says EAGAIN), -EINVAL if the first record doesn't fit.
+    [[nodiscard]] long drain(std::span<std::byte> out) {
+        std::lock_guard l{mu_};
+        catch_up_locked();
+        const long n = in_.encode(out.data(), out.size());
+        signal_locked();
         return n;
     }
 
-    struct Watch { int wd; int fd; std::uint32_t mask; std::string path; bool is_dir; };
-    int kq_;
-    int next_wd_{1};
-    std::vector<Watch> watches_;
+private:
+    void watch() {
+        for (;;) {
+            struct ::kevent ev{};
+            const int n = ::kevent(kq_, nullptr, 0, &ev, 1, nullptr);
+            if (stop_) return;
+            if (n < 0 && errno != EINTR) return;
+            std::lock_guard l{mu_};
+            catch_up_locked();
+            signal_locked();
+        }
+    }
+    void catch_up_locked() {
+        const auto before = in_.specs().size();
+        for (const auto& e : kernel::fsnotify::read_log(hub_.log_path(id_), at_)) in_.deliver(e);
+        // a oneshot or DELETE_SELF ended a watch: emitters stop sending it
+        if (in_.specs().size() != before) hub_.publish(id_, in_.specs());
+    }
+    // One byte in the pipe iff records are pending.
+    void signal_locked() {
+        const bool want = in_.pending();
+        if (want == byte_) return;
+        if (want) { const char b = 1; byte_ = ::write(pipe_[1], &b, 1) == 1; }
+        else { char b; byte_ = !(::read(pipe_[0], &b, 1) == 1); }
+    }
+    kernel::fsnotify::Hub& hub_;
+    std::string id_;
+    int pipe_[2]{-1, -1};
+    int kq_{-1};
+    int log_fd_{-1};
+    bool ok_{false};
+    bool byte_{false};
+    std::atomic<bool> stop_{false};
+    std::mutex mu_;
+    std::thread thread_;
+    long long at_{0};
+    kernel::fsnotify::Instance in_;
 };
 
 // -- memfd ----------------------------------------------------------------
