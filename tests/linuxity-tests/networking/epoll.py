@@ -109,14 +109,32 @@ def eventfd_timerfd():
     os.eventfd_write(cnt, 7)
     eq(os.eventfd_read(cnt), 12, "eventfd counter")
     expect_errno(errno.EINVAL, "eventfd read into a short buffer", os.read, cnt, 4)
-    tfd = os.timerfd_create(time.CLOCK_MONOTONIC)
-    os.timerfd_settime(tfd, initial=0.01, interval=0.01)
+    if hasattr(os, "timerfd_create"):
+        tfd = os.timerfd_create(time.CLOCK_MONOTONIC)
+        os.timerfd_settime(tfd, initial=0.01, interval=0.01)
+        gettime = lambda: os.timerfd_gettime(tfd)
+    else:   # os.timerfd_* are new in Python 3.13: the libc calls directly
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+
+        class Its(ctypes.Structure):
+            _fields_ = [("i_s", ctypes.c_long), ("i_ns", ctypes.c_long),
+                        ("v_s", ctypes.c_long), ("v_ns", ctypes.c_long)]
+        tfd = libc.timerfd_create(time.CLOCK_MONOTONIC, 0)
+        check(tfd >= 0, f"timerfd_create: errno {ctypes.get_errno()}")
+        check(libc.timerfd_settime(tfd, 0, ctypes.byref(Its(0, 10_000_000, 0, 10_000_000)), None) == 0,
+              "timerfd_settime")
+
+        def gettime():
+            it = Its()
+            check(libc.timerfd_gettime(tfd, ctypes.byref(it)) == 0, "timerfd_gettime")
+            return it.v_s + it.v_ns / 1e9, it.i_s + it.i_ns / 1e9
     t0, ticks = time.monotonic(), 0
     while time.monotonic() - t0 < 0.2:
         ticks += struct.unpack("Q", os.read(tfd, 8))[0]
     expect = (time.monotonic() - t0) / 0.01
     check(abs(ticks - expect) <= 3, f"timerfd {ticks} ticks, expected ~{expect:.0f}")
-    left, interval = os.timerfd_gettime(tfd)
+    left, interval = gettime()
     check(0 < left <= 0.01 and abs(interval - 0.01) < 1e-6, "timerfd_gettime")
     return f"eventfd 100, counter, timerfd {ticks} ticks"
 
