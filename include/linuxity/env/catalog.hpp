@@ -43,7 +43,14 @@ inline constexpr std::string_view kAlpineSetup =
     "apk update -q >/dev/null 2>&1 || "
     "echo 'linuxity: no network for the package index yet; run `apk update` when there is' >&2; true";
 inline constexpr std::string_view kUbuntuSetup =
-    "apt-get update -qq >/dev/null 2>&1 || "
+    // debconf's default Dialog frontend isn't in the base image (nor is
+    // Readline's perl module), so every install printed "unable to
+    // initialize frontend" twice before falling back to Teletype; and
+    // without apt-utils every install noted it was "delaying package
+    // configuration". Pick the frontend that exists, install the helper.
+    "echo 'debconf debconf/frontend select Teletype' | debconf-set-selections 2>/dev/null; "
+    "apt-get update -qq >/dev/null 2>&1 && "
+    "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends apt-utils >/dev/null 2>&1 || "
     "echo 'linuxity: no network for the package lists yet; run `apt update` when there is' >&2; true";
 
 // Arch needs a mirror and a keyring before pacman can do anything.

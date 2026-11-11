@@ -215,8 +215,21 @@ int run_foreground(const std::string& name, const std::vector<std::string>& argv
         ::execv(av[0], av.data());
         ::_exit(127);
     }
+    // The child makes itself a process group and takes the terminal (see
+    // host_run). When it's done, take the terminal back for our own group,
+    // which the user's shell is waiting on -- otherwise fish/zsh would read
+    // from a terminal it no longer owns. SIGTTOU held off, as a shell does.
+    const int tty = in_fd == 0 && ::isatty(0) ? 0 : -1;
+    const ::pid_t ours = ::getpgrp();
     int st = 0;
     while (::waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    if (tty >= 0 && ::tcgetpgrp(tty) != ours) {
+        sigset_t ttou, old;
+        sigemptyset(&ttou); sigaddset(&ttou, SIGTTOU);
+        ::sigprocmask(SIG_BLOCK, &ttou, &old);
+        (void)::tcsetpgrp(tty, ours);
+        ::sigprocmask(SIG_SETMASK, &old, nullptr);
+    }
     return WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
 }
 

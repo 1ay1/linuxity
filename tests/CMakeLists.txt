@@ -162,6 +162,14 @@ endif()
 if(TARGET linuxity AND NOT WIN32)
     add_test(NAME cli_contract
              COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/cli_contract.sh $<TARGET_FILE:linuxity>)
+    # A real login shell on a pty survives commands, ^C, ^Z and pty-master
+    # requests. Needs an environment: LINUXITY_TEST_ENV=<name>, else skips.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_FOUND)
+        add_test(NAME session_tty
+                 COMMAND sh -c "[ -n \"$LINUXITY_TEST_ENV\" ] || exit 77; ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/session_tty.py $<TARGET_FILE:linuxity> \"$LINUXITY_TEST_ENV\"")
+        set_tests_properties(session_tty PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    endif()
 endif()
 
 # The runtime/ layering invariants (no cross-backend includes, portable

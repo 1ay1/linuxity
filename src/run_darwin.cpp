@@ -1075,6 +1075,28 @@ int cli::host_internal(const Options& o, int argc, char** argv, int i) {
 }
 
 int cli::host_run(Options& o, int, char**) {
+    // The guest's pid 1 leads its own process group -- the guest believes it
+    // does (an unset pgid is the pid itself), and bash hands the terminal
+    // back to that group after every job with tcsetpgrp(getpgrp()). When
+    // linuxity was started by something else that shares the terminal (the
+    // `linuxity shell` CLI, a script, sudo), this process was a mere MEMBER
+    // of the launcher's group: the hand-back named a group that doesn't
+    // exist on the host (EINVAL), the terminal stayed with the finished
+    // job, the shell's next read was EIO, and it logged out on its own.
+    // So make the host agree, before any zygote inherits the old group,
+    // and take the terminal's foreground if we were in it. SIGTTOU is held
+    // off for the hand-over, as a job-control shell does.
+    if (::getpgrp() != ::getpid()) {
+        const int tty = ::isatty(0) ? 0 : -1;
+        const bool was_fg = tty >= 0 && ::tcgetpgrp(tty) == ::getpgrp();
+        if (::setpgid(0, 0) == 0 && was_fg) {
+            sigset_t ttou, old;
+            sigemptyset(&ttou); sigaddset(&ttou, SIGTTOU);
+            ::pthread_sigmask(SIG_BLOCK, &ttou, &old);
+            (void)::tcsetpgrp(tty, ::getpgrp());
+            ::pthread_sigmask(SIG_SETMASK, &old, nullptr);
+        }
+    }
     process_start();
     if (o.instance) {
         // The CLI never asks for one here (host_runs_instances); a direct

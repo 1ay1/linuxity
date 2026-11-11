@@ -4771,6 +4771,24 @@ private:
         // openpty() reported "out of pty devices".
         const std::uint32_t req = static_cast<std::uint32_t>(req64);
         const GuestRam ram = machine_.ram();
+        // A PTY MASTER: Linux applies termios and window-size requests to
+        // the slave's line discipline; Darwin refuses them on the master
+        // (ENOTTY). apt/dpkg, script(1), tmux and expect all size and
+        // configure the terminal they allocated through the master, so
+        // every apt run printed "Setting TIOCSWINSZ for master fd failed".
+        // Do it on the slave, which is the same terminal.
+        struct SlaveFd {
+            int fd{-1};
+            ~SlaveFd() { if (fd >= 0) ::close(fd); }
+        } slave;
+        if (tty::is_termios_request(req)) {
+            // a master is what ptsname answers for (Darwin's isatty() says
+            // yes for a master too, yet refuses most requests on it)
+            char name[128];
+            if (::ptsname_r(hfd, name, sizeof name) == 0)
+                slave.fd = ::open(name, O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
+            if (slave.fd >= 0) hfd = slave.fd;
+        }
         using namespace tty;
         switch (req) {
             case L_TCGETS: case L_TCGETS2: {

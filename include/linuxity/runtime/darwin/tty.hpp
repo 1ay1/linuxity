@@ -48,6 +48,19 @@ enum Req : std::uint64_t {
     L_TCSETSF2 = 0x402c542d,
 };
 
+// Requests about the terminal's line discipline and size -- what Linux
+// answers on a pty MASTER as on its slave, and Darwin refuses there.
+[[nodiscard]] constexpr bool is_termios_request(std::uint64_t r) noexcept {
+    switch (r) {
+        case L_TCGETS: case L_TCSETS: case L_TCSETSW: case L_TCSETSF:
+        case L_TCGETS2: case L_TCSETS2: case L_TCSETSW2: case L_TCSETSF2:
+        case L_TIOCGWINSZ: case L_TIOCSWINSZ: case L_TCFLSH: case L_TCXONC:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // struct termios as the Linux kernel ABI defines it (NOT glibc's, which adds
 // speed fields the kernel never sees).
 struct LinuxTermios {
