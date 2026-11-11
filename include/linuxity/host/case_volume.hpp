@@ -129,10 +129,15 @@ inline bool other_linuxity_running() {
         (void)detail::run_tool({"hdiutil", "detach", "-quiet", "-force", stage});   // a stale one
         (void)::mkdir(stage.c_str(), 0755);
         if (announce)
-            std::fputs("linuxity: moving your environments onto it -- one time, it can take a "
-                       "few minutes for big ones; don't interrupt (it resumes if you do)...\n", stderr);
+            std::fputs("linuxity: moving your environments onto it (one time)...\n", stderr);
         if (!attach(stage) ||
-            detail::run_tool({"/usr/bin/ditto", dir, stage}) != 0 ||
+            // tar, not ditto: ditto OPENS a FIFO to copy it and blocks forever
+            // waiting for a writer (fish leaves one in the guest's /tmp, and
+            // the move hung right there). tar archives it as a FIFO entry,
+            // keeps hardlinks, modes and xattrs, and overwrites a partial copy.
+            detail::run_tool({"/bin/sh", "-c",
+                              "/usr/bin/tar -C \"$1\" -cf - . | /usr/bin/tar -C \"$2\" -xpf -",
+                              "sh", dir, stage}) != 0 ||
             detail::run_tool({"hdiutil", "detach", "-quiet", stage}) != 0 ||
             ::rename(dir.c_str(), old.c_str()) != 0) {
             (void)detail::run_tool({"hdiutil", "detach", "-quiet", "-force", stage});
