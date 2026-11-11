@@ -243,5 +243,33 @@ def exit_does_not_wait_for_the_output_to_be_read():
         os.close(m)
 
 
+@check
+def epoll_on_stdin_sees_keys():
+    # Every TUI event loop (agentty, crossterm, libuv, Go) waits on fd 0
+    # with epoll. fd 0 is the one fd whose number is 0 -- which an
+    # implementation storing the fd as an opaque tag can mistake for "none".
+    rp, wp = os.pipe()
+    pid, m = pty.fork()
+    if pid == 0:
+        try:
+            tty.setraw(0)
+            ep = select.epoll()
+            ep.register(0, select.EPOLLIN)
+            os.write(wp, b"g")
+            ev = ep.poll(5)
+            got = os.read(0, 10) if ev else b""
+            os.write(wp, repr((ev, got)).encode())
+        finally:
+            os._exit(0)
+    os.close(wp)
+    eq(os.read(rp, 1), b"g", "the child is waiting")
+    time.sleep(0.1)
+    os.write(m, b"k")
+    res = os.read(rp, 200).decode()
+    reap(pid)
+    eq(res, repr(([(0, select.EPOLLIN)], b"k")), "epoll reports the key on fd 0")
+    os.close(m)
+
+
 if __name__ == "__main__":
     sys.exit(main("terminals"))

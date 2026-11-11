@@ -155,7 +155,10 @@ public:
         std::vector<int> out_fd;     // which guest fd each `out` entry is
         for (int i = 0; i < n; ++i) {
             const auto& ev = evs[static_cast<std::size_t>(i)];
-            const int gfd = static_cast<int>(ev.udata ? reinterpret_cast<std::intptr_t>(ev.udata) : -1);
+            // udata IS the guest fd -- and 0 is a real one (stdin: every TUI's
+            // input). Reading a null udata as "none" dropped each event on
+            // fd 0, so an epoll loop on a terminal never saw a key.
+            const int gfd = static_cast<int>(reinterpret_cast<std::intptr_t>(ev.udata));
             auto it = regs_.find(gfd);
             if (it == regs_.end()) continue;
             std::uint32_t bits = 0;
