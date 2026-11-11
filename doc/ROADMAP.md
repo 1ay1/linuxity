@@ -137,9 +137,15 @@ every `syscall` into a VM exit.
       from earlier: single-shot timings here swing ~0.15s.)
       Overlay directory unions are built lazily, on first getdents:
       `pacman -S python` takes 4.4 s, down from 2m41s.
-      Remaining: `mprotect` is tracked in the VMA map but not enforced in
-      the page tables; `ps` needs a fuller /proc; CI does not yet build the
-      macOS binary (it needs a signed binary and a rootfs).
+      **The oracle passes**: all 410 checks of `tests/oracle.py` (process,
+      filesystem, memory, ipc, sync, net, tty, sys, tools; as root and as
+      a user) behave as on real Linux, which passes the same checks. Getting
+      there meant working around XNU where it differs from Linux; see
+      ARCHITECTURE.md §5b for the list.
+      Remaining: `ps` shows other processes' user as root and their RSS as
+      their VSZ (`/proc/<pid>/status` and `statm` for a process that isn't
+      the reader); CI does not yet build the macOS binary (it needs a signed
+      binary and a rootfs).
 - [ ] **M1: Linux completeness ladder.** Each rung is a release:
       1. busybox / coreutils / bash
       2. `pacman -Syu`, `apk add`, `apt install`

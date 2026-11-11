@@ -143,6 +143,46 @@ tools/linux-build-check.sh            # first run sets the environment up
 
 That is GCC + musl on aarch64, which CI's x86-64/glibc job never sees.
 
+### Does it behave like Linux? The oracle
+
+`ctest` checks linuxity's pieces. `tests/oracle.py` checks the whole: one
+command that runs nine torture suites inside an environment, each check in
+its own process under a deadline, and gives one verdict.
+
+| suite | covers |
+|---|---|
+| process | fork/exec/wait, signals, sessions, job control, pidfds, `/proc/<pid>` |
+| filesystem | files, dirs, names, links, metadata, permissions, locks |
+| memory | mmap, protection, sharing, mremap, memfd, JIT, limits |
+| ipc | pipes, SysV shm/sem/msg, POSIX shm/sem/mqueue, eventfd |
+| sync | threads, futexes, clocks, timers, signalfd, asyncio |
+| net | TCP, UDP, AF_UNIX, fd passing, readiness, DNS |
+| tty | ptys, line discipline, termios, SIGWINCH, an interactive bash |
+| sys | uname, creds, caps, rlimits, `/proc`, `/sys`, namespaces, seccomp, landlock, ptrace |
+| tools | bash, coreutils, find/grep/sed/awk, tar, perl, sqlite WAL, a parallel build |
+
+Run as root, it runs everything twice -- as root, then as an ordinary user --
+because permission rules are half the kernel:
+
+```sh
+linuxity run ubuntu --user root --bind "$PWD/tests:/mnt/t" -- python3 /mnt/t/oracle.py
+# inside the guest:
+python3 /mnt/t/oracle.py net tty -v     # some suites, with tracebacks
+python3 /mnt/t/fs_torture.py rename     # one suite, checks matching a word
+```
+
+The oracle is the kernel, not linuxity: every check must also pass on real
+Linux, which `tests/oracle.Dockerfile` (Ubuntu 24.04) provides:
+
+```sh
+docker build -t lx-oracle -f tests/oracle.Dockerfile tests
+docker run --privileged --rm -v "$PWD/tests:/mnt/t:ro" lx-oracle
+```
+
+On macOS (Apple Silicon) linuxity passes all 410 checks; the 4 skips are the
+host's (APFS folds Unicode names, and the unprivileged pass can't test what
+needs root). Exit status 0 means nothing failed anywhere.
+
 ### Verifying on Android / arm64
 
 `ctest` proves linuxity agrees with the kernel it was built on. Android is a
@@ -304,6 +344,8 @@ linuxity's subsystems or **forwarded** to the host kernel acting on the guest.
   copy-on-write overlay, shadow-metadata fake-root, the pid namespace, signals,
   synthesized `/proc`/`/sys`/`/dev`, the loader/exec rewriting, resource
   governance, and how to extend it. **Read this to *understand* linuxity.**
+- **[tests/oracle.py](tests/oracle.py)** — the oracle: does an environment
+  behave like Linux? Nine suites, one verdict (see *Build* above).
 - **[doc/reference-study.md](doc/reference-study.md)** — how the techniques map
   from proot / termux-exec / proot-distro / ish onto linuxity, and why.
 

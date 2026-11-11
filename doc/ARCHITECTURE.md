@@ -14,6 +14,7 @@ This is the *why* and the *how it works*; for the *how to use it* see
 4. [The type discipline](#4-the-type-discipline)
 5. [The trap backend (native execution)](#5-the-trap-backend-native-execution)
 5a. [The kernel-less backends (macOS, Windows)](#5a-the-kernel-less-backends-macos-windows)
+5b. [macOS: where XNU isn't Linux](#5b-macos-where-xnu-isnt-linux)
 6. [Syscall fates: virtualize / forward / redirect / inject / signal](#6-syscall-fates)
 7. [The seccomp filter](#7-the-seccomp-filter)
 8. [The filesystem namespace](#8-the-filesystem-namespace)
@@ -222,6 +223,37 @@ linking it would make the binary fail in the loader with `0xC0000135` on a
 machine where it is off, instead of printing a diagnostic. `linuxity --check`
 reports exactly which prerequisite is missing, and on a capable machine proves
 the whole path by trapping a real syscall out of natively-executed guest code.
+
+### 5b. macOS: where XNU isn't Linux
+
+On macOS every guest process is its own host process (its own linuxity, its
+own HVF VM), and most syscalls end up as Darwin calls. The hard part is where
+Darwin answers differently from Linux. Each difference below once broke a
+real program, and most have a check in `tests/oracle.py` so they stay fixed.
+The darwin backend lives in `runtime/darwin/`.
+
+| XNU does | Linux does | linuxity |
+|---|---|---|
+| makes a session leader's exit wait, with no timeout, until its tty's output is read (`proc_exit` → `ttywait`) | exits at once and leaves the output for the master | `end_process` marks the exit *final* in the shared pid table and wakes the parent; `wait4` reaps it from the table (pexpect, harnesses) |
+| refuses `EVFILT_PROC` on a zombie (`ESRCH`) | opens a pidfd on it, readable at once | `make_pidfd` sees the zombie with `waitid(WNOWAIT)` and fires an `EVFILT_USER` (asyncio's child watcher) |
+| never reports a FIFO's last writer closing to `poll` or kqueue (`select` does) | `POLLHUP` | `signal_aware_poll` switches to `select` for FIFOs; epoll waits on them the same way |
+| reports a pipe writer with no reader as `POLLHUP` | `POLLERR` | translated when revents are copied back |
+| drops a process's POSIX locks when it closes *any* fd on the file | the same rule, but only the program's own closes count | linuxity's own work never closes guest files in the parent (fork used to, and lost the parent's locks) |
+| refuses `setpgid` on a child that has exec'd (`EACCES`), and every HVF child has | allows it until the child execs *as a guest* | the parent's request goes through the shared pid table; the child applies it |
+| never raises `SIGXCPU` for a thread spinning in `hv_vcpu_run` | enforces `RLIMIT_CPU` | emulated in `timer.hpp` |
+| refuses `task_for_pid` without the debugger entitlement | `/proc/<pid>/mem`, `process_vm_readv` | each linuxity serves its own guest RAM on a socket (`memsvc.hpp`) |
+| has no POSIX message queues | `mq_*` | queue files in the env's shared shm directory, under `flock` (`mqueue.hpp`) |
+| has no `NETLINK_ROUTE` and no `/proc/net` | `ip addr`, `getifaddrs`, Go's `net.Interfaces` | answered from the host's `getifaddrs()` (`rtnetlink.hpp`, `vfs/procnet_synth.hpp`) |
+| counts linuxity's own timer/service threads in the task | a process's threads are the program's | `/proc/<pid>/stat`, `status` and `task/` count guest threads only (Python warns on `fork()` otherwise) |
+| allows 128 Hypervisor.framework VMs on the whole Mac at once | no such limit | warm zygotes (pre-forked spares) are budgeted across the tree by `PidSpace`, keeping headroom for real forks |
+| has a case-insensitive disk by default | names are bytes | environments live on a case-sensitive APFS sparsebundle |
+
+State that has to cross a fork (fd table, credentials, signal dispositions)
+goes through `Kernel::export_fork`/`import_fork`. Facts every process of the
+tree must agree on (pids, pgids, exit statuses, trace stops, scheduler
+settings) live in `PidSpace`'s shared table (`runtime/darwin/proc.hpp`), never
+in per-process copies: two copies of a pgid once raced into a job that spun
+forever.
 
 ---
 
