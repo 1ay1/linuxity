@@ -97,7 +97,13 @@ def links_and_unlinked_files():
     t = os.open(".", os.O_TMPFILE | os.O_RDWR, 0o600)
     os.write(t, b"born anonymous")
     eq(set(os.listdir(".")), before, "an O_TMPFILE file showed up in the directory")
-    os.link(f"/proc/self/fd/{t}", "materialized")
+    # The documented idiom (open(2)): linkat with AT_SYMLINK_FOLLOW. A plain
+    # link(2) -- what os.link() issues by default -- does not follow the
+    # /proc magic link on Linux either, and answers EXDEV.
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    rc = libc.linkat(-100, f"/proc/self/fd/{t}".encode(), -100, b"materialized", 0x400)
+    eq((rc, ctypes.get_errno() if rc else 0), (0, 0), "linkat(AT_SYMLINK_FOLLOW) of an O_TMPFILE")
     with open("materialized", "rb") as f:
         eq(f.read(), b"born anonymous", "O_TMPFILE given a name")
     return "nlink, shared writes, rename no-op, deleted-but-open, O_TMPFILE"
@@ -123,9 +129,16 @@ def rename_rules():
     with open("b", "w") as f:
         f.write("B")
     AT = -100
-    rc = libc.renameat2(AT, b"a", AT, b"b", 1)   # RENAME_NOREPLACE
+    # Through syscall(2): musl before 1.2.5 has no renameat2() wrapper.
+    nr = {"aarch64": 276, "x86_64": 316}.get(os.uname().machine)
+    if nr is None:
+        return "overwrite rules (no renameat2 number for this arch)"
+    libc.syscall.restype = ctypes.c_long
+    renameat2 = lambda a, b, fl: libc.syscall(ctypes.c_long(nr), ctypes.c_int(AT), a,
+                                              ctypes.c_int(AT), b, ctypes.c_uint(fl))
+    rc = renameat2(b"a", b"b", 1)   # RENAME_NOREPLACE
     eq((rc, ctypes.get_errno()), (-1, errno.EEXIST), "RENAME_NOREPLACE onto an existing name")
-    if libc.renameat2(AT, b"a", AT, b"b", 2) == 0:   # RENAME_EXCHANGE
+    if renameat2(b"a", b"b", 2) == 0:   # RENAME_EXCHANGE
         with open("a") as f, open("b") as g:
             eq((f.read(), g.read()), ("B", "A"), "RENAME_EXCHANGE swapped")
     else:

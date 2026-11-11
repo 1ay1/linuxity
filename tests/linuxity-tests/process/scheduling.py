@@ -62,14 +62,42 @@ def nice_and_priority():
 @test
 def policies():
     """Scheduler policy queries and the classes a normal process may pick."""
-    eq(os.sched_getscheduler(0), os.SCHED_OTHER, "default policy")
+    getsched, setsched = os.sched_getscheduler, os.sched_setscheduler
+    try:
+        getsched(0)
+    except OSError as e:
+        if e.errno != errno.ENOSYS:
+            raise
+        # musl's sched_{get,set}scheduler wrappers answer ENOSYS without
+        # entering the kernel (POSIX says per-process, Linux is per-thread),
+        # so ask the kernel directly.
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.syscall.restype = ctypes.c_long
+        nrs = {"aarch64": (119, 120), "x86_64": (144, 145)}.get(os.uname().machine)
+        if nrs is None:
+            raise
+
+        def getsched(pid):
+            rc = libc.syscall(ctypes.c_long(nrs[1]), ctypes.c_int(pid))
+            if rc < 0:
+                raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
+            return rc
+
+        def setsched(pid, policy, param):
+            prio = ctypes.c_int(param.sched_priority)
+            rc = libc.syscall(ctypes.c_long(nrs[0]), ctypes.c_int(pid), ctypes.c_int(policy),
+                              ctypes.byref(prio))
+            if rc < 0:
+                raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
+    eq(getsched(0), os.SCHED_OTHER, "default policy")
     eq((os.sched_get_priority_min(os.SCHED_FIFO), os.sched_get_priority_max(os.SCHED_FIFO)), (1, 99), "FIFO range")
     eq(os.sched_get_priority_max(os.SCHED_OTHER), 0, "OTHER range")
-    os.sched_setscheduler(0, os.SCHED_BATCH, os.sched_param(0))
-    eq(os.sched_getscheduler(0), os.SCHED_BATCH, "SCHED_BATCH")
-    os.sched_setscheduler(0, os.SCHED_IDLE, os.sched_param(0))
-    eq(os.sched_getscheduler(0), os.SCHED_IDLE, "SCHED_IDLE")
-    expect_errno(errno.EINVAL, "FIFO with priority 0", os.sched_setscheduler, 0, os.SCHED_FIFO, os.sched_param(0))
+    setsched(0, os.SCHED_BATCH, os.sched_param(0))
+    eq(getsched(0), os.SCHED_BATCH, "SCHED_BATCH")
+    setsched(0, os.SCHED_IDLE, os.sched_param(0))
+    eq(getsched(0), os.SCHED_IDLE, "SCHED_IDLE")
+    expect_errno(errno.EINVAL, "FIFO with priority 0", setsched, 0, os.SCHED_FIFO, os.sched_param(0))
     check(os.sched_rr_get_interval(0) >= 0, "rr interval")
     os.sched_yield()
     return "OTHER/BATCH/IDLE, ranges, EINVAL, rr interval, yield"
