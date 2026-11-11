@@ -36,6 +36,7 @@
 
 #include <sys/stat.h>
 #include "linuxity/abi/wire/stat.hpp"
+#include "linuxity/kernel/journal_tail.hpp"
 #include "linuxity/host/win_posix.hpp"
 
 #include <algorithm>
@@ -320,74 +321,38 @@ private:
         std::fclose(fp);   // seen_ stays: see append
     }
 
-    // Fold in what other processes appended since we last read. The journal
-    // only ever grows, except when compaction REPLACES it (a new inode, or a
-    // smaller file): then read it whole again. Last line wins either way, so
-    // applying a tail on top of the table is exactly a full replay.
+    // Fold in what other processes appended (kernel/journal_tail.hpp: one
+    // stat when nothing changed; a replaced journal is read whole).
     void catch_up() const {
-        if (journal_path_.empty()) return;
-        struct ::stat st{};
-        if (::stat(journal_path_.c_str(), &st) != 0) return;
-        const auto size = static_cast<long long>(st.st_size);
-        const auto ino = static_cast<std::uint64_t>(st.st_ino);
-        if (size == seen_ && ino == seen_ino_) return;
-        if (ino != seen_ino_ || size < seen_) {
-            table_.clear();
-            seen_ = 0;
-        }
-        seen_ino_ = ino;
-        (void)replay_from(seen_);
+        (void)tail_.follow([this] { table_.clear(); },
+                           [this](std::string_view l) { apply_line(l); });
     }
-
-    // Replay the journal into memory, last-writer-wins (a later append for the
-    // same path supersedes the earlier one — so append-only is self-healing).
     std::size_t replay() {
-        struct ::stat st{};
-        seen_ino_ = ::stat(journal_path_.c_str(), &st) == 0 ? static_cast<std::uint64_t>(st.st_ino) : 0;
-        seen_ = 0;
-        return replay_from(0);
+        tail_.set_path(journal_path_);
+        return tail_.reload([this] { table_.clear(); },
+                            [this](std::string_view l) { apply_line(l); });
     }
-    // From byte `from`; leaves seen_ at the end of the last COMPLETE line,
-    // so a line another process is half-way through appending is read later.
-    std::size_t replay_from(long long from) const {
-        std::FILE* fp = std::fopen(journal_path_.c_str(), "r");
-        if (!fp) return 0;
-        if (from > 0 && std::fseek(fp, static_cast<long>(from), SEEK_SET) != 0) { std::fclose(fp); return 0; }
-        std::size_t lines = 0;
-        char line[8192];
-        long long at = from;
-        while (std::fgets(line, sizeof line, fp)) {
-            const std::size_t len = std::strlen(line);
-            if (len == 0 || line[len - 1] != '\n') break;   // torn tail: not yet
-            at += static_cast<long long>(len);
-            ++lines;
-            unsigned mode = 0, uid = 0, gid = 0, have = 0;
-            int off = 0;
-            // "%o %u %u %u " then the rest (which may contain spaces) is the
-            // path -- unless `have` says a 5th number (nlink) comes first.
-            if (std::sscanf(line, "%o %u %u %u %n", &mode, &uid, &gid, &have,
-                            &off) < 4)
-                continue;
-            unsigned nlink = 0;
-            if (have != 255u && (have & MetaRecord::kNlink) != 0) {
-                int off2 = 0;
-                if (std::sscanf(line + off, "%u %n", &nlink, &off2) == 1)
-                    off += off2;
-            }
-            std::string path = line + off;
-            while (!path.empty() && (path.back() == '\n' || path.back() == '\r'))
-                path.pop_back();
-            if (path.empty()) continue;
-            if (have == 255u) { table_.erase(path); continue; }  // tombstone
-            MetaRecord r;
-            r.mode = mode; r.uid = uid; r.gid = gid; r.nlink = nlink;
-            r.have = static_cast<std::uint8_t>(have);
-            if (is_redundant(r)) { table_.erase(path); continue; }
-            table_[path] = r;   // last line for a path wins
+    // One journal line: "%o %u %u %u [nlink] path", or a tombstone.
+    void apply_line(std::string_view sv) const {
+        const std::string line{sv};
+        unsigned mode = 0, uid = 0, gid = 0, have = 0;
+        int off = 0;
+        // "%o %u %u %u " then the rest (which may contain spaces) is the
+        // path -- unless `have` says a 5th number (nlink) comes first.
+        if (std::sscanf(line.c_str(), "%o %u %u %u %n", &mode, &uid, &gid, &have, &off) < 4) return;
+        unsigned nlink = 0;
+        if (have != 255u && (have & MetaRecord::kNlink) != 0) {
+            int off2 = 0;
+            if (std::sscanf(line.c_str() + off, "%u %n", &nlink, &off2) == 1) off += off2;
         }
-        std::fclose(fp);
-        seen_ = at;
-        return lines;
+        std::string path = line.substr(static_cast<std::size_t>(off));
+        if (path.empty()) return;
+        if (have == 255u) { table_.erase(path); return; }   // tombstone
+        MetaRecord r;
+        r.mode = mode; r.uid = uid; r.gid = gid; r.nlink = nlink;
+        r.have = static_cast<std::uint8_t>(have);
+        if (is_redundant(r)) { table_.erase(path); return; }
+        table_[path] = r;   // last line for a path wins
     }
 
     std::string upper_;
@@ -396,8 +361,7 @@ private:
     // A cache of the journal (see lookup); mutable so a const lookup can
     // catch up on other processes' appends.
     mutable std::unordered_map<std::string, MetaRecord> table_;
-    mutable long long seen_{0};          // journal bytes folded into table_
-    mutable std::uint64_t seen_ino_{0};  // ...of this inode
+    mutable JournalTail tail_;           // how much of the journal table_ holds
     std::vector<std::string>* changed_{nullptr};
 
     // Rewrite the journal to exactly the live records, atomically.
@@ -409,11 +373,7 @@ private:
         if (std::fclose(fp) == 0) std::rename(tmp.c_str(), journal_path_.c_str());
         else std::remove(tmp.c_str());
         // the table IS this file now: don't re-read it as someone else's
-        struct ::stat st{};
-        if (::stat(journal_path_.c_str(), &st) == 0) {
-            seen_ = static_cast<long long>(st.st_size);
-            seen_ino_ = static_cast<std::uint64_t>(st.st_ino);
-        }
+        tail_.adopt();
     }
 };
 

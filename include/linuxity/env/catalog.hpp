@@ -49,8 +49,15 @@ inline constexpr std::string_view kUbuntuSetup =
     // without apt-utils every install noted it was "delaying package
     // configuration". Pick the frontend that exists, install the helper.
     "echo 'debconf debconf/frontend select Teletype' | debconf-set-selections 2>/dev/null; "
+    // ubuntu-base is "minimized": dpkg skips /usr/share/man and doc, and
+    // /usr/bin/man is a stub that only says so. Every package install then
+    // warns "skip creation of /usr/share/man/..." and `man` doesn't work.
+    // An environment is for people: keep the pages, restore the real man.
+    "rm -f /etc/dpkg/dpkg.cfg.d/excludes; "
+    "if dpkg-divert --list /usr/bin/man | grep -q .; then rm -f /usr/bin/man; "
+    "dpkg-divert --quiet --local --rename --remove /usr/bin/man; fi; "
     "apt-get update -qq >/dev/null 2>&1 && "
-    "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends apt-utils >/dev/null 2>&1 || "
+    "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends apt-utils man-db >/dev/null 2>&1 || "
     "echo 'linuxity: no network for the package lists yet; run `apt update` when there is' >&2; true";
 
 // Arch needs a mirror and a keyring before pacman can do anything.

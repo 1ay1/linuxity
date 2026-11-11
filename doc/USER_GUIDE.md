@@ -94,9 +94,12 @@ linuxity new ubuntu dev      # named "dev"
 | `arch` | Arch Linux / Arch Linux ARM | 150 / 830 MB | `pacman`; x86-64 needs `zstd` installed |
 
 `new` downloads the image (with `curl` or `wget`), checks it against the
-checksum its publisher lists, unpacks it, runs the distro's first-time setup
-(Arch: mirror and keyring), and asks for your user name. Downloads are kept,
-so a second `new` of the same distro is instant.
+checksum its publisher lists, unpacks it, runs the distro's first-time setup,
+and asks for your user name. Downloads are kept, so a second `new` of the
+same distro is instant. The setup fetches the package index (so `apk add` and
+`apt install` work at once); on Ubuntu it also undoes the base image's
+"minimized" mode, so packages install their man pages and `man` works; on
+Arch it sets a mirror and the keyring.
 
 Options:
 

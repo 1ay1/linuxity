@@ -38,6 +38,7 @@
 #include "linuxity/host/dirent_type.hpp"
 #include "linuxity/host/long_path.hpp"
 #include "linuxity/kernel/fork_state.hpp"
+#include "linuxity/kernel/journal_tail.hpp"
 #include "linuxity/kernel/fsnotify.hpp"
 
 #include <cstdint>
@@ -182,6 +183,7 @@ public:
             meta_attached_ = true;
             if (fsnotify_emulated_) fsnotify_.attach(upper + "/" + std::string{fsnotify::kDirLeaf});
             whiteout_journal_ = upper + "/.linuxity-whiteout";
+            whiteout_tail_.set_path(whiteout_journal_);
             const std::size_t wl = load_whiteouts();
             if (is_root_ && wl > 1024 && wl > whiteouts_.size() * 4) rewrite_whiteouts();
             if (is_root_) repair_pacman_db(upper);
@@ -193,6 +195,12 @@ public:
     // A fork child (a guest process started by another guest process) must
     // not do root-only hygiene. Set before the first mount_host.
     void set_fork_child(bool child) noexcept { is_root_ = !child; }
+    // Every guest process is its own linuxity with its own copy of this
+    // namespace (macOS). Then deletions another process made must be read
+    // before a lookup trusts the in-memory whiteout set -- one stat of the
+    // journal when nothing changed. A host where all guest processes share
+    // one namespace (Linux) needs none of it.
+    void set_shared_with_other_processes(bool on) noexcept { follow_journals_ = on; }
 
     // The files linuxity keeps at the top of an upper layer: never part of
     // the guest's tree, neither in a listing nor by name. The ONE list.
@@ -478,6 +486,7 @@ public:
                                      bool for_write = false,
                                      bool follow = true,
                                      WriteIntent wi = WriteIntent::copy_leaf) const {
+        if (follow_journals_) catch_up_whiteouts();
         PathClass pc = classify_impl(abs, for_write, follow, wi, 0);
         // a write through a read-only mount; device nodes are exempt, as in
         // the kernel
@@ -674,7 +683,12 @@ public:
                 // N characters before the end of `up` is N before the end of
                 // `abs` too.
                 Widened widened;
-                if (wi == WriteIntent::parents_only)
+                // A path deleted in this overlay (whited out) is NEW when it
+                // is written again: copying the lower file up would bring the
+                // deleted contents back (`rm f; touch f` showed the old bytes,
+                // and `rm f; echo x >> f` appended to them).
+                const bool deleted = !whiteouts_.empty() && is_whiteout(abs);
+                if (wi == WriteIntent::parents_only || deleted)
                     mirror_parents_from_lower(up, lo, &widened);
                 else
                     copy_up(up, lo, &widened);
@@ -737,6 +751,7 @@ public:
         const Mount* m = deepest(abs);
         std::vector<VirtualDirent> out;
         if (!m || m->producer || m->upper.empty()) return out;  // not overlaid
+        if (follow_journals_) catch_up_whiteouts();
         std::string_view rel = abs;
         rel.remove_prefix(m->prefix == "/" ? 0 : m->prefix.size());
         while (!rel.empty() && rel.front() == '/') rel.remove_prefix(1);
@@ -2066,6 +2081,8 @@ private:
     // removal persists across runs, exactly like copied-up files and meta.
     mutable std::unordered_set<std::string, SvHash, SvEq> whiteouts_;
     std::string whiteout_journal_;
+    mutable JournalTail whiteout_tail_;   // how much of it whiteouts_ holds
+    bool follow_journals_{false};         // see set_shared_with_other_processes
 
 public:
     // Drop a whiteout because the path really exists again (an upper-layer
@@ -2114,22 +2131,17 @@ public:
 
 private:
     std::size_t load_whiteouts() {
-        if (whiteout_journal_.empty()) return 0;
-        std::FILE* fp = std::fopen(whiteout_journal_.c_str(), "r");
-        if (!fp) return 0;
-        std::size_t lines = 0;
-        char line[4096];
-        while (std::fgets(line, sizeof line, fp)) {
-            ++lines;
-            std::string s{line};
-            while (!s.empty() && (s.back() == '\n' || s.back() == '\r'))
-                s.pop_back();
-            if (s.empty()) continue;
-            if (s.front() == '!') whiteouts_.erase(s.substr(1)); // un-whiteout
-            else                  whiteouts_.insert(s);
-        }
-        std::fclose(fp);
-        return lines;
+        return whiteout_tail_.reload([this] { whiteouts_.clear(); },
+                                     [this](std::string_view l) { apply_whiteout_line(l); });
+    }
+    void catch_up_whiteouts() const {
+        (void)whiteout_tail_.follow([this] { whiteouts_.clear(); },
+                                    [this](std::string_view l) { apply_whiteout_line(l); });
+    }
+    void apply_whiteout_line(std::string_view l) const {
+        if (l.empty()) return;
+        if (l.front() == '!') whiteouts_.erase(std::string{l.substr(1)});   // un-whiteout
+        else                  whiteouts_.insert(std::string{l});
     }
     // The whiteout journal is append-only too (100k lines for 4.8k live
     // entries after a few upgrades). Rewrite it to the live set, atomically.
@@ -2140,6 +2152,7 @@ private:
         for (const auto& w : whiteouts_) std::fprintf(fp, "%s\n", w.c_str());
         if (std::fclose(fp) == 0) std::rename(tmp.c_str(), whiteout_journal_.c_str());
         else std::remove(tmp.c_str());
+        whiteout_tail_.adopt();
     }
 };
 

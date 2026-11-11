@@ -93,6 +93,7 @@ struct Machine {
         if (char cwd[4096]; ::getcwd(cwd, sizeof cwd) != nullptr)
             k.files().set_host_cwd(cwd);
         k.files().set_fork_child(fork_child);
+        k.files().set_shared_with_other_processes(true);   // a process per guest process
         // kqueue can't name directory entries: linuxity keeps inotify
         k.files().set_fsnotify_emulated(true);
         kernel::MachineSpec spec;
