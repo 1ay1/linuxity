@@ -26,6 +26,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -154,7 +155,88 @@ public:
         }
         return true;
     }
+    // -- Guest ptrace slots (see Shared::tracer) ---------------------------
+    [[nodiscard]] std::int32_t tracer_of(std::int32_t g) const noexcept {
+        return (g > 0 && g < kMax && shared_) ? shared_->tracer[g].load(std::memory_order_acquire) : 0;
+    }
+    void set_tracer(std::int32_t g, std::int32_t t) noexcept {
+        if (g > 0 && g < kMax && shared_) {
+            shared_->trace_opts[g].store(0, std::memory_order_relaxed);
+            shared_->stop_status[g].store(0, std::memory_order_relaxed);
+            shared_->tracer[g].store(t, std::memory_order_release);
+        }
+    }
+    [[nodiscard]] std::int32_t trace_opts(std::int32_t g) const noexcept {
+        return (g > 0 && g < kMax && shared_) ? shared_->trace_opts[g].load() : 0;
+    }
+    void set_trace_opts(std::int32_t g, std::int32_t o) noexcept {
+        if (g > 0 && g < kMax && shared_) shared_->trace_opts[g].store(o);
+    }
+    // Tracee: park at a stop until the tracer resumes it. Returns the
+    // request (PTRACE_CONT 7, PTRACE_SYSCALL 24, ...) and the signal to
+    // deliver. `published` holds the regs the tracer may read and change.
+    struct Resume { std::int32_t cmd, sig; bool regs_changed; };
+    [[nodiscard]] Resume trace_stop(std::int32_t g, std::int32_t wstatus,
+                                    const std::uint64_t (&published)[34], std::uint64_t (&back)[34],
+                                    const std::function<bool()>& still_traced) noexcept {
+        if (g <= 0 || g >= kMax || !shared_) return {7, 0, false};
+        std::memcpy(shared_->regs[g], published, sizeof published);
+        shared_->regs_dirty[g].store(false, std::memory_order_relaxed);
+        const std::uint32_t gen = shared_->resume[g].load(std::memory_order_acquire);
+        shared_->stop_reported[g].store(false, std::memory_order_relaxed);
+        shared_->stop_status[g].store(wstatus, std::memory_order_release);
+        // the tracer is a parent sleeping in wait: wake it
+        const std::int32_t t = shared_->tracer[g].load();
+        if (const auto th = host_of(t)) ::kill(*th, SIGCHLD);
+        while (shared_->resume[g].load(std::memory_order_acquire) == gen) {
+            if (!still_traced()) return {7, 0, false};
+            ::usleep(200);
+        }
+        shared_->stop_status[g].store(0, std::memory_order_release);
+        const bool changed = shared_->regs_dirty[g].exchange(false);
+        if (changed) std::memcpy(back, shared_->regs[g], sizeof back);
+        return {shared_->resume_cmd[g].load(), shared_->resume_sig[g].load(), changed};
+    }
+    // Tracer: the stop g sits in (0 = running), and whether wait took it.
+    [[nodiscard]] std::int32_t stop_of(std::int32_t g) const noexcept {
+        return (g > 0 && g < kMax && shared_) ? shared_->stop_status[g].load(std::memory_order_acquire) : 0;
+    }
+    [[nodiscard]] bool take_stop_report(std::int32_t g) noexcept {
+        if (g <= 0 || g >= kMax || !shared_) return false;
+        return shared_->stop_status[g].load() && !shared_->stop_reported[g].exchange(true);
+    }
+    // A stop posted and not yet reported (wait must not sleep past it).
+    [[nodiscard]] bool take_stop_report_peek(std::int32_t g) const noexcept {
+        if (g <= 0 || g >= kMax || !shared_) return false;
+        return shared_->stop_status[g].load() && !shared_->stop_reported[g].load();
+    }
+    void trace_resume(std::int32_t g, std::int32_t cmd, std::int32_t sig) noexcept {
+        if (g <= 0 || g >= kMax || !shared_) return;
+        shared_->resume_cmd[g].store(cmd);
+        shared_->resume_sig[g].store(sig);
+        shared_->resume[g].fetch_add(1, std::memory_order_acq_rel);
+    }
+    [[nodiscard]] std::uint64_t* trace_regs(std::int32_t g) noexcept {
+        return (g > 0 && g < kMax && shared_) ? shared_->regs[g] : nullptr;
+    }
+    void mark_regs_dirty(std::int32_t g) noexcept {
+        if (g > 0 && g < kMax && shared_) shared_->regs_dirty[g].store(true);
+    }
+
     // Every live member of a group, for kill(-pgid) and kill(0).
+    struct PeerIds { std::uint32_t euid, egid; };
+    void set_ids(std::int32_t g, std::uint32_t euid, std::uint32_t egid) noexcept {
+        if (g <= 0 || g >= kMax || !shared_) return;
+        shared_->euid1[g].store(euid + 1, std::memory_order_relaxed);
+        shared_->egid1[g].store(egid + 1, std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::optional<PeerIds> ids_of(std::int32_t g) const noexcept {
+        if (g <= 0 || g >= kMax || !shared_) return std::nullopt;
+        const auto u = shared_->euid1[g].load(std::memory_order_relaxed);
+        const auto gg = shared_->egid1[g].load(std::memory_order_relaxed);
+        if (!u) return std::nullopt;
+        return PeerIds{u - 1, gg ? gg - 1 : 0};
+    }
     [[nodiscard]] std::vector<std::int32_t> members_of(std::int32_t pgid) const {
         std::vector<std::int32_t> out;
         for (std::int32_t p = 1; p < kMax; ++p) {
@@ -204,7 +286,10 @@ public:
         if (g > 1 && g < kMax) {
             shared_->exe[g][0] = '\0';
             shared_->comm[g][0] = '\0';
+            shared_->tracer[g].store(0, std::memory_order_relaxed);
+            shared_->stop_status[g].store(0, std::memory_order_relaxed);
             shared_->exited[g].store(false, std::memory_order_relaxed);
+            shared_->exit_final[g].store(false, std::memory_order_relaxed);
             shared_->subreaper[g].store(false, std::memory_order_relaxed);
             shared_->host[g].store(0, std::memory_order_relaxed);
         }
@@ -281,6 +366,15 @@ public:
         if (g <= 0 || g >= kMax || !shared_) return;
         shared_->exit_status[g].store(linux_wstatus, std::memory_order_relaxed);
         shared_->exited[g].store(true, std::memory_order_release);
+    }
+    // The posted status is FINAL though g's host process hasn't ended: its
+    // HOST parent reaps g from it instead of waiting for the host exit
+    // (HvfTrap::end_process says when that wait would never end).
+    void mark_exit_final(std::int32_t g) noexcept {
+        if (g > 0 && g < kMax && shared_) shared_->exit_final[g].store(true, std::memory_order_release);
+    }
+    [[nodiscard]] bool exit_final(std::int32_t g) const noexcept {
+        return g > 0 && g < kMax && shared_ && shared_->exit_final[g].load(std::memory_order_acquire);
     }
     [[nodiscard]] std::optional<int> exit_of(std::int32_t g) const noexcept {
         if (g <= 0 || g >= kMax || !shared_ || !shared_->exited[g].load(std::memory_order_acquire))
@@ -442,6 +536,7 @@ private:
         std::atomic<bool> subreaper[kMax]{};
         std::atomic<bool> exited[kMax]{};
         std::atomic<int> exit_status[kMax]{};
+        std::atomic<bool> exit_final[kMax]{};
         // setpgid(child, g) the PARENT asked for. Darwin refuses setpgid on
         // a child that has exec'd (EACCES), and every HVF child has exec'd
         // on the host from its first instruction -- though the GUEST child
@@ -455,6 +550,24 @@ private:
         std::atomic<int> warm_vms{0};
         // See set_nice/set_policy/set_affinity.
         std::atomic<std::int8_t> nice[kMax]{};
+        // Each process's effective uid/gid, as it last published them (SO_PEERCRED,
+        // which a peer asks about from another host process). +1, 0 = unknown.
+        std::atomic<std::uint32_t> euid1[kMax]{}, egid1[kMax]{};
+        // Guest ptrace (no host ptrace across HVF processes). tracer: the
+        // guest pid tracing g (0 = none). A tracee that hits a stop posts
+        // stop_status (a Linux wait status, nonzero) and parks on `resume`
+        // until the tracer bumps it, with the request in cmd/sig. A stop is
+        // reported to wait once: `reported` is set when the tracer took it.
+        // The tracee publishes its registers at each stop (regs, x0..x30, sp,
+        // pc, pstate) for PTRACE_GETREGSET; SETREGSET writes them back.
+        std::atomic<std::int32_t> tracer[kMax]{};
+        std::atomic<std::int32_t> trace_opts[kMax]{};
+        std::atomic<std::int32_t> stop_status[kMax]{};
+        std::atomic<bool> stop_reported[kMax]{};
+        std::atomic<std::uint32_t> resume[kMax]{};
+        std::atomic<std::int32_t> resume_cmd[kMax]{}, resume_sig[kMax]{};
+        std::atomic<bool> regs_dirty[kMax]{};
+        std::uint64_t regs[kMax][34]{};
         std::atomic<std::int8_t> policy[kMax]{};
         std::atomic<std::uint64_t> affinity[kMax]{};
         // See post_signal. Allocated lazily: kMax x 1024 records is 64 MiB

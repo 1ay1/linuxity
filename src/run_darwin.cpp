@@ -816,11 +816,18 @@ void run_guest_thread(ThreadContext& ctx, runtime::HvfTrap::ThreadStart start) {
         const std::int32_t g = pids.guest_of(static_cast<pid_t>(h));
         return g > 0 ? g : 0;
     });
+    // who traces guest g, and is g stopped for them (/proc State 't')
+    m.k.procs().set_tracer_resolver([&pids](std::int32_t g) {
+        return std::pair<std::int32_t, bool>{pids.tracer_of(g), pids.stop_of(g) != 0};
+    });
     // /proc's per-task facts: macOS has no host /proc, so this process
     // answers for itself (and its threads), Darwin for the others.
     m.k.procs().set_host_facts([&proc, &pids](std::int32_t g, std::string_view leaf)
                                    -> std::optional<std::string> {
         const auto h = pids.host_of(g);
+        // procfs about to open /proc/<g>/mem: whichever pid, the OPENER is
+        // this process, and its next /dev/null open becomes g's memory
+        if (leaf == "mem-open") { proc.pending_mem_pid.store(g, std::memory_order_relaxed); return std::string{}; }
         if (!h || *h <= 0) return std::nullopt;
         if (*h == ::getpid()) {
             const runtime::procinfo::Self self{proc, g};

@@ -1,0 +1,119 @@
+// linuxity/runtime/darwin/memsvc.hpp
+//
+// Another process's memory, for a host that won't hand it out (macOS
+// refuses task_for_pid without the debugger entitlement). Every guest
+// process is its own linuxity with its own copy of guest RAM, so
+// /proc/<pid>/mem and process_vm_readv/writev of ANOTHER guest pid have
+// to ask that process.
+//
+// Each linuxity runs one small host thread serving its own RAM on an
+// AF_UNIX socket named after its guest pid in the env's shared directory.
+// It answers whether the guest is running, blocked in a host call or
+// stopped: the request never waits for the guest. A request is
+//
+//   { u32 op (1 read, 2 write), u32 pad, u64 addr, u64 len } [+ len bytes for a write]
+//
+// and the reply { i64 result (bytes moved, or -errno) } [+ bytes for a read].
+// Only guest addresses inside RAM are served; anything else is EFAULT.
+#pragma once
+#if defined(__APPLE__)
+
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <cerrno>
+#include <cstdint>
+#include <cstring>
+#include <functional>
+#include <span>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace lx::runtime::memsvc {
+
+struct Request { std::uint32_t op, pad; std::uint64_t addr, len; };
+inline constexpr std::uint64_t kMaxChunk = 1 << 20;
+
+[[nodiscard]] inline bool full_io(int fd, void* p, std::size_t n, bool reading) {
+    auto* b = static_cast<char*>(p);
+    while (n) {
+        const ssize_t r = reading ? ::read(fd, b, n) : ::write(fd, b, n);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) return false;
+        b += r; n -= static_cast<std::size_t>(r);
+    }
+    return true;
+}
+
+[[nodiscard]] inline std::string sock_path(const std::string& dir, std::int32_t pid) {
+    return dir + "/.mem." + std::to_string(pid);
+}
+
+// The server: binds `path`, serves `ram` (guest address -> host span, empty
+// if unmapped) until the process exits. Detached; never returns an error to
+// the guest (a client that can't connect sees ESRCH).
+inline void serve(std::string path, std::function<std::span<std::byte>(std::uint64_t, std::uint64_t)> ram) {
+    ::unlink(path.c_str());
+    const int s = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (s < 0) return;
+    ::sockaddr_un a{};
+    a.sun_family = AF_UNIX;
+    if (path.size() >= sizeof a.sun_path) { ::close(s); return; }
+    std::memcpy(a.sun_path, path.c_str(), path.size() + 1);
+    if (::bind(s, reinterpret_cast<::sockaddr*>(&a), sizeof a) < 0 || ::listen(s, 8) < 0) { ::close(s); return; }
+    std::thread([s, ram = std::move(ram)] {
+        for (;;) {
+            const int c = ::accept(s, nullptr, nullptr);
+            if (c < 0) { if (errno == EINTR) continue; return; }
+            Request q{};
+            if (full_io(c, &q, sizeof q, true) && q.len <= kMaxChunk) {
+                auto win = ram(q.addr, q.len);
+                std::int64_t rc = win.size() == q.len ? static_cast<std::int64_t>(q.len) : -EFAULT;
+                if (q.op == 2) {
+                    std::vector<std::byte> in(q.len);
+                    if (!full_io(c, in.data(), in.size(), true)) { ::close(c); continue; }
+                    if (rc > 0) std::memcpy(win.data(), in.data(), in.size());
+                    (void)full_io(c, &rc, sizeof rc, false);
+                } else {
+                    (void)full_io(c, &rc, sizeof rc, false);
+                    if (rc > 0) (void)full_io(c, win.data(), win.size(), false);
+                }
+            }
+            ::close(c);
+        }
+    }).detach();
+}
+
+// The client: one read or write of another process's guest memory.
+// Bytes moved, or -errno (ESRCH: no such process serving).
+[[nodiscard]] inline std::int64_t transfer(const std::string& path, bool writing, std::uint64_t addr,
+                                           std::span<std::byte> buf) {
+    std::int64_t done = 0;
+    while (done < static_cast<std::int64_t>(buf.size())) {
+        const std::uint64_t n = std::min<std::uint64_t>(buf.size() - static_cast<std::size_t>(done), kMaxChunk);
+        const int c = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        if (c < 0) return done ? done : -errno;
+        ::sockaddr_un a{};
+        a.sun_family = AF_UNIX;
+        std::memcpy(a.sun_path, path.c_str(), std::min(path.size() + 1, sizeof a.sun_path));
+        if (::connect(c, reinterpret_cast<::sockaddr*>(&a), sizeof a) < 0) { ::close(c); return done ? done : -ESRCH; }
+        Request q{writing ? 2u : 1u, 0, addr + static_cast<std::uint64_t>(done), n};
+        std::int64_t rc = -EIO;
+        bool ok = full_io(c, &q, sizeof q, false);
+        if (ok && writing) ok = full_io(c, buf.data() + done, n, false);
+        ok = ok && full_io(c, &rc, sizeof rc, true);
+        if (ok && rc > 0 && !writing) ok = full_io(c, buf.data() + done, static_cast<std::size_t>(rc), true);
+        ::close(c);
+        if (!ok) return done ? done : -EIO;
+        if (rc <= 0) return done ? done : rc;
+        done += rc;
+    }
+    return done;
+}
+
+}  // namespace lx::runtime::memsvc
+
+#endif  // __APPLE__

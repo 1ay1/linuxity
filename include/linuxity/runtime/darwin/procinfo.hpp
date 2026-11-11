@@ -173,10 +173,12 @@ struct Self {
             }
             const std::uint64_t end = hit ? std::min(hit->end, r.e) : next;
             const auto has = [&](GuestProt f) { return runtime::has(r.prot, f); };
+            const std::uint64_t off = hit ? hit->off + (at - hit->begin) : 0;
             std::snprintf(line, sizeof line, "%08llx-%08llx %c%c%c%c %08llx 00:00 0",
                           static_cast<unsigned long long>(at), static_cast<unsigned long long>(end),
                           has(GuestProt::read) ? 'r' : '-', has(GuestProt::write) ? 'w' : '-',
-                          has(GuestProt::exec) ? 'x' : '-', 'p', 0ull);
+                          has(GuestProt::exec) ? 'x' : '-', hit && hit->shared ? 's' : 'p',
+                          static_cast<unsigned long long>(off));
             out += line;
             if (hit && !hit->name.empty()) {
                 out.append(std::max<std::size_t>(1, 73 - std::strlen(line)), ' ');
@@ -200,13 +202,17 @@ fact(std::string_view leaf, pid_t host, const Self* self, std::optional<int> nic
         if (!ht) return std::nullopt;
         const int nv = nice.value_or(ht->nice);
         const std::uint64_t vs = self ? guest_vsize(self->proc) : ht->rss;
+        // the GUEST's threads, as status and task/ count them -- not the host
+        // task's, whose linuxity timer/service threads made every python
+        // fork() warn "this process is multi-threaded"
+        const std::uint64_t nth = self ? std::max<std::size_t>(1, self->proc.thread_count()) : ht->threads;
         char b[512];
         std::snprintf(b, sizeof b,
             "0 (x) %c 0 0 0 0 -1 4194304 %llu 0 %llu 0 %llu %llu 0 0 %d %d %llu 0 %llu %llu %llu "
             "18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
             ht->state, static_cast<unsigned long long>(ht->minflt), static_cast<unsigned long long>(ht->majflt),
             static_cast<unsigned long long>(ht->utime), static_cast<unsigned long long>(ht->stime),
-            20 + nv, nv, static_cast<unsigned long long>(ht->threads),
+            20 + nv, nv, static_cast<unsigned long long>(nth),
             static_cast<unsigned long long>(ht->start_ticks), static_cast<unsigned long long>(vs),
             static_cast<unsigned long long>(ht->rss / 4096));
         return std::string{b};
@@ -263,6 +269,7 @@ fact(std::string_view leaf, pid_t host, const Self* self, std::optional<int> nic
     }
     if (leaf == "environ") return p.environ();
     if (leaf == "auxv") return p.auxv();
+    if (leaf == "cmdline") { auto c = p.cmdline(); if (c.empty()) return std::nullopt; return c; }
     if (leaf == "limits") {
         // fs/proc/base.c's proc_pid_limits, column for column
         static constexpr struct { const char* name; const char* unit; } kRows[16] = {
@@ -287,9 +294,54 @@ fact(std::string_view leaf, pid_t host, const Self* self, std::optional<int> nic
         return s;
     }
     if (leaf == "maps") return maps(p);
-    if (leaf == "task") {
+    if (leaf == "smaps" || leaf == "smaps_rollup") {
+        // Each mapping's line, then its page accounting. Residency per
+        // mapping isn't tracked; Rss is the process total, attributed to
+        // the rollup (what tools sum), and the per-range fields are the
+        // range's size where Linux would show at most that.
+        const std::string m = maps(p);
+        auto field = [](std::string& s, const char* name, std::uint64_t kb) {
+            char b[64];
+            std::snprintf(b, sizeof b, "%-16s%8llu kB\n", name, static_cast<unsigned long long>(kb));
+            s += b;
+        };
+        const std::uint64_t rss = ht ? ht->rss / 1024 : 0;
+        if (leaf == "smaps_rollup") {
+            std::string s = "00400000-ffffffffff601000 ---p 00000000 00:00 0                  [rollup]\n";
+            field(s, "Rss:", rss); field(s, "Pss:", rss); field(s, "Pss_Anon:", rss);
+            for (const char* f : {"Shared_Clean:", "Shared_Dirty:", "Private_Clean:"}) field(s, f, 0);
+            field(s, "Private_Dirty:", rss); field(s, "Referenced:", rss); field(s, "Anonymous:", rss);
+            for (const char* f : {"LazyFree:", "AnonHugePages:", "Swap:", "SwapPss:", "Locked:"}) field(s, f, 0);
+            return s;
+        }
         std::string s;
-        for (const auto t : p.thread_ids()) s += std::to_string(t) + "\n";
+        for (std::size_t at = 0; at < m.size();) {
+            const std::size_t nl = std::min(m.find('\n', at), m.size());
+            const std::string line = m.substr(at, nl - at);
+            at = nl + 1;
+            unsigned long long lo = 0, hi = 0;
+            if (std::sscanf(line.c_str(), "%llx-%llx", &lo, &hi) != 2) continue;
+            s += line + "\n";
+            const std::uint64_t kb = (hi - lo) / 1024;
+            field(s, "Size:", kb);
+            field(s, "KernelPageSize:", 4);
+            field(s, "MMUPageSize:", 4);
+            for (const char* f : {"Rss:", "Pss:", "Shared_Clean:", "Shared_Dirty:", "Private_Clean:",
+                                  "Private_Dirty:", "Referenced:", "Anonymous:", "LazyFree:",
+                                  "AnonHugePages:", "Swap:", "SwapPss:", "Locked:"})
+                field(s, f, 0);
+            s += "VmFlags: rd wr mr mw me ac\n";
+        }
+        return s;
+    }
+    if (leaf == "task") {
+        // The leader is always a member while the process lives (Linux keeps
+        // a dead leader's entry as a zombie until the group exits). The
+        // thread table can lack it briefly: a sibling thread's exit runs
+        // under the same lock that a leader's (re)registration takes.
+        std::string s = std::to_string(self->pid) + "\n";
+        for (const auto t : p.thread_ids())
+            if (t != self->pid) s += std::to_string(t) + "\n";
         return s;
     }
     if (leaf == "fd") {

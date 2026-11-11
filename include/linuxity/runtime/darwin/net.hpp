@@ -253,9 +253,14 @@ struct LinuxSockaddr {
 // set boolean as the option's own bit (TCP_NODELAY reads back 4), Linux as
 // 1; SO_ERROR is an errno; SO_TYPE a socket type. One table says it, and
 // get/set both translate through it.
-enum class Val : std::uint8_t { raw, boolean, errno_, socktype };
+// timeval: Linux's struct timeval is {long sec; long usec}, Darwin's
+// {long sec; int usec} -- the same 16 bytes but a different usec width.
+// uchar: Darwin's IP multicast TTL/LOOP are u_char; Linux takes and gives an
+// int (and accepts a single byte too).
+enum class Val : std::uint8_t { raw, boolean, errno_, socktype, timeval, uchar };
 struct Option { int level, name; Val val{Val::raw}; };
 
+// Linux numbers (asm-generic/socket.h, linux/in.h, linux/in6.h, linux/tcp.h).
 [[nodiscard]] inline std::optional<Option> opt_to_darwin(int level, int name) noexcept {
     constexpr int kSolSocket = 1, kSolTcp = 6, kSolIp = 0, kSolIpv6 = 41;
     if (level == kSolSocket) {
@@ -272,11 +277,14 @@ struct Option { int level, name; Val val{Val::raw}; };
             case 10: return Option{SOL_SOCKET, SO_OOBINLINE, Val::boolean};
             case 13: return Option{SOL_SOCKET, SO_LINGER};
             case 15: return Option{SOL_SOCKET, SO_REUSEPORT, Val::boolean};
-            case 20: return Option{SOL_SOCKET, SO_RCVLOWAT};
+            case 18: return Option{SOL_SOCKET, SO_RCVLOWAT};
             case 19: return Option{SOL_SOCKET, SO_SNDLOWAT};
-            case 21: return Option{SOL_SOCKET, SO_RCVTIMEO};
-            case 22: return Option{SOL_SOCKET, SO_SNDTIMEO};
+            case 20: return Option{SOL_SOCKET, SO_RCVTIMEO, Val::timeval};
+            case 21: return Option{SOL_SOCKET, SO_SNDTIMEO, Val::timeval};
+            case 29: return Option{SOL_SOCKET, SO_TIMESTAMP, Val::boolean};
             case 30: return Option{SOL_SOCKET, SO_ACCEPTCONN, Val::boolean};
+            case 32: return Option{SOL_SOCKET, SO_SNDBUF};      // SO_SNDBUFFORCE
+            case 33: return Option{SOL_SOCKET, SO_RCVBUF};      // SO_RCVBUFFORCE
             default: return std::nullopt;
         }
     }
@@ -287,10 +295,44 @@ struct Option { int level, name; Val val{Val::raw}; };
             case 4:  return Option{IPPROTO_TCP, TCP_KEEPALIVE};        // TCP_KEEPIDLE
             case 5:  return Option{IPPROTO_TCP, TCP_KEEPINTVL};
             case 6:  return Option{IPPROTO_TCP, TCP_KEEPCNT};
+            case 23: return Option{IPPROTO_TCP, TCP_FASTOPEN};
+            case 25: return Option{IPPROTO_TCP, TCP_NOTSENT_LOWAT};
             default: return std::nullopt;
         }
     }
-    if (level == kSolIp || level == kSolIpv6) return Option{level == kSolIp ? IPPROTO_IP : IPPROTO_IPV6, name};
+    if (level == kSolIp) {
+        switch (name) {
+            case 1:  return Option{IPPROTO_IP, IP_TOS};
+            case 2:  return Option{IPPROTO_IP, IP_TTL};
+            case 3:  return Option{IPPROTO_IP, IP_HDRINCL, Val::boolean};
+            case 4:  return Option{IPPROTO_IP, IP_OPTIONS};
+            case 6:  return Option{IPPROTO_IP, IP_RECVOPTS, Val::boolean};
+            case 8:  return Option{IPPROTO_IP, IP_RECVPKTINFO, Val::boolean};   // IP_PKTINFO
+            case 12: return Option{IPPROTO_IP, IP_RECVTTL, Val::boolean};
+            case 13: return Option{IPPROTO_IP, IP_RECVTOS, Val::boolean};
+            case 32: return Option{IPPROTO_IP, IP_MULTICAST_IF};
+            case 33: return Option{IPPROTO_IP, IP_MULTICAST_TTL, Val::uchar};
+            case 34: return Option{IPPROTO_IP, IP_MULTICAST_LOOP, Val::uchar};
+            case 35: return Option{IPPROTO_IP, IP_ADD_MEMBERSHIP};
+            case 36: return Option{IPPROTO_IP, IP_DROP_MEMBERSHIP};
+            default: return std::nullopt;
+        }
+    }
+    if (level == kSolIpv6) {
+        switch (name) {
+            case 16: return Option{IPPROTO_IPV6, IPV6_UNICAST_HOPS};
+            case 17: return Option{IPPROTO_IPV6, IPV6_MULTICAST_IF};
+            case 18: return Option{IPPROTO_IPV6, IPV6_MULTICAST_HOPS};
+            case 19: return Option{IPPROTO_IPV6, IPV6_MULTICAST_LOOP};
+            case 20: return Option{IPPROTO_IPV6, IPV6_JOIN_GROUP};
+            case 21: return Option{IPPROTO_IPV6, IPV6_LEAVE_GROUP};
+            case 26: return Option{IPPROTO_IPV6, IPV6_V6ONLY, Val::boolean};
+            case 49: return Option{IPPROTO_IPV6, 61 /*IPV6_RECVPKTINFO*/, Val::boolean};
+            case 66: return Option{IPPROTO_IPV6, 35 /*IPV6_RECVTCLASS*/, Val::boolean};
+            case 67: return Option{IPPROTO_IPV6, 36 /*IPV6_TCLASS*/};
+            default: return std::nullopt;
+        }
+    }
     return std::nullopt;
 }
 

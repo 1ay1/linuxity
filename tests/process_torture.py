@@ -713,6 +713,39 @@ def pidfd_poll_and_signal():
     os.close(fd)
 
 
+@check
+def pidfd_on_an_exited_child():
+    # a child that exits before pidfd_open (asyncio's watcher racing a
+    # quick subprocess): still opens, readable at once; reaped -> ESRCH
+    if not hasattr(os, "pidfd_open"):
+        raise Skip("no os.pidfd_open")
+    pid = child(lambda: 3)
+    time.sleep(0.2)
+    fd = os.pidfd_open(pid)
+    eq(select.select([fd], [], [], 1)[0], [fd], "readable at once")
+    eq(status(pid), 3, "the zombie's status")
+    os.close(fd)
+    try:
+        os.close(os.pidfd_open(pid))
+        raise AssertionError("pidfd_open of a reaped pid succeeded")
+    except ProcessLookupError:
+        pass
+
+
+@check
+def thread_counts_agree():
+    # stat's num_threads, status's Threads and task/ are one count -- python
+    # warns on every fork() when stat says more than one
+    def counts():
+        stat = int(open("/proc/self/stat").read().rsplit(")", 1)[1].split()[17])
+        st = [int(l.split()[1]) for l in open("/proc/self/status") if l.startswith("Threads:")][0]
+        return stat, st, len(os.listdir("/proc/self/task"))
+    def single():
+        eq(counts(), (1, 1, 1), "a single-threaded process")
+        return 0
+    eq(status(child(single)), 0, "in a fresh child")
+
+
 # ---------------------------------------------------------------- identity, /proc
 
 @check

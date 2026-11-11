@@ -249,7 +249,24 @@ inline bool set_memfd_seals(int fd, std::uint32_t s) {
     if (kq < 0) return -1;
     struct ::kevent ev{};
     EV_SET(&ev, pid, EVFILT_PROC, EV_ADD | EV_CLEAR, NOTE_EXIT, 0, nullptr);
-    if (::kevent(kq, &ev, 1, nullptr, 0, nullptr) < 0) { ::close(kq); return -1; }
+    if (::kevent(kq, &ev, 1, nullptr, 0, nullptr) < 0) {
+        // XNU refuses EVFILT_PROC on a zombie (ESRCH); Linux opens a pidfd
+        // on one and it polls readable at once. A child that exits before
+        // its parent's pidfd_open (asyncio's child watcher racing a quick
+        // `sh -c 'exit 3'`) must not be "No such process".
+        const int ke = errno;
+        siginfo_t si{};
+        if (ke != ESRCH ||
+            ::waitid(P_PID, static_cast<id_t>(pid), &si, WEXITED | WNOHANG | WNOWAIT) != 0 ||
+            si.si_pid != pid) {
+            ::close(kq); errno = ke; return -1;
+        }
+        EV_SET(&ev, 1, EVFILT_USER, EV_ADD, 0, 0, nullptr);
+        struct ::kevent fire{};
+        EV_SET(&fire, 1, EVFILT_USER, 0, NOTE_TRIGGER, 0, nullptr);
+        if (::kevent(kq, &ev, 1, nullptr, 0, nullptr) < 0 ||
+            ::kevent(kq, &fire, 1, nullptr, 0, nullptr) < 0) { ::close(kq); return -1; }
+    }
     ::fcntl(kq, F_SETFD, FD_CLOEXEC);
     return kq;
 }

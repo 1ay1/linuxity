@@ -220,5 +220,28 @@ def interactive_bash_through_a_pty():
     eq(reap(pid), 5, "exit status")
 
 
+@check
+def exit_does_not_wait_for_the_output_to_be_read():
+    # Linux ends a session leader at once and leaves its last output
+    # buffered for the master (XNU would block the exit until it drains):
+    # a parent that reaps before reading -- pexpect, any harness -- works
+    for argv in (["/bin/sh", "-c", "echo bye; exit 5"],
+                 ["/bin/bash", "--norc", "--noprofile", "+m", "-i", "-c", "echo bye; exit 5"]):
+        pid, m = spawn_on_pty(argv)
+        end = time.monotonic() + 3
+        while time.monotonic() < end:
+            done, st = os.waitpid(pid, os.WNOHANG)
+            if done:
+                break
+            time.sleep(0.02)
+        else:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+            raise AssertionError(f"{argv[0]}: not reapable until its output is read")
+        eq(os.waitstatus_to_exitcode(st), 5, f"{argv[0]}: exit status")
+        ok(b"bye" in read_until(m, b"bye", 3), f"{argv[0]}: the output is still there")
+        os.close(m)
+
+
 if __name__ == "__main__":
     sys.exit(main("terminals"))

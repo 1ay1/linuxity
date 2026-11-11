@@ -284,6 +284,28 @@ public:
         w.pod(c.uids); w.pod(c.gids);
         w.pod(c.cap_eff); w.pod(c.cap_prm); w.pod(c.cap_inh); w.pod(c.cap_bnd); w.pod(c.cap_amb);
         w.pod(c.keepcaps); w.pod(c.no_new_privs); w.pod(c.nice);
+        // The namespaces (a fresh-process child must land in the same ones,
+        // its pid-for-children made current) and the pid-namespace chain
+        // above them with each one's numbering so far.
+        const NsSet ns = it == procs_.end() ? NsSet{} : it->second.ns;
+        w.pod(ns);
+        std::vector<std::uint64_t> chain;
+        for (std::uint64_t n = ns.pid_for_children ? ns.pid_for_children : ns[NsKind::pid]; n;) {
+            chain.push_back(n);
+            auto p = pidns_.find(n);
+            n = p == pidns_.end() ? 0 : p->second.parent;
+        }
+        w.pod(static_cast<std::uint32_t>(chain.size()));
+        for (const auto n : chain) {
+            const auto p = pidns_.find(n);
+            w.pod(n);
+            w.pod(p == pidns_.end() ? std::uint64_t{0} : p->second.parent);
+            w.pod(p == pidns_.end() ? std::int32_t{1} : p->second.next);
+            std::vector<std::int32_t> pairs;
+            if (p != pidns_.end())
+                for (const auto& [g, l] : p->second.local_of) { pairs.push_back(g); pairs.push_back(l); }
+            w.vec(pairs);
+        }
     }
     void import_creds(fork_state::Reader& r) {
         Creds c;
@@ -295,7 +317,22 @@ public:
         c.cap_amb = r.pod<std::uint64_t>();
         c.keepcaps = r.pod<bool>(); c.no_new_privs = r.pod<bool>(); c.nice = r.pod<std::int32_t>();
         inherited_creds_ = std::move(c);
+        inherited_ns_ = r.pod<NsSet>();
+        const auto n = r.pod<std::uint32_t>();
+        for (std::uint32_t i = 0; i < n && i < 64; ++i) {
+            const auto id = r.pod<std::uint64_t>();
+            auto& p = pidns_[id];
+            p.parent = r.pod<std::uint64_t>();
+            p.next = r.pod<std::int32_t>();
+            const auto pairs = r.vec<std::int32_t>();
+            for (std::size_t k = 0; k + 1 < pairs.size(); k += 2) {
+                p.local_of[pairs[k]] = pairs[k + 1];
+                p.global_of[pairs[k + 1]] = pairs[k];
+            }
+        }
     }
+    // The namespaces a fresh-process fork child starts in (import_creds).
+    [[nodiscard]] const std::optional<NsSet>& inherited_ns() const noexcept { return inherited_ns_; }
     // The credentials a record created on first sight starts with: what
     // the fork handed over, or the defaults.
     [[nodiscard]] const std::optional<Creds>& inherited_creds() const noexcept { return inherited_creds_; }
@@ -705,6 +742,7 @@ private:
     bool host_pids_{false};
     std::int32_t last_pid_{1};
     std::optional<Creds> inherited_creds_;   // a fresh-process fork's (import_creds)
+    std::optional<NsSet> inherited_ns_;      // ...and its namespaces
     Namespaces ns_;
     SysvIpc ipc_;
     std::map<std::uint64_t, PidNs> pidns_;

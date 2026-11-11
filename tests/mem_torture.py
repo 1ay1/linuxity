@@ -189,15 +189,21 @@ def large_sparse_reservation_costs_only_what_is_touched():
         with open("/proc/self/status") as f:
             return next(int(l.split()[1]) for l in f if l.startswith("VmRSS:"))
     before = rss()
-    a = anon(8 << 30, flags=MAP_PRIVATE | MAP_ANON | MAP_NORESERVE)   # 8 GiB of address space
-    for i in range(0, 8 << 30, 256 << 20):
-        poke(a + i, b"t")                        # 32 pages
+    # A reservation far beyond what's touched: half of this machine's RAM
+    # (8 GiB on a big host), and only 32 pages written.
+    with open("/proc/meminfo") as f:
+        total = next(int(l.split()[1]) for l in f if l.startswith("MemTotal:")) * 1024
+    size = min(8 << 30, (total // 2) & ~((256 << 20) - 1))
+    step = size // 32
+    a = anon(size, flags=MAP_PRIVATE | MAP_ANON | MAP_NORESERVE)
+    for i in range(0, size, step):
+        poke(a + i, b"t")
     after = rss()
-    ok(after - before < 64 * 1024, f"RSS grew {after - before} KiB for 32 touched pages")
-    eq(peek(a + (256 << 20), 1), b"t", "a far page holds its byte")
+    ok(after - before < 64 * 1024, f"RSS grew {after - before} KiB for 32 touched pages of {size >> 20} MiB")
+    eq(peek(a + step, 1), b"t", "a far page holds its byte")
     with open("/proc/self/status") as f:
         vm = next(int(l.split()[1]) for l in f if l.startswith("VmSize:"))
-    ok(vm > 8 << 20, f"VmSize counts the reservation ({vm} KiB)")
+    ok(vm > size >> 10, f"VmSize counts the reservation ({vm} KiB)")
 
 
 @check

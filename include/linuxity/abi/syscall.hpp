@@ -6024,10 +6024,21 @@ private:
         // the parent's linuxity -- the one here is only this process's seed
         // (pid 1, default root) -- so the creds the fork handed over win.
         if (const auto& ic = k_.procs().inherited_creds()) pi.creds() = *ic;
+        // ...and the namespaces: the parent's, its pid-for-children made
+        // current (a child of unshare(CLONE_NEWPID) is pid 1 in the new one)
+        bool fresh_ns = false;
+        if (const auto& ins = k_.procs().inherited_ns(); ins) {
+            pi.ns = *ins;
+            if (ins->pid_for_children) pi.ns[kernel::NsKind::pid] = ins->pid_for_children;
+            if (ins->time_for_children) pi.ns[kernel::NsKind::time] = ins->time_for_children;
+            pi.ns.pid_for_children = pi.ns.time_for_children = 0;
+            fresh_ns = true;
+        }
         pi.creds_given = true;
         pi.live_seen = true;
         k_.procs().upsert(pi);
-        if (id.ppid > 0) k_.procs().assign_ns_pid_from(id.pid, id.ppid);
+        if (fresh_ns) k_.procs().assign_ns_pid(id.pid);
+        else if (id.ppid > 0) k_.procs().assign_ns_pid_from(id.pid, id.ppid);
         return *k_.procs().find_mut(id.pid);
     }
 
@@ -7033,8 +7044,46 @@ public:
         note_opened_fd(fd);
     }
 
+    // Everything note_opened_fd will consume, captured while the dispatch
+    // that set it still holds the kernel lock. The open itself runs unlocked
+    // (it may block), and another thread of the process dispatches in the
+    // meantime -- its own open, or a thread exit -- and overwrote or cleared
+    // this state. /proc/self/task then listed nothing: the directory's
+    // entries had been stashed here and were gone by the time the fd came
+    // back. Restore it, under the lock again, just before note_opened_fd.
+    struct OpenState {
+        std::int32_t pid{0}, ppid{0};
+        std::string open, lazy;
+        std::uint64_t flags{0};
+        bool dir{false}, is_new{false};
+        std::vector<kernel::VirtualDirent> entries;
+        std::pair<std::int32_t, std::int32_t> comm{0, 0};
+        std::pair<std::int32_t, std::string> map{};
+    };
+    [[nodiscard]] OpenState save_open_state() {
+        const auto id = ids();
+        return {id.pid, id.ppid, pending_open_, pending_lazy_, pending_flags_, pending_dir_,
+                pending_new_, pending_entries_, pending_comm_, pending_map_};
+    }
+    void restore_open_state(OpenState s) {
+        k_.files().set_current_pid(s.pid, s.ppid);
+        pending_open_ = std::move(s.open);
+        pending_lazy_ = std::move(s.lazy);
+        pending_flags_ = s.flags;
+        pending_dir_ = s.dir;
+        pending_new_ = s.is_new;
+        pending_entries_ = std::move(s.entries);
+        pending_comm_ = s.comm;
+        pending_map_ = std::move(s.map);
+    }
+
     // A hard link is the same inode, so the new name gets the source's
     // owner and mode. They're kept per path, so copy them over.
+    // Does the caller see pids through a pid namespace of its own (so a
+    // backend's global getpid would be wrong)?
+    [[nodiscard]] bool caller_in_child_pidns() {
+        return kernel::ProcessTable::pid_ns(k_.procs().ns_of(me().pid)) != 0;
+    }
     void note_linked(const std::string& src, const std::string& dst) {
         auto& m = k_.files().meta();
         const auto rec = m.lookup(src);
@@ -7613,7 +7662,12 @@ public:
 
     // The inode behind guest fd `fd`, or 0.
     [[nodiscard]] std::uint64_t ll_fd_ino(int fd) {
-        if constexpr (!requires { mem_.host_tid(); }) {
+        if constexpr (requires { mem_.host_fd_of(fd); } && !requires { mem_.host_tid(); }) {
+            // the guest's fd is a host fd of ours (macOS): stat it directly
+            const int h = mem_.host_fd_of(fd);
+            struct ::stat st{};
+            return h >= 0 && ::fstat(h, &st) == 0 ? static_cast<std::uint64_t>(st.st_ino) : 0;
+        } else if constexpr (!requires { mem_.host_tid(); }) {
             (void)fd;
             return 0;
         } else {
@@ -7911,6 +7965,20 @@ public:
             want += c == '\0' ? '@' : c;
         }
         if constexpr (!requires { mem_.host_tid(); }) {
+            // No host /proc/net/unix (macOS): the backend keeps, beside each
+            // abstract socket it binds, the binder's domain chain (the ids,
+            // outermost first); a name with none was bound unrestricted.
+            if constexpr (requires { mem_.abstract_binder_domain(std::string{}); }) {
+                std::string raw;
+                for (std::size_t i = 3; i < len; ++i) raw += static_cast<char>(std::to_integer<unsigned>(sa[i]));
+                const auto chain = mem_.abstract_binder_domain(raw);
+                if (!chain) return Errno::ok;                      // nobody bound it
+                // `within(binder, d)`: the binder's chain holds d's innermost
+                // id at d's depth
+                if (!d || d->empty()) return Errno::ok;
+                if (chain->size() < d->size()) return Errno::eperm;
+                return (*chain)[d->size() - 1] == d->back().domain_id ? Errno::ok : Errno::eperm;
+            }
             return Errno::ok;
         } else {
             std::set<std::string> inodes;
@@ -7963,6 +8031,14 @@ public:
             }
             return Errno::eperm;   // held outside the guest tree: outside the domain
         }
+    }
+    // The caller's landlock domain chain (ids, outermost first), for a
+    // backend that must publish it beside an abstract socket it binds.
+    [[nodiscard]] std::vector<std::uint64_t> caller_ll_chain() {
+        std::vector<std::uint64_t> out;
+        if (const auto& d = me().landlock)
+            for (const auto& l : *d) out.push_back(l.domain_id);
+        return out;
     }
     // Is `pid` under a Landlock domain? The domain is inherited, so walk up.
     [[nodiscard]] bool is_landlocked(std::int32_t pid) const {

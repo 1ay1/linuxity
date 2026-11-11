@@ -19,6 +19,7 @@
 #include "linuxity/kernel/file_namespace.hpp"
 #include "linuxity/kernel/machine.hpp"
 #include "linuxity/kernel/process_table.hpp"
+#include "linuxity/vfs/procnet_synth.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -332,6 +333,18 @@ inline std::optional<Result<kernel::VirtualFile>> net_view(std::string_view rest
     (void)host_pid;
     return std::nullopt;
 #else
+#if defined(__APPLE__)
+    // No /proc/net on the host (macOS): the files programs read, made here.
+    if (struct ::stat nst{}; ::stat("/proc/net", &nst) != 0) {
+        if (rest.empty()) {
+            std::vector<kernel::VirtualDirent> e;
+            for (auto f : procnet::kFiles) e.push_back({std::string{f}, false});
+            return ok(detail::dir_file(std::move(e)));
+        }
+        if (auto t = procnet::file(rest)) return ok(detail::text_file(std::move(*t)));
+        return err<kernel::VirtualFile>(Errno::enoent);
+    }
+#endif
     // a task in a real network namespace of its own reads that one
     const std::string base = host_pid > 0 ? "/proc/" + std::to_string(host_pid) + "/net" : "/proc/net";
     const std::string host = rest.empty() ? base : base + "/" + std::string{rest};
@@ -1035,6 +1048,8 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                     {"/proc", "proc", "rw,nosuid,nodev,noexec"},
                     {"/sys", "sysfs", "rw,nosuid,nodev,noexec"},
                     {"/dev", "devtmpfs", "rw,nosuid"},
+                    {"/dev/pts", "devpts", "rw,nosuid,noexec,gid=5,mode=620,ptmxmode=000"},
+                    {"/dev/shm", "tmpfs", "rw,nosuid,nodev"},
                     {"/tmp", "tmpfs", "rw,nosuid,nodev"}};
                 std::string s;
                 int id = 21, minor = 2;
@@ -1075,11 +1090,17 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
                     "2 1 0:2 / /proc rw,nosuid,nodev,noexec - proc proc rw\n"
                     "3 1 0:3 / /sys rw,nosuid,nodev,noexec - sysfs sysfs rw\n"
                     "4 1 0:4 / /dev rw,nosuid - devtmpfs devtmpfs rw\n"
+                    "6 4 0:6 / /dev/pts rw,nosuid,noexec - devpts devpts rw,gid=5,mode=620,ptmxmode=000\n"
+                    "7 4 0:7 / /dev/shm rw,nosuid,nodev - tmpfs tmpfs rw\n"
+                    "8 3 0:8 / /sys/fs/cgroup rw,nosuid,nodev,noexec - cgroup2 cgroup2 rw\n"
                     "5 1 0:5 / /tmp rw,nosuid,nodev - tmpfs tmpfs rw\n"));
             return ok(text_file(
                 rdev + " / " + rfs + " rw,relatime 0 0\nproc /proc proc rw,nosuid,nodev,noexec 0 0\n"
                 "sysfs /sys sysfs rw,nosuid,nodev,noexec 0 0\n"
                 "devtmpfs /dev devtmpfs rw,nosuid 0 0\n"
+                "devpts /dev/pts devpts rw,nosuid,noexec,gid=5,mode=620,ptmxmode=000 0 0\n"
+                "tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0\n"
+                "cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec 0 0\n"
                 "tmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n"));
         }
         // /proc/sys: the knobs programs read. Machine facts are ours; the
@@ -1399,9 +1420,16 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
             // its real memory: the host task's file
             if (tail == "mem") {
                 const int h = procs.host_of(self_tid);
-                if (h <= 0) return err<kernel::VirtualFile>(Errno::enoent);
+                if (h <= 0 && !procs.has_host_facts()) return err<kernel::VirtualFile>(Errno::enoent);
                 kernel::VirtualFile vf;
-                vf.redirect_host = "/proc/" + std::to_string(h) + "/" + tail;
+                // no host /proc (macOS): the backend serves the guest
+                // memory of the process the marker names
+                vf.redirect_host = procs.has_host_facts()
+                    ? std::string{"/dev/null"}
+                    : "/proc/" + std::to_string(h) + "/" + tail;
+                // which process the backend should serve (it opens /dev/null
+                // and turns the fd into that process's memory)
+                if (procs.has_host_facts()) (void)procs.host_fact(I.pid, "mem-open");
                 return ok(std::move(vf));
             }
             // auxv as a direct exec shows it, even when linuxity started the
@@ -1415,6 +1443,8 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
             const char state = procs.tracer_of(self_tid).second ? 't' : host_state(procs, self_tid, I.state);
             if (tail == "comm")   return ok(text_file(comm + "\n"));
             if (tail == "cmdline") {
+                // the process's own argv, where the backend keeps it
+                if (auto f = procs.host_fact(self_tid, "cmdline")) return ok(text_file(std::move(*f)));
                 std::string cl = I.cmdline; cl.push_back('\0');  // NUL-terminated
                 return ok(text_file(std::move(cl)));
             }
@@ -1493,6 +1523,8 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
             }
             // the guest's cgroup root, which /sys/fs/cgroup describes
             if (tail == "cgroup") return ok(text_file("0::/\n"));
+            if (tail == "smaps" || tail == "smaps_rollup")
+                if (auto f = procs.host_fact(self_tid, tail)) return ok(text_file(std::move(*f)));
             if (tail == "statm") {
                 if (auto f = procs.host_fact(self_tid, "statm"))
                     return ok(text_file(std::move(*f)));

@@ -151,6 +151,19 @@ public:
             // The dispatcher classifies the trapped syscall: service it from
             // our subsystems, forward it to the host kernel, or exit.
             abi::Outcome o = locked([&] { return sys.dispatch(f.regs); });
+            // An open's pending state, taken with the dispatch: the open runs
+            // unlocked and a sibling thread's dispatch would clobber it. Only
+            // the outcomes that open something carry it.
+            using OpenState = typename std::remove_cvref_t<decltype(sys)>::OpenState;
+            std::optional<OpenState> open_state;
+            if (o.template get_if<abi::Inject>() || o.template get_if<abi::Redirect>())
+                open_state = locked([&] { return sys.save_open_state(); });
+            auto note_opened = [&](std::int64_t fd) {
+                locked([&] {
+                    if (open_state) sys.restore_open_state(std::move(*open_state));
+                    sys.note_opened_fd(fd);
+                });
+            };
             // publish what the call changed to the in-guest handler
             if constexpr (runtime::AnswersInGuest<T, K, decltype(sys)>)
                 locked([&] { trap_.ig_after_dispatch(f.regs, kernel_, sys); });
@@ -221,7 +234,7 @@ public:
                             auto fdr = trap_.redirect(in.path_arg, via);
                             ::close(m);   // the guest's open holds it now
                             if (!fdr) return recover(fdr.error());
-                            locked([&] { sys.note_opened_fd(*fdr); });
+                            note_opened(*fdr);
                             return Step::next;
                         }
 #endif
@@ -253,7 +266,7 @@ public:
 #endif
                     if (!fdr) return recover(fdr.error());
                     if (!tmp.empty()) temps_.push_back(std::move(tmp));
-                    locked([&] { sys.note_opened_fd(*fdr); });
+                    note_opened(*fdr);
                     return Step::next;
                 },
 
@@ -342,7 +355,7 @@ public:
                         arg2, hp2_fit);
                     if (!retr) return recover(retr.error());
                     if (rd.force_ret) return Step::next;   // nothing was opened
-                    locked([&] { sys.note_opened_fd(*retr); });
+                    note_opened(*retr);
                     return Step::next;
                 },
 

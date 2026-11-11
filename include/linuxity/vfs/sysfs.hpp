@@ -67,6 +67,29 @@ inline VirtualFile dir(std::vector<VirtualDirent> e) {
     VirtualFile vf; vf.is_dir = true; vf.entries = std::move(e); return vf;
 }
 
+// The class/bus symlinks (see make_sysfs): link -> its relative target.
+inline constexpr std::pair<std::string_view, std::string_view> kClassLinks[] = {
+    {"/sys/class/net/lo",       "../../devices/virtual/net/lo"},
+    {"/sys/class/hwmon/hwmon0", "../../devices/virtual/hwmon/hwmon0"},
+    {"/sys/class/hwmon/hwmon1", "../../devices/virtual/hwmon/hwmon1"},
+    {"/sys/class/block/vda",    "../../devices/virtual/block/vda"},
+    {"/sys/class/block/vda1",   "../../devices/virtual/block/vda/vda1"},
+    {"/sys/block/vda",          "../devices/virtual/block/vda"},
+};
+// The absolute path a class link's relative target names.
+inline std::string link_dest(std::string_view link, std::string_view target) {
+    std::string at{link.substr(0, link.rfind('/'))};
+    while (target.starts_with("../")) {
+        at.resize(at.rfind('/'));
+        target.remove_prefix(3);
+    }
+    return at + "/" + std::string{target};
+}
+inline bool is_class_link(std::string_view p) {
+    for (const auto& l : kClassLinks) if (l.first == p) return true;
+    return false;
+}
+
 // "cpu0" -> 0 ; returns -1 if `s` isn't "cpu"<digits>.
 inline long index_after(std::string_view s, std::string_view prefix) {
     if (!s.starts_with(prefix)) return -1;
@@ -342,7 +365,7 @@ inline std::vector<HalZone> android_zones() {
 // /proc. One physical package, `ncpu` cores, no SMT.
 [[nodiscard]] inline kernel::FileNamespace::Producer
 make_sysfs(const kernel::MachineSpec& mach) {
-    auto synth = [&mach](std::string_view abs) -> Result<kernel::VirtualFile> {
+    auto body = [&mach](std::string_view abs) -> Result<kernel::VirtualFile> {
         using namespace sysfs_detail;
         const long ncpu = mach.ncpu < 1 ? 1 : mach.ncpu;
         const long khz  = mach.cpu_khz();
@@ -606,7 +629,9 @@ make_sysfs(const kernel::MachineSpec& mach) {
         // ================= hwmon (temperatures) ==========================
         // One virtual hwmon exposing a CPU package temperature.
         if (abs == "/sys/devices/virtual")
-            return D({{"hwmon",true},{"net",true}});
+            return D({{"block",true},{"hwmon",true},{"net",true}});
+        if (abs == "/sys/devices/virtual/block")
+            return D({{"vda",true}});
         // Android's thermal HAL (see android_zones): its real sensors as a
         // second hwmon, temps labelled by zone, so `sensors` and monitors show
         // skin, TPU, battery and modem temperatures. Only with host hardware.
@@ -735,8 +760,10 @@ make_sysfs(const kernel::MachineSpec& mach) {
         if (abs.find("/net/lo/statistics/") != std::string_view::npos) return T("0\n");
 
         // ================= /sys/block (one virtual disk) =================
-        if (abs == "/sys/block" || abs == "/sys/class/block")
+        if (abs == "/sys/block")
             return D({{"vda",true}});
+        if (abs == "/sys/class/block")
+            return D({{"vda",true},{"vda1",true}});
         if (abs == "/sys/block/vda")
             return D({{"stat",false},{"size",false},{"ro",false},
                      {"removable",false},{"queue",true},{"device",true},
@@ -805,6 +832,38 @@ make_sysfs(const kernel::MachineSpec& mach) {
             return D({});
 
         return err<kernel::VirtualFile>(Errno::enoent);
+    };
+    // Linux's /sys/class/<c>/<x> and /sys/block/<x> are SYMLINKS into
+    // /sys/devices; tools (lsblk, sensors, udevadm, `ip -d link`) follow
+    // them and expect realpath() to land under /sys/devices/. Served as
+    // real virtual links: a class entry reads back its relative target, and
+    // a path THROUGH it is the device path's file.
+    auto synth = [body](std::string_view abs) -> Result<kernel::VirtualFile> {
+        using namespace sysfs_detail;
+        // The disk's device directory is served by the /sys/block/vda code.
+        auto dev = [&body](const std::string& p) {
+            constexpr std::string_view kDisk = "/sys/devices/virtual/block/vda";
+            if (p.starts_with(kDisk) && (p.size() == kDisk.size() || p[kDisk.size()] == '/'))
+                return body("/sys/block/vda" + p.substr(kDisk.size()));
+            return body(p);
+        };
+        for (const auto& [link, target] : kClassLinks) {
+            if (!abs.starts_with(link)) continue;
+            if (abs.size() == link.size()) {
+                // only while the device is there (hwmon1 needs a HAL)
+                if (auto d = dev(link_dest(link, target)); !d) return d;
+                VirtualFile vf;
+                vf.symlink_target = std::string{target};
+                return ok(std::move(vf));
+            }
+            if (abs[link.size()] == '/')
+                return dev(link_dest(link, target) + std::string{abs.substr(link.size())});
+        }
+        auto r = dev(std::string{abs});
+        if (r && r->is_dir)
+            for (auto& e : r->entries)
+                if (is_class_link(std::string{abs} + "/" + e.name)) e.type = DType::symlink;
+        return r;
     };
     return [&mach, synth](std::string_view abs) -> Result<kernel::VirtualFile> {
         using namespace sysfs_detail;

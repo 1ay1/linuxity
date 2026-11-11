@@ -72,6 +72,9 @@
 #include "linuxity/runtime/darwin/tty.hpp"
 #include "linuxity/runtime/darwin/mem.hpp"
 #include "linuxity/runtime/darwin/net.hpp"
+#include "linuxity/runtime/darwin/rtnetlink.hpp"
+#include "linuxity/runtime/darwin/mqueue.hpp"
+#include "linuxity/runtime/darwin/memsvc.hpp"
 #include "linuxity/runtime/darwin/regs.hpp"
 #include "linuxity/runtime/darwin/vm.hpp"
 #include "linuxity/runtime/shared/address_space.hpp"
@@ -180,6 +183,70 @@ public:
     [[nodiscard]] int host_fd_of(int gfd) const {
         return proc_.with_fds([&](const FdTable& t) { return t.host(gfd).value_or(-1); });
     }
+    // ptrace of the call being dispatched now (the core checked permission).
+    [[nodiscard]] std::int64_t guest_ptrace_now() { return do_guest_ptrace(); }
+
+    // GuestCalls (abi/outcome.hpp): run a short chain of syscalls for the
+    // trapped task, in place of its own, and complete it with the chosen
+    // step's result. Every step is one this backend serves itself, so the
+    // chain runs right here: registers set, service(), next. Strings go on
+    // the guest stack below the red zone, as the chain's pointer args.
+    struct GuestCall { abi::Sysno nr; std::array<std::uint64_t, 6> a; };
+    // aarch64 numbers of the calls a GuestCalls chain uses (the inverse of
+    // abi::decode for them; the full table lives with the Linux backend)
+    [[nodiscard]] static std::uint64_t aarch64_nr(abi::Sysno s) noexcept {
+        using S = abi::Sysno;
+        switch (s) {
+            case S::memfd_create: return 279; case S::close: return 57; case S::fcntl: return 25;
+            case S::mmap: return 222; case S::munmap: return 215; case S::openat: return 56;
+            case S::socket: return 198; case S::bind: return 200; case S::unshare: return 97;
+            case S::wait4: return 260;
+            default: return 0;
+        }
+    }
+    void set_before_resume(std::function<void(std::int64_t)> f) { before_resume_ = std::move(f); }
+    [[nodiscard]] Result<std::int64_t> run_in_guest(const std::vector<GuestCall>& calls,
+                                                    const std::vector<std::string>& strings = {},
+                                                    int result_of = -1, std::int64_t = 0,
+                                                    bool echild_is_zero = false) {
+        constexpr std::uint64_t kPrev = abi::GuestCalls::prev, kStr0 = abi::GuestCalls::str0,
+                                kStep = abi::GuestCalls::prev_of(0);
+        const GuestRegs entry = regs_;
+        const GuestRam ram = machine_.ram();
+        const auto st = cpu_.save();
+        std::vector<std::uint64_t> saddr;
+        std::uint64_t at = (st.sp_el0 - 512) & ~std::uint64_t{15};
+        for (const auto& s : strings) {
+            at = (at - (s.size() + 1)) & ~std::uint64_t{15};
+            auto w = ram.at(at, s.size() + 1);
+            if (w.size() != s.size() + 1) return complete(-14);
+            std::memcpy(w.data(), s.c_str(), s.size() + 1);
+            saddr.push_back(at);
+        }
+        std::int64_t prev = 0;
+        std::vector<std::int64_t> rets;
+        for (const auto& c : calls) {
+            for (std::size_t k = 0; k < 6; ++k) {
+                std::uint64_t v = c.a[k];
+                if (v == kPrev) v = static_cast<std::uint64_t>(prev);
+                else if (v >= kStr0 && v < kStr0 + saddr.size()) v = saddr[v - kStr0];
+                else if (v >= kStep && v < kStep + rets.size()) v = static_cast<std::uint64_t>(rets[v - kStep]);
+                regs_.x[k] = v;
+            }
+            regs_.x[8] = aarch64_nr(c.nr);
+            if (regs_.x[8] == 0) { prev = -38; rets.push_back(prev); break; }
+            prev = service(nullptr, nullptr);
+            rets.push_back(prev);
+            if (prev < 0 && prev >= -4095) break;
+        }
+        regs_ = entry;
+        const bool failed = prev < 0 && prev >= -4095;
+        if (!failed && result_of >= 0 && static_cast<std::size_t>(result_of) < rets.size())
+            prev = rets[static_cast<std::size_t>(result_of)];
+        if (echild_is_zero && prev == -10) prev = 0;
+        if (auto f = std::exchange(before_resume_, {})) f(prev);
+        return complete(prev);
+    }
     // The same facts in abi/identity.hpp's shape, so the shared answers can
     // be used by this backend's own service routine too (not just through
     // the portable dispatcher's current_ids() probe).
@@ -223,6 +290,7 @@ public:
     // after setpgid/setsid. Anything NOT listed keeps trapping, so a
     // missing refresh is a lost optimisation, never a wrong answer.
     void refresh_guest_answers() {
+        if (seccomp_mode_ == 1 || in_child_pidns_) return;   // every call must trap
         // The table is PROCESS-wide (one VM, one private page), so only a
         // value every thread agrees on may go in it. getpid is the THREAD
         // GROUP id -- the main thread's tid -- which is exactly that;
@@ -244,6 +312,8 @@ public:
             return;
         }
         machine_.set_guest_answer(174, ids->uid);    // getuid
+        pids_.set_ids(tgid_, ids->euid, ids->egid);  // for a peer's SO_PEERCRED
+        if (seccomp_mode_ == 1) { for (int nr : {174, 175, 176, 177}) machine_.clear_guest_answer(nr); return; }
         machine_.set_guest_answer(175, ids->euid);   // geteuid
         machine_.set_guest_answer(176, ids->gid);    // getgid
         machine_.set_guest_answer(177, ids->egid);   // getegid
@@ -254,7 +324,16 @@ public:
     // guest answers in-VM agrees with what the dispatcher would say.
     template <class K, class S>
     void ig_after_dispatch(const abi::Regs& r, K&, S& sys) {
-        if (!S::changes_creds(abi::decode(abi::Arch::aarch64, r.nr)) && proc_.ids()) return;
+        const auto sc = abi::decode(abi::Arch::aarch64, r.nr);
+        if (sc == abi::Sysno::landlock_restrict_self) ll_chain_ = sys.caller_ll_chain();
+        // In a child pid namespace getpid & co are LOCAL numbers, which the
+        // core keeps: stop answering them here (and in-guest).
+        if (!in_child_pidns_ && (sc == abi::Sysno::unshare || sc == abi::Sysno::setns ||
+                                 !proc_.ids()) && sys.caller_in_child_pidns()) {
+            in_child_pidns_ = true;
+            for (int nr : {172, 173, 178}) machine_.clear_guest_answer(nr);
+        }
+        if (!S::changes_creds(sc) && proc_.ids()) return;
         if (!proc_events_.empty()) return;   // an exec not yet applied: wait for it
         const auto c = sys.caller_ids();
         if (proc_.note_ids({c.uid, c.euid, c.gid, c.egid})) publish_ids();
@@ -334,6 +413,7 @@ public:
         }
         proc_.set_environ(ex.environ);
         proc_.set_auxv(ex.auxv);
+        proc_.set_cmdline(ex.cmdline);
     }
     // Room below the initial sp for the stack to grow (Linux's default
     // RLIMIT_STACK, which is what prlimit64 reports).
@@ -353,7 +433,11 @@ public:
 
     [[nodiscard]] Result<bool> next(TrapFrame& f) {
         constexpr std::uint64_t kEcSvc64 = 0x15;
-        if (!ready_announced_) { pids_.mark_ready(tgid_); ready_announced_ = true; }
+        if (!ready_announced_) {
+            pids_.mark_ready(tgid_);
+            ready_announced_ = true;
+            if (!threaded_) start_memsvc();
+        }
         for (;;) {
             if (exited_) return ok(false);
             apply_posted_pgid();
@@ -393,6 +477,20 @@ public:
             }
             // aarch64 Linux: nr in x8, args x0..x5.
             f.regs.nr = regs_.nr();
+            // SECCOMP_MODE_STRICT: read, write, exit, rt_sigreturn and
+            // nothing else; any other call is SIGKILL (kernel/seccomp.c).
+            if (seccomp_mode_ == 1) {
+                const auto nr = regs_.nr();
+                if (nr != 63 && nr != 64 && nr != 93 && nr != 139) kill_with(9);
+            }
+            // PTRACE_SYSCALL: stop at the entry (SIGTRAP, | 0x80 with
+            // TRACESYSGOOD); the exit stop comes after the call (complete).
+            if (syscall_stops_ && traced()) {
+                const bool good = pids_.trace_opts(tgid_) & 1;
+                in_syscall_stop_ = true;
+                trace_point(0x7f | ((good ? 0x85 : 5) << 8));
+                f.regs.nr = regs_.nr();
+            }
             for (std::size_t i = 0; i < 6; ++i) f.regs.arg[i] = regs_.arg(i);
             f.pc = regs_.elr;
             return ok(true);
@@ -539,6 +637,9 @@ public:
     // space, and our trap boundary is that point.
     void mark_self_pending(int sig) {
         if (sig == 0) return;
+        // traced: even SIGSTOP is a signal-delivery stop for the tracer
+        // (deliver_pending), not a host stop the tracer can't see
+        if (sig == 19 && traced()) { g_pending.enqueue({19, tgid_, 0, 0}); return; }
         if (sig == 9 || sig == 19) {
             // SIGKILL/SIGSTOP from INSIDE the namespace cannot touch its init
             // (only an ancestor namespace can) -- see is_namespace_init().
@@ -717,7 +818,30 @@ private:
             }
             std::fprintf(stderr, "      \"%s\"\n", shown.c_str());
         }
+        // A send on a socket the peer RESET: Darwin says EPIPE and keeps
+        // the ECONNRESET in SO_ERROR; Linux reports that pending error from
+        // the send (consuming it), with no SIGPIPE.
+        if (rc == -32) {
+            const auto sc = abi::decode(abi::Arch::aarch64, regs_.nr());
+            if (sc == abi::Sysno::sendto || sc == abi::Sysno::sendmsg || sc == abi::Sysno::write ||
+                sc == abi::Sysno::writev || sc == abi::Sysno::sendmmsg) {
+                const int h = host_fd_of(static_cast<int>(regs_.arg(0)));
+                int e = 0; socklen_t el = sizeof e;
+                if (h >= 0 && ::getsockopt(h, SOL_SOCKET, SO_ERROR, &e, &el) == 0 && e && e != EPIPE)
+                    rc = -static_cast<std::int64_t>(darwin::errno_to_linux(e));
+            }
+        }
         account_io(rc);
+        // PTRACE_SYSCALL's exit stop, the call's result in x0
+        if (in_syscall_stop_ && traced()) {
+            in_syscall_stop_ = false;
+            regs_.x[0] = static_cast<std::uint64_t>(rc);
+            if (syscall_stops_) {
+                const bool good = pids_.trace_opts(tgid_) & 1;
+                trace_point(0x7f | ((good ? 0x85 : 5) << 8));
+                rc = static_cast<std::int64_t>(regs_.x[0]);
+            }
+        }
         LX_TRY(resume(rc));
         return ok(rc);
     }
@@ -770,6 +894,23 @@ private:
             case S::pwritev2: case S::sendto: case S::sendmsg:
                 proc_.syscw.fetch_add(1, std::memory_order_relaxed);
                 if (rc > 0) proc_.wchar.fetch_add(static_cast<std::uint64_t>(rc), std::memory_order_relaxed);
+                // Writing to a socket whose peer is gone is EPIPE AND
+                // SIGPIPE on Linux, unless the call said MSG_NOSIGNAL
+                // (0x4000). Sockets run with Darwin's SO_NOSIGPIPE (a
+                // signal there would hit linuxity, not the guest), so the
+                // host gives only the EPIPE: raise the guest's signal here.
+                // (A pipe's SIGPIPE needs nothing: the host raises it, and
+                // the handler routes it to the guest.)
+                if (rc == -32) {
+                    const auto sc = abi::decode(abi::Arch::aarch64, regs_.nr());
+                    const std::uint64_t fl = sc == S::sendto ? regs_.arg(3)
+                                           : sc == S::sendmsg ? regs_.arg(2) : 0;
+                    int typ = 0; socklen_t tl = sizeof typ;
+                    const int h = host_fd(static_cast<int>(regs_.arg(0)));
+                    if (!(fl & 0x4000) && h >= 0 &&
+                        ::getsockopt(h, SOL_SOCKET, SO_TYPE, &typ, &tl) == 0)
+                        mark_self_pending(13);
+                }
                 break;
             default: break;
         }
@@ -950,6 +1091,28 @@ private:
 
         switch (sc) {
             case S::socket: {
+                // AF_NETLINK + NETLINK_ROUTE: emulated (rtnetlink.hpp). The
+                // guest's end is half of a datagram pair; we answer on the other.
+                if (regs_.arg(0) == 16) {
+                    const int type = static_cast<int>(a1 & ~(net::kSockNonblock | net::kSockCloexec));
+                    if (a2 != 0) return -93;                         // EPROTONOSUPPORT: route only
+                    if (type != SOCK_RAW && type != SOCK_DGRAM) return -94;
+                    int p[2];
+                    if (::socketpair(AF_UNIX, SOCK_DGRAM, 0, p) < 0) return darwin::fail();
+                    finish_socket(p[0], a1);
+                    ::fcntl(p[1], F_SETFD, FD_CLOEXEC);
+                    // a dump datagram is up to 8 KiB, several queued at once
+                    for (int e : p) {
+                        int sz = 256 << 10;
+                        (void)::setsockopt(e, SOL_SOCKET, SO_SNDBUF, &sz, sizeof sz);
+                        (void)::setsockopt(e, SOL_SOCKET, SO_RCVBUF, &sz, sizeof sz);
+                    }
+                    const std::uint64_t ino = sock_ino(p[0]);
+                    rtnl_[ino] = p[1];
+                    const int g = install_socket(p[0], (a1 & net::kSockCloexec) != 0);
+                    if (g < 0) { rtnl_.erase(ino); ::close(p[1]); }
+                    return g;
+                }
                 const auto af = net::af_to_darwin(static_cast<std::uint16_t>(regs_.arg(0)));
                 if (!af) return -97;                                 // EAFNOSUPPORT
                 // Linux packs SOCK_NONBLOCK/SOCK_CLOEXEC into the type word;
@@ -976,6 +1139,10 @@ private:
                 for (int e : hp) finish_socket(e, a1);
                 if (seqpacket)
                     for (int e : hp) seqpacket_.insert(sock_ino(e));
+                // Linux fixes a socketpair's peer credentials at creation:
+                // both ends name the creating process for good, whoever holds
+                // them later. Darwin's LOCAL_PEERPID follows the last user.
+                for (int e : hp) pair_creator_[sock_ino(e)] = tgid_;
                 const bool cx = (a1 & net::kSockCloexec) != 0;
                 const auto g = proc_.with_fds([&](FdTable& t) {
                     return std::pair{t.install(hp[0], cx), t.install(hp[1], cx)};
@@ -1033,6 +1200,17 @@ private:
             case S::getsockname: case S::getpeername: {
                 const int h = host_fd(gfd);
                 if (h < 0) return -9;
+                if (!rtnl_.empty() && rtnl_.count(sock_ino(h))) {
+                    // struct sockaddr_nl { family 16, pad, pid, groups }
+                    std::uint32_t want = 0;
+                    if (!ram.get(a2, want)) return -14;
+                    const std::uint32_t nl[3] = {16, sc == S::getsockname ? static_cast<std::uint32_t>(tgid_) : 0u, 0};
+                    const std::uint32_t n = std::min<std::uint32_t>(want, 12);
+                    auto w = ram.at(a1, n);
+                    if (w.empty() && n) return -14;
+                    std::memcpy(w.data(), nl, n);
+                    return ram.put(a2, std::uint32_t{12}) ? 0 : -14;
+                }
                 ::sockaddr_storage ss{};
                 socklen_t len = sizeof ss;
                 const int rc = sc == S::getsockname
@@ -1051,6 +1229,9 @@ private:
                 if (h < 0) return -9;
                 auto buf = ram.clamp(a1, a2);
                 if (buf.empty() && a2) return -14;
+                if (!rtnl_.empty())
+                    if (auto it = rtnl_.find(sock_ino(h)); it != rtnl_.end())
+                        return rtnl_request(it->second, buf);
                 ::sockaddr_storage ss{};
                 socklen_t slen = 0;
                 if (a4) {
@@ -1064,6 +1245,10 @@ private:
                                         net::msg_flags_to_darwin(a3),
                                         slen ? reinterpret_cast<::sockaddr*>(&ss) : nullptr,
                                         slen);
+                // an emulated SEQPACKET peer that's gone: Darwin's datagram
+                // pair says EDESTADDRREQ/ECONNRESET, Linux EPIPE
+                if (n < 0 && (errno == EDESTADDRREQ || errno == ECONNRESET) && seqpacket_.count(sock_ino(h)))
+                    return -32;
                 return n < 0 ? darwin::fail() : n;
             }
             case S::recvfrom: {
@@ -1088,7 +1273,12 @@ private:
                                           net::msg_flags_to_darwin(a3),
                                           a4 ? reinterpret_cast<::sockaddr*>(&ss) : nullptr,
                                           a4 ? &slen : nullptr);
-                if (n < 0) return darwin::fail();
+                if (n < 0) {
+                    // An emulated SEQPACKET pair (a Darwin datagram pair):
+                    // the peer closing is ECONNRESET there, EOF on Linux.
+                    if (errno == ECONNRESET && seqpacket_.count(sock_ino(h))) return 0;
+                    return darwin::fail();
+                }
                 if (a4 && !write_sockaddr(ss, a4, regs_.arg(5))) return -14;
                 return real > n ? real : n;
             }
@@ -1113,14 +1303,54 @@ private:
                 if (!opt) return 0;
                 auto val = ram.at(a3, a4);
                 if (val.empty() && a4) return -14;
-                return ::setsockopt(h, opt->level, opt->name, val.data(),
-                                    static_cast<socklen_t>(a4)) < 0
-                           ? darwin::fail() : 0;
+                if (opt->val == net::Val::timeval) {
+                    struct { std::int64_t sec, usec; } lt{};
+                    if (a4 < sizeof lt) return -22;
+                    std::memcpy(&lt, val.data(), sizeof lt);
+                    if (lt.usec < 0 || lt.usec >= 1'000'000) return -33;     // EDOM
+                    ::timeval tv{static_cast<time_t>(lt.sec), static_cast<suseconds_t>(lt.usec)};
+                    if (lt.sec < 0) tv = {};                                  // Linux: 0 = forever
+                    return ::setsockopt(h, opt->level, opt->name, &tv, sizeof tv) < 0 ? darwin::fail() : 0;
+                }
+                if (opt->val == net::Val::uchar) {
+                    int v = 0;
+                    if (a4 >= sizeof(int)) std::memcpy(&v, val.data(), sizeof v);
+                    else if (a4 >= 1) v = std::to_integer<int>(val[0]);
+                    else return -22;
+                    const unsigned char c = static_cast<unsigned char>(v);
+                    return ::setsockopt(h, opt->level, opt->name, &c, 1) < 0 ? darwin::fail() : 0;
+                }
+                if (::setsockopt(h, opt->level, opt->name, val.data(), static_cast<socklen_t>(a4)) == 0)
+                    return 0;
+                // Linux takes buffer sizes it then clamps; Darwin refuses
+                // ones past its limit (ENOBUFS). Clamp ourselves and retry.
+                if (errno == ENOBUFS && (opt->name == SO_SNDBUF || opt->name == SO_RCVBUF)) {
+                    int v = 4 << 20;
+                    return ::setsockopt(h, opt->level, opt->name, &v, sizeof v) < 0 ? darwin::fail() : 0;
+                }
+                return darwin::fail();
             }
             case S::getsockopt: {
                 const int h = host_fd(gfd);
                 if (h < 0) return -9;
                 // SO_TYPE of an emulated SEQPACKET pair, and SO_PASSCRED.
+                // SO_PROTOCOL (38) and SO_DOMAIN (39): Darwin has no such
+                // option. The family comes from the socket's own address; the
+                // protocol is the family's default for the type.
+                if (a1 == 1 && (a2 == 38 || a2 == 39)) {
+                    ::sockaddr_storage ss{};
+                    socklen_t sl = sizeof ss;
+                    if (::getsockname(h, reinterpret_cast<::sockaddr*>(&ss), &sl) < 0) return darwin::fail();
+                    int typ = 0; socklen_t tl = sizeof typ;
+                    (void)::getsockopt(h, SOL_SOCKET, SO_TYPE, &typ, &tl);
+                    const int fam = ss.ss_family == AF_INET6 ? 10 : ss.ss_family == AF_UNIX ? 1 : 2;
+                    const int proto = fam == 1 ? 0 : typ == SOCK_STREAM ? 6 : typ == SOCK_DGRAM ? 17 : 0;
+                    const std::int32_t v = a2 == 39 ? fam : proto;
+                    std::uint32_t want = 0;
+                    if (!ram.get(a4, want)) return -14;
+                    if (want < sizeof v) return -22;
+                    return ram.put(a3, v) && ram.put(a4, std::uint32_t{sizeof v}) ? 0 : -14;
+                }
                 if (a1 == 1 && (a2 == 3 || a2 == 16)) {
                     const auto ino = sock_ino(h);
                     const bool ours = a2 == 3 ? seqpacket_.count(ino) != 0 : true;
@@ -1161,8 +1391,22 @@ private:
                         hpid = ::getpid();
                     }
                     const std::int32_t g = pids_.guest_of(hpid);
-                    const std::int32_t gpid = g > 0 ? g : 1;
-                    const std::int32_t cred[3] = {gpid, 0, 0};
+                    std::int32_t gpid = hpid == ::getpid() ? tgid_ : (g > 0 ? g : 1);
+                    if (auto pc = pair_creator_.find(sock_ino(h)); pc != pair_creator_.end()) gpid = pc->second;
+                    // The guest credentials of whoever connected: ours, for a
+                    // socketpair; the peer process's, as it last published
+                    // them, otherwise.
+                    std::int32_t uid = 0, gid = 0;
+                    if (gpid == tgid_) {
+                        if (const auto ids = proc_.ids()) {
+                            uid = static_cast<std::int32_t>(ids->euid);
+                            gid = static_cast<std::int32_t>(ids->egid);
+                        }
+                    } else if (const auto ids = pids_.ids_of(gpid)) {
+                        uid = static_cast<std::int32_t>(ids->euid);
+                        gid = static_cast<std::int32_t>(ids->egid);
+                    }
+                    const std::int32_t cred[3] = {gpid, uid, gid};
                     const std::uint32_t n = std::min<std::uint32_t>(want, sizeof cred);
                     auto val = ram.at(a3, n);
                     if (val.empty() && n) return -14;
@@ -1177,6 +1421,27 @@ private:
                 auto val = ram.at(a3, want);
                 if (val.empty() && want) return -14;
                 socklen_t len = static_cast<socklen_t>(want);
+                if (opt->val == net::Val::timeval) {
+                    ::timeval tv{};
+                    socklen_t tl = sizeof tv;
+                    if (::getsockopt(h, opt->level, opt->name, &tv, &tl) < 0) return darwin::fail();
+                    const std::int64_t lt[2] = {tv.tv_sec, tv.tv_usec};
+                    const std::uint32_t n = std::min<std::uint32_t>(want, sizeof lt);
+                    std::memcpy(val.data(), lt, n);
+                    return ram.put(a4, n) ? 0 : -14;
+                }
+                if (opt->val == net::Val::uchar) {
+                    unsigned char c = 0;
+                    socklen_t cl = 1;
+                    if (::getsockopt(h, opt->level, opt->name, &c, &cl) < 0) return darwin::fail();
+                    if (want >= sizeof(int)) {
+                        const int v = c;
+                        std::memcpy(val.data(), &v, sizeof v);
+                        return ram.put(a4, std::uint32_t{sizeof v}) ? 0 : -14;
+                    }
+                    if (want >= 1) val[0] = static_cast<std::byte>(c);
+                    return ram.put(a4, std::uint32_t{1}) ? 0 : -14;
+                }
                 if (::getsockopt(h, opt->level, opt->name, val.data(), &len) < 0)
                     return darwin::fail();
                 // the VALUE's encoding (net::Val), for an int-sized answer
@@ -1188,6 +1453,8 @@ private:
                         case net::Val::errno_:   v = v ? darwin::errno_to_linux(v) : 0; break;
                         case net::Val::socktype: break;   // SOCK_STREAM/DGRAM/RAW/SEQPACKET agree
                         case net::Val::raw:      break;
+                        case net::Val::timeval:  break;
+                        case net::Val::uchar:    break;
                     }
                     std::memcpy(val.data(), &v, sizeof v);
                 }
@@ -1255,6 +1522,15 @@ private:
     // length even when the guest's buffer was too small (the address is
     // truncated, the length is not), which is what tells a caller to retry
     // with a bigger buffer.
+    // Answer one rtnetlink request (rtnetlink.hpp): queue the reply
+    // datagrams where the guest's end reads them. The send "succeeds" with
+    // the request's length, as the kernel's does.
+    [[nodiscard]] std::int64_t rtnl_request(int far, std::span<const std::byte> req) {
+        const std::string r(reinterpret_cast<const char*>(req.data()), req.size());
+        for (const std::string& d : rtnl::answer(r, static_cast<std::uint32_t>(tgid_)))
+            if (::send(far, d.data(), d.size(), 0) < 0) return darwin::fail();
+        return static_cast<std::int64_t>(req.size());
+    }
     [[nodiscard]] bool write_sockaddr(const ::sockaddr_storage& ss,
                                       std::uint64_t addr_at, std::uint64_t len_at) {
         const GuestRam ram = machine_.ram();
@@ -1311,6 +1587,29 @@ private:
         ::msghdr hm{};
         hm.msg_iov = hiov.data();
         hm.msg_iovlen = static_cast<int>(hiov.size());
+        // An emulated rtnetlink socket: a request goes to the responder; a
+        // reply read gets a sockaddr_nl from the kernel (pid 0).
+        if (!rtnl_.empty())
+            if (auto it = rtnl_.find(sock_ino(h)); it != rtnl_.end()) {
+                if (sending) {
+                    std::string req;
+                    for (const auto& v : hiov) req.append(static_cast<const char*>(v.iov_base), v.iov_len);
+                    return rtnl_request(it->second, std::as_bytes(std::span{req.data(), req.size()}));
+                }
+                const auto n = ::recvmsg(h, &hm, net::msg_flags_to_darwin(flags));
+                if (n < 0) return darwin::fail();
+                if (m.name && m.namelen >= 12) {
+                    const std::uint32_t nl[3] = {16, 0, 0};
+                    auto w = ram.at(m.name, 12);
+                    if (!w.empty()) std::memcpy(w.data(), nl, 12);
+                }
+                LinuxMsghdr back = m;
+                back.namelen = m.name ? 12 : 0;
+                back.controllen = 0;
+                back.flags = (hm.msg_flags & MSG_TRUNC) ? 0x20 : 0;
+                if (!ram.put(msg_at, back)) return -14;
+                return n;
+            }
         if (sending && m.name) {
             auto addr = ram.at(m.name, m.namelen);
             if (addr.empty()) return -14;
@@ -1866,6 +2165,29 @@ private:
             info = *t;
         }
         s = info.signo;
+        // Traced: every signal (but SIGKILL) first becomes a signal-delivery
+        // stop the tracer sees in wait; it decides what is delivered by the
+        // signal it passes to PTRACE_CONT/SYSCALL (0: suppressed).
+        if (s != 9 && traced() && !injecting_) {
+            const std::int32_t wst = 0x7f | (s << 8);
+            auto c = cpu_.save();
+            std::uint64_t pub[34]{}, back[34]{};
+            for (int i = 0; i < 31; ++i) pub[i] = c.x[i];
+            pub[31] = c.sp_el0; pub[32] = c.pc; pub[33] = c.cpsr;
+            const auto r = pids_.trace_stop(tgid_, wst, pub, back, [this] { return traced() && !exited_; });
+            syscall_stops_ = r.cmd == 24;
+            if (r.cmd == 8) kill_with(9);
+            if (r.regs_changed) {
+                for (int i = 0; i < 31; ++i) c.x[i] = back[i];
+                c.sp_el0 = back[31]; c.pc = back[32];
+                cpu_.load(c);
+            }
+            if (r.sig <= 0 || !traced()) return true;            // the tracer swallowed it
+            s = r.sig;                                           // (or replaced it)
+            injecting_ = true;
+            struct Done { bool& f; ~Done() { f = false; } } done{injecting_};
+            if (s == 19) { ::raise(SIGSTOP); return true; }      // a real stop, now untraced-style
+        }
         // The sigsuspend mask covered exactly this delivery; the handler
         // runs with it, and the saved mask is what sigreturn restores.
         if (task_.suspend_restore) {
@@ -2015,6 +2337,7 @@ private:
         }
         pids_.reparent_children_of(tgid_);
         pids_.post_exit(tgid_, linux_sig & 0x7f);
+        release_parent_from_tty_drain();
         ::raise(signal_from_linux(linux_sig));
         exited_ = true;
         code_ = 128 + linux_sig;
@@ -2083,6 +2406,7 @@ private:
             // not here: the portable dispatcher owns them (abi/creds.hpp),
             // and ig_after_dispatch republishes them for the in-guest table.
             case S::getpid: case S::gettid: case S::getppid:
+                if (in_child_pidns_) return std::nullopt;        // the core's local numbers
                 if (auto a = abi::identity_answer(sc, task_identity()))
                     return *a;
                 return -38;                                  // ENOSYS
@@ -2261,6 +2585,7 @@ private:
         img.pte_hi = proc_.pte_hi;
         img.environ = proc_.environ();
         img.auxv = proc_.auxv();
+        img.cmdline = proc_.cmdline();
         proc_.with_names([&](auto& v) {
             for (const auto& r : v)
                 img.range_names += std::to_string(r.begin) + " " + std::to_string(r.end) + " " +
@@ -2336,6 +2661,7 @@ public:
         std::array<ProcessState::Rlim, 16> rlimits{};
         std::string environ;            // /proc/<pid>/environ, until exec
         std::string auxv;               // /proc/<pid>/auxv, until exec
+        std::string cmdline;            // /proc/<pid>/cmdline, until exec
         std::string range_names;        // "begin end name\n"..., for maps
         struct Backed { std::uint64_t at, len; std::int64_t off; std::int32_t group; };
         std::vector<Backed> backings;   // shared host pages; `group` indexes fd_hosts
@@ -2413,6 +2739,7 @@ public:
         proc_.pte_hi = img.pte_hi;
         proc_.set_environ(img.environ);
         proc_.set_auxv(img.auxv);
+        proc_.set_cmdline(img.cmdline);
         for (std::size_t at = 0; at < img.range_names.size();) {
             const std::size_t nl = std::min(img.range_names.find('\n', at), img.range_names.size());
             unsigned long long b = 0, e = 0;
@@ -2466,7 +2793,103 @@ private:
         if (options & ~(1 | 2 | 8 | 0x01000000 | 0x20000000 | 0x40000000 | static_cast<int>(0x80000000u)))
             return -22;                                   // EINVAL: unknown option
         const int hopts = (options & (WNOHANG | WUNTRACED)) | ((options & 8) ? WCONTINUED : 0);
-        if (gpid > 0) {
+        // A tracee of ours in a ptrace stop (Linux reports these without
+        // WUNTRACED). They're our children, so look before host waiting.
+        auto trace_stop_for = [&](std::int32_t g) -> std::int64_t {
+            if (pids_.tracer_of(g) != tgid_ || !pids_.take_stop_report(g)) return 0;
+            if (status) (void)machine_.ram().put(status, pids_.stop_of(g));
+            return g;
+        };
+        // A child that said PTRACE_TRACEME made us its tracer without our
+        // asking: learn of it here, where its stops are reported -- and keep
+        // looking while we wait, since the child may do it after we start.
+        auto discover = [&] {
+            for (const Child& c : children_)
+                if (!tracees_.count(c.guest) && pids_.tracer_of(c.guest) == tgid_) tracees_.insert(c.guest);
+        };
+        discover();
+        // A child whose exit is final in the table though its host process
+        // lingers (a session leader the host holds until its tty drains:
+        // release_parent_from_tty_drain) is reaped from the table.
+        auto reap_final = [&](std::int32_t g) -> std::int64_t {
+            if (!pids_.exit_final(g)) return 0;
+            const auto ws = pids_.exit_of(g);
+            if (!ws) return 0;
+            if (options & 0x01000000) return g;              // WNOWAIT: leave it
+            if (status) (void)machine_.ram().put(status, std::int32_t{*ws});
+            for (const Child& c : children_)
+                if (c.guest == g) lingering_.push_back(c.host);
+            pids_.release(g);
+            std::erase_if(children_, [g](const Child& c) { return c.guest == g; });
+            return g;
+        };
+        // their host processes, once the tty drained: no host zombies
+        std::erase_if(lingering_, [](pid_t h) { int s; return ::waitpid(h, &s, WNOHANG) != 0; });
+        if (gpid > 0)
+            if (const auto r = reap_final(gpid)) return r;
+        // A specific child that's traced -- or could yet be (TRACEME after
+        // we started waiting) -- is polled, so its stop is seen; a blocking
+        // host waitpid would never return for a ptrace stop.
+        const bool poll_it = gpid > 0 && (tracees_.count(gpid) ||
+            std::any_of(children_.begin(), children_.end(), [&](const Child& c) { return c.guest == gpid; }));
+        if (!tracees_.empty() || poll_it) {
+            for (;;) {
+                discover();
+                for (const std::int32_t g : tracees_)
+                    if ((gpid <= 0 || gpid == g) && (gpid >= -1 || pids_.pgid_of(g) == -gpid ||
+                                                     (gpid == 0 && pids_.pgid_of(g) == guest_pid_of(::getpgrp()))))
+                        if (const auto r = trace_stop_for(g)) return r;
+                int s2 = 0;
+                pid_t got2 = 0;
+                if (gpid > 0) {
+                    if (const auto r = reap_final(gpid)) return r;
+                    if (auto h = pids_.host_of(gpid)) got2 = ::waitpid(*h, &s2, WNOHANG | (hopts & (WUNTRACED | WCONTINUED)));
+                    if (got2 > 0) { st = s2; got = got2; break; }
+                    if (got2 < 0 && errno == ECHILD) return -10;
+                } else {
+                    break;                          // the general path polls on a tick below
+                }
+                if (hopts & WNOHANG) return 0;
+                // Sleep until the child exits or one of its trace stops kicks
+                // us (trace_stop sends SIGCHLD; TRACEME too): no busy tick.
+                if (!tracees_.count(gpid)) {
+                    const int kq = ::kqueue();
+                    if (kq < 0) return darwin::fail();
+                    struct ::kevent ev{}, out{};
+                    const auto h = pids_.host_of(gpid);
+                    if (!h) { ::close(kq); return -10; }
+                    EV_SET(&ev, static_cast<uintptr_t>(*h), EVFILT_PROC, EV_ADD | EV_ONESHOT, NOTE_EXIT, 0, nullptr);
+                    const int wk = g_pending.wake_rd;
+                    struct ::kevent ev2{};
+                    int nev = 1;
+                    if (wk >= 0) { EV_SET(&ev2, static_cast<uintptr_t>(wk), EVFILT_READ, EV_ADD, 0, 0, nullptr); nev = 2; }
+                    struct ::kevent evs[2] = {ev, ev2};
+                    const struct ::timespec tick{0, 200'000'000};
+                    // registered first, THEN checked: a child that exited before
+                    // the kqueue saw it (EV_ADD on a dead pid fails) is reaped
+                    // by the non-blocking look, never waited on forever
+                    const int reg = ::kevent(kq, evs, nev, nullptr, 0, nullptr);
+                    int s3 = 0;
+                    const pid_t g3 = ::waitpid(*h, &s3, WNOHANG | (hopts & (WUNTRACED | WCONTINUED)));
+                    if (g3 > 0) { ::close(kq); st = s3; got = g3; break; }
+                    if (reg == 0 && !pids_.take_stop_report_peek(gpid))
+                        (void)::kevent(kq, nullptr, 0, &out, 1, &tick);
+                    ::close(kq);
+                    if (const std::uint64_t ready = (g_pending.bits.load(std::memory_order_relaxed) |
+                                                     task_.pending.load(std::memory_order_relaxed)) & ~task_.sig_mask;
+                        ready & ~sigbit(17))
+                        return -4;                  // a signal other than our own SIGCHLD kick
+                    g_pending.drain_wake();
+                    continue;
+                }
+                // untraced and not yet TRACEME'd: a cheap poll, a few ms
+                std::vector<struct ::pollfd> none;
+                if (signal_aware_poll(none, 2) == -4) return -4;
+            }
+        }
+        if (got > 0) {
+            // fell out of the tracee loop with a real status
+        } else if (gpid > 0) {
             auto h = pids_.host_of(gpid);
             if (!h) return -10;
             got = ::waitpid(*h, &st, hopts);
@@ -2496,6 +2919,11 @@ private:
                     adopted.push_back(g);
                 }
                 if (hs.empty() && adopted.empty()) return -10;  // ECHILD
+                for (std::size_t i = 0; i < children_.size(); ++i) {
+                    const std::int32_t g = children_[i].guest;
+                    if (want_pgid && pids_.pgid_of(g) != *want_pgid) continue;
+                    if (const auto r = reap_final(g)) return r;
+                }
                 for (pid_t h : hs) {
                     got = ::waitpid(h, &st, WNOHANG | (hopts & (WUNTRACED | WCONTINUED)));
                     if (got > 0) break;
@@ -2503,6 +2931,9 @@ private:
                         std::erase_if(children_, [h](const Child& c) { return c.host == h; });
                 }
                 if (got > 0) break;
+                for (const std::int32_t g : tracees_)
+                    if (!want_pgid || pids_.pgid_of(g) == *want_pgid)
+                        if (const auto r = trace_stop_for(g)) return r;
                 if (hopts & WNOHANG) return 0;
                 // Sleep until one of them exits (or stops, for WUNTRACED: a
                 // stop raises no NOTE_EXIT, so bound the sleep and re-poll).
@@ -2518,15 +2949,30 @@ private:
                         EV_SET(&ev, static_cast<uintptr_t>(*h), EVFILT_PROC, EV_ADD | EV_ONESHOT, NOTE_EXIT, 0, nullptr);
                         evs.push_back(ev);
                     }
+                // the kick of a child whose exit went final (no NOTE_EXIT yet)
+                const int wk = g_pending.wake_rd;
+                if (wk >= 0) {
+                    struct ::kevent ev{};
+                    EV_SET(&ev, static_cast<uintptr_t>(wk), EVFILT_READ, EV_ADD, 0, 0, nullptr);
+                    evs.push_back(ev);
+                }
                 struct ::kevent out{};
                 const struct ::timespec tick{0, 50'000'000};
                 // an adopted orphan posts its status a moment before its host
                 // process ends: re-poll on a tick rather than trust one event
                 const int n = ::kevent(kq, evs.data(), static_cast<int>(evs.size()), &out, 1,
-                                       (hopts & (WUNTRACED | WCONTINUED)) || !adopted.empty() ? &tick : nullptr);
+                                       (hopts & (WUNTRACED | WCONTINUED)) || !adopted.empty() || !tracees_.empty()
+                                           ? &tick : nullptr);
                 const int e = errno;
                 ::close(kq);
                 if (n < 0 && e == EINTR) return -4;             // EINTR, as Linux
+                if (n > 0 && wk >= 0 && out.filter == EVFILT_READ && out.ident == static_cast<uintptr_t>(wk)) {
+                    if (const std::uint64_t ready = (g_pending.bits.load(std::memory_order_relaxed) |
+                                                     task_.pending.load(std::memory_order_relaxed)) & ~task_.sig_mask;
+                        ready & ~sigbit(17))
+                        return -4;                              // a real signal for the guest
+                    g_pending.drain_wake();
+                }
                 // n > 0: an exit (or an EV_ERROR for a pid already gone --
                 // either way the WNOHANG sweep above now finds it).
             }
@@ -2739,6 +3185,13 @@ private:
         // The kernel side of execve (set-ID credentials, SysV detach) is the
         // shared loop's: report the exec like any backend would.
         proc_events_.push_back({ProcEvent::exec, tgid_, parent_, {}, {}});
+        // Traced: the new image stops with SIGTRAP before its first
+        // instruction (PTRACE_EVENT_EXEC with TRACEEXEC; plain SIGTRAP else).
+        if (traced()) {
+            regs_.x[0] = 0;
+            const bool ev = pids_.trace_opts(tgid_) & 0x10;   // PTRACE_O_TRACEEXEC
+            trace_point(0x7f | (5 << 8) | (ev ? (4 << 16) : 0));
+        }
         return 0;
     }
 
@@ -3033,32 +3486,49 @@ private:
                 return 0;
 
             // -- process_vm_readv/writev: read or write ANOTHER process's
-            //    memory. Every guest process shares one guest RAM mapping,
-            //    so this is a copy between two guest address ranges -- and
-            //    because guest VA == GPA here, the "remote" pid's memory is
-            //    at the same addresses we can already reach.
+            //    memory. Each guest process has its OWN guest RAM (a fork
+            //    is copy-on-write), so another pid's is asked of that pid's
+            //    linuxity through its memory service (memsvc.hpp); our own
+            //    is a plain copy. The remote vector is walked in step with
+            //    the local one, splitting where their lengths differ.
             case S::process_vm_readv: case S::process_vm_writev: {
                 const auto target = static_cast<std::int32_t>(a0);
-                if (!pids_.host_of(target) && target != task_.tid) return -3;   // ESRCH
+                if (!pids_.host_of(target) && target != task_.tid && target != tgid_) return -3;   // ESRCH
+                if (regs_.arg(5)) return -22;                                 // flags must be 0
                 const bool reading = sc == S::process_vm_readv;
+                const bool self = target == tgid_ || target == task_.tid ||
+                                  pids_.host_of(target).value_or(0) == ::getpid();
+                const std::string svc = self ? std::string{} : memsvc_path(target);
+                std::vector<GuestIovec> lv(a2), rv(regs_.arg(4));
+                for (std::uint64_t i = 0; i < a2; ++i)
+                    if (!ram.get(a1 + i * sizeof(GuestIovec), lv[i])) return -14;
+                for (std::uint64_t j = 0; j < rv.size(); ++j)
+                    if (!ram.get(regs_.arg(3) + j * sizeof(GuestIovec), rv[j])) return -14;
                 std::uint64_t moved = 0;
-                for (std::uint64_t i = 0; i < a2; ++i) {
-                    GuestIovec local{};
-                    if (!ram.get(a1 + i * sizeof(GuestIovec), local)) return -14;
-                    // Walk the remote vector in step, splitting as needed.
-                    for (std::uint64_t j = 0; j < regs_.arg(4); ++j) {
-                        GuestIovec remote{};
-                        if (!ram.get(regs_.arg(3) + j * sizeof(GuestIovec), remote))
-                            return -14;
-                        const auto n = std::min(local.len, remote.len);
-                        if (!n) continue;
-                        auto dst = ram.at(reading ? local.base : remote.base, n);
-                        auto src = ram.at(reading ? remote.base : local.base, n);
-                        if (dst.empty() || src.empty()) return -14;
-                        std::memmove(dst.data(), src.data(), n);
-                        moved += n;
-                        break;
+                std::size_t li = 0, ri = 0;
+                std::uint64_t lo = 0, ro = 0;
+                while (li < lv.size() && ri < rv.size()) {
+                    const std::uint64_t n = std::min(lv[li].len - lo, rv[ri].len - ro);
+                    if (n) {
+                        auto mine = ram.at(lv[li].base + lo, n);
+                        if (mine.empty()) return moved ? static_cast<std::int64_t>(moved) : -14;
+                        std::int64_t got;
+                        if (self) {
+                            auto theirs = ram.at(rv[ri].base + ro, n);
+                            if (theirs.empty()) return moved ? static_cast<std::int64_t>(moved) : -14;
+                            std::memmove(reading ? mine.data() : theirs.data(),
+                                         reading ? theirs.data() : mine.data(), n);
+                            got = static_cast<std::int64_t>(n);
+                        } else {
+                            got = memsvc::transfer(svc, !reading, rv[ri].base + ro, mine);
+                        }
+                        if (got <= 0) return moved ? static_cast<std::int64_t>(moved) : got;
+                        moved += static_cast<std::uint64_t>(got);
+                        if (static_cast<std::uint64_t>(got) < n) break;
                     }
+                    lo += n; ro += n;
+                    if (lo == lv[li].len) { ++li; lo = 0; }
+                    if (ro == rv[ri].len) { ++ri; ro = 0; }
                 }
                 return static_cast<std::int64_t>(moved);
             }
@@ -3197,11 +3667,10 @@ private:
             case S::fspick:
                 return -38;            // new mount API; the core handles mount()
             case S::ptrace:
-                // Debugging a guest from inside the guest needs us to be its
-                // tracer, which on this backend the hypervisor already is.
-                // A real implementation would re-enter our own trap loop as a
-                // nested tracer; it is a feature, not a translation.
-                return -38;
+                // Guest ptrace between guest processes (each its own
+                // linuxity): stops and requests travel through the shared
+                // pid table, memory through the tracee's memory service.
+                return do_guest_ptrace();
             case S::epoll_pwait2: {
                 // epoll_pwait with a timespec instead of milliseconds.
                 auto it = epolls_.find(static_cast<int>(a0));
@@ -3227,9 +3696,115 @@ private:
             //    which is a feature in its own right rather than an ABI
             //    translation. glibc reports ENOSYS as "mqueue not supported",
             //    which is the truth.
-            case S::mq_open: case S::mq_unlink: case S::mq_timedsend:
-            case S::mq_timedreceive: case S::mq_notify: case S::mq_getsetattr:
-                return -38;
+            // -- POSIX message queues: Darwin has no mq_* at all, so they are
+            //    files in the env's shared shm directory (runtime/darwin/
+            //    mqueue.hpp). The guest's descriptor is the queue file.
+            case S::mq_open: {
+                const std::string name = ram.cstr(a0, 256);
+                if (name.empty() || name.size() > 255 || name.find('/') != std::string::npos)
+                    return name.empty() ? -2 : (name.size() > 255 ? -36 : -13);   // ENOENT/ENAMETOOLONG/EACCES
+                const std::string host = mq_path(name);
+                if (host.empty()) return -38;
+                const int acc = static_cast<int>(a1 & 3);
+                const bool creat = a1 & 0100, excl = a1 & 0200;
+                int hfl = (acc == 0 ? O_RDONLY : acc == 1 ? O_WRONLY : O_RDWR) | O_CLOEXEC;
+                // the queue file must be readable and writable by us whatever
+                // the guest asked, so open RDWR and keep the guest's mode
+                // in the descriptor's own flags below
+                hfl = O_RDWR | O_CLOEXEC;
+                if (creat) hfl |= O_CREAT;
+                if (creat && excl) hfl |= O_EXCL;
+                const int fd = ::open(host.c_str(), hfl, static_cast<mode_t>(a2 & 0777) | 0600);
+                if (fd < 0) return darwin::fail();
+                struct ::stat st{};
+                (void)::fstat(fd, &st);
+                if (st.st_size == 0) {
+                    if (!creat) { ::close(fd); return -2; }
+                    struct { std::int64_t flags, maxmsg, msgsize, curmsgs, pad[4]; } attr{};
+                    if (a3 && !ram.get(a3, attr)) { ::close(fd); return -14; }
+                    if (a3 && (attr.maxmsg <= 0 || attr.msgsize <= 0 || attr.maxmsg > 65536 ||
+                               attr.msgsize > (16 << 20))) { ::close(fd); ::unlink(host.c_str()); return -22; }
+                    if (!mq::init(fd, a3 ? static_cast<std::uint32_t>(attr.maxmsg) : 10,
+                                  a3 ? static_cast<std::uint32_t>(attr.msgsize) : 8192)) {
+                        ::close(fd); return -12;
+                    }
+                }
+                const int g = proc_.with_fds([&](FdTable& t) { return t.install(fd, (a1 & abi::wire::kOCloexec) != 0); });
+                if (g < 0) { ::close(fd); return -24; }
+                mq_mode_[sock_ino(fd)] = acc;
+                if (a1 & 04000) mq_nonblock_.insert(g);                 // O_NONBLOCK
+                return g;
+            }
+            case S::mq_unlink: {
+                const std::string name = ram.cstr(a0, 256);
+                const std::string host = name.empty() ? std::string{} : mq_path(name);
+                if (host.empty()) return -2;
+                return ::unlink(host.c_str()) < 0 ? darwin::fail() : 0;
+            }
+            case S::mq_timedsend: case S::mq_timedreceive: {
+                const int g = static_cast<int>(a0);
+                const int h = host_fd(g);
+                if (h < 0) return -9;
+                mq::Header hd{};
+                if (!mq::read_header(h, hd)) return -9;
+                const int acc = mq_mode_.count(sock_ino(h)) ? mq_mode_[sock_ino(h)] : 2;
+                const bool sending = sc == S::mq_timedsend;
+                if (sending ? acc == 0 : acc == 1) return -9;          // EBADF: wrong direction
+                // the deadline: an absolute CLOCK_REALTIME timespec, or none
+                bool has_deadline = false;
+                std::chrono::system_clock::time_point deadline{};
+                if (regs_.arg(4)) {
+                    struct { std::int64_t sec, nsec; } ts{};
+                    if (!ram.get(regs_.arg(4), ts)) return -14;
+                    if (ts.nsec < 0 || ts.nsec >= 1'000'000'000) return -22;
+                    has_deadline = true;
+                    deadline = std::chrono::system_clock::time_point{std::chrono::duration_cast<std::chrono::system_clock::duration>(
+                        std::chrono::seconds{ts.sec} + std::chrono::nanoseconds{ts.nsec})};
+                }
+                const bool nb = mq_nonblock_.count(g) != 0;
+                for (;;) {
+                    std::int64_t r;
+                    if (sending) {
+                        auto win = ram.clamp(a1, a2);
+                        if (win.empty() && a2) return -14;
+                        if (a3 >= 32768) return -22;                       // MQ_PRIO_MAX
+                        const int e = mq::try_send(h, win.data(), win.size(), static_cast<std::uint32_t>(a3));
+                        r = e ? -e : 0;
+                    } else {
+                        auto win = ram.clamp(a1, a2);
+                        if (win.empty() && a2) return -14;
+                        std::uint32_t prio = 0;
+                        r = mq::try_receive(h, win.data(), win.size(), &prio);
+                        if (r >= 0 && a3 && !ram.put(a3, prio)) return -14;
+                    }
+                    if (r != -EAGAIN) return r < 0 ? -static_cast<std::int64_t>(darwin::errno_to_linux(static_cast<int>(-r))) : r;
+                    if (nb) return -11;
+                    if (has_deadline && std::chrono::system_clock::now() >= deadline) return -110;   // ETIMEDOUT
+                    // wait a moment, or for a signal
+                    std::vector<struct ::pollfd> none;
+                    if (signal_aware_poll(none, 5) == -4) return poll_interrupted() == -4 ? -4 : kRestartSys;
+                }
+            }
+            case S::mq_getsetattr: {
+                const int g = static_cast<int>(a0);
+                const int h = host_fd(g);
+                if (h < 0) return -9;
+                mq::Header hd{};
+                if (!mq::read_header(h, hd)) return -9;
+                struct { std::int64_t flags, maxmsg, msgsize, curmsgs, pad[4]; } attr{};
+                if (a2) {
+                    attr.flags = mq_nonblock_.count(g) ? 04000 : 0;
+                    attr.maxmsg = hd.maxmsg; attr.msgsize = hd.msgsize; attr.curmsgs = hd.count;
+                    if (!ram.put(a2, attr)) return -14;
+                }
+                if (a1) {
+                    if (!ram.get(a1, attr)) return -14;
+                    if (attr.flags & 04000) mq_nonblock_.insert(g); else mq_nonblock_.erase(g);
+                }
+                return 0;
+            }
+            case S::mq_notify:
+                return 0;                    // registered, never fires (no one asks for it yet)
 
             case S::nanosleep: case S::clock_nanosleep: {
                 // nanosleep(req, rem) / clock_nanosleep(clk, flags, req, rem).
@@ -3679,7 +4254,12 @@ private:
                     case kGetPdeathsig:
                         return ram.put(a1, std::int32_t{pdeathsig_}) ? 0 : -14;
                     case kSetSeccomp:
-                        return 0;               // see S::seccomp below
+                        // PR_SET_SECCOMP(SECCOMP_MODE_STRICT=1) is enforced;
+                        // a filter (2) is accepted, see S::seccomp below.
+                        if (a1 == 1) enter_seccomp_strict();
+                        else if (a1 == 2) seccomp_mode_ = 2;
+                        else return -22;
+                        return 0;
                     case kGetSeccomp:
                         return seccomp_mode_;
                     case kCapbsetRead:
@@ -3710,7 +4290,7 @@ private:
                                         kSetModeFilter = 1,
                                         kGetActionAvail = 2;
                 switch (a0) {
-                    case kSetModeStrict: seccomp_mode_ = 1; return 0;
+                    case kSetModeStrict: if (a1 || a2) return -22; enter_seccomp_strict(); return 0;
                     case kSetModeFilter: seccomp_mode_ = 2; return 0;
                     case kGetActionAvail: return 0;    // every action "available"
                     default: return -22;
@@ -3835,6 +4415,27 @@ public:
     // flushes, and _exit. Never returns.
     using ExitHook = std::function<void()>;
     void on_exit(ExitHook h) { exit_hooks_.push_back(std::move(h)); }
+    // XNU's exit makes a SESSION LEADER wait, with no timeout, until its
+    // controlling tty's output has drained (proc_exit -> ttywait), and a
+    // leader can't drop the tty first (TIOCNOTTY is EINVAL). Linux exits at
+    // once and leaves the bytes buffered for the master. So a parent that
+    // waits for the child before reading the pty (pexpect, test harnesses)
+    // deadlocked: the shell's "exit" echo was never read, so it never ended.
+    // Here the posted status is made final and the parent kicked: it reaps
+    // us from the table, and the host process ends whenever the reader
+    // drains the tty -- the output is kept, as on Linux.
+    void release_parent_from_tty_drain() noexcept {
+        if (::getsid(0) != ::getpid()) return;
+        const int t = ::open("/dev/tty", O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
+        if (t < 0) return;
+        int q = 0;
+        const bool pending = ::ioctl(t, TIOCOUTQ, &q) == 0 && q > 0;
+        ::close(t);
+        if (!pending) return;
+        pids_.mark_exit_final(tgid_);
+        ::kill(::getppid(), SIGCHLD);
+    }
+
     [[noreturn]] void end_process(int status) {
         pids_.reparent_children_of(tgid_);
         pids_.post_exit(tgid_, (status & 0xff) << 8);
@@ -3842,6 +4443,7 @@ public:
         sync_all_shared();
         for (auto& h : exit_hooks_) h();
         std::fflush(nullptr);
+        release_parent_from_tty_drain();
         ::_exit(status);
     }
 private:
@@ -4032,7 +4634,12 @@ private:
                     return 0;
                 });
                 const std::uint64_t lo = AddressSpace::page_up(before), hi = AddressSpace::page_up(now);
-                if (hi > lo) machine_.zero(lo, hi - lo);
+                if (hi > lo) {
+                    machine_.zero(lo, hi - lo);
+                    reset_pte_prot(lo, hi - lo);       // the heap may grow over an unmapped hole
+                } else if (lo > hi) {
+                    set_pte_prot(hi, lo - hi, GuestProt::none);   // shrunk: the old top is gone
+                }
                 return static_cast<std::int64_t>(now);
             }
             case S::mmap: {
@@ -4041,6 +4648,17 @@ private:
                 // which is how a constant ends up with no single place to fix.
                 const bool anon = abi::wire::is_anonymous(a3);
                 const std::uint64_t len = AddressSpace::page_up(a1);
+                if (a1 == 0) return -22;
+                // RLIMIT_AS: the whole address space (every VMA) may not
+                // pass the soft limit -- ENOMEM, as mm/mmap.c may_expand_vm.
+                if (const auto as = proc_.rlimits[9].cur; as != ProcessState::kInf) {
+                    const std::uint64_t used = proc_.with_space([&](AddressSpace& t) {
+                        std::uint64_t n = 0;
+                        for (const Vma& v : t.vmas()) n += v.end - v.begin;
+                        return n;
+                    });
+                    if (used + len > as) return -12;
+                }
                 // MAP_FIXED_NOREPLACE: the address is pinned, but an overlap
                 // is EEXIST -- it must never replace what is there.
                 if (abi::wire::fixed_must_not_replace(a3)) {
@@ -4062,21 +4680,35 @@ private:
                 const std::uint64_t hp = HvfMachine::host_page();
                 // A shared map gets REAL shared pages, which the host only
                 // has at its own page size: place it on a host page, and
-                // round its span up (the tail is the object's, unseen).
-                const bool host_shared = shared && (anon || (regs_.arg(5) % hp) == 0) &&
-                                         (!abi::wire::wants_fixed(a3) || a0 % hp == 0);
-                const std::uint64_t span = host_shared ? (len + hp - 1) / hp * hp : len;
-                std::uint64_t at = proc_.with_space([&](AddressSpace& t) { return t.map(a0, host_shared ? span : a1, prot_from_linux(a2),
-                                           abi::wire::wants_fixed(a3), anon,
-                                           host_shared ? hp : AddressSpace::kPageSize); });
-                if (at == AddressSpace::kFail) return -12;          // ENOMEM
+                // round its span up (the tail is the object's, unseen). A file
+                // offset inside a host page (4 KiB-aligned, as Linux allows)
+                // is backed from the host page that holds it, with the guest's
+                // window starting `lead` bytes in -- so the pages are still the
+                // file's own, coherent with write() and every other mapper.
+                const std::uint64_t lead0 = (shared && !anon) ? regs_.arg(5) % hp : 0;
+                const bool host_shared = shared && (anon || lead0 % AddressSpace::kPageSize == 0) &&
+                                         (!abi::wire::wants_fixed(a3) || (a0 - lead0) % hp == 0);
+                const std::uint64_t lead = host_shared ? lead0 : 0;
+                const std::uint64_t span = host_shared ? (lead + len + hp - 1) / hp * hp : len;
+                std::uint64_t base = proc_.with_space([&](AddressSpace& t) {
+                    return t.map(abi::wire::wants_fixed(a3) && host_shared ? a0 - lead : a0,
+                                 host_shared ? span : a1, prot_from_linux(a2),
+                                 abi::wire::wants_fixed(a3), anon,
+                                 host_shared ? hp : AddressSpace::kPageSize); });
+                if (base == AddressSpace::kFail) return -12;          // ENOMEM
+                if (host_shared && lead) {
+                    // the bytes before the window belong to no guest mapping
+                    proc_.with_space([&](AddressSpace& t) { return t.unmap(base, lead); });
+                    set_pte_prot(base, lead, GuestProt::none);
+                }
+                std::uint64_t at = base + (host_shared ? lead : 0);
                 {
                     // the new range's permissions, enforced (the range may
                     // also carry a narrower one from an earlier mapping)
                     const GuestProt np = prot_from_linux(a2);
                     const GuestProt rwx = GuestProt::read | GuestProt::write | GuestProt::exec;
-                    if (np != rwx) set_pte_prot(at, span, np);
-                    else reset_pte_prot(at, span);
+                    if (np != rwx) set_pte_prot(at, span - lead, np);
+                    else reset_pte_prot(at, span - lead);
                 }
                 // (a shared map's host-page tail is part of its VMA: what
                 // lies past the object's end faults there, as past EOF)
@@ -4135,14 +4767,15 @@ private:
                             return -1;
                 }
                 if (char fp[PATH_MAX]; ::fcntl(ffd, F_GETPATH, fp) == 0)
-                    proc_.name(at, at + len, unresolve_ ? unresolve_(fp) : std::string{fp});
+                    proc_.name(at, at + len, unresolve_ ? unresolve_(fp) : std::string{fp},
+                               static_cast<std::uint64_t>(foff), shared);
                 if (host_shared) {
                     // The file's own pages: coherent with read()/write() and
                     // every other process mapping it -- and with another
                     // mapping of it here (a JIT's RW view and RX view). Past
                     // EOF the host faults; the guest sees that as SIGBUS.
-                    if (add_backing(at, span, ffd, foff)) {
-                        if (has(prot_from_linux(a2), GuestProt::exec)) machine_.publish_code(at, span);
+                    if (add_backing(base, span, ffd, foff - static_cast<off_t>(lead))) {
+                        if (has(prot_from_linux(a2), GuestProt::exec)) machine_.publish_code(at, span - lead);
                         // The host maps 16 KiB pages, so guest 4 KiB pages
                         // wholly past EOF but inside the host's last page
                         // read zeros; on Linux they are SIGBUS. Fence them
@@ -4176,6 +4809,8 @@ private:
                 return static_cast<std::int64_t>(at);
             }
             case S::munmap: {
+                // EINVAL for an unaligned start or an empty range (mm/mmap.c)
+                if ((a0 & (AddressSpace::kPageSize - 1)) || a1 == 0) return -22;
                 std::uint64_t len = AddressSpace::page_up(a1);
                 proc_.lock_pages(a0, len, false);        // unmapped memory isn't locked
                 // A shared map's VMA spans whole host pages; unmapping the
@@ -4189,7 +4824,10 @@ private:
                 drop_backings(a0, len);
                 proc_.with_space([&](AddressSpace& t) { return t.unmap(a0, len); });
                 proc_.unname(a0, a0 + len);
-                reset_pte_prot(a0, len);
+                // Gone means gone: a later touch faults (SIGSEGV), as on
+                // Linux. The pages stay fenced until something maps them
+                // again (mmap, brk and mremap all set their own protection).
+                set_pte_prot(a0, len, GuestProt::none);
                 return 0;
             }
             case S::mprotect: {
@@ -4276,7 +4914,7 @@ private:
                 if (!v) return -14;
                 if (new_len <= old_len) {
                     proc_.with_space([&](AddressSpace& t) { return t.unmap(a0 + new_len, old_len - new_len); });
-                    reset_pte_prot(a0 + new_len, old_len - new_len);
+                    set_pte_prot(a0 + new_len, old_len - new_len, GuestProt::none);
                     return static_cast<std::int64_t>(a0);
                 }
                 if (!(a3 & kMayMove)) return -12;
@@ -4290,7 +4928,7 @@ private:
                 std::memmove(dst.data(), src.data(), old_len);
                 machine_.zero(to + old_len, new_len - old_len);
                 proc_.with_space([&](AddressSpace& t) { return t.unmap(a0, old_len); });
-                reset_pte_prot(a0, old_len);
+                set_pte_prot(a0, old_len, GuestProt::none);
                 set_pte_prot(to, new_len, prot);
                 return static_cast<std::int64_t>(to);
             }
@@ -4337,6 +4975,13 @@ private:
         const std::uint64_t a0 = regs_.arg(0), a1 = regs_.arg(1),
                             a2 = regs_.arg(2), a3 = regs_.arg(3);
         const GuestRam ram = machine_.ram();
+
+        // /proc/<pid>/mem: positional access to a guest's memory
+        if (!mem_fds_.empty())
+            if (auto it = mem_fds_.find(gfd); it != mem_fds_.end()) {
+                if (sc == S::close) { mem_fds_.erase(it); }
+                else if (auto r = mem_io(sc, it->second)) return r;
+            }
 
         // /dev/full (emulated over host /dev/zero): every write is ENOSPC.
         if (sc == S::write || sc == S::pwrite64 || sc == S::writev ||
@@ -4440,7 +5085,9 @@ private:
                 if (a1 & abi::wire::kONonblock)
                     ::fcntl(p[0], F_SETFL, ::fcntl(p[0], F_GETFL) | O_NONBLOCK);
                 const int g = proc_.with_fds([&](FdTable& t) {
-                    return t.install_eventfd(p[0], p[1], (a1 & 1) != 0);
+                    // a counter, read as a sum: a timerfd's read returns every
+                    // expiration since the last one (the eventfd arithmetic)
+                    return t.install_eventfd(p[0], p[1], (a1 & 1) != 0, HostFd::Kind::eventfd);
                 });
                 if (g < 0) { ::close(p[0]); ::close(p[1]); return -24; }
                 // Each fire writes one u64 to the pipe, so a read yields the
@@ -4579,8 +5226,10 @@ private:
         // free; the arithmetic is here. Passing the pipe's bytes straight
         // through made `write 5, write 7, read` return 5, not 12.
         if (sc == S::read || sc == S::write)
-            if (const auto ev = proc_.with_fds([&](const FdTable& t) { return t.eventfd(gfd); }))
+            if (const auto ev = proc_.with_fds([&](const FdTable& t) { return t.eventfd(gfd); })) {
+                if (sc == S::write && timerfds_.count(gfd)) return -22;   // a timerfd takes no writes
                 return eventfd_io(*ev, sc == S::read, a1, a2);
+            }
         switch (sc) {
             case S::read: {
                 if (!need_fd()) return -9;                          // EBADF
@@ -4602,6 +5251,8 @@ private:
                 if (const auto j = tty_job_control(*hfd, false)) return j;  // background reader
                 if (const auto w = wait_ready(*hfd, POLLIN)) return w;    // a signal came first
                 auto n = ::read(*hfd, win.data(), win.size());
+                if (n < 0 && errno == ECONNRESET && !seqpacket_.empty() && seqpacket_.count(sock_ino(*hfd)))
+                    return 0;                                          // SEQPACKET: the peer left
                 return n < 0 ? darwin::fail() : n;
             }
             case S::write: {
@@ -4856,8 +5507,14 @@ private:
                 auto it = epolls_.find(gfd);
                 if (it == epolls_.end()) return -22;            // EINVAL: not an epoll fd
                 const int target = static_cast<int>(a2);
-                const int target_host = host_fd(target);
+                int target_host = host_fd(target);
                 if (target_host < 0) return -9;
+                if (target == gfd) return -22;                  // EINVAL: itself
+                // An epoll inside an epoll: the inner set's guest fd is a
+                // placeholder; its kqueue is what turns readable when the inner
+                // set has events (a kqueue is pollable by another kqueue).
+                if (auto inner = epolls_.find(target); inner != epolls_.end())
+                    target_host = inner->second->fd();
                 std::uint32_t mask = 0;
                 std::uint64_t token = 0;
                 if (static_cast<int>(a1) != kEpollCtlDel) {
@@ -5105,6 +5762,25 @@ private:
             case 1034: {                         // F_GET_SEALS
                 const auto s = memfd_seals(h);
                 return s ? static_cast<std::int64_t>(*s) : -22;
+            }
+            case 1031: case 1032: {              // F_SETPIPE_SZ / F_GETPIPE_SZ
+                struct ::stat st{};
+                if (::fstat(h, &st) != 0 || !S_ISFIFO(st.st_mode)) return -9;   // EBADF: not a pipe
+                const std::uint64_t ino = static_cast<std::uint64_t>(st.st_ino);
+                if (cmd == 1032) {
+                    auto it = pipe_size_.find(ino);
+                    return it == pipe_size_.end() ? 65536 : it->second;
+                }
+                // Linux rounds up to a power-of-two number of pages, at least
+                // one page; past /proc/sys/fs/pipe-max-size (1 MiB) only
+                // CAP_SYS_RESOURCE may go. Darwin's pipe is fixed at 64 KiB, so
+                // the size is the guest's, for F_GETPIPE_SZ to report back.
+                std::uint64_t want = std::max<std::uint64_t>(arg, 4096), sz = 4096;
+                while (sz < want) sz <<= 1;
+                if (sz > (1u << 20) && !privileged_resource()) return -1;      // EPERM
+                if (sz > (1u << 30)) return -22;
+                pipe_size_[ino] = static_cast<std::int64_t>(sz);
+                return static_cast<std::int64_t>(sz);
             }
             case kGetfl: {
                 const int fl = ::fcntl(h, F_GETFL);
@@ -5378,6 +6054,15 @@ private:
         // fails at once with EBADF; poll would wait for it forever.
         const int acc = fl & O_ACCMODE;
         if ((events & POLLOUT) ? acc == O_RDONLY : acc == O_WRONLY) return 0;
+        // A terminal in non-canonical mode with VMIN/VTIME times its own
+        // reads (VMIN=0: return after VTIME even with nothing): a poll that
+        // waits for data first would block the 0.2s read forever. Leave
+        // those to the host's tty driver, which implements exactly that.
+        if ((events & POLLIN) && ::isatty(h)) {
+            struct ::termios t{};
+            if (::tcgetattr(h, &t) == 0 && !(t.c_lflag & ICANON) && (t.c_cc[VMIN] == 0 || t.c_cc[VTIME] != 0))
+                return 0;
+        }
         std::vector<struct ::pollfd> p{{h, events, 0}};
         if (signal_aware_poll(p, -1) != -4) return 0;
         const std::uint64_t ready = (g_pending.bits.load(std::memory_order_relaxed)
@@ -5571,13 +6256,42 @@ private:
             timeout = static_cast<int>(ts.sec * 1000 + ts.nsec / 1'000'000);
         }
         std::vector<struct ::pollfd> hv(h.begin(), h.end());
-        const int rc = signal_aware_poll(hv, timeout);
-        if (rc == -4) return poll_interrupted();
-        if (rc < 0) return rc;
-        std::copy(hv.begin(), hv.end(), h.begin());
+        // An mqueue descriptor (a queue file) is readable when it holds a
+        // message and writable when it has room -- decided here, since the
+        // host calls any regular file always ready. Its entries leave the
+        // host poll; if one is ready now, nobody waits.
+        int mq_ready = 0;
+        std::vector<bool> is_mq(n, false);
+        if (!mq_mode_.empty())
+            for (std::uint64_t i = 0; i < n; ++i) {
+                mq::Header hd{};
+                if (hv[i].fd < 0 || !mq_mode_.count(sock_ino(hv[i].fd)) || !mq::read_header(hv[i].fd, hd)) continue;
+                is_mq[i] = true;
+                short r = 0;
+                if ((hv[i].events & POLLIN) && hd.count > 0) r |= POLLIN;
+                if ((hv[i].events & POLLOUT) && hd.count < hd.maxmsg) r |= POLLOUT;
+                h[i].revents = r;
+                if (r) ++mq_ready;
+                hv[i].fd = -1;
+            }
+        if (mq_ready) timeout = 0;
+        const int rc0 = signal_aware_poll(hv, timeout);
+        if (rc0 == -4) return poll_interrupted();
+        if (rc0 < 0) return rc0;
+        for (std::uint64_t i = 0; i < n; ++i)
+            if (!is_mq[i]) h[i].revents = hv[i].revents;
+        const int rc = rc0 + mq_ready;
         for (std::uint64_t i = 0; i < n; ++i) {
             // An fd the guest named that we don't know is POLLNVAL, per POSIX.
             g[i].revents = h[i].fd < 0 && g[i].fd >= 0 ? 0x20 : h[i].revents;
+            // A pipe's WRITE end with no reader left: Linux says POLLERR
+            // (pipe_poll), Darwin POLLHUP.
+            if ((g[i].revents & POLLHUP) && h[i].fd >= 0 && (h[i].events & POLLOUT)) {
+                struct ::stat st{};
+                const int acc = ::fcntl(h[i].fd, F_GETFL) & O_ACCMODE;
+                if (acc == O_WRONLY && ::fstat(h[i].fd, &st) == 0 && S_ISFIFO(st.st_mode))
+                    g[i].revents = static_cast<std::int16_t>((g[i].revents & ~POLLHUP) | POLLERR);
+            }
             if (!ram.put(fds_at + i * sizeof(LinuxPollfd), g[i])) return -14;
         }
         return rc;
@@ -6015,6 +6729,11 @@ private:
                     }
                 }
                 int fd = ::open(path->c_str(), hflags, static_cast<mode_t>(lmode));
+                // /proc/<pid>/mem (procfs's marker): a placeholder fd whose
+                // reads/writes at an offset are guest memory of that pid
+                std::int32_t mem_pid = 0;
+                if (fd >= 0 && *path == "/dev/null")
+                    if (const auto mp = proc_.pending_mem_pid.exchange(0, std::memory_order_relaxed)) mem_pid = mp;
                 // /dev/full: macOS has none. /dev/zero reads the same; the
                 // fd is marked so its writes fail with ENOSPC.
                 const bool dev_full = fd < 0 && errno == ENOENT && *path == "/dev/full";
@@ -6032,6 +6751,7 @@ private:
                 return proc_.with_fds([&](FdTable& t) {
                     const int g = t.install(fd, (lflags & abi::wire::kOCloexec) != 0);
                     if (dev_full && g >= 0) t.set_kind(g, HostFd::Kind::full);
+                    if (mem_pid && g >= 0) mem_fds_[g] = {mem_pid, 0};
                     return g;
                 });
             }
@@ -6266,6 +6986,9 @@ private:
                 // IP address the guest supplied directly.
                 const int h = host_fd(static_cast<int>(regs_.arg(0)));
                 if (h < 0) return -9;
+                // an emulated netlink socket: binding to sockaddr_nl (any
+                // pid, no groups) or connecting to the kernel just works
+                if (!rtnl_.empty() && rtnl_.count(sock_ino(h))) return 0;
                 ::sockaddr_storage ss{};
                 socklen_t slen = 0;
                 if (path) {
@@ -6317,6 +7040,20 @@ private:
                 const int rc = sc == S::bind
                     ? ::bind(h, reinterpret_cast<::sockaddr*>(&ss), slen)
                     : ::connect(h, reinterpret_cast<::sockaddr*>(&ss), slen);
+                // an abstract name we just took: record our landlock domain
+                // beside it, for a scoped peer's connect (ll_abstract_scope)
+                if (rc == 0 && sc == S::bind && ss.ss_family == AF_UNIX) {
+                    const auto* sun = reinterpret_cast<const ::sockaddr_un*>(&ss);
+                    const std::string hp{sun->sun_path, ::strnlen(sun->sun_path, sizeof sun->sun_path)};
+                    if (net::abstract_name_of(hp) || hp.starts_with(net::abstract_dir())) {
+                        const std::string side = hp + ".ll";
+                        if (ll_chain_.empty()) (void)::unlink(side.c_str());
+                        else if (std::FILE* f = std::fopen(side.c_str(), "we")) {
+                            for (const auto id : ll_chain_) std::fprintf(f, "%llu\n", static_cast<unsigned long long>(id));
+                            std::fclose(f);
+                        }
+                    }
+                }
                 if (rc == 0) return 0;
                 // Darwin: connecting to a path that is not a socket says
                 // ENOTSOCK (about the ADDRESS); Linux, ECONNREFUSED.
@@ -6341,6 +7078,7 @@ private:
     bool threaded_{false};        // a clone(CLONE_THREAD) has happened
     struct Child { std::int32_t guest; pid_t host; };
     std::vector<Child> children_;
+    std::vector<pid_t> lingering_;   // reaped from the table, host process not yet gone
     std::vector<ProcEvent> proc_events_;
     std::vector<ExitHook> exit_hooks_;
     // AF_UNIX: the guest's spelling of each path it bound, by translated
@@ -6349,6 +7087,85 @@ private:
     // SO_PASSCRED / are emulated SEQPACKET, by host socket inode.
     std::unordered_map<std::string, std::string> bound_paths_;
     std::unordered_set<std::uint64_t> passcred_, seqpacket_;
+    // emulated rtnetlink sockets: the guest end's inode -> our (far) end
+    std::unordered_map<std::uint64_t, int> rtnl_;
+    // socketpair ends this process made (or inherited): inode -> creator pid
+    std::unordered_map<std::uint64_t, std::int32_t> pair_creator_;
+    std::unordered_map<std::uint64_t, std::int64_t> pipe_size_;   // F_SETPIPE_SZ, by pipe inode
+    // POSIX mqueues: each open queue's guest access mode (by file inode) and
+    // the guest fds opened (or set) O_NONBLOCK
+    std::unordered_map<std::uint64_t, int> mq_mode_;
+    std::unordered_set<int> mq_nonblock_;
+    // A queue's host file: "/name" -> <shm dir>/.mq.name, beside /dev/shm's.
+    // Guest pid `g`'s memory service socket (memsvc.hpp), beside the queues.
+    [[nodiscard]] std::string memsvc_path(std::int32_t g) const {
+        if (!resolve_) return {};
+        const std::string dir = resolve_("/dev/shm");
+        return dir.empty() ? std::string{} : memsvc::sock_path(dir, g);
+    }
+    // Serve this process's guest RAM to other guest processes, once per
+    // process (a fork child serves its own copy under its new pid).
+    void start_memsvc() {
+        if (memsvc_pid_ == tgid_) return;
+        const std::string p = memsvc_path(tgid_);
+        if (p.empty()) return;
+        memsvc_pid_ = tgid_;
+        HvfMachine* m = &machine_;
+        memsvc::serve(p, [m](std::uint64_t addr, std::uint64_t len) -> std::span<std::byte> {
+            return m->ram().at(addr, len);
+        });
+    }
+    std::int32_t memsvc_pid_{0};
+    // open /proc/<pid>/mem fds: guest fd -> (pid, file offset)
+    struct MemFd { std::int32_t pid; std::uint64_t off; };
+    std::unordered_map<int, MemFd> mem_fds_;
+    [[nodiscard]] Maybe mem_io(abi::Sysno sc, MemFd& m) {
+        using S = abi::Sysno;
+        const GuestRam ram = machine_.ram();
+        const bool self = m.pid == tgid_;
+        auto xfer = [&](bool writing, std::uint64_t addr, std::span<std::byte> buf) -> std::int64_t {
+            if (self) {
+                auto there = ram.at(addr, buf.size());
+                if (there.size() != buf.size()) return -5;                // EIO: unmapped
+                std::memcpy(writing ? there.data() : buf.data(), writing ? buf.data() : there.data(), buf.size());
+                return static_cast<std::int64_t>(buf.size());
+            }
+            const std::int64_t r = memsvc::transfer(memsvc_path(m.pid), writing, addr, buf);
+            return r == -EFAULT ? -5 : r < 0 ? -static_cast<std::int64_t>(darwin::errno_to_linux(static_cast<int>(-r))) : r;
+        };
+        switch (sc) {
+            case S::read: case S::write: case S::pread64: case S::pwrite64: {
+                const bool writing = sc == S::write || sc == S::pwrite64;
+                const bool positional = sc == S::pread64 || sc == S::pwrite64;
+                auto win = ram.clamp(regs_.arg(1), regs_.arg(2));
+                if (win.empty() && regs_.arg(2)) return -14;
+                const std::uint64_t at = positional ? regs_.arg(3) : m.off;
+                const std::int64_t n = xfer(writing, at, win);
+                if (n > 0 && !positional) m.off += static_cast<std::uint64_t>(n);
+                return n;
+            }
+            case S::lseek: {
+                const auto o = static_cast<std::int64_t>(regs_.arg(1));
+                const int wh = static_cast<int>(regs_.arg(2));
+                if (wh == SEEK_SET) m.off = static_cast<std::uint64_t>(o);
+                else if (wh == SEEK_CUR) m.off += static_cast<std::uint64_t>(o);
+                else return -22;
+                return static_cast<std::int64_t>(m.off);
+            }
+            default: return std::nullopt;
+        }
+    }
+    [[nodiscard]] std::string mq_path(const std::string& name) const {
+        if (!resolve_) return {};
+        std::string dir = resolve_("/dev/shm");
+        if (dir.empty()) return {};
+        return dir + "/.mq." + (name.front() == '/' ? name.substr(1) : name);
+    }
+    // CAP_SYS_RESOURCE, as the dispatcher last published it: euid 0.
+    [[nodiscard]] bool privileged_resource() const {
+        const auto ids = proc_.ids();
+        return !ids || ids->euid == 0;
+    }
     bool ready_announced_{false};   // PidSpace::ready: the kick handler is in
     Resolver resolve_;
     Resolver unresolve_;
@@ -6368,6 +7185,146 @@ private:
     int pdeathsig_{0};
     std::atomic<std::uint64_t> pdeath_gen_{0};   // see kSetPdeathsig
     std::int64_t seccomp_mode_{0};
+    bool in_child_pidns_{false};        // identity calls are the core's (see ig_after_dispatch)
+
+    // -- Guest ptrace (PidSpace's trace slots carry it between processes) --
+    // Tracer side: the guest pids we trace (for wait). Tracee side: whether
+    // we're traced, and which syscall boundary the tracer wants us to stop
+    // at next (PTRACE_SYSCALL).
+    std::unordered_set<std::int32_t> tracees_;
+    bool syscall_stops_{false};        // PTRACE_SYSCALL in force
+    bool injecting_{false};            // delivering a signal the tracer passed on
+    std::vector<std::uint64_t> ll_chain_;   // our landlock domain chain (ig_after_dispatch)
+    std::function<void(std::int64_t)> before_resume_;   // see run_in_guest
+    bool in_syscall_stop_{false};      // between the entry stop and the exit stop
+    [[nodiscard]] bool traced() const noexcept { return pids_.tracer_of(tgid_) != 0; }
+    // Stop for the tracer with Linux wait status `wst` (0x7f | sig << 8),
+    // publishing registers; returns once resumed. A signal the tracer passes
+    // on is made pending; PTRACE_SYSCALL arms the next syscall boundary.
+    void trace_point(std::int32_t wst) {
+        auto c = cpu_.save();
+        // a stop at a syscall boundary: the live registers are in regs_
+        for (int i = 0; i < 9; ++i) c.x[i] = regs_.x[static_cast<std::size_t>(i)];
+        std::uint64_t pub[34]{}, back[34]{};
+        for (int i = 0; i < 31; ++i) pub[i] = c.x[i];
+        pub[31] = c.sp_el0; pub[32] = regs_.elr; pub[33] = regs_.spsr;
+        const auto r = pids_.trace_stop(tgid_, wst, pub, back, [this] { return traced() && !exited_; });
+        if (r.regs_changed) {
+            for (int i = 0; i < 9; ++i) regs_.x[static_cast<std::size_t>(i)] = back[i];
+            for (int i = 0; i < 31; ++i) c.x[i] = back[i];
+            c.sp_el0 = back[31]; c.pc = back[32];
+            regs_.elr = back[32];
+            cpu_.load(c);
+        }
+        syscall_stops_ = r.cmd == 24;           // PTRACE_SYSCALL
+        if (r.sig > 0 && r.sig != 5) mark_self_pending(r.sig);
+        if (r.cmd == 8) kill_with(9);           // PTRACE_KILL
+    }
+    [[nodiscard]] std::int64_t do_guest_ptrace() {
+        constexpr std::int64_t kTraceme = 0, kPeektext = 1, kPeekdata = 2, kPeekuser = 3,
+                               kPoketext = 4, kPokedata = 5, kCont = 7, kKill = 8, kSinglestep = 9,
+                               kAttach = 16, kDetach = 17, kSyscall = 24, kSetoptions = 0x4200,
+                               kGetregset = 0x4204, kSetregset = 0x4205, kSeize = 0x4206,
+                               kInterrupt = 0x4207, kGetsiginfo = 0x4202;
+        const auto req = static_cast<std::int64_t>(regs_.arg(0));
+        const auto pid = static_cast<std::int32_t>(regs_.arg(1));
+        const std::uint64_t addr = regs_.arg(2), data = regs_.arg(3);
+        const GuestRam ram = machine_.ram();
+        if (req == kTraceme) {
+            if (traced()) return -1;                                   // EPERM
+            pids_.set_tracer(tgid_, parent_ > 0 ? parent_ : 1);
+            // a parent already blocked in wait for us: re-check (trace_stop
+            // kicks it the same way)
+            if (const auto ph = pids_.host_of(parent_ > 0 ? parent_ : 1)) ::kill(*ph, SIGCHLD);
+            return 0;
+        }
+        if (pid <= 0) return -3;
+        if (req == kAttach || req == kSeize) {
+            if (pid == tgid_ || pids_.tracer_of(pid)) return -1;
+            if (!pids_.host_of(pid)) return -3;
+            pids_.set_tracer(pid, tgid_);
+            tracees_.insert(pid);
+            if (req == kAttach) (void)deliver_signal(pid, 19);         // SIGSTOP
+            if (req == kSeize) pids_.set_trace_opts(pid, static_cast<std::int32_t>(data));
+            return 0;
+        }
+        if (pids_.tracer_of(pid) != tgid_) return -3;                  // ESRCH: not ours
+        tracees_.insert(pid);
+        const bool stopped = pids_.stop_of(pid) != 0;
+        switch (req) {
+            case kSetoptions:
+                pids_.set_trace_opts(pid, static_cast<std::int32_t>(data));
+                return stopped ? 0 : -3;
+            case kCont: case kSyscall: case kSinglestep: case kDetach: {
+                if (!stopped) return -3;
+                if (req == kDetach) { pids_.set_tracer(pid, 0); tracees_.erase(pid); }
+                pids_.trace_resume(pid, req == kSinglestep ? kCont : static_cast<std::int32_t>(req),
+                                   static_cast<std::int32_t>(data));
+                return 0;
+            }
+            case kKill:
+                if (stopped) pids_.trace_resume(pid, kKill, 0);
+                else (void)deliver_signal(pid, 9);
+                return 0;
+            case kInterrupt:
+                (void)deliver_signal(pid, 19);
+                return 0;
+            case kPeekuser: {
+                if (!stopped) return -3;
+                const std::uint64_t* r = pids_.trace_regs(pid);
+                const std::uint64_t i = addr / 8;
+                if (!r || i >= 34 || addr % 8) return -5;                // EIO
+                return ram.put(data, r[i]) ? 0 : -14;
+            }
+            case kGetregset: case kSetregset: {
+                if (!stopped) return -3;
+                if (addr != 1) return -22;                             // NT_PRSTATUS only
+                GuestIovec iov{};
+                if (!ram.get(data, iov)) return -14;
+                std::uint64_t* r = pids_.trace_regs(pid);
+                if (!r) return -3;
+                const std::size_t n = std::min<std::size_t>(iov.len, 34 * 8);
+                auto w = ram.at(iov.base, n);
+                if (w.size() != n) return -14;
+                if (req == kGetregset) {
+                    std::memcpy(w.data(), r, n);
+                    iov.len = n;
+                    return ram.put(data, iov) ? 0 : -14;
+                }
+                std::memcpy(r, w.data(), n);
+                pids_.mark_regs_dirty(pid);
+                return 0;
+            }
+            case kGetsiginfo: {
+                if (!stopped) return -3;
+                std::uint8_t si[128]{};
+                const std::int32_t sig = (pids_.stop_of(pid) >> 8) & 0x7f;
+                std::memcpy(si, &sig, 4);
+                auto w = ram.at(data, sizeof si);
+                if (w.size() != sizeof si) return -14;
+                std::memcpy(w.data(), si, sizeof si);
+                return 0;
+            }
+            case kPeektext: case kPeekdata: case kPoketext: case kPokedata: {
+                if (!stopped) return -3;
+                const bool poke = req == kPoketext || req == kPokedata;
+                std::uint64_t word = poke ? data : 0;
+                std::span<std::byte> b{reinterpret_cast<std::byte*>(&word), 8};
+                const std::int64_t n = memsvc::transfer(memsvc_path(pid), poke, addr, b);
+                if (n != 8) return -5;
+                return poke ? 0 : (ram.put(data, word) ? 0 : -14);
+            }
+            default:
+                return -5;                                             // EIO
+        }
+    }
+    // Strict mode: from now on every syscall but read/write/exit/sigreturn
+    // kills. The in-guest handler answers some calls (getpid, getuid, ...)
+    // without trapping, so withdraw every answer: each call reaches next().
+    void enter_seccomp_strict() {
+        seccomp_mode_ = 1;
+        machine_.clear_all_guest_answers();
+    }
     TimerSet timers_;
     // epoll sets, keyed by the guest fd that names them.
     std::map<int, std::shared_ptr<EpollSet>> epolls_;
@@ -6435,6 +7392,27 @@ public:
     // process's GUEST pid. Without a trap attached, the core falls back to
     // init's identity, which is right for single-process tests.
     struct TaskIds { std::int32_t pid, tid, ppid; };
+    // The portable dispatcher's ptrace runs its permission checks, then asks
+    // the backend (abi::Syscalls::do_ptrace): guest ptrace between guest
+    // processes, served by HvfTrap::do_guest_ptrace.
+    [[nodiscard]] std::int64_t guest_ptrace(std::int64_t, std::int64_t, std::uint64_t, std::uint64_t) const {
+        return trap_ ? const_cast<HvfTrap*>(trap_)->guest_ptrace_now() : -38;
+    }
+    // Landlock scope (abi/syscall.hpp ll_abstract_scope): the domain chain
+    // of whoever bound abstract name `name` (no leading NUL), or nullopt
+    // when nobody did. Read from the sidecar the binder wrote.
+    [[nodiscard]] std::optional<std::vector<std::uint64_t>> abstract_binder_domain(const std::string& name) const {
+        const std::string node = net::abstract_host_path(name);
+        struct ::stat st{};
+        if (::lstat(node.c_str(), &st) != 0) return std::nullopt;
+        std::vector<std::uint64_t> chain;
+        if (std::FILE* f = std::fopen((node + ".ll").c_str(), "re")) {
+            unsigned long long v;
+            while (std::fscanf(f, "%llu", &v) == 1) chain.push_back(v);
+            std::fclose(f);
+        }
+        return chain;
+    }
     [[nodiscard]] TaskIds current_ids() const noexcept {
         if (!trap_) return {1, 1, 0};
         auto t = trap_->current_ids();

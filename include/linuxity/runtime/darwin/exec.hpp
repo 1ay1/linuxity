@@ -62,6 +62,7 @@ struct ExecResult {
     std::string program, interp;
     std::string environ;        // envp, NUL-separated, as /proc/<pid>/environ
     std::string auxv;           // the aux vector's bytes, as /proc/<pid>/auxv
+    std::string cmdline;        // argv, each NUL-terminated, as /proc/<pid>/cmdline
 };
 
 // Load `path` into a FRESH address space (execve replaces the image). Handles
@@ -97,6 +98,7 @@ struct ExecResult {
     out.program_segments = out.segments.size();
     out.program = guest_path;
     for (const auto& e : envp) { out.environ += e; out.environ.push_back('\0'); }
+    for (const auto& a : argv) { out.cmdline += a; out.cmdline.push_back('\0'); }
     std::uint64_t entry = prog->entry;
     std::uint64_t at_base = 0;
 

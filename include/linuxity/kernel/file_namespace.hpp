@@ -590,6 +590,18 @@ public:
                 return PathClass{Realm2::host_backed,
                                  std::move(vf->redirect_host), Errno::enoent, {}};
             }
+            // A virtual SYMLINK with a RELATIVE target (/sys/class/net/lo ->
+            // ../../devices/virtual/net/lo): a following lookup lands on the
+            // target, like any link. Absolute ones (/dev/stdin ->
+            // /proc/self/fd/0) name /proc magic links that only the
+            // dispatcher can resolve, so it keeps doing that itself.
+            if (follow && !vf->symlink_target.empty() && vf->symlink_target.front() != '/' &&
+                vf->symlink_target != "(proc-link)") {
+                if (depth >= 40) return PathClass{Realm2::absent, {}, Errno::eloop, {}};
+                const std::string next = normalize(
+                    std::string{abs.substr(0, abs.rfind('/') + 1)} + vf->symlink_target);
+                return classify_impl(next, for_write, true, wi, depth + 1);
+            }
             return PathClass{Realm2::virtual_file, {}, Errno::enoent,
                              std::string{abs}};
         }

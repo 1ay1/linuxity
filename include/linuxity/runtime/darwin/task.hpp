@@ -195,6 +195,15 @@ public:
         std::lock_guard g{mu_};
         return auxv_;
     }
+    // argv of the current image, NUL-terminated each (/proc/<pid>/cmdline)
+    void set_cmdline(std::string blob) {
+        std::lock_guard g{mu_};
+        cmdline_ = std::move(blob);
+    }
+    [[nodiscard]] std::string cmdline() const {
+        std::lock_guard g{mu_};
+        return cmdline_;
+    }
     std::atomic<std::uint64_t> rchar{0}, wchar{0}, syscr{0}, syscw{0};
     // The guest-address window whose page-table permissions were narrowed
     // from the default RWX (mmap/mprotect); exec resets it. Empty: lo >= hi.
@@ -210,7 +219,7 @@ public:
         {8ull << 20, 8ull << 20}, {kInf, kInf}, {kInf, kInf},           // MEMLOCK AS LOCKS
         {63432, 63432}, {819200, 819200}, {0, 0}, {0, 0}, {kInf, kInf}, // SIGPENDING MSGQUEUE NICE RTPRIO RTTIME
     }};
-    struct NamedRange { std::uint64_t begin, end; std::string name; };
+    struct NamedRange { std::uint64_t begin, end; std::string name; std::uint64_t off{0}; bool shared{false}; };
     template <class Fn>
     decltype(auto) with_names(Fn&& fn) {
         std::lock_guard g{mu_};
@@ -222,15 +231,15 @@ public:
         std::vector<NamedRange> keep;
         for (auto& r : names_) {
             if (r.end <= b || r.begin >= e) { keep.push_back(std::move(r)); continue; }
-            if (r.begin < b) keep.push_back({r.begin, b, r.name});
-            if (r.end > e) keep.push_back({e, r.end, r.name});
+            if (r.begin < b) keep.push_back({r.begin, b, r.name, r.off, r.shared});
+            if (r.end > e) keep.push_back({e, r.end, r.name, r.off + (e - r.begin), r.shared});
         }
         names_ = std::move(keep);
     }
-    void name(std::uint64_t b, std::uint64_t e, std::string n) {
+    void name(std::uint64_t b, std::uint64_t e, std::string n, std::uint64_t off = 0, bool shared = false) {
         unname(b, e);
         std::lock_guard g{mu_};
-        names_.push_back({b, e, std::move(n)});
+        names_.push_back({b, e, std::move(n), off, shared});
     }
     // exit_group(2): every thread in the process dies. Mark it, then kick
     // the others so they leave the guest and notice promptly even if they
@@ -254,6 +263,9 @@ public:
     // boundary, so /proc/<pid>/status's SigBlk shows it (it lives in the
     // leader's TaskState, which nothing else can see).
     std::atomic<std::uint64_t> leader_sigmask{0};
+    // procfs redirected an open of /proc/<pid>/mem to /dev/null: that pid
+    // (0 = none). The backend's open turns the fd into its memory.
+    std::atomic<std::int32_t> pending_mem_pid{0};
 
     // -- Writable MAP_SHARED file mappings ---------------------------------
     // Guest RAM is one flat allocation, so a file mapping here is a pread
@@ -361,6 +373,7 @@ private:
     std::set<std::uint64_t> locked_;
     std::string environ_;
     std::string auxv_;
+    std::string cmdline_;
     std::vector<NamedRange> names_;
     std::atomic<bool> group_exiting_{false};
     int group_status_{0};
