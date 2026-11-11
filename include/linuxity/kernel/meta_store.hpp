@@ -241,6 +241,16 @@ public:
         if (had) append_tombstone(guest_path);
     }
 
+    // Nothing recorded at all (after catching up once): the common case,
+    // which lets a per-component walk skip every lookup.
+    [[nodiscard]] bool empty() const { catch_up(); return table_.empty(); }
+    // The record for a path in the table as it stands (no catch-up): for a
+    // walk that already caught up through empty().
+    [[nodiscard]] const MetaRecord* peek(const std::string& guest_path) const {
+        auto it = table_.find(guest_path);
+        return it == table_.end() ? nullptr : &it->second;
+    }
+
     // The recorded overlay for a path, or nullopt if the guest never touched
     // its metadata (so the host inode's real values stand).
     //

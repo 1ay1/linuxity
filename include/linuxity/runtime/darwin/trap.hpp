@@ -587,7 +587,12 @@ public:
         const int rc = sc == abi::Sysno::bind
             ? ::bind(h, reinterpret_cast<::sockaddr*>(&sun), sun.sun_len)
             : ::connect(h, reinterpret_cast<::sockaddr*>(&sun), sun.sun_len);
-        if (rc < 0) return complete(darwin::fail());
+        if (rc < 0) {
+            // Darwin says ENOTSOCK for connecting to a path that is not a
+            // socket (about the ADDRESS -- the fd is one); Linux, ECONNREFUSED.
+            if (errno == ENOTSOCK && sc == abi::Sysno::connect) return complete(-111);
+            return complete(darwin::fail());
+        }
         // getsockname/getpeername give the guest back ITS spelling (a
         // relative "rel.sock" stays relative), not the translated host path.
         if (sc == abi::Sysno::bind)
@@ -693,12 +698,13 @@ private:
             return v && v[0] == '2';
         }();
         if (strace)
-            std::fprintf(stderr, "[%d] %3llu(%#llx, %#llx, %#llx, %#llx) = %lld\n",
+            std::fprintf(stderr, "[%d] %3llu(%#llx, %#llx, %#llx, %#llx, %#llx) = %lld\n",
                          task_.tid, static_cast<unsigned long long>(regs_.nr()),
                          static_cast<unsigned long long>(regs_.arg(0)),
                          static_cast<unsigned long long>(regs_.arg(1)),
                          static_cast<unsigned long long>(regs_.arg(2)),
                          static_cast<unsigned long long>(regs_.arg(3)),
+                         static_cast<unsigned long long>(regs_.arg(4)),
                          static_cast<long long>(rc));
         if (payloads && regs_.nr() == 64 && rc > 0) {          // aarch64 write
             auto win = machine_.ram().clamp(regs_.arg(1), static_cast<std::size_t>(rc));
@@ -4133,6 +4139,11 @@ private:
                     // EOF the host faults; the guest sees that as SIGBUS.
                     if (add_backing(at, span, ffd, foff)) {
                         if (has(prot_from_linux(a2), GuestProt::exec)) machine_.publish_code(at, span);
+                        // The host maps 16 KiB pages, so guest 4 KiB pages
+                        // wholly past EOF but inside the host's last page
+                        // read zeros; on Linux they are SIGBUS. Fence them
+                        // now, as a later truncate would (file_resized).
+                        file_resized(ffd);
                         return static_cast<std::int64_t>(at);
                     }
                 }
@@ -4322,6 +4333,12 @@ private:
         const std::uint64_t a0 = regs_.arg(0), a1 = regs_.arg(1),
                             a2 = regs_.arg(2), a3 = regs_.arg(3);
         const GuestRam ram = machine_.ram();
+
+        // /dev/full (emulated over host /dev/zero): every write is ENOSPC.
+        if (sc == S::write || sc == S::pwrite64 || sc == S::writev ||
+            sc == S::pwritev || sc == S::pwritev2)
+            if (proc_.with_fds([&](FdTable& t) { return t.kind(gfd) == HostFd::Kind::full; }))
+                return std::int64_t{-28};
 
         // fd-table operations first: they don't need a resolved host fd.
         switch (sc) {
@@ -4605,7 +4622,12 @@ private:
                 auto win = ram.clamp(a1, a2);
                 if (win.empty() && a2) return -14;
                 if (const auto e = seal_denies(*hfd, static_cast<std::int64_t>(a3), win.size())) return e;
-                auto n = ::pwrite(*wfd, win.data(), win.size(), static_cast<off_t>(a3));
+                if (static_cast<std::int64_t>(a3) < 0) return -22;
+                // Linux: pwrite on an O_APPEND fd appends, whatever the
+                // offset (pwrite(2) BUGS); Darwin writes at the offset.
+                const int fl = ::fcntl(*wfd, F_GETFL);
+                auto n = (fl >= 0 && (fl & O_APPEND)) ? ::write(*wfd, win.data(), win.size())
+                                                     : ::pwrite(*wfd, win.data(), win.size(), static_cast<off_t>(a3));
                 return n < 0 ? darwin::fail() : n;
             }
             case S::readv: case S::writev:
@@ -4623,7 +4645,11 @@ private:
                 const bool writing = sc == S::pwritev || sc == S::pwritev2;
                 // The offset is split across two registers on 32-bit ABIs;
                 // on both of ours it is a single argument.
-                const auto off = static_cast<off_t>(a3);
+                auto off = static_cast<off_t>(a3);
+                if (writing && off >= 0) {                     // O_APPEND: appends (see pwrite64)
+                    const int fl = ::fcntl(*wfd, F_GETFL);
+                    if (fl >= 0 && (fl & O_APPEND)) off = -1;
+                }
                 return do_vector_at(writing, writing ? *wfd : *hfd, a1, a2, off);
             }
 
@@ -4680,22 +4706,59 @@ private:
             // -- Allocation and flushing.
             case S::fallocate: {
                 // fallocate(fd, mode, offset, len). Darwin's F_PREALLOCATE
-                // reserves space; mode 0 means "allocate and extend", which
-                // also needs the file length updated.
+                // reserves space and F_PUNCHHOLE frees it; the size change
+                // is ours. Modes: 0 allocate and extend, KEEP_SIZE (1)
+                // allocate only, PUNCH_HOLE (2, needs KEEP_SIZE) zero and
+                // free. Collapse/zero/insert ranges have no host primitive.
                 if (!need_fd()) return -9;
+                constexpr std::uint64_t kKeepSize = 1, kPunchHole = 2;
+                const auto off = static_cast<std::int64_t>(a2), len = static_cast<std::int64_t>(a3);
+                if (off < 0 || len <= 0) return -22;
+                if (a1 & ~(kKeepSize | kPunchHole)) return -95;   // EOPNOTSUPP
+                if ((a1 & kPunchHole) && !(a1 & kKeepSize)) return -95;
+                struct ::stat s{};
+                if (::fstat(*hfd, &s) != 0) return darwin::fail();
+                if (S_ISDIR(s.st_mode)) return -21;
+                if (S_ISFIFO(s.st_mode)) return -29;               // ESPIPE
+                if (!S_ISREG(s.st_mode)) return -19;               // ENODEV
+                const int acc = ::fcntl(*hfd, F_GETFL) & O_ACCMODE;
+                if (acc == O_RDONLY) return -9;
+                if (a1 & kPunchHole) {
+                    // Only inside the file; the block-aligned middle is
+                    // freed, the ragged edges are written as zeros.
+                    const std::int64_t end = std::min<std::int64_t>(off + len, s.st_size);
+                    if (off >= end) return 0;
+                    const std::int64_t bs = s.st_blksize > 0 ? s.st_blksize : 4096;
+                    const std::int64_t lo = (off + bs - 1) / bs * bs, hi = end / bs * bs;
+                    auto zero = [&](std::int64_t from, std::int64_t to) -> bool {
+                        static const std::vector<char> z(1 << 16, 0);
+                        while (from < to) {
+                            const auto n = ::pwrite(*hfd, z.data(),
+                                static_cast<std::size_t>(std::min<std::int64_t>(to - from, 1 << 16)), from);
+                            if (n <= 0) return false;
+                            from += n;
+                        }
+                        return true;
+                    };
+                    if (lo < hi) {
+                        ::fpunchhole_t ph{0, 0, lo, hi - lo};
+                        if (::fcntl(*hfd, F_PUNCHHOLE, &ph) < 0 && !zero(lo, hi)) return darwin::fail();
+                        if (!zero(off, lo) || !zero(hi, end)) return darwin::fail();
+                    } else if (!zero(off, end)) {
+                        return darwin::fail();
+                    }
+                    return 0;
+                }
                 ::fstore_t st{};
                 st.fst_flags = F_ALLOCATECONTIG | F_ALLOCATEALL;
                 st.fst_posmode = F_PEOFPOSMODE;
                 st.fst_offset = 0;
-                st.fst_length = static_cast<off_t>(a3);
+                st.fst_length = static_cast<off_t>(len);
                 (void)::fcntl(*hfd, F_PREALLOCATE, &st);   // best effort
-                if (a1 == 0) {                             // extend the size
-                    struct ::stat s{};
-                    if (::fstat(*hfd, &s) == 0) {
-                        const auto want = static_cast<off_t>(a2 + a3);
-                        if (want > s.st_size && ::ftruncate(*hfd, want) < 0)
-                            return darwin::fail();
-                    }
+                if (!(a1 & kKeepSize)) {                   // extend the size
+                    const auto want = static_cast<off_t>(off + len);
+                    if (want > s.st_size && ::ftruncate(*hfd, want) < 0)
+                        return darwin::fail();
                 }
                 return 0;
             }
@@ -4853,8 +4916,16 @@ private:
                 if (a3 && off_out >= 0 && !ram.put(a3, off_out)) return -14;
                 return static_cast<std::int64_t>(done);
             }
-            case S::fadvise64:
-                return 0;              // purely advisory; Darwin's F_RDAHEAD differs
+            case S::fadvise64: {
+                // Purely advisory (Darwin's F_RDAHEAD differs), but its
+                // errors are not: a bad fd, a pipe, a bad advice value.
+                if (!need_fd()) return -9;
+                struct ::stat s{};
+                if (::fstat(*hfd, &s) == 0 && S_ISFIFO(s.st_mode)) return -29;   // ESPIPE
+                if (a3 > 5) return -22;
+                if (static_cast<std::int64_t>(a2) < 0) return -22;
+                return 0;
+            }
             // close_range(first, last, flags): libc's closefrom(), used by
             // every spawn helper right before exec.
             case S::close_range: {
@@ -5686,6 +5757,20 @@ private:
             if (e == ENOTSUP) return std::int64_t{-95};                   // EOPNOTSUPP
             return darwin::fail();
         };
+        // Linux knows four namespaces; anything else is EOPNOTSUPP. Darwin
+        // takes any name. user.* is the guest's own, and a user xattr on a
+        // symlink is EPERM (user xattrs are only for files and dirs).
+        if (sc != S::listxattr && sc != S::llistxattr && sc != S::flistxattr) {
+            const std::string name = ram.cstr(arg(0), 256);
+            const bool known = name.starts_with("user.") || name.starts_with("trusted.") ||
+                               name.starts_with("security.") || name.starts_with("system.");
+            if (!known) return -95;
+            if (name.starts_with("user.") && nofollow && path && fd < 0 &&
+                (sc == S::lsetxattr || sc == S::lremovexattr)) {
+                struct ::stat st{};
+                if (::lstat(path, &st) == 0 && S_ISLNK(st.st_mode)) return -1;
+            }
+        }
         switch (sc) {
             case S::listxattr: case S::llistxattr: case S::flistxattr: {
                 auto buf = ram.clamp(arg(0), arg(1));
@@ -5787,10 +5872,12 @@ private:
         // /proc/self/fd/N: the portable procfs forwards these to the HOST's
         // /proc (on Linux the guest is a real process, so that is exact).
         // macOS has no /proc, so answer from the guest fd table here.
+        proc_fd_host_ = -1;
         if (path) {
             if (auto g = proc_fd_number(*path)) {
                 auto h = proc_.with_fds([&](FdTable& t) { return t.host(*g); });
                 if (!h) return -2;                                   // ENOENT
+                proc_fd_host_ = *h;
                 if (sc == S::readlinkat) {
                     const std::string target = describe_fd(*h);
                     auto win = machine_.ram().clamp(regs_.arg(2), regs_.arg(3));
@@ -5819,12 +5906,26 @@ private:
                         // and unlinked at once -- its own offset, as Linux.
                         const std::uint64_t fl = sc == S::openat ? regs_.arg(2) : regs_.arg(1);
                         if ((fl & 3) == 0) {
-                            char tmpl[] = "/tmp/linuxity-reopen-XXXXXX";
-                            if (const int t = ::mkstemp(tmpl); t >= 0) {
+                            // A clone can't cross volumes, and an env's files
+                            // live on their own APFS volume: put it beside
+                            // the file's last name (F_GETPATH still knows it).
+                            std::string dir = "/tmp";
+                            if (::fcntl(*h, F_GETPATH, p) == 0) {
+                                dir = p;
+                                dir.erase(dir.find_last_of('/'));
+                                if (dir.empty() || ::access(dir.c_str(), W_OK) != 0) dir = "/tmp";
+                            }
+                            std::string tmpl_s = dir + "/.linuxity-reopen-XXXXXX";
+                            std::vector<char> tmpl(tmpl_s.begin(), tmpl_s.end());
+                            tmpl.push_back('\0');
+                            if (const int t = ::mkstemp(tmpl.data()); t >= 0) {
                                 ::close(t);
-                                ::unlink(tmpl);
-                                if (::fclonefileat(*h, AT_FDCWD, tmpl, 0) == 0) {
-                                    fd_path_storage_ = tmpl;
+                                ::unlink(tmpl.data());
+                                // a clone copies what is ON DISK: flush the
+                                // writes still in the page cache first
+                                (void)::fsync(*h);
+                                if (::fclonefileat(*h, AT_FDCWD, tmpl.data(), 0) == 0) {
+                                    fd_path_storage_ = tmpl.data();
                                     unlink_after_open_ = true;
                                 }
                             }
@@ -5837,11 +5938,20 @@ private:
         const GuestRam ram = machine_.ram();
         const std::uint64_t a2 = regs_.arg(2), a3 = regs_.arg(3);
         switch (sc) {
-            case S::open: case S::openat: {
+            case S::open: case S::openat: case S::openat2: {
                 if (!path) return -2;                               // ENOENT
-                const bool at = sc == S::openat;
-                const std::uint64_t lflags = at ? a2 : regs_.arg(1);
-                const std::uint64_t lmode  = at ? a3 : a2;
+                const bool at = sc != S::open;
+                std::uint64_t lflags = at ? a2 : regs_.arg(1);
+                std::uint64_t lmode  = at ? a3 : a2;
+                // openat2(dirfd, path, &how, size): the core already walked
+                // RESOLVE_* in the guest's tree and handed us the path; the
+                // flags and mode are the first two u64s of `struct open_how`.
+                if (sc == S::openat2) {
+                    struct { std::uint64_t flags, mode; } how{};
+                    if (!ram.get(a2, how)) return -14;
+                    lflags = how.flags;
+                    lmode = how.mode;
+                }
                 // Open CLOEXEC on the host side unconditionally: the host fd
                 // belongs to linuxity, and must never leak into a process we
                 // spawn. The GUEST's O_CLOEXEC is tracked in the fd table.
@@ -5881,6 +5991,10 @@ private:
                     }
                 }
                 int fd = ::open(path->c_str(), hflags, static_cast<mode_t>(lmode));
+                // /dev/full: macOS has none. /dev/zero reads the same; the
+                // fd is marked so its writes fail with ENOSPC.
+                const bool dev_full = fd < 0 && errno == ENOENT && *path == "/dev/full";
+                if (dev_full) fd = ::open("/dev/zero", hflags & ~O_CREAT);
                 if (fd < 0 && errno == ENAMETOOLONG && path->size() >= host::kHostPathMax) {
                     // a guest path deeper than Darwin's 1024-byte PATH_MAX
                     // (Linux allows 4096): walk to the parent a step at a time
@@ -5891,7 +6005,11 @@ private:
                 }
                 if (std::exchange(unlink_after_open_, false)) ::unlink(path->c_str());
                 if (fd < 0) return darwin::fail();
-                return proc_.with_fds([&](FdTable& t) { return t.install(fd, (lflags & abi::wire::kOCloexec) != 0); });
+                return proc_.with_fds([&](FdTable& t) {
+                    const int g = t.install(fd, (lflags & abi::wire::kOCloexec) != 0);
+                    if (dev_full && g >= 0) t.set_kind(g, HostFd::Kind::full);
+                    return g;
+                });
             }
             case S::newfstatat: {
                 if (!path) return -2;
@@ -5977,9 +6095,13 @@ private:
             }
             case S::unlinkat: {
                 if (!path) return -2;
-                int rc = abi::wire::has_at(a2, abi::wire::AtFlag::removedir) ? ::rmdir(path->c_str())
-                                           : ::unlink(path->c_str());
-                return rc < 0 ? darwin::fail() : 0;
+                const bool dir = abi::wire::has_at(a2, abi::wire::AtFlag::removedir);
+                if ((dir ? ::rmdir(path->c_str()) : ::unlink(path->c_str())) == 0) return 0;
+                const std::int64_t e = darwin::fail();
+                // Darwin says EPERM for unlink(dir); Linux, EISDIR.
+                struct ::stat st{};
+                if (!dir && e == -1 && ::lstat(path->c_str(), &st) == 0 && S_ISDIR(st.st_mode)) return -21;
+                return e;
             }
             case S::renameat: case S::renameat2: {
                 if (!path || !path2) return -2;
@@ -5997,10 +6119,28 @@ private:
                 return ::rename(path->c_str(), path2->c_str()) < 0
                            ? darwin::fail() : 0;
             }
-            case S::linkat:
+            case S::linkat: {
                 if (!path || !path2) return -2;
-                return ::link(path->c_str(), path2->c_str()) < 0
+                // Linux links a symlink ITSELF unless AT_SYMLINK_FOLLOW
+                // (0x400); Darwin's link() follows it.
+                const bool follow = sc == S::linkat && (regs_.arg(4) & 0x400);
+                // linkat("/proc/self/fd/N", name, AT_SYMLINK_FOLLOW) gives an
+                // UNLINKED file (O_TMPFILE, a deleted temp) a name again.
+                // Darwin can't link an inode with no name; a clone of its
+                // content (flushed first) is the closest thing.
+                if (follow && proc_fd_host_ >= 0) {
+                    struct ::stat st{};
+                    if (::fstat(proc_fd_host_, &st) == 0 && st.st_nlink == 0 && S_ISREG(st.st_mode)) {
+                        (void)::fsync(proc_fd_host_);
+                        if (::fclonefileat(proc_fd_host_, AT_FDCWD, path2->c_str(), 0) == 0) return 0;
+                        return errno == EEXIST ? -17 : darwin::fail();
+                    }
+                }
+                // The core resolves a FOLLOW source itself (see path_mut2), so
+                // the path here is already the right object: link it exactly.
+                return ::linkat(AT_FDCWD, path->c_str(), AT_FDCWD, path2->c_str(), 0) < 0
                            ? darwin::fail() : 0;
+            }
             case S::symlinkat:
                 // symlinkat(target, newdirfd, linkpath): only the LINK PATH
                 // is translated (it's the dispatcher's path_arg); the target
@@ -6153,7 +6293,12 @@ private:
                 const int rc = sc == S::bind
                     ? ::bind(h, reinterpret_cast<::sockaddr*>(&ss), slen)
                     : ::connect(h, reinterpret_cast<::sockaddr*>(&ss), slen);
-                return rc < 0 ? darwin::fail() : 0;
+                if (rc == 0) return 0;
+                // Darwin: connecting to a path that is not a socket says
+                // ENOTSOCK (about the ADDRESS); Linux, ECONNREFUSED.
+                if (errno == ENOTSOCK && sc == S::connect && path)
+                    return -111;
+                return darwin::fail();
             }
             default:
                 return std::nullopt;
@@ -6186,6 +6331,7 @@ private:
     kernel::fsnotify::Hub* hub_{nullptr};
     std::function<void(std::int64_t)> on_result_;
     std::string fd_path_storage_;
+    int proc_fd_host_{-1};            // the host fd a /proc/self/fd/N path named, this call
     bool unlink_after_open_{false};   // fd_path_storage_ is a reopen clone
     bool memfds_{false};              // a memfd has been seen: check seals
     std::unordered_map<std::int32_t, std::int32_t> rt_prio_;   // sched_param of FIFO/RR tasks

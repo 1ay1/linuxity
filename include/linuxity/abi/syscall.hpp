@@ -1366,6 +1366,16 @@ private:
     [[nodiscard]] std::string read_cstr(UAddr a) {
         std::string s = read_string(a);
         if (s.size() >= 4096) path_too_long_ = true;
+        // NAME_MAX: no component may pass 255 BYTES. APFS counts UTF-16
+        // units instead, so a 128-character accented name (256 bytes) was
+        // accepted on a Mac and then broke every Linux tool that copies it.
+        if (s.size() > 255) {
+            std::size_t run = 0;
+            for (const char c : s) {
+                run = c == '/' ? 0 : run + 1;
+                if (run > 255) { path_too_long_ = true; break; }
+            }
+        }
         return s;
     }
     // Any other guest string (an argv entry, a label): no length rule.
@@ -1595,7 +1605,31 @@ private:
                                             const std::string& host_path) {
         if (dot_tail(raw) == DotTail::none) return false;
         if (host_path.empty()) return false;
-        return ::access(host_path.c_str(), X_OK) != 0 && errno == EACCES;
+        if (::access(host_path.c_str(), X_OK) != 0 && errno == EACCES) return true;
+        // the host keeps directories searchable for linuxity itself; the
+        // guest's mode decides whether an ordinary user may pass
+        const std::string g = k_.files().absolutize(raw, k_.files().cwd());
+        return guest_search_denied(g + "/");
+    }
+
+    // An ordinary guest user must be able to SEARCH (x) every directory on
+    // the way to `abs`. The host can't judge that: linuxity is one host
+    // user who owns the whole tree, and the guest's modes live in the
+    // shadow store -- so `chmod 600 d; stat d/x` succeeded for a user it
+    // should have stopped. Only directories the shadow store holds a mode
+    // for can differ from the host's answer, so only those are checked:
+    // a guest that never chmod'ed a directory pays one lookup per
+    // component and no host call.
+    [[nodiscard]] bool guest_search_denied(const std::string& abs) {
+        if (privileged() || abs.size() < 2) return false;
+        auto& meta = k_.files().meta();
+        if (meta.empty()) return false;
+        for (std::size_t i = abs.find('/', 1); i != std::string::npos; i = abs.find('/', i + 1)) {
+            const std::string dir = abs.substr(0, i);
+            if (const auto* rec = meta.peek(dir); rec && (rec->have & kernel::MetaRecord::kMode))
+                if (!guest_may(dir, 1)) return true;
+        }
+        return false;
     }
 
     // Lexically normalizing "."/".." DROPS the requirement that whatever
@@ -2238,6 +2272,19 @@ private:
                 PathSyntax::needs_dir &&
             host_path_is_dir(pc.host_path))
             return eno(Errno::eisdir);
+        // The general rule: a trailing slash on open asserts a directory.
+        // An existing non-directory is ENOTDIR; a missing name with O_CREAT
+        // is EISDIR (open can't create directories); the stripped slash let
+        // open("file/") succeed and open("new/", O_CREAT) make a FILE.
+        if (pc.realm == kernel::Realm2::host_backed && !pc.host_path.empty() &&
+            path_syntax(read_cstr(uaddr(r.arg[static_cast<std::size_t>(path_arg)]))) ==
+                PathSyntax::needs_dir) {
+            if (host_lexists(pc.host_path)) {
+                if (!host_path_is_dir(pc.host_path)) return eno(Errno::enotdir);
+            } else if (wire::has(flags, wire::OpenFlag::creat)) {
+                return eno(Errno::eisdir);
+            }
+        }
         // O_EXCL asks about the NAME, not what it resolves to: a dangling
         // symlink occupies the name, so creating through it is EEXIST. We
         // classify with follow=true, which resolves the link to its absent
@@ -2313,6 +2360,7 @@ private:
             // terminal, which is not the guest's.)
             if (abs == "/dev/tty" && pc.host_path == "/dev/tty" && caller_ctty() < 0)
                 return eno(Errno::enxio);
+            if (guest_search_denied(abs)) return eno(Errno::eacces);
             pending_new_ = wire::has(flags, wire::OpenFlag::creat) && !guest_exists(abs);
             // creating a name writes its directory, like mkdir and unlink
             if (pending_new_ && !privileged())
@@ -2325,6 +2373,17 @@ private:
                 if (wire::has(flags, wire::OpenFlag::trunc)) want |= 2;
                 if (!guest_may(abs, want)) return eno(Errno::eacces);
                 if (privileged()) grant_root_dir_access(abs, pc.host_path);
+                // A write by someone without CAP_FSETID clears set-user-ID
+                // (and set-group-ID with group exec). The shadow store keeps
+                // these bits for root's sake, so clear them here, when the
+                // writer opens: every write follows an open for writing.
+                if ((want & 2) && !creds::capable(me(), creds::kCapFsetid))
+                    if (auto rec = k_.files().meta().lookup(abs);
+                        rec && (rec->have & kernel::MetaRecord::kMode) && (rec->mode & 06000u)) {
+                        std::uint32_t m = rec->mode & ~04000u;
+                        if (m & 010u) m &= ~02000u;
+                        if (m != rec->mode) k_.files().meta().set_mode(abs, m);
+                    }
             }
             // An emulated FIFO opens onto its shared pipe instead (only the
             // Linux launcher turns the emulation on; see fifo_open).
@@ -2601,6 +2660,7 @@ private:
             return eno(e);
 
         std::string abs = resolve_raw(r, raw, at, follow);
+        if (guest_search_denied(abs)) return eno(Errno::eacces);
         auto pc = k_.files().classify(abs, /*for_write=*/false, follow);
 
         // "/etc/passwd/" must be ENOTDIR. The Redirect below hands the host a
@@ -2696,6 +2756,7 @@ private:
         if (const Errno e = dot_prefix_error(r, 1, /*at=*/true); e != Errno::ok)
             return eno(e);
         std::string abs = resolve_arg(r, 1, true, /*follow_leaf=*/!nofollow);
+        if (guest_search_denied(abs)) return eno(Errno::eacces);
         // Honor AT_SYMLINK_NOFOLLOW (0x100): coreutils `stat`/`ls -la` statx a
         // symlink with this flag and expect S_IFLNK; following it reported the
         // target's type ("regular file") and made git's symlink probe fail.
@@ -3535,6 +3596,12 @@ private:
         // only for size 0 with a non-NULL buffer.
         if (cap == 0) return eno(Errno::einval);
         if (cap < need) return eno(Errno::erange);
+        // The current directory was removed: Linux's getcwd says ENOENT
+        // (the dentry is unlinked), it doesn't hand back a dead name.
+        if (const auto pc = k_.files().classify(std::string{cwd});
+            pc.realm == kernel::Realm2::host_backed && !pc.host_path.empty() &&
+            pc.host_path.size() < host::kHostPathMax && !host_path_is_dir(pc.host_path))
+            return eno(Errno::enoent);
         std::vector<std::byte> buf(need);
         for (std::size_t i = 0; i < cwd.size(); ++i)
             buf[i] = static_cast<std::byte>(cwd[i]);
@@ -3799,9 +3866,11 @@ private:
                 return fifo_create(abs, pc.host_path, mode);
         }
         // A removal drops any shadow record so a fresh file created at the same
-        // path later starts from the host defaults, not a stale owner/mode.
+        // path later starts from the host defaults, not a stale owner/mode --
+        // once it SUCCEEDS (note_removed). Forgetting up front meant a
+        // refused `rmdir d` (ENOTEMPTY) handed d back to root, and its owner
+        // could no longer create in it.
         if (wi == Wi::remove) {
-            k_.files().meta().forget(abs);
             // An emulated hardlink name: removing an alias drops it from the
             // table; removing the backing while aliases remain must keep the
             // data alive under one of them, as the kernel keeps an inode
@@ -3809,10 +3878,14 @@ private:
             // only changes if the host unlink succeeds.
             auto& lt = k_.files().links();
             if (!lt.empty() && (lt.backing_of(pc.host_path) != nullptr ||
-                                lt.has_aliases(pc.host_path)))
-                return unlink_with_links(pc.host_path);
+                                lt.has_aliases(pc.host_path))) {
+                Outcome lo = unlink_with_links(pc.host_path);
+                if (const auto* v = lo.get_if<Virtualize>(); v && v->ret >= 0) note_removed(abs);
+                return lo;
+            }
         }
         Redirect o{PathArg{path_arg, std::move(pc.host_path)}};
+        if (wi == Wi::remove) o.removed = abs;
         // Only creates need their parent chain pre-built by the trap; the
         // parents_only classify already mirrored them, so this is belt-and-
         // suspenders for the deep-create case.
@@ -3837,6 +3910,18 @@ private:
     [[nodiscard]] Errno dir_entry_allowed(const std::string& guest, bool removing) {
         const std::size_t cut = guest.rfind('/');
         const std::string parent = cut == 0 ? std::string{"/"} : guest.substr(0, cut);
+        // The walk fails before any permission check when the parent isn't
+        // there (ENOENT) or isn't a directory (ENOTDIR). Asking guest_may
+        // about a missing path answered with root's default owner, so an
+        // ordinary user's `mkdir a/b` with no a was EACCES.
+        if (const auto ppc = k_.files().classify(parent);
+            ppc.realm == kernel::Realm2::host_backed && !ppc.host_path.empty() &&
+            ppc.host_path.size() < host::kHostPathMax) {        // a longer one: the host call decides
+            struct ::stat pst{};
+            if (::stat(ppc.host_path.c_str(), &pst) != 0)
+                return errno == ENOTDIR ? Errno::enotdir : errno == EACCES ? Errno::eacces : Errno::enoent;
+            if (!S_ISDIR(pst.st_mode)) return Errno::enotdir;
+        }
         if (!guest_may(parent, 3)) return Errno::eacces;
         if (!removing) return Errno::ok;
         // the sticky bit: only the file's owner or the dir's owner (or
@@ -3990,13 +4075,16 @@ private:
                 // linuxity itself could no longer open for writing, so guest
                 // root got EACCES writing its own read-only file.
                 //
-                // Regular files only. A directory's mode goes on literally,
-                // because its search bit is a lookup rule the guest relies
-                // on: chmod 0644 on a directory must make it unsearchable
-                // (conform_diff pins `mkdir dir/.` as EACCES there), and a
-                // floor of 0700 had quietly kept it searchable.
+                // Directories keep owner rwx on the host too. Their search
+                // bit is a lookup rule, but linuxity is ONE host user, so a
+                // literal 0600 made the tree unreachable for everyone --
+                // guest root included, and as ENOENT (the overlay read the
+                // host's EACCES as absence). The guest's rule is enforced
+                // from the shadow mode instead (guest_search_denied for an
+                // ordinary user; root's CAP_DAC_OVERRIDE passes it).
                 const std::uint32_t keep =
-                    host_path_is_regular(wc.host_path) ? 0600u : 0u;
+                    host_path_is_regular(wc.host_path) ? 0600u
+                    : host_path_is_dir(wc.host_path)   ? 0700u : 0u;
                 errno = 0;
                 if (::chmod(wc.host_path.c_str(), static_cast<mode_t>((mode & wire::kPermMask) | keep)) == 0) {
                     std::uint32_t got = 0;
@@ -4018,6 +4106,11 @@ private:
         if ((mode & 02000u) && !creds::capable(me(), creds::kCapFsetid) &&
             !in_group(owner_of(target).second))
             mode &= ~02000u;
+        // Set-id bits are always kept in the shadow store, even when the
+        // host inode carries them: the host kernel strips them on the next
+        // write by its (unprivileged) owner, linuxity, where guest root's
+        // CAP_FSETID would keep them -- so the inode can't be the record.
+        if (mode & 06000u) landed = 0xffffffffu;
         k_.files().meta().set_mode(target, mode, landed);
         return val(0);
     }
@@ -4137,16 +4230,34 @@ private:
         const std::uint32_t ng = static_cast<std::uint32_t>(r.arg[static_cast<std::size_t>(gid_arg)]);
         if (Errno e = chown_allowed(target, nu, ng); e != Errno::ok) return eno(e);
         k_.files().meta().set_owner(target, nu, ng);
-        // A chown by someone without CAP_FSETID drops set-user-ID, and
-        // set-group-ID when group exec is set. Root keeps them, which is how
-        // a package install leaves sudo setuid.
-        if (auto rec = k_.files().meta().lookup(target);
-            !creds::capable(me(), creds::kCapFsetid) && (nu != creds::kKeep || ng != creds::kKeep) &&
-            rec && (rec->have & kernel::MetaRecord::kMode)) {
-            std::uint32_t m = rec->mode;
-            m &= ~04000u;
-            if (m & 010u) m &= ~02000u;
-            if (m != rec->mode) k_.files().meta().set_mode(target, m);
+        // A chown of a non-directory drops set-user-ID, and set-group-ID
+        // when group exec is set -- for root too (chown(2): "since Linux
+        // 2.2.13, root is treated like other users"), which is why tar and
+        // install set the mode AFTER the owner. The mode may live in the
+        // shadow store or, when the host inode took it exactly, only there.
+        if (nu != creds::kKeep || ng != creds::kKeep) {
+            const auto rec = k_.files().meta().lookup(target);
+            std::uint32_t m = 0;
+            bool have = false, dir = false;
+            if (rec && (rec->have & kernel::MetaRecord::kMode)) { m = rec->mode; have = true; }
+            const auto pc = k_.files().classify(target, false, follow);
+            struct ::stat st{};
+            if (pc.realm == kernel::Realm2::host_backed && !pc.host_path.empty() &&
+                ::lstat(pc.host_path.c_str(), &st) == 0) {
+                dir = S_ISDIR(st.st_mode);
+                if (!have) { m = st.st_mode & 07777u; have = true; }
+                if (S_ISLNK(st.st_mode)) have = false;
+            }
+            if (have && !dir) {
+                std::uint32_t nm = m & ~04000u;
+                if (nm & 010u) nm &= ~02000u;
+                if (nm != m) {
+                    if (pc.realm == kernel::Realm2::host_backed && !pc.host_path.empty())
+                        (void)::chmod(pc.host_path.c_str(), static_cast<mode_t>(nm & 0777u) |
+                                      (host_path_is_regular(pc.host_path) ? 0600u : 0u));
+                    k_.files().meta().set_mode(target, nm);
+                }
+            }
         }
         return val(0);
     }
@@ -4236,8 +4347,14 @@ private:
             int link_fd = -1;
             if (empty_cstr_arg(r, a1) && wire::has_at(lf, wire::AtFlag::empty_path))
                 link_fd = static_cast<int>(r.arg[0]);
-            else if (wire::has_at(lf, wire::AtFlag::symlink_follow))
-                link_fd = magic_fd_of(resolve_arg(r, a1, at));
+            else if (wire::has_at(lf, wire::AtFlag::symlink_follow)) {
+                // As WRITTEN: resolve_arg expands the magic link to the file
+                // it names, which for an unlinked file is a path that no
+                // longer exists (EXDEV/ENOENT on the host).
+                const std::string raw = read_cstr(uaddr(r.arg[static_cast<std::size_t>(a1)]));
+                link_fd = magic_fd_of(raw.starts_with('/') ? raw : resolve_arg(r, a1, at));
+                if (link_fd < 0) link_fd = magic_fd_of(resolve_arg(r, a1, at));
+            }
             if (link_fd >= 0) return link_from_fd(r, link_fd, a2, at);
         }
         // BOTH operands. Checking only the source left symlinkat(x, "") and
@@ -4252,6 +4369,12 @@ private:
         // name (its placeholder), not drag the shared file behind it along.
         // link's source is the opposite -- the new name joins the inode the
         // source NAMES, so it is alias-resolved.
+        // linkat with AT_SYMLINK_FOLLOW links what a symlink source POINTS
+        // to; the host is told the resolved path, since Darwin's link()
+        // would follow anyway and linkat(0) would not.
+        const bool link_follow = !move_meta && link_flags_arg >= 0 &&
+            wire::has_at(r.arg[static_cast<std::size_t>(link_flags_arg)], wire::AtFlag::symlink_follow);
+        if (link_follow) src = k_.files().resolve_links(src);
         auto ps = move_meta ? k_.files().classify_name(src, true, false, Wi::copy_leaf)
                             : k_.files().classify(src, true, false, Wi::copy_leaf);
         auto pd = move_meta ? k_.files().classify_name(dst, true, false, Wi::parents_only)
@@ -4461,10 +4584,27 @@ private:
         }
         if (ps.host_path.empty() || pd.host_path.empty())
             return eno(ps.host_path.empty() ? ps.error : pd.error);
+        // An ordinary user needs write+search on both parents, and in a
+        // sticky one must own the name it removes or replaces (rename and
+        // unlink share the rule). rename had no check at all, so any user
+        // could move another's file out of /tmp.
+        if (!privileged()) {
+            if (move_meta) {
+                if (Errno e = dir_entry_allowed(src, true); e != Errno::ok) return eno(e);
+                if (host_lexists(pd.host_path)) {
+                    if (Errno e = dir_entry_allowed(dst, true); e != Errno::ok) return eno(e);
+                } else if (Errno e = dir_entry_allowed(dst, false); e != Errno::ok) {
+                    return eno(e);
+                }
+            } else if (Errno e = dir_entry_allowed(dst, false); e != Errno::ok) {
+                return eno(e);
+            }
+        }
         // rename carries the shadow metadata with the file (a hardlink/link
         // does NOT: both names share the inode, so the original keeps its own
-        // record). Do the in-store move BEFORE the redirect returns.
-        if (move_meta) k_.files().meta().rename(src, dst);
+        // record). It moves in note_moved, once the host rename SUCCEEDED:
+        // moving it up front meant a refused rename (EISDIR, ENOTEMPTY) left
+        // the destination with the source's owner and mode.
         // Both operands are guest paths, so both get translated.
         //
         // NO .parents(): the chain is pre-created to MIRROR a lower-layer
@@ -4508,9 +4648,11 @@ private:
         // the table is only updated if the host rename really happened.
         if (move_meta && !k_.files().links().empty() &&
             (k_.files().links().touches(ps.host_path) ||
-             k_.files().links().touches(pd.host_path)))
-            return rename_with_links(r, ps.host_path, pd.host_path,
-                                     rename_flags_arg);
+             k_.files().links().touches(pd.host_path))) {
+            Outcome o = rename_with_links(r, ps.host_path, pd.host_path, rename_flags_arg);
+            if (const auto* v = o.get_if<Virtualize>(); v && v->ret >= 0) note_moved(src, dst);
+            return o;
+        }
         Redirect rd{PathArg{a1, std::move(ps.host_path)}};
         rd.second = PathArg{a2, std::move(pd.host_path)};
         // a rename (not a link): tell note_moved what moved where
@@ -4584,7 +4726,11 @@ private:
         }
         if (st.st_nlink == 0) {                           // O_TMPFILE: no name
             const Errno e = k_.files().emulate_link_from_fd(sfd, pd.host_path);
-            return e == Errno::ok ? val(0) : eno(e);
+            if (e != Errno::ok) return eno(e);
+            // a fresh file: its creator's, like any create (O_TMPFILE's
+            // owner is whoever opened it, and that is who names it)
+            note_created(dst, false);
+            return val(0);
         }
         // A named file: alias whatever host path the fd really refers to.
         const std::string tgt = host::fd_path(sfd);
@@ -4852,7 +4998,15 @@ private:
         // The empty-target check comes BEFORE anything about the link name,
         // so it outranks the trailing-slash rule below: symlink("",
         // "existing-dir/") is ENOENT, not the EEXIST the name alone gives.
-        if (empty_path_arg(r, target_arg)) return eno(Errno::enoent);
+        // The target is text, resolved only when followed: its components
+        // may be any length, so reading it must not trip NAME_MAX.
+        {
+            const bool before = path_too_long_;
+            const bool empty = empty_path_arg(r, target_arg);
+            const auto tlen = read_string(uaddr(r.arg[static_cast<std::size_t>(target_arg)])).size();
+            path_too_long_ = before || tlen >= 4096;
+            if (empty) return eno(Errno::enoent);
+        }
         // A "."/".." in the link name does not excuse the components before
         // it: an unsearchable directory mid-path is EACCES, and a missing one
         // ENOENT, both ahead of anything about the name being taken. Same
@@ -6890,11 +7044,16 @@ public:
         if (rec->have & kernel::MetaRecord::kMode) m.set_mode(dst, rec->mode);
     }
 
+    // A removal succeeded: the name's shadow owner/mode goes with it.
+    void note_removed(const std::string& guest) { k_.files().meta().forget(guest); }
+
     // A rename went through: guest path `from` is now `to`. The kernel ties a
     // landlock rule to the inode, so the rule moves with it; ours are keyed
     // by path, so rewrite them, in rule sets being built and in live domains.
     void note_moved(const std::string& from, const std::string& to) {
         namespace ll = kernel::landlock;
+        k_.files().meta().rename(from, to);
+        k_.files().moved(from, to);
         if (ll_sets_.empty() && ll_layers_ == 0) return;
         auto fix = [&](std::string& p) {
             if (ll::under(p, from) && from != "/") p = to + p.substr(from.size());

@@ -172,6 +172,9 @@ struct Redirect {
     bool                   created_dir{false};
     // on success, guest path `moved->first` is now `moved->second` (rename)
     std::optional<std::pair<std::string, std::string>> moved{};
+    // on success, guest path `removed` is gone (unlink/rmdir): drop its
+    // shadow owner/mode then, not before -- a refused rmdir kept the dir
+    std::optional<std::string> removed{};
     // on success, `linked->second` is a new hard link to `linked->first`
     std::optional<std::pair<std::string, std::string>> linked{};
     std::optional<Scrub>   scrub{};

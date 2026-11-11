@@ -50,7 +50,14 @@ struct StatTimes {
     h.mode  = static_cast<std::uint32_t>(st.st_mode);
     h.dev   = static_cast<std::uint64_t>(st.st_dev);
     h.ino   = static_cast<std::uint64_t>(st.st_ino);
+    // A Darwin directory's link count is 2 + EVERY entry, not Linux's 2 +
+    // subdirectories; find(1) would trust it to skip leaf directories.
+    // Report 1, Linux's "not counted" (btrfs, FUSE), which find knows.
+#if defined(__APPLE__)
+    h.nlink = S_ISDIR(st.st_mode) ? 1u : static_cast<std::uint64_t>(st.st_nlink);
+#else
     h.nlink = static_cast<std::uint64_t>(st.st_nlink);
+#endif
     h.rdev  = static_cast<std::uint64_t>(st.st_rdev);
     h.size  = static_cast<std::uint64_t>(st.st_size);
 #if defined(_WIN32)

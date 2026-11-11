@@ -39,6 +39,7 @@ namespace lx::runtime::darwin {
 // Darwin's O_* values (O_CREAT is 0x200 here, 0100 there), which is exactly
 // why open_flags() below has to translate.
 using LinuxOpen = abi::wire::OpenFlag;
+inline constexpr std::uint64_t kLinuxDsync = 0x1000, kLinuxSync = 0x101000;
 
 [[nodiscard]] inline int open_flags(std::uint64_t lf) noexcept {
     // This backend's guest is aarch64, where O_DIRECTORY/O_NOFOLLOW are NOT
@@ -62,6 +63,10 @@ using LinuxOpen = abi::wire::OpenFlag;
     if (bit(LinuxOpen::directory)) df |= O_DIRECTORY;
     if (bit(LinuxOpen::nofollow))  df |= O_NOFOLLOW;
     if (bit(LinuxOpen::cloexec))   df |= O_CLOEXEC;
+    // O_DSYNC 0x1000, O_SYNC 0x101000 (__O_SYNC|O_DSYNC): the same on
+    // every Linux arch; Darwin's are 0x400000 and 0x80.
+    if ((lf & kLinuxSync) == kLinuxSync) df |= O_SYNC;
+    else if (lf & kLinuxDsync)          df |= O_DSYNC;
     return df;
 }
 
@@ -75,6 +80,8 @@ using LinuxOpen = abi::wire::OpenFlag;
     }
     if (df & O_APPEND)   lf |= static_cast<std::uint64_t>(LinuxOpen::append);
     if (df & O_NONBLOCK) lf |= static_cast<std::uint64_t>(LinuxOpen::nonblock);
+    if (df & O_SYNC)       lf |= kLinuxSync;
+    else if (df & O_DSYNC) lf |= kLinuxDsync;
     return static_cast<std::int64_t>(lf);
 }
 
@@ -153,12 +160,22 @@ static_assert(offsetof(LinuxStat, st_blocks) == 64);
     return static_cast<std::uint64_t>(host);
 }
 
+// A directory's link count. Linux's is 2 + subdirectories, and find(1)
+// uses it to skip stat()ing a leaf directory's entries. APFS reports 2 +
+// EVERY entry instead, which made find think files were directories still
+// to visit. Counting subdirectories costs a readdir per stat, so report
+// 1 -- what btrfs and FUSE report, Linux's "not counted", which find
+// knows to mean "look at everything".
+[[nodiscard]] inline std::uint32_t dir_nlink(const struct ::stat& s) noexcept {
+    return S_ISDIR(s.st_mode) ? 1u : static_cast<std::uint32_t>(s.st_nlink);
+}
+
 [[nodiscard]] inline LinuxStat to_linux(const struct ::stat& s) noexcept {
     LinuxStat o{};
     o.st_dev    = static_cast<std::uint64_t>(s.st_dev);
     o.st_ino    = s.st_ino;
     o.st_mode   = s.st_mode;         // S_IF* and permission bits agree
-    o.st_nlink  = s.st_nlink;
+    o.st_nlink  = dir_nlink(s);
     o.st_uid    = 0;
     o.st_gid    = 0;
     o.st_rdev   = rdev_to_linux(s.st_rdev);
@@ -308,7 +325,7 @@ inline constexpr std::uint32_t kStatxBasicStats = 0x7ff;
     LinuxStatx x{};
     x.stx_mask    = kStatxBasicStats;
     x.stx_blksize = static_cast<std::uint32_t>(s.st_blksize);
-    x.stx_nlink   = s.st_nlink;
+    x.stx_nlink   = dir_nlink(s);
     x.stx_uid     = 0;                 // linuxity presents a root-owned world
     x.stx_gid     = 0;
     x.stx_mode    = static_cast<std::uint16_t>(s.st_mode);

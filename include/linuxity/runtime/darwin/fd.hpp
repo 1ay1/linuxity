@@ -44,8 +44,9 @@ public:
     // What a pipe-pair descriptor IS (the read end carries it, so every dup
     // and forked copy agrees): a plain pipe end, an eventfd counter (and
     // whether EFD_SEMAPHORE), or another pollable record source (timerfd,
-    // signalfd) whose reads the backend formats itself.
-    enum class Kind : std::uint8_t { plain, eventfd, eventfd_sem, records };
+    // signalfd) whose reads the backend formats itself. `full` is /dev/full,
+    // which the host lacks: host /dev/zero for reads, ENOSPC for writes.
+    enum class Kind : std::uint8_t { plain, eventfd, eventfd_sem, records, full };
     Kind kind{Kind::plain};
 private:
     int fd_;
@@ -164,6 +165,17 @@ public:
         if (slots_.size() >= limit_) return -24;
         slots_.push_back({std::move(file), cloexec, std::move(peer)});
         return static_cast<int>(slots_.size() - 1);
+    }
+
+    // What guest fd `g`'s open file is (plain when unknown).
+    [[nodiscard]] HostFd::Kind kind(int g) const noexcept {
+        if (g < 0 || static_cast<std::size_t>(g) >= slots_.size()) return HostFd::Kind::plain;
+        const Slot& s = slots_[static_cast<std::size_t>(g)];
+        return s.file ? s.file->kind : HostFd::Kind::plain;
+    }
+    void set_kind(int g, HostFd::Kind k) noexcept {
+        if (g < 0 || static_cast<std::size_t>(g) >= slots_.size()) return;
+        if (auto& f = slots_[static_cast<std::size_t>(g)].file) f->kind = k;
     }
 
     // If `g` is an eventfd (a counter): its two host ends and its mode.

@@ -380,9 +380,13 @@ public:
         // dup2(src_i, 3+i) is wrong whenever some later src_j happens to be
         // a number an earlier dup2 already overwrote: src_j then names the
         // wrong file. Classic parallel-assignment hazard. Fix: first dup
-        // every source to a private HIGH number in the parent (above any
-        // target), then dup2 from those. No high fd can be a target, so no
-        // action can clobber another's source.
+        // every source to a private HIGH number (above every target AND
+        // every source), then dup2 from those, then close the high copies.
+        //
+        // All of it as file actions, i.e. IN THE CHILD. Staging the copies
+        // in the parent meant closing them there afterwards -- and closing
+        // ANY fd of a file drops every POSIX record lock the process holds
+        // on it, so each fork silently released the parent's fcntl locks.
         //
         // The groups come straight from the table's export, which already
         // lists every distinct open file -- including each eventfd's hidden
@@ -391,26 +395,28 @@ public:
         ::posix_spawn_file_actions_init(&fa);
         const std::vector<int>& sources = img.fd_hosts;
         std::vector<int> placed(sources.size(), -1);
-        std::vector<int> staged;                     // high copies, closed after spawn
         const int targets = static_cast<int>(sources.size()) + 1;   // + the pid table
-        const int high_floor = 3 + targets + 64;
+        int high = 3 + targets + 64;
+        for (const int s : sources) high = std::max(high, s + 1);
+        high = std::max(high, pids_.fd() + 1);
+        std::vector<int> staged;                     // the child's high copies
         auto stage = [&](int src) {
-            const int h = ::fcntl(src, F_DUPFD_CLOEXEC, high_floor);
+            const int h = high + static_cast<int>(staged.size());
+            ::posix_spawn_file_actions_adddup2(&fa, src, h);
             staged.push_back(h);
             return h;
         };
+        for (const int s : sources) (void)stage(s);
+        const int pid_stage = stage(pids_.fd());
         int next = 3;
         for (std::size_t gi = 0; gi < sources.size(); ++gi) {
             placed[gi] = next;
-            ::posix_spawn_file_actions_adddup2(&fa, stage(sources[gi]), next);
+            ::posix_spawn_file_actions_adddup2(&fa, staged[gi], next);
             ++next;
         }
         const int pid_fd_child = next++;
-        ::posix_spawn_file_actions_adddup2(&fa, stage(pids_.fd()), pid_fd_child);
-        struct Closer {
-            std::vector<int>& v;
-            ~Closer() { for (int fd : v) if (fd >= 0) ::close(fd); }
-        } close_staged{staged};
+        ::posix_spawn_file_actions_adddup2(&fa, pid_stage, pid_fd_child);
+        for (const int h : staged) ::posix_spawn_file_actions_addclose(&fa, h);
 
         // POSIX_SPAWN_CLOEXEC_DEFAULT: the child starts with ONLY 0/1/2 and
         // the fds placed above. Without it, every host fd linuxity happens

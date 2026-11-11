@@ -275,6 +275,24 @@ public:
     [[nodiscard]] std::string_view cwd() const noexcept { return cwd_of(cur_pid_); }
     void set_cwd(std::string c) { cwds_[cur_pid_] = normalize(c); last_cwd_ = cwds_[cur_pid_]; }
 
+    // A successful rename of `from` to `to`: every current directory and
+    // every fd path at or below `from` now names the moved object. The
+    // kernel tracks both by inode, so `cd a; mv ../a ../b; pwd` says b, and
+    // an *at call on a dirfd keeps working after its directory moves.
+    void moved(const std::string& from, const std::string& to) {
+        if (from.empty() || from == "/" || from == to) return;
+        auto fix = [&](std::string& p) {
+            if (p.size() >= from.size() && p.compare(0, from.size(), from) == 0 &&
+                (p.size() == from.size() || p[from.size()] == '/'))
+                p = to + p.substr(from.size());
+        };
+        for (auto& [pid, c] : cwds_) fix(c);
+        fix(last_cwd_);
+        for (auto& [pid, t] : fd_tables_)
+            for (auto& [fd, p] : t.paths) fix(p);
+        for (auto& [fd, p] : inherited_fds_.paths) fix(p);
+    }
+
     // How AF_UNIX sockets are named on this host. Filesystem everywhere POSIX
     // lets us create a socket node; abstract where it does not (Android's
     // SELinux denies the bind in every directory an app can write). Probed
@@ -1945,16 +1963,24 @@ private:
             std::string sub = dir.substr(0, i);
             // The lower counterpart shares the TAIL of the path, so take the
             // same number of trailing components off the lower directory.
+            // Mirror only a directory the lower layer HAS: the point is to
+            // give an existing lower dir an upper twin, never to invent one.
+            // Creating every ancestor turned `mkdir a/b` with no a into
+            // `mkdir -p` (root got success, a user EACCES on the invented a).
             ::mode_t mode = 0755;
+            bool in_lower = false;
             if (!lo_dir.empty()) {
                 const std::size_t tail = dir.size() - i;
                 if (tail <= lo_dir.size()) {
                     struct ::stat st{};
                     const std::string lsub = lo_dir.substr(0, lo_dir.size() - tail);
-                    if (::stat(lsub.c_str(), &st) == 0 && S_ISDIR(st.st_mode))
+                    if (::stat(lsub.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
                         mode = st.st_mode & 07777;
+                        in_lower = true;
+                    }
                 }
             }
+            if (!in_lower) continue;
             // Owner rwx at least: linuxity must be able to create inside a
             // directory guest root writes into, and a 0555 lower directory
             // (ca-certificates' cadir) mirrored literally refused it.

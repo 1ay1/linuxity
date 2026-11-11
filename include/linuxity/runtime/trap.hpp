@@ -324,6 +324,8 @@ public:
                                 locked([&] { sys.note_created(*rd.created, rd.created_dir); });
                             if (rc == 0 && rd.moved)
                                 locked([&] { sys.note_moved(rd.moved->first, rd.moved->second); });
+                            if (rc == 0 && rd.removed)
+                                locked([&] { sys.note_removed(*rd.removed); });
                             if (rc == 0 && rd.linked)
                                 locked([&] { sys.note_linked(rd.linked->first, rd.linked->second); });
                             if constexpr (requires { trap_.set_ret_now(std::int64_t{0}); })
