@@ -101,7 +101,10 @@ inline bool other_linuxity_running() {
     struct ::stat st{};
     const bool have_image = ::stat(image.c_str(), &st) == 0;
     (void)::mkdir(dir.c_str(), 0755);
-    if (!have_image && !detail::is_empty_dir(dir) && detail::other_linuxity_running()) {
+    // Anything in `dir` (environments from before, or an interrupted move)
+    // must be MOVED onto the volume -- never hidden by mounting over it.
+    const bool needs_move = !detail::is_empty_dir(dir);
+    if (needs_move && detail::other_linuxity_running()) {
         why = "environments need moving onto case-sensitive storage, but another linuxity "
               "is running; close it and run linuxity again";
         return false;
@@ -116,30 +119,35 @@ inline bool other_linuxity_running() {
             why = "hdiutil could not create " + image;
             return false;
         }
-        // What's already there (environments made before this existed)
-        // moves onto the volume. The old copy is kept until that succeeded.
-        if (!detail::is_empty_dir(dir)) {
-            const std::string stage = dir + ".moving";
-            const std::string old = dir + ".case-insensitive";
-            (void)::mkdir(stage.c_str(), 0755);
-            if (!attach(stage) ||
-                detail::run_tool({"/usr/bin/ditto", dir, stage}) != 0 ||
-                detail::run_tool({"hdiutil", "detach", "-quiet", stage}) != 0 ||
-                ::rename(dir.c_str(), old.c_str()) != 0) {
-                (void)detail::run_tool({"hdiutil", "detach", "-quiet", "-force", stage});
-                why = "could not move " + dir + " onto the case-sensitive volume";
-                return false;
-            }
-            (void)::rmdir(stage.c_str());
-            (void)::mkdir(dir.c_str(), 0755);
-            if (!attach(dir)) { (void)::rename(old.c_str(), dir.c_str()); why = "hdiutil attach failed"; return false; }
-            (void)detail::run_tool({"/bin/rm", "-rf", old});
-            if (announce)
-                std::fputs("linuxity: environments moved onto it. Packages installed before may\n"
-                           "          have lost files whose names differ only in case; reinstall\n"
-                           "          them if something is missing (apt install --reinstall PKG).\n", stderr);
-            return case_sensitive(dir);
+    }
+    if (needs_move) {
+        // Copy onto the volume mounted aside, then swap. The originals stay
+        // until the copy is complete; an interrupted move just resumes here
+        // (ditto merges into what was already copied).
+        const std::string stage = dir + ".moving";
+        const std::string old = dir + ".case-insensitive";
+        (void)detail::run_tool({"hdiutil", "detach", "-quiet", "-force", stage});   // a stale one
+        (void)::mkdir(stage.c_str(), 0755);
+        if (announce)
+            std::fputs("linuxity: moving your environments onto it -- one time, it can take a "
+                       "few minutes for big ones; don't interrupt (it resumes if you do)...\n", stderr);
+        if (!attach(stage) ||
+            detail::run_tool({"/usr/bin/ditto", dir, stage}) != 0 ||
+            detail::run_tool({"hdiutil", "detach", "-quiet", stage}) != 0 ||
+            ::rename(dir.c_str(), old.c_str()) != 0) {
+            (void)detail::run_tool({"hdiutil", "detach", "-quiet", "-force", stage});
+            why = "could not move " + dir + " onto the case-sensitive volume";
+            return false;
         }
+        (void)::rmdir(stage.c_str());
+        (void)::mkdir(dir.c_str(), 0755);
+        if (!attach(dir)) { (void)::rmdir(dir.c_str()); (void)::rename(old.c_str(), dir.c_str()); why = "hdiutil attach failed"; return false; }
+        (void)detail::run_tool({"/bin/rm", "-rf", old});
+        if (announce)
+            std::fputs("linuxity: done. Packages installed before may have lost files whose names\n"
+                       "          differ only in case; reinstall them if something is missing\n"
+                       "          (apt install --reinstall PKG).\n", stderr);
+        return case_sensitive(dir);
     }
     if (!attach(dir) && !case_sensitive(dir)) {   // (another linuxity may have just attached it)
         why = "hdiutil could not attach " + image;
