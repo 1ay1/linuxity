@@ -11,17 +11,21 @@
 // It answers whether the guest is running, blocked in a host call or
 // stopped: the request never waits for the guest. A request is
 //
-//   { u32 op (1 read, 2 write), u32 pad, u64 addr, u64 len } [+ len bytes for a write]
+//   { u32 op (1 read, 2 write, 3 resident), u32 pad, u64 addr, u64 len } [+ len bytes for a write]
 //
 // and the reply { i64 result (bytes moved, or -errno) } [+ bytes for a read].
 // Only guest addresses inside RAM are served; anything else is EFAULT.
+// Op 3 ignores addr/len and answers the guest's resident bytes (another
+// reader's /proc/<pid>/stat RSS: the host task's count includes linuxity).
 #pragma once
 #if defined(__APPLE__)
 
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
@@ -52,10 +56,36 @@ inline constexpr std::uint64_t kMaxChunk = 1 << 20;
     return dir + "/.mem." + std::to_string(pid);
 }
 
+// Bytes of `ranges` (host spans) that are resident, by mincore. Host pages
+// may be larger than the guest's (16 KiB on Apple Silicon): a resident host
+// page counts only the part of it the range covers.
+[[nodiscard]] inline std::uint64_t resident_bytes(const std::vector<std::span<std::byte>>& ranges) {
+    const auto pg = static_cast<std::uintptr_t>(::getpagesize());
+    std::uint64_t n = 0;
+    std::vector<char> vec;
+    for (const auto& r : ranges) {
+        if (r.empty()) continue;
+        const auto lo = reinterpret_cast<std::uintptr_t>(r.data());
+        const auto hi = lo + r.size();
+        const auto alo = lo & ~(pg - 1), ahi = (hi + pg - 1) & ~(pg - 1);
+        vec.assign((ahi - alo) / pg, 0);
+        if (::mincore(reinterpret_cast<caddr_t>(alo), ahi - alo, vec.data()) != 0) continue;
+        for (std::size_t i = 0; i < vec.size(); ++i) {
+            if (!(vec[i] & MINCORE_INCORE)) continue;
+            const auto p0 = alo + i * pg;
+            n += std::min(hi, p0 + pg) - std::max(lo, p0);
+        }
+    }
+    return n;
+}
+
+using RamFn = std::function<std::span<std::byte>(std::uint64_t, std::uint64_t)>;
+using ResidentFn = std::function<std::uint64_t()>;
+
 // The server: binds `path`, serves `ram` (guest address -> host span, empty
 // if unmapped) until the process exits. Detached; never returns an error to
 // the guest (a client that can't connect sees ESRCH).
-inline void serve(std::string path, std::function<std::span<std::byte>(std::uint64_t, std::uint64_t)> ram) {
+inline void serve(std::string path, RamFn ram, ResidentFn resident = {}) {
     ::unlink(path.c_str());
     const int s = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (s < 0) return;
@@ -64,12 +94,16 @@ inline void serve(std::string path, std::function<std::span<std::byte>(std::uint
     if (path.size() >= sizeof a.sun_path) { ::close(s); return; }
     std::memcpy(a.sun_path, path.c_str(), path.size() + 1);
     if (::bind(s, reinterpret_cast<::sockaddr*>(&a), sizeof a) < 0 || ::listen(s, 8) < 0) { ::close(s); return; }
-    std::thread([s, ram = std::move(ram)] {
+    std::thread([s, ram = std::move(ram), resident = std::move(resident)] {
         for (;;) {
             const int c = ::accept(s, nullptr, nullptr);
             if (c < 0) { if (errno == EINTR) continue; return; }
             Request q{};
-            if (full_io(c, &q, sizeof q, true) && q.len <= kMaxChunk) {
+            if (!full_io(c, &q, sizeof q, true)) { ::close(c); continue; }
+            if (q.op == 3) {
+                std::int64_t rc = resident ? static_cast<std::int64_t>(resident()) : -ENOSYS;
+                (void)full_io(c, &rc, sizeof rc, false);
+            } else if (q.len <= kMaxChunk) {
                 auto win = ram(q.addr, q.len);
                 std::int64_t rc = win.size() == q.len ? static_cast<std::int64_t>(q.len) : -EFAULT;
                 if (q.op == 2) {
@@ -112,6 +146,26 @@ inline void serve(std::string path, std::function<std::span<std::byte>(std::uint
         done += rc;
     }
     return done;
+}
+
+// The client for op 3: the serving process's guest resident bytes, or -errno.
+// Bounded: a process that can't answer (stopped by a signal, wedged) must
+// not hang the ps that asked -- it gets the host's count instead.
+[[nodiscard]] inline std::int64_t resident(const std::string& path) {
+    const int c = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (c < 0) return -errno;
+    const ::timeval tv{0, 100'000};
+    (void)::setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    (void)::setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    ::sockaddr_un a{};
+    a.sun_family = AF_UNIX;
+    std::memcpy(a.sun_path, path.c_str(), std::min(path.size() + 1, sizeof a.sun_path));
+    if (::connect(c, reinterpret_cast<::sockaddr*>(&a), sizeof a) < 0) { ::close(c); return -ESRCH; }
+    Request q{3u, 0, 0, 0};
+    std::int64_t rc = -EIO;
+    const bool ok = full_io(c, &q, sizeof q, false) && full_io(c, &rc, sizeof rc, true);
+    ::close(c);
+    return ok ? rc : -EIO;
 }
 
 }  // namespace lx::runtime::memsvc

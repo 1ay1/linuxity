@@ -37,6 +37,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <cstdio>
 #include <cstring>
 #include <optional>
@@ -191,21 +192,49 @@ struct Self {
     return out;
 }
 
+// What another guest process published about itself (PidSpace): the host
+// task's numbers count linuxity, not the program. 0 = not published.
+struct Peer {
+    std::uint32_t threads{0};
+    std::uint64_t vsize{0};
+    // the guest's resident bytes (asked only for the leaves that show it;
+    // 0 = unknown, use the host task's count)
+    std::function<std::uint64_t()> resident{};
+};
+
 // One fact, Linux-formatted, or nullopt for "not known here".
 [[nodiscard]] inline std::optional<std::string>
-fact(std::string_view leaf, pid_t host, const Self* self, std::optional<int> nice = std::nullopt) {
+fact(std::string_view leaf, pid_t host, const Self* self, std::optional<int> nice = std::nullopt,
+     Peer peer = {}) {
     const auto ht = host > 0 ? host_task(host) : std::nullopt;
+    // The GUEST's size and threads: its own mappings and vCPU threads, never
+    // the host task's (linuxity's timer/service threads made every python
+    // fork() warn "this process is multi-threaded"; ps showed RSS == VSZ).
+    // Resident memory is the host's count, which includes linuxity's own;
+    // capped at the size, since nothing is resident that isn't mapped.
+    struct Sizes { std::uint64_t vs, rss, nth; };
+    auto sizes = [&]() -> Sizes {
+        const std::uint64_t vs = self ? guest_vsize(self->proc)
+                               : peer.vsize ? peer.vsize : (ht ? ht->rss : 0);
+        // Both counts over-count: the host task's includes linuxity itself,
+        // and mincore still calls MADV_FREE'd guest pages resident until the
+        // host reclaims them. The smaller is the closer.
+        // (never asked of a stopped or dead process: it can't answer)
+        const bool can_answer = ht && ht->state != 'T' && ht->state != 'Z';
+        const std::uint64_t res_guest = peer.resident && can_answer ? peer.resident() : 0;
+        const std::uint64_t host_rss = ht ? (res_guest ? std::min(res_guest, ht->rss) : ht->rss) : 0;
+        const std::uint64_t rss = std::min(host_rss, vs ? vs : host_rss);
+        const std::uint64_t nth = self ? std::max<std::size_t>(1, self->proc.thread_count())
+                                : peer.threads ? peer.threads : 1;
+        return {vs, rss, nth};
+    };
     if (leaf == "stat") {
         // after "pid (comm) ": state ppid pgrp session tty tpgid flags minflt
         // cminflt majflt cmajflt utime stime cutime cstime prio nice nthreads
         // itreal starttime vsize rss rsslim ... (procfs keeps its own ids)
         if (!ht) return std::nullopt;
+        const auto [vs, rss, nth] = sizes();
         const int nv = nice.value_or(ht->nice);
-        const std::uint64_t vs = self ? guest_vsize(self->proc) : ht->rss;
-        // the GUEST's threads, as status and task/ count them -- not the host
-        // task's, whose linuxity timer/service threads made every python
-        // fork() warn "this process is multi-threaded"
-        const std::uint64_t nth = self ? std::max<std::size_t>(1, self->proc.thread_count()) : ht->threads;
         char b[512];
         std::snprintf(b, sizeof b,
             "0 (x) %c 0 0 0 0 -1 4194304 %llu 0 %llu 0 %llu %llu 0 0 %d %d %llu 0 %llu %llu %llu "
@@ -214,13 +243,14 @@ fact(std::string_view leaf, pid_t host, const Self* self, std::optional<int> nic
             static_cast<unsigned long long>(ht->utime), static_cast<unsigned long long>(ht->stime),
             20 + nv, nv, static_cast<unsigned long long>(nth),
             static_cast<unsigned long long>(ht->start_ticks), static_cast<unsigned long long>(vs),
-            static_cast<unsigned long long>(ht->rss / 4096));
+            static_cast<unsigned long long>(rss / 4096));
         return std::string{b};
     }
     if (leaf == "statm") {
         if (!ht) return std::nullopt;
-        const std::uint64_t res = ht->rss / 4096;
-        const std::uint64_t size = std::max(res, self ? guest_vsize(self->proc) / 4096 : res);
+        const auto [vs, rss, nth] = sizes();
+        const std::uint64_t res = rss / 4096;
+        const std::uint64_t size = vs / 4096;
         char b[128];
         std::snprintf(b, sizeof b, "%llu %llu 0 0 0 %llu 0\n", static_cast<unsigned long long>(size),
                       static_cast<unsigned long long>(res), static_cast<unsigned long long>(res));
@@ -232,13 +262,12 @@ fact(std::string_view leaf, pid_t host, const Self* self, std::optional<int> nic
         auto kb = [&](const char* k, std::uint64_t bytes) {
             s += k; s += ":\t"; s += std::to_string(bytes / 1024); s += " kB\n";
         };
-        const std::uint64_t vs = std::max(ht->rss, self ? guest_vsize(self->proc) : ht->rss);
+        const auto [vs, rss, nth] = sizes();
         kb("VmPeak", vs); kb("VmSize", vs);
         kb("VmLck", self ? self->proc.locked_bytes() : 0);
-        kb("VmHWM", ht->peak_rss); kb("VmRSS", ht->rss);
-        kb("RssAnon", ht->rss); kb("RssFile", 0); kb("RssShmem", 0);
-        s += "Threads:\t" + std::to_string(self ? std::max<std::size_t>(1, self->proc.thread_count())
-                                                : ht->threads) + "\n";
+        kb("VmHWM", std::min(ht->peak_rss, vs ? vs : ht->peak_rss)); kb("VmRSS", rss);
+        kb("RssAnon", rss); kb("RssFile", 0); kb("RssShmem", 0);
+        s += "Threads:\t" + std::to_string(nth) + "\n";
         if (self) {
             std::uint64_t ign = 0, cgt = 0;
             self->proc.with_signals([&](SignalDispositions& d) {
@@ -305,7 +334,7 @@ fact(std::string_view leaf, pid_t host, const Self* self, std::optional<int> nic
             std::snprintf(b, sizeof b, "%-16s%8llu kB\n", name, static_cast<unsigned long long>(kb));
             s += b;
         };
-        const std::uint64_t rss = ht ? ht->rss / 1024 : 0;
+        const std::uint64_t rss = ht ? sizes().rss / 1024 : 0;
         if (leaf == "smaps_rollup") {
             std::string s = "00400000-ffffffffff601000 ---p 00000000 00:00 0                  [rollup]\n";
             field(s, "Rss:", rss); field(s, "Pss:", rss); field(s, "Pss_Anon:", rss);

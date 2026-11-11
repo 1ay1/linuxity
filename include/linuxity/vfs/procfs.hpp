@@ -539,7 +539,7 @@ inline std::string sysvipc_from_host(const kernel::ProcessTable& procs, const st
 // table and the spec are captured by reference (owned by the kernel).
 [[nodiscard]] inline kernel::FileNamespace::Producer
 make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) {
-    return [&procs, &mach](std::string_view abs) -> Result<kernel::VirtualFile> {
+    auto inner = [&procs, &mach](std::string_view abs) -> Result<kernel::VirtualFile> {
         using detail::text_file; using detail::dir_file;
         const long  nproc   = static_cast<long>(procs.count());
         const long  ncpu    = mach.ncpu < 1 ? 1 : mach.ncpu;
@@ -1704,6 +1704,23 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
         }
 
         return err<kernel::VirtualFile>(Errno::enoent);
+    };
+    // /proc/<pid> and everything in it belong to the process: its effective
+    // uid and gid, which is how ps, top and pgrep -u tell whose it is (they
+    // stat the directory). Everything else in /proc is root's.
+    return [&procs, inner](std::string_view abs) -> Result<kernel::VirtualFile> {
+        auto r = inner(abs);
+        if (!r) return r;
+        // numeric /proc/<pid> only: /proc/self is a link, resolved first
+        auto [pid, tail] = detail::split_pid(abs);
+        if (pid <= 0) return r;
+        std::int32_t g = static_cast<std::int32_t>(pid);
+        if (const auto pns = procs.reader_pid_ns(); pns) g = procs.pid_from(pns, g);
+        const kernel::ProcInfo* pi = g > 0 ? procs.find(g) : nullptr;
+        if (!pi && g > 0)
+            if (const auto tg = procs.thread_group_of(g)) pi = procs.find(tg);
+        if (pi) { r->uid = pi->uids[1]; r->gid = pi->gids[1]; }
+        return r;
     };
 }
 

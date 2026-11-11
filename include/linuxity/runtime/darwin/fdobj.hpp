@@ -22,16 +22,21 @@
 //   memfd     -- an unlinked temp file: anonymous, sizeable, mappable,
 //                sealable-ish. What memfd is FOR (shared buffers, passing
 //                an fd instead of a path) works unchanged.
-//   pidfd     -- a kqueue with EVFILT_PROC, so poll() wakes on child exit.
+//   pidfd     -- one end of a socketpair whose other end a watcher thread
+//                closes on the process's exit (EVFILT_PROC): poll() wakes,
+//                and unlike a kqueue it survives fork.
 #pragma once
 
 #if defined(__APPLE__)
 
 #include <atomic>
+#include <map>
 #include <mutex>
 #include <thread>
 #include <span>
 #include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
 
 #include "linuxity/kernel/fsnotify.hpp"
 #include <sys/event.h>
@@ -242,33 +247,101 @@ inline bool set_memfd_seals(int fd, std::uint32_t s) {
 }
 
 // -- pidfd ----------------------------------------------------------------
-// A kqueue with EVFILT_PROC, so poll()/epoll on the fd wakes when the
-// process exits -- the property pidfd exists for.
-[[nodiscard]] inline int make_pidfd(::pid_t pid) {
-    const int kq = ::kqueue();
-    if (kq < 0) return -1;
-    struct ::kevent ev{};
-    EV_SET(&ev, pid, EVFILT_PROC, EV_ADD | EV_CLEAR, NOTE_EXIT, 0, nullptr);
-    if (::kevent(kq, &ev, 1, nullptr, 0, nullptr) < 0) {
-        // XNU refuses EVFILT_PROC on a zombie (ESRCH); Linux opens a pidfd
-        // on one and it polls readable at once. A child that exits before
-        // its parent's pidfd_open (asyncio's child watcher racing a quick
-        // `sh -c 'exit 3'`) must not be "No such process".
-        const int ke = errno;
-        siginfo_t si{};
-        if (ke != ESRCH ||
-            ::waitid(P_PID, static_cast<id_t>(pid), &si, WEXITED | WNOHANG | WNOWAIT) != 0 ||
-            si.si_pid != pid) {
-            ::close(kq); errno = ke; return -1;
-        }
-        EV_SET(&ev, 1, EVFILT_USER, EV_ADD, 0, 0, nullptr);
-        struct ::kevent fire{};
-        EV_SET(&fire, 1, EVFILT_USER, 0, NOTE_TRIGGER, 0, nullptr);
-        if (::kevent(kq, &ev, 1, nullptr, 0, nullptr) < 0 ||
-            ::kevent(kq, &fire, 1, nullptr, 0, nullptr) < 0) { ::close(kq); return -1; }
+// The guest's pidfd is one end of an AF_UNIX socketpair; a single watcher
+// thread holds the other and closes it when the process exits, so the
+// guest's end polls readable (EOF) exactly then -- the property pidfd
+// exists for. Not a kqueue, which is what it was: a kqueue can't cross a
+// fork, so a process holding a pidfd (asyncio's child watcher, between a
+// spawn and its reaping) failed every other fork with EAGAIN. A socket end
+// is an ordinary fd: it forks, dups and goes into epoll like any other.
+class PidfdWatcher {
+public:
+    static PidfdWatcher& get() {
+        static PidfdWatcher* w = new PidfdWatcher;   // lives as long as the process
+        return *w;
     }
-    ::fcntl(kq, F_SETFD, FD_CLOEXEC);
-    return kq;
+    // Watch `pid`; returns the guest's end, or -1 with errno. `exited`: it
+    // has (its end is readable at once).
+    [[nodiscard]] int watch(::pid_t pid, bool exited) {
+        int sv[2];
+        if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -1;
+        for (const int fd : sv) {
+            (void)::fcntl(fd, F_SETFD, FD_CLOEXEC);
+            const int one = 1;
+            (void)::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+        }
+        if (exited) { ::close(sv[1]); return sv[0]; }
+        std::lock_guard g{mu_};
+        struct ::kevent ev[2]{};
+        EV_SET(&ev[0], pid, EVFILT_PROC, EV_ADD | EV_ONESHOT, NOTE_EXIT, 0,
+               reinterpret_cast<void*>(static_cast<std::intptr_t>(sv[1])));
+        // the guest closing every copy of its end: stop watching
+        EV_SET(&ev[1], sv[1], EVFILT_READ, EV_ADD, 0, 0,
+               reinterpret_cast<void*>(static_cast<std::intptr_t>(pid)));
+        if (kq_ < 0 || ::kevent(kq_, ev, 2, nullptr, 0, nullptr) != 0) {
+            const int e = errno;
+            ::close(sv[0]); ::close(sv[1]);
+            errno = e;
+            return -1;
+        }
+        ours_[sv[1]] = pid;
+        return sv[0];
+    }
+
+private:
+    PidfdWatcher() : kq_{::kqueue()} {
+        if (kq_ < 0) return;
+        (void)::fcntl(kq_, F_SETFD, FD_CLOEXEC);
+        std::thread([this] { run(); }).detach();
+    }
+    void run() {
+        for (;;) {
+            struct ::kevent out[16]{};
+            const int n = ::kevent(kq_, nullptr, 0, out, 16, nullptr);
+            if (n < 0) { if (errno == EINTR) continue; return; }
+            std::lock_guard g{mu_};
+            for (int i = 0; i < n; ++i) {
+                int ours = -1;
+                if (out[i].filter == EVFILT_PROC)
+                    ours = static_cast<int>(reinterpret_cast<std::intptr_t>(out[i].udata));
+                else if (out[i].filter == EVFILT_READ && (out[i].flags & EV_EOF))
+                    ours = static_cast<int>(out[i].ident);
+                else
+                    continue;
+                auto it = ours_.find(ours);
+                if (it == ours_.end()) continue;
+                // closing our end removes its EVFILT_READ; the proc filter
+                // was ONESHOT, or goes with the process
+                if (out[i].filter == EVFILT_READ) {
+                    struct ::kevent del{};
+                    EV_SET(&del, it->second, EVFILT_PROC, EV_DELETE, 0, 0, nullptr);
+                    (void)::kevent(kq_, &del, 1, nullptr, 0, nullptr);
+                }
+                ::close(ours);
+                ours_.erase(it);
+            }
+        }
+    }
+    int kq_;
+    std::mutex mu_;
+    std::map<int, ::pid_t> ours_;     // our end -> the pid it watches
+};
+
+[[nodiscard]] inline int make_pidfd(::pid_t pid, bool guest_exited = false) {
+    // Is it already past watching? XNU refuses EVFILT_PROC (ESRCH) on a
+    // zombie, and on a process still EXITING -- alive to kill(0), not yet
+    // a zombie, which for a process tearing down a VM is a wide window under
+    // load. Linux opens a pidfd on either and it polls readable at once. A
+    // child that exits right after its spawn (asyncio's watcher racing a
+    // quick `sh -c 'exit 3'`) must not be "No such process". `guest_exited`:
+    // the guest already posted its exit status (PidSpace::post_exit).
+    int fd = PidfdWatcher::get().watch(pid, false);
+    if (fd >= 0 || errno != ESRCH) return fd;
+    siginfo_t si{};
+    const bool zombie = ::waitid(P_PID, static_cast<id_t>(pid), &si,
+                                 WEXITED | WNOHANG | WNOWAIT) == 0 && si.si_pid == pid;
+    if (!zombie && !guest_exited) { errno = ESRCH; return -1; }
+    return PidfdWatcher::get().watch(pid, true);
 }
 
 } // namespace lx::runtime

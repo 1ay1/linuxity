@@ -62,6 +62,10 @@ struct StatFields {
     std::uint64_t atime_ns{0};
     std::uint64_t mtime_ns{0};
     std::uint64_t ctime_ns{0};
+    // the owner as the GUEST sees it (already mapped into the reader's user
+    // namespace). 0 for a host file, whose owner the scrub overlays.
+    std::uint32_t uid{0};
+    std::uint32_t gid{0};
 };
 
 // -- struct stat -----------------------------------------------------------

@@ -782,6 +782,7 @@ void run_guest_thread(ThreadContext& ctx, runtime::HvfTrap::ThreadStart start) {
     runtime::HvfMem mem{ctx.machine, &trap};
 
     ctx.proc.add_thread(task.tid, &cpu);
+    ctx.pids.set_threads(start.tgid, static_cast<std::uint32_t>(ctx.proc.thread_count()));
     runtime::g_pending.register_cpu(cpu.handle());
 
     runtime::Cpu loop{trap, ctx.machine_wrap.k, mem, abi::Arch::aarch64};
@@ -789,6 +790,7 @@ void run_guest_thread(ThreadContext& ctx, runtime::HvfTrap::ThreadStart start) {
 
     runtime::g_pending.unregister_cpu(cpu.handle());
     ctx.proc.remove_thread(task.tid);
+    ctx.pids.set_threads(start.tgid, static_cast<std::uint32_t>(std::max<std::size_t>(1, ctx.proc.thread_count())));
     ctx.pids.release(task.tid);          // the tid returns to the shared namespace
 }
 
@@ -822,21 +824,33 @@ void run_guest_thread(ThreadContext& ctx, runtime::HvfTrap::ThreadStart start) {
     });
     // /proc's per-task facts: macOS has no host /proc, so this process
     // answers for itself (and its threads), Darwin for the others.
-    m.k.procs().set_host_facts([&proc, &pids](std::int32_t g, std::string_view leaf)
+    m.k.procs().set_host_facts([&proc, &pids, &trap](std::int32_t g, std::string_view leaf)
                                    -> std::optional<std::string> {
         const auto h = pids.host_of(g);
         // procfs about to open /proc/<g>/mem: whichever pid, the OPENER is
         // this process, and its next /dev/null open becomes g's memory
         if (leaf == "mem-open") { proc.pending_mem_pid.store(g, std::memory_order_relaxed); return std::string{}; }
         if (!h || *h <= 0) return std::nullopt;
+        // another process's threads: only its linuxity tracks them, but
+        // each holds a tid bound to that host process in the shared table
+        if (leaf == "task" && *h != ::getpid()) {
+            std::string s;
+            for (const auto t : pids.tids_of(g)) s += std::to_string(t) + "\n";
+            return s;
+        }
+        // RSS is the GUEST's pages in core; the host task's also counts ours
+        runtime::procinfo::Peer peer{pids.threads_of(g), pids.vsize_of(g),
+                                     [&trap, g] { return trap.resident_of(g); }};
         if (*h == ::getpid()) {
             const runtime::procinfo::Self self{proc, g};
-            return runtime::procinfo::fact(leaf, *h, &self, pids.nice_of(g));
+            return runtime::procinfo::fact(leaf, *h, &self, pids.nice_of(g), std::move(peer));
         }
-        return runtime::procinfo::fact(leaf, *h, nullptr, pids.nice_of(g));
+        return runtime::procinfo::fact(leaf, *h, nullptr, pids.nice_of(g), std::move(peer));
     });
 
     proc.add_thread(task.tid, &cpu);
+    pids.set_threads(task.tid, static_cast<std::uint32_t>(proc.thread_count()));
+    pids.set_vsize(task.tid, runtime::procinfo::guest_vsize(proc));
     runtime::g_pending.register_cpu(cpu.handle());
     trap.start_timers();
 
@@ -888,6 +902,13 @@ void attach_live_procs(Machine& m, runtime::PidSpace& pids) {
             pi.state = 'S';
             pi.exe = exe;
             return pi;
+        }
+        std::optional<LiveCreds> creds(std::int32_t pid) const override {
+            const auto h = ps.host_of(pid);
+            if (!h || *h == ::getpid()) return std::nullopt;   // ours is the authority
+            const auto ids = ps.all_ids_of(pid);
+            if (!ids) return std::nullopt;
+            return LiveCreds{ids->uid, ids->euid, ids->gid, ids->egid};
         }
         std::int32_t pgid(std::int32_t pid) const override {
             return ps.is_process(pid) ? ps.pgid_of(pid) : 0;

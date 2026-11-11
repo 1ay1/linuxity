@@ -2596,8 +2596,8 @@ private:
             if (pc.realm == kernel::Realm2::virtual_file) {
                 const std::string& vp = pc.virtual_path.empty() ? gp : pc.virtual_path;
                 if (auto vf = k_.files().produce(vp); vf && vf->redirect_host.empty())
-                    return statx ? write_statx(buf, vf->is_dir, vf->bytes.size(), false, gp)
-                                 : write_statbuf(buf, vf->is_dir, vf->bytes.size());
+                    return statx ? write_statx(buf, synth_hstat_of(*vf, vf->bytes.size(), false), gp)
+                                 : write_statbuf(buf, synth_hstat_of(*vf, vf->bytes.size(), false));
             }
         }
         if constexpr (!requires { mem_.host_tid(); } && !requires { mem_.host_fd_of(0); }) {
@@ -2730,9 +2730,9 @@ private:
             // (/proc/self/{exe,cwd,root}, /proc/<pid>/fd/N), so reporting
             // the target length was wrong in a way `find -type l -size` and
             // archivers that preallocate from st_size can see.
-            return write_statbuf(sb, vf->is_dir,
+            return write_statbuf(sb, synth_hstat_of(*vf,
                                  vf->symlink_target.empty() ? vf->bytes.size() : 0,
-                                 !vf->symlink_target.empty());
+                                 !vf->symlink_target.empty()));
         }
         return eno(pc.error);
     }
@@ -2789,8 +2789,8 @@ private:
                 }
             }
             if (!vf) return eno(vf.error());
-            return write_statx(uaddr(r.arg[4]), vf->is_dir, vf->bytes.size(),
-                               !vf->symlink_target.empty(), abs);
+            return write_statx(uaddr(r.arg[4]), synth_hstat_of(*vf, vf->bytes.size(),
+                               !vf->symlink_target.empty()), abs);
         }
         return eno(pc.error);
     }
@@ -5219,6 +5219,15 @@ private:
                                       bool is_link = false, std::string_view guest = {}) {
         return write_statx(buf, synth_hstat(is_dir, size, is_link), guest);
     }
+    // A produced virtual node, owner included (as the reader's namespace
+    // names it).
+    [[nodiscard]] wire::StatFields synth_hstat_of(const kernel::VirtualFile& vf, std::uint64_t size,
+                                                  bool is_link) {
+        auto h = synth_hstat(vf.is_dir, size, is_link);
+        if (vf.uid) h.uid = ns_id(*vf.uid, false);
+        if (vf.gid) h.gid = ns_id(*vf.gid, true);
+        return h;
+    }
 
     // The HStat a VIRTUAL node implies. Built once, here, so the synthesized
     // mode/ino/blocks story is told in one place and both ABI encoders agree
@@ -5255,8 +5264,10 @@ private:
         sx.stx_mask    = kBasicStats;
         sx.stx_blksize = static_cast<std::uint32_t>(h.blksize);
         sx.stx_nlink   = static_cast<std::uint32_t>(h.nlink);
-        // uid/gid stay 0: the guest is root and sees root-owned files, the
-        // same policy scrub_ids applies to a forwarded stat.
+        // uid/gid: a host file's stay 0 here and scrub_ids overlays them;
+        // a virtual node's come from its producer (synth_hstat_of)
+        sx.stx_uid     = h.uid;
+        sx.stx_gid     = h.gid;
         sx.stx_mode    = static_cast<std::uint16_t>(h.mode);
         sx.stx_ino     = h.ino;
         sx.stx_size    = h.size;
@@ -5340,8 +5351,7 @@ private:
             st.st_dev = h.dev; st.st_ino = h.ino;
             st.st_nlink = static_cast<std::uint32_t>(h.nlink);
             st.st_mode = mode; st.st_rdev = h.rdev;
-            // uid/gid stay 0: the guest is root and sees root-owned files,
-            // the same policy scrub_ids applies to a forwarded stat.
+            st.st_uid = h.uid; st.st_gid = h.gid;   // see write_statx
             st.st_size = static_cast<std::int64_t>(size);
             st.st_blksize = static_cast<std::int32_t>(h.blksize);
             st.st_blocks = blocks;
@@ -5368,6 +5378,8 @@ private:
         st.st_ino     = h.ino;
         st.st_nlink   = h.nlink;
         st.st_mode    = mode;
+        st.st_uid     = h.uid;
+        st.st_gid     = h.gid;
         st.st_rdev    = h.rdev;
         st.st_size    = static_cast<std::int64_t>(size);
         st.st_blksize = h.blksize;

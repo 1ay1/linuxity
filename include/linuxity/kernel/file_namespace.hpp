@@ -122,6 +122,11 @@ struct VirtualFile {
     // A virtual SYMLINK: its readlink(2) contents. Guest-absolute targets
     // (e.g. /dev/stdin -> /proc/self/fd/0) resolve through OUR namespace.
     std::string symlink_target;
+
+    // The node's owner, when it isn't root: everything under /proc/<pid> is
+    // the process's (its effective uid/gid), which is how ps and top learn
+    // whose a process is. Global ids; the reader's namespace maps them.
+    std::optional<std::uint32_t> uid, gid;
 };
 
 // The filesystem namespace. Backends register two kinds of mounts:

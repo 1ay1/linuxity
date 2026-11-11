@@ -313,6 +313,7 @@ public:
         }
         machine_.set_guest_answer(174, ids->uid);    // getuid
         pids_.set_ids(tgid_, ids->euid, ids->egid);  // for a peer's SO_PEERCRED
+        pids_.set_real_ids(tgid_, ids->uid, ids->gid);   // and another reader's /proc
         if (seccomp_mode_ == 1) { for (int nr : {174, 175, 176, 177}) machine_.clear_guest_answer(nr); return; }
         machine_.set_guest_answer(175, ids->euid);   // geteuid
         machine_.set_guest_answer(176, ids->gid);    // getgid
@@ -1068,7 +1069,13 @@ private:
         if (auto r = do_ipc(sc))            return *r;
         if (auto r = do_lifecycle(sc))      return *r;
         if (auto r = do_process(sc))        return *r;
-        if (auto r = do_memory(sc))         return *r;
+        if (auto r = do_memory(sc)) {
+            // another process's /proc/<us>/stat and ps VSZ: the guest's
+            // mappings, which only we can count
+            if (using S = abi::Sysno; sc == S::mmap || sc == S::munmap || sc == S::mremap || sc == S::brk)
+                pids_.set_vsize(tgid_, proc_.with_space([](AddressSpace& s) { return s.mapped_bytes(); }));
+            return *r;
+        }
         if (auto r = do_io(sc))             return *r;
         if (auto r = do_socket(sc))         return *r;
         if (auto r = do_path(sc, path, path2)) return *r;
@@ -3185,6 +3192,7 @@ private:
         // The kernel side of execve (set-ID credentials, SysV detach) is the
         // shared loop's: report the exec like any backend would.
         proc_events_.push_back({ProcEvent::exec, tgid_, parent_, {}, {}});
+        pids_.set_vsize(tgid_, proc_.with_space([](AddressSpace& s) { return s.mapped_bytes(); }));
         // Traced: the new image stops with SIGTRAP before its first
         // instruction (PTRACE_EVENT_EXEC with TRACEEXEC; plain SIGTRAP else).
         if (traced()) {
@@ -5172,7 +5180,11 @@ private:
             case S::pidfd_open: {
                 auto h = pids_.host_of(static_cast<std::int32_t>(a0));
                 if (!h) return -3;                           // ESRCH
-                const int fd = make_pidfd(*h);
+                int fd = make_pidfd(*h);
+                // ESRCH from an EXITING process: its status is posted before
+                // its host exit begins, so ask now (not before the attach)
+                if (fd < 0 && errno == ESRCH && pids_.exit_of(static_cast<std::int32_t>(a0)))
+                    fd = make_pidfd(*h, /*guest_exited=*/true);
                 if (fd < 0) return darwin::fail();
                 const auto g = install_or_close(fd, true);
                 if (g >= 0) pidfds_[static_cast<int>(g)] = static_cast<std::int32_t>(a0);
@@ -7111,10 +7123,33 @@ private:
         if (p.empty()) return;
         memsvc_pid_ = tgid_;
         HvfMachine* m = &machine_;
+        ProcessState* pr = &proc_;
         memsvc::serve(p, [m](std::uint64_t addr, std::uint64_t len) -> std::span<std::byte> {
             return m->ram().at(addr, len);
-        });
+        }, [m, pr] { return guest_resident(*m, *pr); });
     }
+    // The guest's resident set: its own mappings' pages the host has in core
+    // (the host task's RSS also counts linuxity's binary, heap and threads).
+    [[nodiscard]] static std::uint64_t guest_resident(HvfMachine& m, ProcessState& pr) {
+        std::vector<std::span<std::byte>> ranges;
+        pr.with_space([&](AddressSpace& s) {
+            for (const Vma& v : s.vmas())
+                if (auto w = m.ram().at(v.begin, v.end - v.begin); !w.empty()) ranges.push_back(w);
+        });
+        return memsvc::resident_bytes(ranges);
+    }
+public:
+    // /proc/<g>'s resident set, for procinfo: ours directly, another guest
+    // process's from its memory service. 0 = not known (the caller falls
+    // back to the host task's count).
+    [[nodiscard]] std::uint64_t resident_of(std::int32_t g) {
+        if (g == tgid_) return guest_resident(machine_, proc_);
+        const std::string p = memsvc_path(g);
+        if (p.empty()) return 0;
+        const std::int64_t r = memsvc::resident(p);
+        return r > 0 ? static_cast<std::uint64_t>(r) : 0;
+    }
+private:
     std::int32_t memsvc_pid_{0};
     // open /proc/<pid>/mem fds: guest fd -> (pid, file offset)
     struct MemFd { std::int32_t pid; std::uint64_t off; };

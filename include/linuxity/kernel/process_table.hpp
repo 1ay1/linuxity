@@ -493,6 +493,7 @@ public:
                     p.comm = l.comm;         // same image, renamed (exec of a link, PR_SET_NAME)
                 }
                 if (l.ppid) p.ppid = l.ppid;
+                overlay_live_creds(pid, p);
                 return &(scratch_[pid] = std::move(p));
             }
             return &it->second;
@@ -515,9 +516,19 @@ public:
             // ppid is strictly closer to pid 1, whose record is always seeded.)
             if (p.pgid == 0 && p.ppid != 0 && p.ppid != pid)
                 p.pgid = pgid_of(p.ppid);
+            overlay_live_creds(pid, p);
             return &(scratch_[pid] = std::move(p));
         }
         return nullptr;
+    }
+    void overlay_live_creds(std::int32_t pid, ProcInfo& p) const {
+        const auto c = live_->creds(pid);
+        if (!c) return;
+        // saved and fs ids follow the effective ones, as they do unless a
+        // set-ID program juggles them; those it keeps to itself
+        p.uids = {c->uid, c->euid, c->euid, c->euid};
+        p.gids = {c->gid, c->egid, c->egid, c->egid};
+        p.uid = c->uid; p.gid = c->gid;
     }
 
     [[nodiscard]] std::vector<std::int32_t> pids() const {
@@ -563,6 +574,12 @@ public:
         // A rename (a /proc/<pid>/comm write) for the backend's shared copy
         // of the name, which info() then reports.
         virtual void set_comm(std::int32_t, const std::string&) const {}
+        // Another HOST process's credentials as it published them (real,
+        // effective). Our copy of its record is a fork-time snapshot: pid 1
+        // read root forever after the shell dropped to a user. nullopt for
+        // a process whose record is OURS to keep (this host process).
+        struct LiveCreds { std::uint32_t uid, euid, gid, egid; };
+        [[nodiscard]] virtual std::optional<LiveCreds> creds(std::int32_t) const { return std::nullopt; }
     };
     void set_live_source(const LiveSource* s) noexcept { live_ = s; }
 

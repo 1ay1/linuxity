@@ -733,6 +733,36 @@ def pidfd_on_an_exited_child():
 
 
 @check
+def pidfd_open_races_quick_children():
+    # asyncio's watcher: spawn, then pidfd_open at once. Children that are
+    # mid-exit (alive, not yet zombies) at that moment must still open --
+    # a window that opens under load, so six spawners run at once.
+    if not hasattr(os, "pidfd_open"):
+        raise Skip("no os.pidfd_open")
+    errors = []
+
+    def spawner(k):
+        try:
+            for i in range(8):
+                pid = os.posix_spawn("/bin/sh", ["sh", "-c", "exit 3"], os.environ)
+                time.sleep(((i + k) % 4) * 0.003)
+                fd = os.pidfd_open(pid)
+                if select.select([fd], [], [], 5)[0] != [fd]:
+                    errors.append(f"spawner {k} child {i}: never readable")
+                os.close(fd)
+                st = os.waitpid(pid, 0)[1]
+                if os.waitstatus_to_exitcode(st) != 3:
+                    errors.append(f"spawner {k} child {i}: status {st}")
+        except OSError as e:
+            errors.append(f"spawner {k}: {e!r}")
+
+    ts = [threading.Thread(target=spawner, args=(k,)) for k in range(6)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    eq(errors, [], "every pidfd_open of a just-spawned child")
+
+
+@check
 def thread_counts_agree():
     # stat's num_threads, status's Threads and task/ are one count -- python
     # warns on every fork() when stat says more than one
@@ -744,6 +774,54 @@ def thread_counts_agree():
         eq(counts(), (1, 1, 1), "a single-threaded process")
         return 0
     eq(status(child(single)), 0, "in a fresh child")
+
+
+@check
+def another_process_as_ps_sees_it():
+    # what ps/top read about a process that is NOT the reader: whose it is
+    # (the owner of /proc/<pid>, status Uid/Gid), its threads and memory
+    me = os.geteuid()
+    want = 65534 if me == 0 else me          # root: the child drops to nobody
+    r, w = os.pipe()
+    go_r, go_w = os.pipe()
+
+    def body():
+        os.close(r); os.close(go_w)
+        if me == 0:
+            os.setgid(want); os.setuid(want)
+        buf = bytearray(8 << 20)              # 8 MiB, touched: resident
+        for i in range(0, len(buf), 4096):
+            buf[i] = 1
+        for _ in range(2):
+            threading.Thread(target=os.read, args=(go_r, 1), daemon=True).start()
+        time.sleep(0.2)
+        os.write(w, b"r")
+        os.read(go_r, 1)
+        return 0
+
+    pid = child(body)
+    os.close(w); os.close(go_r)
+    try:
+        eq(os.read(r, 1), b"r", "the child is set up")
+        st = os.stat(f"/proc/{pid}")
+        eq((st.st_uid, st.st_gid), (want, want), "/proc/<pid> is owned by the process")
+        if me != 0:
+            # (a process that changed credentials is non-dumpable, and Linux
+            # gives its files to root -- only the directory says whose it is)
+            eq(os.stat(f"/proc/{pid}/status").st_uid, want, "and so are its files")
+        f = {l.split(":")[0]: l.split(":", 1)[1].split() for l in open(f"/proc/{pid}/status")}
+        eq(int(f["Uid"][1]), want, "status: effective uid")
+        eq(int(f["Gid"][1]), want, "status: effective gid")
+        eq(int(f["Threads"][0]), 3, "status: its threads, not the runtime's")
+        stat = open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()
+        eq(int(stat[17]), 3, "stat: num_threads")
+        size, res = (int(x) for x in open(f"/proc/{pid}/statm").read().split()[:2])
+        ok(res < size, f"resident ({res}) is less than the size ({size}) pages")
+        ok(res * os.sysconf("SC_PAGE_SIZE") >= 8 << 20, "the touched 8 MiB are resident")
+        eq(len(os.listdir(f"/proc/{pid}/task")), 3, "task/ lists its threads")
+    finally:
+        os.write(go_w, b"xxx")
+        status(pid)
 
 
 # ---------------------------------------------------------------- identity, /proc

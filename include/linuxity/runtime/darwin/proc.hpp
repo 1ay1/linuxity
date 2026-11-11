@@ -230,6 +230,48 @@ public:
         shared_->euid1[g].store(euid + 1, std::memory_order_relaxed);
         shared_->egid1[g].store(egid + 1, std::memory_order_relaxed);
     }
+    // ...and the real ones, for another reader's /proc/<g>/status Uid/Gid
+    // and ps's RUSER (everything else in /proc reads the effective ones)
+    void set_real_ids(std::int32_t g, std::uint32_t uid, std::uint32_t gid) noexcept {
+        if (g <= 0 || g >= kMax || !shared_) return;
+        shared_->ruid1[g].store(uid + 1, std::memory_order_relaxed);
+        shared_->rgid1[g].store(gid + 1, std::memory_order_relaxed);
+    }
+    struct AllIds { std::uint32_t uid, euid, gid, egid; };
+    [[nodiscard]] std::optional<AllIds> all_ids_of(std::int32_t g) const noexcept {
+        const auto e = ids_of(g);
+        if (!e) return std::nullopt;
+        const auto u = shared_->ruid1[g].load(std::memory_order_relaxed);
+        const auto gg = shared_->rgid1[g].load(std::memory_order_relaxed);
+        return AllIds{u ? u - 1 : e->euid, e->euid, gg ? gg - 1 : e->egid, e->egid};
+    }
+    // What only the process itself knows about its GUEST, published for the
+    // others' /proc: the host task's numbers count linuxity (its threads,
+    // its own memory), not the program. 0 = not published.
+    void set_threads(std::int32_t g, std::uint32_t n) noexcept {
+        if (g > 0 && g < kMax && shared_) shared_->nthreads[g].store(n, std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint32_t threads_of(std::int32_t g) const noexcept {
+        return g > 0 && g < kMax && shared_ ? shared_->nthreads[g].load(std::memory_order_relaxed) : 0;
+    }
+    // Guest process g's threads, leader first: every slot bound to g's host
+    // process (a thread allocates its tid here with its process's host pid).
+    // For another process's /proc/<g>/task, which only g's linuxity tracks.
+    [[nodiscard]] std::vector<std::int32_t> tids_of(std::int32_t g) const {
+        std::vector<std::int32_t> v;
+        const auto h = host_of(g);
+        if (!h || *h <= 0) return v;
+        v.push_back(g);
+        for (int t = 1; t < kMax; ++t)
+            if (t != g && shared_->host[t].load(std::memory_order_relaxed) == *h) v.push_back(t);
+        return v;
+    }
+    void set_vsize(std::int32_t g, std::uint64_t bytes) noexcept {
+        if (g > 0 && g < kMax && shared_) shared_->vsize[g].store(bytes, std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t vsize_of(std::int32_t g) const noexcept {
+        return g > 0 && g < kMax && shared_ ? shared_->vsize[g].load(std::memory_order_relaxed) : 0;
+    }
     [[nodiscard]] std::optional<PeerIds> ids_of(std::int32_t g) const noexcept {
         if (g <= 0 || g >= kMax || !shared_) return std::nullopt;
         const auto u = shared_->euid1[g].load(std::memory_order_relaxed);
@@ -291,6 +333,12 @@ public:
             shared_->exited[g].store(false, std::memory_order_relaxed);
             shared_->exit_final[g].store(false, std::memory_order_relaxed);
             shared_->subreaper[g].store(false, std::memory_order_relaxed);
+            shared_->nthreads[g].store(0, std::memory_order_relaxed);
+            shared_->vsize[g].store(0, std::memory_order_relaxed);
+            shared_->euid1[g].store(0, std::memory_order_relaxed);
+            shared_->egid1[g].store(0, std::memory_order_relaxed);
+            shared_->ruid1[g].store(0, std::memory_order_relaxed);
+            shared_->rgid1[g].store(0, std::memory_order_relaxed);
             shared_->host[g].store(0, std::memory_order_relaxed);
         }
     }
@@ -553,6 +601,9 @@ private:
         // Each process's effective uid/gid, as it last published them (SO_PEERCRED,
         // which a peer asks about from another host process). +1, 0 = unknown.
         std::atomic<std::uint32_t> euid1[kMax]{}, egid1[kMax]{};
+        std::atomic<std::uint32_t> ruid1[kMax]{}, rgid1[kMax]{};
+        std::atomic<std::uint32_t> nthreads[kMax]{};
+        std::atomic<std::uint64_t> vsize[kMax]{};
         // Guest ptrace (no host ptrace across HVF processes). tracer: the
         // guest pid tracing g (0 = none). A tracee that hits a stop posts
         // stop_status (a Linux wait status, nonzero) and parks on `resume`
