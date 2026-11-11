@@ -82,6 +82,11 @@ void crash_handler(int sig) {
 }
 
 
+[[nodiscard]] std::string host_terminfo_bridge(const std::string& root, const char* term);
+
+// Where the host's terminfo for this terminal shows up in the guest.
+constexpr const char* kGuestTerminfo = "/usr/lib/linuxity-terminfo";
+
 // -- The guest "machine": kernel + namespace ----------------------------------
 struct Machine {
     host::PosixHost hw;
@@ -165,6 +170,16 @@ struct Machine {
             if (const char* tty = ::isatty(fd) ? ::ttyname(fd) : nullptr)
                 k.files().mount_host(tty, tty);
         k.files().mount_host("/dev/tty", "/dev/tty");
+        // The Mac terminal's terminfo (kitty, ghostty, wezterm...), compiled
+        // from the host's own description and MOUNTED into the guest -- it
+        // used to sit in host /tmp on the assumption that the guest's /tmp
+        // is the host's, which an environment's isn't. Here, not in
+        // host_run, so a fork child (same flags, same TERM) mounts it too.
+        if (const char* t = std::getenv("TERM"))
+            if (auto dir = host_terminfo_bridge(o.root, t); !dir.empty()) {
+                k.files().mount_host(kGuestTerminfo, dir);
+                has_terminfo_bridge = true;
+            }
         // DNS, /etc/hostname, /etc/hosts -- the same as every host. A fork
         // child rebuilds the same files from the same flags, silently.
         resolv_ = cli::mount_guest_files(k, o, /*quiet_events=*/fork_child);
@@ -199,6 +214,7 @@ struct Machine {
         char buf[PATH_MAX];
         return (!p.empty() && ::realpath(p.c_str(), buf)) ? std::string{buf} : std::string{};
     }
+    bool has_terminfo_bridge{false};        // kGuestTerminfo is mounted
     std::string root_;
     std::shared_ptr<std::string> resolv_;   // the served /etc/resolv.conf
     std::string upper_;
@@ -240,7 +256,7 @@ struct Machine {
 // its description into a guest-visible directory and point TERMINFO_DIRS at
 // it. The rootfs is never touched; the rootfs's own entry wins when present.
 // Returns the GUEST directory, or "" if nothing was needed or possible.
-[[nodiscard]] std::string host_terminfo_bridge(const std::string& root, const char* term) {
+std::string host_terminfo_bridge(const std::string& root, const char* term) {
     if (!term || !*term || std::strchr(term, '/') || root.empty()) return {};
     const std::string sub = std::string(1, term[0]) + "/" + term;
     char hex[8];
@@ -251,9 +267,8 @@ struct Machine {
                                  root + "/etc/terminfo/" + sub})
         if (::access(d.c_str(), R_OK) == 0) return {};     // rootfs has it
 
-    // Guest /tmp is host /tmp through the overlay (see mount_host), so a
-    // host directory under /tmp is visible at the same path in the guest.
-    const std::string dir = "/tmp/linuxity-terminfo-" + std::to_string(::getuid());
+    // A host directory of our own; Machine mounts it at kGuestTerminfo.
+    const std::string dir = host::tmp_path("linuxity-terminfo-" + std::to_string(::getuid()));
     const std::string want = dir + "/" + sub;
     if (::access(want.c_str(), R_OK) == 0) return dir;     // already bridged
     (void)::mkdir(dir.c_str(), 0755);
@@ -1157,14 +1172,12 @@ int cli::host_run(Options& o, int, char**) {
     }
     if (!ge.notice.empty() && !o.quiet) std::fprintf(stderr, "linuxity: %s\n", ge.notice.c_str());
     std::vector<std::string> env = std::move(ge.vars);
-    // Only on macOS: the host's terminfo for this terminal, compiled into a
-    // guest-visible directory (see host_terminfo_bridge).
-    if (const char* t = std::getenv("TERM"))
-        if (auto dir = host_terminfo_bridge(o.root, t); !dir.empty())
-            env.push_back("TERMINFO_DIRS=" + dir + ":/usr/share/terminfo");
     (void)::umask(static_cast<mode_t>(o.umask));
 
     Machine m{o};
+    // the host's terminfo for this terminal, mounted by Machine
+    if (m.has_terminfo_bridge)
+        env.push_back(std::string{"TERMINFO_DIRS="} + kGuestTerminfo + ":/usr/share/terminfo");
     {
         kernel::ProcInfo init;
         init.pid = 1;

@@ -193,6 +193,16 @@ struct GuestEnv {
     // exports TMPDIR=/data/local/tmp; macOS a /var/folders path). A distro
     // leaves it unset and programs use /tmp.
     std::erase_if(g.vars, [](const std::string& kv) { return kv.starts_with("TMPDIR="); });
+    // An X display that is a host socket PATH (macOS: XQuartz's launchd
+    // socket, /private/tmp/com.apple.launchd.*/org.xquartz:0) names nothing
+    // in the guest: Emacs and friends tried it, printed "Display ...
+    // unavailable" and fell back. `:0`-style displays (a Linux host's
+    // X11 socket) stay. Its XAUTHORITY goes with it.
+    if (std::any_of(g.vars.begin(), g.vars.end(),
+                    [](const std::string& kv) { return kv.starts_with("DISPLAY=/"); }))
+        std::erase_if(g.vars, [](const std::string& kv) {
+            return kv.starts_with("DISPLAY=") || kv.starts_with("XAUTHORITY=");
+        });
     // a locale the rootfs can actually load (top layer first); an explicit
     // system.locale wins, and is still checked
     if (!o.locale.empty()) {
