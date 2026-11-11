@@ -298,9 +298,10 @@ public:
                         if (rd.second) make_host_parents(hp2);
                     }
                     // PATH_MAX applies to the string, not the depth: rebase an
-                    // over-long host path onto the call's own dirfd.
+                    // over-long host path onto the call's own dirfd -- unless
+                    // the backend walks long paths itself (WalksLongPaths).
                     std::string hp1_fit = rd.first.host_path, hp2_fit = hp2;
-                    locked([&] {
+                    if constexpr (!runtime::WalksLongPaths<T>) locked([&] {
                         if (auto s = sys.rebase_on_dirfd(f.regs, rd.first.arg, hp1_fit)) hp1_fit = *s;
                         if (rd.second)
                             if (auto s = sys.rebase_on_dirfd(f.regs, arg2, hp2_fit)) hp2_fit = *s;

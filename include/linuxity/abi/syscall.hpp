@@ -222,6 +222,24 @@ public:
         // a process under a landlock domain linuxity keeps (no host Landlock)
         if (ll_layers_ > 0)
             if (const Errno e = ll_gate(sc, r); e != Errno::ok) return eno(e);
+        path_too_long_ = false;
+        Outcome o = dispatch_calls(sc, r);
+        // The kernel's getname(): a path argument of PATH_MAX bytes or more
+        // (NUL included) is ENAMETOOLONG before any lookup. A forwarding
+        // backend gets that from the host kernel; one that performs calls
+        // itself (HVF walks long host paths) must hear it from here, or a
+        // 5000-byte guest path resolved and the call succeeded. Every path
+        // argument is read through read_cstr, which notes an over-long one.
+        if (path_too_long_) return eno(Errno::enametoolong);
+        return o;
+    }
+
+private:
+    // Set by read_cstr when a string ran past PATH_MAX (see dispatch).
+    bool path_too_long_{false};
+
+    // Every syscall linuxity answers, by number (dispatch wraps it).
+    [[nodiscard]] Outcome dispatch_calls(const Sysno sc, const Regs& r) {
         switch (sc) {
             // -- process lifecycle: let the task ACTUALLY exit in the kernel
             //    (forward), so the trap reaps it and attributes the code. In
@@ -642,7 +660,7 @@ public:
             // the path variants above; other namespaces still forward.
             case Sysno::fsetxattr:
             case Sysno::fremovexattr: {
-                std::string name = read_cstr(uaddr(r.arg[1]));
+                std::string name = read_string(uaddr(r.arg[1]));
                 if (name.rfind("security.", 0) == 0 ||
                     name.rfind("system.",   0) == 0 ||
                     name.rfind("trusted.",  0) == 0)
@@ -723,7 +741,7 @@ public:
                 // not: a mount's target is routinely a directory the guest is
                 // about to populate, and second-guessing that is how a
                 // working init script starts failing.
-                const std::string type = read_cstr(uaddr(r.arg[2]));
+                const std::string type = read_string(uaddr(r.arg[2]));
                 if (!type.empty() && !known_fs_type(type))
                     return eno(Errno::enodev);
                 // A BIND mount's source is a real path that must exist --
@@ -1256,7 +1274,15 @@ private:
     // so we always recover the maximal valid prefix up to the NUL.
     // Handlers read the same path arg several times per syscall; keep the
     // last one until the next dispatch.
+    // A guest string read AS A PATH: at PATH_MAX or more it makes the whole
+    // call ENAMETOOLONG (see dispatch). Every path argument is read here.
     [[nodiscard]] std::string read_cstr(UAddr a) {
+        std::string s = read_string(a);
+        if (s.size() >= 4096) path_too_long_ = true;
+        return s;
+    }
+    // Any other guest string (an argv entry, a label): no length rule.
+    [[nodiscard]] std::string read_string(UAddr a) {
         if (cstr_valid_ && cstr_addr_ == value(a)) return cstr_;
         std::string s = read_cstr_uncached(a);
         cstr_valid_ = true;
@@ -1288,7 +1314,7 @@ private:
                 const std::size_t n = nul ? static_cast<std::size_t>(static_cast<const char*>(nul) - chunk.data()) : want;
                 s.append(chunk.data(), n);
                 if (nul) return s;
-                if (s.size() > 4096) { s.resize(4097); return s; }
+                if (s.size() >= 4096) { s.resize(4097); return s; }
                 off += want;
                 continue;
             }
@@ -1302,7 +1328,7 @@ private:
                 char c = static_cast<char>(one[0]);
                 if (c == '\0') return s;
                 s.push_back(c);
-                if (s.size() > 4096) return s;
+                if (s.size() >= 4096) return s;
             }
             if (!progressed) return s;
             off += want;
@@ -2428,15 +2454,19 @@ private:
                                  : write_statbuf(buf, vf->is_dir, vf->bytes.size());
             }
         }
-        if constexpr (!requires { mem_.host_tid(); }) {
+        if constexpr (!requires { mem_.host_tid(); } && !requires { mem_.host_fd_of(0); }) {
             return fwd();
         } else {
             // the inode itself, through the task's fd (works for unlinked
             // files, pipes and sockets too)
-            char link[64];
-            std::snprintf(link, sizeof link, "/proc/%d/fd/%d", mem_.host_tid(), fd);
             struct ::stat st{};
-            if (::stat(link, &st) != 0) return eno(errno == ENOENT ? Errno::ebadf : wire::errno_from_host(errno));
+            if (const Errno e = host_fstat(fd, st); e != Errno::ok) return eno(e);
+            // An anonymous object (socket, pipe) has no path to overlay, and
+            // a backend that performs calls itself spells its identity its
+            // own way (HVF: a socket's inode is net::socket_inode, matching
+            // its /proc/self/fd link). Let the backend answer those.
+            if constexpr (!requires { mem_.host_tid(); })
+                if (gp.empty() || S_ISSOCK(st.st_mode) || S_ISFIFO(st.st_mode)) return fwd();
             wire::StatFields h = host::stat_fields(st);
             // the same inode by path: fill in what a path stat would (emulated
             // link counts, socket placeholders), only if it IS that inode.
@@ -2900,6 +2930,25 @@ private:
         return s.empty() ? -1 : v;
     }
 
+    // stat(2) the host object behind guest fd `fd`: our own host fd where
+    // the backend holds it (HVF), else the tracee's /proc/<tid>/fd magic
+    // link (ptrace). EBADF for an fd the guest doesn't have.
+    [[nodiscard]] Errno host_fstat(int fd, struct ::stat& st) {
+        if constexpr (requires { mem_.host_fd_of(fd); } && !requires { mem_.host_tid(); }) {
+            const int h = mem_.host_fd_of(fd);
+            if (h < 0) return Errno::ebadf;
+            return ::fstat(h, &st) == 0 ? Errno::ok : wire::errno_from_host(errno);
+        } else if constexpr (requires { mem_.host_tid(); }) {
+            char link[64];
+            std::snprintf(link, sizeof link, "/proc/%d/fd/%d", mem_.host_tid(), fd);
+            if (::stat(link, &st) == 0) return Errno::ok;
+            return errno == ENOENT ? Errno::ebadf : wire::errno_from_host(errno);
+        } else {
+            (void)fd; (void)st;
+            return Errno::enosys;
+        }
+    }
+
     // Does the host say the file behind the tracee's fd was unlinked?
     [[nodiscard]] bool host_fd_deleted(int fd) {
         if constexpr (requires { mem_.host_fd_of(fd); } && !requires { mem_.host_tid(); }) {
@@ -2948,7 +2997,7 @@ private:
             std::uint64_t p = 0; std::memcpy(&p, b.data(), 8);
             if (p == 0) break;
             if (i == 0) continue;                 // argv[0] is the program name
-            std::string a = read_cstr(uaddr(p));
+            std::string a = read_string(uaddr(p));
             if (a == "--") { end_opts = true; continue; }
             if (end_opts || a.size() < 2 || a[0] != '-') continue;
             if (a[1] == '-') {                    // long option
@@ -3305,7 +3354,7 @@ private:
         // read whatever the host actually stored.) name = arg1 for both
         // setxattr(path,name,...) and removexattr(path,name).
         if (for_write) {
-            std::string name = read_cstr(uaddr(r.arg[1]));
+            std::string name = read_string(uaddr(r.arg[1]));
             if (name.rfind("security.", 0) == 0 ||
                 name.rfind("system.",   0) == 0 ||
                 name.rfind("trusted.",  0) == 0)
@@ -3344,7 +3393,7 @@ private:
         const UAddr buf = uaddr(r.arg[list ? 1 : 2]);
         const auto cap = static_cast<std::size_t>(std::min<std::uint64_t>(r.arg[list ? 2 : 3], 1u << 16));
         std::string name;
-        if (!list) name = read_cstr(uaddr(r.arg[1]));
+        if (!list) name = read_string(uaddr(r.arg[1]));
         std::vector<std::byte> out(cap);
         void* p = cap ? out.data() : nullptr;
         const ::ssize_t n = list ? (nofollow ? ::llistxattr(host.c_str(), static_cast<char*>(p), cap)

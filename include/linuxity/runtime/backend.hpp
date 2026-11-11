@@ -129,6 +129,19 @@ concept SocketRewriteYieldsValue =
             -> std::same_as<Result<std::int64_t>>;
     };
 
+// The backend performs a redirected call ITSELF and walks a host path past
+// PATH_MAX a component at a time (host/long_path.hpp). Then the loop hands
+// it the absolute path as is. A backend that forwards to the host kernel
+// (ptrace) can't: there the loop rebases an over-long path onto the call's
+// own dirfd -- a relative path that only means the right thing to a kernel
+// resolving it against the TRACEE's dirfd. Given to a self-performing
+// backend, that relative path resolved against linuxity's own cwd, and an
+// 80-deep mkdir landed somewhere else entirely (EEXIST).
+template <class T>
+concept WalksLongPaths = SyscallTrap<T> && requires {
+    { T::walks_long_paths() } -> std::same_as<bool>;
+} && T::walks_long_paths();
+
 // Rewrite a dynamic execve to run through the real interpreter:
 // `interp_host <prog_guest> <argv...>`.
 template <class T>
@@ -194,6 +207,7 @@ struct Capabilities {
     static constexpr bool signals           = DeliversSignals<T>;
     static constexpr bool arg_rewrite       = RewritesArgs<T>;
     static constexpr bool proc_events       = ReportsProcEvents<T>;
+    static constexpr bool long_paths        = WalksLongPaths<T>;
 };
 
 // A backend that claims full fidelity must actually have everything. Assert

@@ -131,6 +131,11 @@ public:
             TaskState& task, PidSpace& pids) noexcept
         : machine_{machine}, cpu_{cpu}, proc_{proc}, task_{task}, pids_{pids} {}
 
+    // runtime::WalksLongPaths: every redirected call is performed here, and
+    // an over-long host path is walked a component at a time (do_path's
+    // long-path retry), so the loop hands over absolute paths unchanged.
+    [[nodiscard]] static constexpr bool walks_long_paths() noexcept { return true; }
+
     // Translate a guest path to a host path through the portable namespace.
     // Installed by the embedder (main/test), which owns the Kernel; the trap
     // needs it only for execve, where the PROGRAM image must be found.
@@ -5825,6 +5830,8 @@ static_assert(RedirectsTwoPaths<HvfTrap>,
               "HvfTrap must take the scrub observer and the second path");
 static_assert(ForwardsSynchronously<HvfTrap>,
               "HvfTrap must forward synchronously so dup fd bindings mirror");
+static_assert(WalksLongPaths<HvfTrap>,
+              "HvfTrap performs path calls itself: the loop must not rebase onto a dirfd");
 static_assert(TranslatesSockets<HvfTrap>,
               "HvfTrap must translate AF_UNIX paths, else guest sockets land "
               "on the host filesystem");
