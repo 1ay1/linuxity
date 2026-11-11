@@ -235,7 +235,9 @@ The darwin backend lives in `runtime/darwin/`.
 | XNU does | Linux does | linuxity |
 |---|---|---|
 | makes a session leader's exit wait, with no timeout, until its tty's output is read (`proc_exit` → `ttywait`) | exits at once and leaves the output for the master | `end_process` marks the exit *final* in the shared pid table and wakes the parent; `wait4` reaps it from the table (pexpect, harnesses) |
-| refuses `EVFILT_PROC` on a zombie (`ESRCH`) | opens a pidfd on it, readable at once | `make_pidfd` sees the zombie with `waitid(WNOWAIT)` and fires an `EVFILT_USER` (asyncio's child watcher) |
+| refuses `EVFILT_PROC` on a zombie *and on a process still exiting* (`ESRCH`) | opens a pidfd on either, readable at once | `make_pidfd` sees the zombie with `waitid(WNOWAIT)`, or the exit already posted in the pid table, and hands back a pidfd that is readable at once (asyncio's child watcher) |
+| can't pass a kqueue across fork | a pidfd is an ordinary fd | a pidfd is one end of a socketpair; one watcher thread per process closes the other end on `NOTE_EXIT`. With a kqueue, every fork while asyncio held a pidfd failed with `EAGAIN` |
+| keeps each guest process's facts in a separate host process | `/proc/<pid>` of any process tells whose it is, its threads and its memory | each process publishes its ids, thread count and size in the shared pid table, and answers its resident set over its memory socket; `/proc/<pid>` is owned by the process's euid (ps's USER) |
 | never reports a FIFO's last writer closing to `poll` or kqueue (`select` does) | `POLLHUP` | `signal_aware_poll` switches to `select` for FIFOs; epoll waits on them the same way |
 | reports a pipe writer with no reader as `POLLHUP` | `POLLERR` | translated when revents are copied back |
 | drops a process's POSIX locks when it closes *any* fd on the file | the same rule, but only the program's own closes count | linuxity's own work never closes guest files in the parent (fork used to, and lost the parent's locks) |
@@ -244,7 +246,7 @@ The darwin backend lives in `runtime/darwin/`.
 | refuses `task_for_pid` without the debugger entitlement | `/proc/<pid>/mem`, `process_vm_readv` | each linuxity serves its own guest RAM on a socket (`memsvc.hpp`) |
 | has no POSIX message queues | `mq_*` | queue files in the env's shared shm directory, under `flock` (`mqueue.hpp`) |
 | has no `NETLINK_ROUTE` and no `/proc/net` | `ip addr`, `getifaddrs`, Go's `net.Interfaces` | answered from the host's `getifaddrs()` (`rtnetlink.hpp`, `vfs/procnet_synth.hpp`) |
-| counts linuxity's own timer/service threads in the task | a process's threads are the program's | `/proc/<pid>/stat`, `status` and `task/` count guest threads only (Python warns on `fork()` otherwise) |
+| counts linuxity's own timer/service threads and memory in the task | a process's threads and RSS are the program's | `/proc/<pid>/stat`, `status`, `statm` and `task/` count guest threads and guest pages only (Python warns on `fork()` otherwise; ps showed RSS = VSZ) |
 | allows 128 Hypervisor.framework VMs on the whole Mac at once | no such limit | warm zygotes (pre-forked spares) are budgeted across the tree by `PidSpace`, keeping headroom for real forks |
 | has a case-insensitive disk by default | names are bytes | environments live on a case-sensitive APFS sparsebundle |
 

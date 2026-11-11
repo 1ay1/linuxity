@@ -179,7 +179,7 @@ docker build -t lx-oracle -f tests/oracle.Dockerfile tests
 docker run --privileged --rm -v "$PWD/tests:/mnt/t:ro" lx-oracle
 ```
 
-On macOS (Apple Silicon) linuxity passes all 410 checks; the 4 skips are the
+On macOS (Apple Silicon) linuxity passes all 414 checks; the 4 skips are the
 host's (APFS folds Unicode names, and the unprivileged pass can't test what
 needs root). Exit status 0 means nothing failed anywhere.
 
