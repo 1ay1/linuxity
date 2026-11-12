@@ -2058,6 +2058,17 @@ public:
     // Bumped whenever the mount table, a namespace's view of it, or a
     // directory's symlink-ness may have changed.
     [[nodiscard]] std::uint64_t layout_version() const noexcept { return layout_version_; }
+    // Is this host path part of a copy-on-write mount (the rootfs or its
+    // upper)? Binds of host folders are not.
+    [[nodiscard]] bool in_overlay(std::string_view host) const {
+        auto under = [&](const std::string& base) {
+            return !base.empty() && host.starts_with(base) &&
+                   (host.size() == base.size() || host[base.size()] == '/');
+        };
+        for (const auto& m : mounts_)
+            if (!m.upper.empty() && (under(m.host_base) || under(m.upper))) return true;
+        return false;
+    }
     void bump_layout() const noexcept { ++layout_version_; }
     // Bumped on every write: a directory may have become a symlink.
     [[nodiscard]] std::uint64_t dirs_version() const noexcept { return dirs_version_; }

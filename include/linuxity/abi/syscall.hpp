@@ -1623,14 +1623,52 @@ private:
     [[nodiscard]] bool guest_search_denied(const std::string& abs) {
         if (privileged() || abs.size() < 2) return false;
         auto& meta = k_.files().meta();
-        if (meta.empty()) return false;
+        const bool any = !meta.empty();
         for (std::size_t i = abs.find('/', 1); i != std::string::npos; i = abs.find('/', i + 1)) {
             const std::string dir = abs.substr(0, i);
-            if (const auto* rec = meta.peek(dir); rec && (rec->have & kernel::MetaRecord::kMode))
+            if (const auto* rec = any ? meta.peek(dir) : nullptr; rec && (rec->have & kernel::MetaRecord::kMode)) {
                 if (!guest_may(dir, 1)) return true;
+            } else if (image_dir_closed(dir)) {
+                return true;
+            }
         }
         return false;
     }
+
+    // A directory with no shadow mode keeps the one it has on disk (the
+    // image's /root is 0700, root-owned; the upper keeps guest modes). The
+    // host lets linuxity in regardless, so an ordinary user is stopped here.
+    // Binds of host folders keep their host behaviour. Mode and owner are
+    // cached until any write (dirs_version): this runs per path component.
+    [[nodiscard]] bool image_dir_closed(const std::string& dir) {
+        if (closed_dirs_ver_ != k_.files().dirs_version()) {
+            closed_dirs_.clear();
+            closed_dirs_ver_ = k_.files().dirs_version();
+        }
+        auto it = closed_dirs_.find(dir);
+        if (it == closed_dirs_.end()) {
+            DirBits d;
+            const auto pc = k_.files().classify(dir);
+            struct ::stat st{};
+            if (pc.realm == kernel::Realm2::host_backed && !pc.host_path.empty() &&
+                k_.files().in_overlay(pc.host_path) && ::stat(pc.host_path.c_str(), &st) == 0 &&
+                S_ISDIR(st.st_mode) && !(st.st_mode & S_IXOTH)) {
+                d.closed = true;
+                d.mode = st.st_mode & 07777u;
+                std::tie(d.uid, d.gid) = owner_of(dir);
+            }
+            if (closed_dirs_.size() > 4096) closed_dirs_.clear();
+            it = closed_dirs_.emplace(dir, d).first;
+        }
+        const DirBits& d = it->second;
+        if (!d.closed) return false;
+        auto p = me();
+        p.groups = k_.procs().groups_of(p.pid);
+        return !creds::permitted(p, d.mode, d.uid, d.gid, 1, true);
+    }
+    struct DirBits { bool closed{false}; std::uint32_t mode{0}, uid{0}, gid{0}; };
+    std::unordered_map<std::string, DirBits> closed_dirs_;
+    std::uint64_t closed_dirs_ver_{~0ull};
 
     // Lexically normalizing "."/".." DROPS the requirement that whatever
     // came before them exists. The kernel WALKS a path, so "gone/.." fails at
@@ -2251,6 +2289,21 @@ private:
               wire::has(flags, wire::OpenFlag::excl)) ||
              wire::has(flags, wire::OpenFlag::trunc)))
             open_wi = Wi::parents_only;
+        // The name as the guest sees it now: a write classify below can clear
+        // a whiteout (it re-creates the name), after which an unlinked image
+        // file or symlink would look present again. O_EXCL and O_NOFOLLOW
+        // must judge the name from this view; pacman's unlink-then-O_EXCL
+        // over an image symlink failed otherwise.
+        struct NameView { bool exists{false}, is_link{false}; };
+        NameView before{};
+        if (for_write) {
+            const auto n = k_.files().classify(abs, /*for_write=*/false, /*follow=*/false);
+            struct ::stat lst{};
+            before.exists = n.realm == kernel::Realm2::virtual_file ||
+                            (n.realm == kernel::Realm2::host_backed && !n.host_path.empty() &&
+                             ::lstat(n.host_path.c_str(), &lst) == 0);
+            before.is_link = before.exists && n.realm == kernel::Realm2::host_backed && S_ISLNK(lst.st_mode);
+        }
         auto pc = k_.files().classify(abs, for_write, /*follow=*/true, open_wi);
 #if defined(__linux__)
         // the guest's kernel log, whatever node stat shows for it (a packet
@@ -2292,30 +2345,13 @@ private:
         // caller had explicitly asked not to create.
         if (wire::has(flags, wire::OpenFlag::creat) &&
             wire::has(flags, wire::OpenFlag::excl)) {
-            // Ask about the layer the create is actually going to use. `pc`
-            // above already resolved that (the overlay UPPER, with parents
-            // mirrored), and for an overlay the lower layer's copy does not
-            // occupy the name -- an exclusive create over a pristine
-            // read-only file has to succeed, which is how a package manager
-            // overwrites a shipped file.
-            //
-            // Using a fresh follow=false classify here consulted the LOWER
-            // layer and answered EEXIST for a file the guest had just
-            // unlinked, so pacman's unlink-then-O_EXCL failed on every file
-            // in a package ("warning given when extracting ... Can't
-            // create"). The dangling-symlink case below still needs the
-            // name-not-target question, so it asks separately.
+            // The name is taken if the guest can see it: in the upper, or in
+            // the image and not removed -- a dangling symlink included, which
+            // occupies the NAME though it resolves to nothing. Checking only
+            // the upper let O_EXCL over an image file succeed and truncate it
+            // (systemd-tmpfiles wiped /etc/passwd that way).
             if (pc.realm == kernel::Realm2::host_backed &&
-                host_lexists(pc.host_path))
-                return eno(Errno::eexist);
-            // A dangling symlink occupies the NAME even though it resolves
-            // to nothing, so creating through it is EEXIST. classify above
-            // followed the link to its absent target, which would have let
-            // the overlay create that target instead.
-            auto named = k_.files().classify(abs, /*for_write=*/false,
-                                             /*follow=*/false);
-            if (named.realm == kernel::Realm2::host_backed &&
-                host_path_is_symlink(named.host_path))
+                (host_lexists(pc.host_path) || before.exists))
                 return eno(Errno::eexist);
         }
         // O_NOFOLLOW refuses to traverse a final symlink. Without O_PATH
@@ -2330,6 +2366,8 @@ private:
         if (wire::has_for(arch_, flags, wire::OpenFlag::nofollow)) {
             auto named = k_.files().classify(abs, /*for_write=*/false,
                                              /*follow=*/false);
+            // a write may have just cleared a whiteout: ask the earlier view
+            if (for_write && !before.is_link) named.host_path.clear();
             if (!named.host_path.empty()) {
                 struct ::stat lst{};
                 if (::lstat(named.host_path.c_str(), &lst) == 0 &&
@@ -3811,6 +3849,9 @@ private:
             }
         }
         std::string abs = resolve_arg(r, path_arg, at);
+        // mkdir/mknod: the name is taken if the guest sees it, the image's
+        // copy included. Asked before classify, which clears a whiteout.
+        const bool create_taken = wi == Wi::parents_only && guest_exists(abs);
         auto pc = k_.files().classify(abs, /*for_write=*/true, /*follow=*/false, wi);
         // A "."/".." component was normalized away above, but resolving it
         // traverses its directory, which needs +x there.
@@ -3852,6 +3893,7 @@ private:
             if (pc.host_path.empty()) return val(0);
         }
         if (pc.host_path.empty()) return eno(pc.error);
+        if (create_taken && pc.realm == kernel::Realm2::host_backed) return eno(Errno::eexist);
         // Creating or removing a name writes the parent directory, and in a
         // sticky one only the file's or the directory's owner may remove it.
         if ((wi == Wi::remove || wi == Wi::parents_only) && !privileged()) {
@@ -4151,11 +4193,17 @@ private:
                 return eno(Errno::enotsup);
         }
         // Best-effort apply to the host inode (execute bit for execve);
-        // record in the shadow store only what the inode couldn't take.
+        // record in the shadow store only what the inode couldn't take. The
+        // host keeps owner rw (rwx for a dir), as chmod does: libarchive
+        // fixes directory modes through an fd, and a 0444 dir it made that
+        // way couldn't be copied by a snapshot.
         auto wc = k_.files().classify(std::string{gp}, /*for_write=*/true,
                                       /*follow=*/false, Wi::copy_leaf);
         std::uint32_t landed = 0xffffffffu;
-        if (!wc.host_path.empty() && ::chmod(wc.host_path.c_str(), mode & wire::kPermMask) == 0) {
+        const std::uint32_t keep = host_path_is_regular(wc.host_path) ? 0600u
+                                 : host_path_is_dir(wc.host_path)     ? 0700u : 0u;
+        if (!wc.host_path.empty() &&
+            ::chmod(wc.host_path.c_str(), static_cast<mode_t>((mode & wire::kPermMask) | keep)) == 0) {
             std::uint32_t got = 0;
             if (hostcompat::host_mode_of(wc.host_path.c_str(), got))
                 landed = got;
@@ -4375,6 +4423,13 @@ private:
         const bool link_follow = !move_meta && link_flags_arg >= 0 &&
             wire::has_at(r.arg[static_cast<std::size_t>(link_flags_arg)], wire::AtFlag::symlink_follow);
         if (link_follow) src = k_.files().resolve_links(src);
+        // link(2) and RENAME_NOREPLACE never replace: the name is taken if the
+        // guest sees it, the image's copy included. Asked before classify,
+        // which clears a whiteout at the destination. Flags the kernel
+        // rejects (NOREPLACE|EXCHANGE, unknown bits) stay its EINVAL.
+        const std::uint64_t rflags = rename_flags_arg >= 0 ? r.arg[static_cast<std::size_t>(rename_flags_arg)] : 0;
+        const bool no_replace = !move_meta || rflags == 1u;
+        const bool dst_taken = no_replace && guest_exists(dst);
         auto ps = move_meta ? k_.files().classify_name(src, true, false, Wi::copy_leaf)
                             : k_.files().classify(src, true, false, Wi::copy_leaf);
         auto pd = move_meta ? k_.files().classify_name(dst, true, false, Wi::parents_only)
@@ -4629,6 +4684,13 @@ private:
         // independent files that drifted apart on the first write. ps was
         // classified with alias resolution, so linking an alias joins the
         // same inode rather than aliasing a placeholder.
+        // the image holds the destination name (see dst_taken); the source
+        // exists, or the host would have said so above
+        if (dst_taken) {
+            struct ::stat sst{};
+            if (::lstat(ps.host_path.c_str(), &sst) != 0) return eno(static_cast<Errno>(errno));
+            return eno(Errno::eexist);
+        }
         if (!move_meta && !host_links_work(pd.host_path)) {
             struct ::stat sst{};
             if (::lstat(ps.host_path.c_str(), &sst) != 0)
@@ -4655,8 +4717,9 @@ private:
         }
         Redirect rd{PathArg{a1, std::move(ps.host_path)}};
         rd.second = PathArg{a2, std::move(pd.host_path)};
-        // a rename (not a link): tell note_moved what moved where
-        if (link_flags_arg < 0) rd.moved = std::pair{src, dst};
+        // a rename moves the record; a link copies it (link(2) has no flags
+        // arg, so move_meta is what tells the two apart)
+        if (move_meta) rd.moved = std::pair{src, dst};
         else rd.linked = std::pair{src, dst};
         return rd;
     }
@@ -4716,11 +4779,18 @@ private:
         struct ::stat st{};
         if (::fstat(sfd, &st) != 0) return eno(static_cast<Errno>(errno));
         if (S_ISDIR(st.st_mode)) return eno(Errno::eperm);
+        // the name may exist in the image only: then the upper path is free,
+        // but the guest sees a file there (pacman's tmpfiles hook replaced
+        // /etc/passwd this way)
         struct ::stat dt{};
-        if (::lstat(pd.host_path.c_str(), &dt) == 0) return eno(Errno::eexist);
+        if (::lstat(pd.host_path.c_str(), &dt) == 0 || guest_exists(dst)) return eno(Errno::eexist);
         if (host_links_work(pd.host_path)) {
             const int e = host::link_fd(sfd, pd.host_path);
-            if (e == 0) return val(0);
+            if (e == 0) {
+                // an O_TMPFILE named: whoever opened it owns it, like a create
+                if (st.st_nlink == 0) note_created(dst, false);
+                return val(0);
+            }
             // an unnamed file the host can't link (no /proc/self/fd): copy
             if (!(e == ENOENT && st.st_nlink == 0)) return eno(wire::errno_from_host(e));
         }
@@ -5053,6 +5123,9 @@ private:
                               : k_.files().absolutize(
                                     read_cstr(uaddr(r.arg[static_cast<std::size_t>(link_arg)])),
                                     k_.files().cwd());
+        // taken if the guest sees it, the image's copy included; asked before
+        // classify, which clears a whiteout
+        const bool taken = guest_exists(link);
         auto pc = k_.files().classify(link, true, false, Wi::parents_only);
         // A "."/".." in the link name was normalized away; traversing it
         // still needs +x on that directory.
@@ -5067,6 +5140,7 @@ private:
             // Reached only when the link name RESOLVED, so the name is taken.
             return eno(virtual_mut_errno(link, VMut::exists));
         if (pc.host_path.empty()) return eno(pc.error);
+        if (taken) return eno(Errno::eexist);
         if (!privileged())
             if (Errno e = dir_entry_allowed(link, false); e != Errno::ok) return eno(e);
         // Rewrite ONLY the linkpath; `target` stays guest-literal.
@@ -6658,6 +6732,11 @@ public:
         if (guest == "/dev/tty") return !(want & 1);
         const auto pc = k_.files().classify(guest);
         if (pc.realm != kernel::Realm2::host_backed || pc.host_path.empty()) return true;
+        // A redirect into the host's /proc (the caller's own fd, fdinfo, ns)
+        // is checked by the host kernel in the guest's context, which is
+        // right by construction. Judged from here it's linuxity's own entry,
+        // shown root-owned, so a user couldn't list its own /proc/self/fd.
+        if (pc.host_path == "/proc" || pc.host_path.starts_with("/proc/")) return true;
         struct ::stat st{};
         if (::stat(pc.host_path.c_str(), &st) != 0) return true;
         std::uint32_t mode = st.st_mode & 07777u;
@@ -6687,6 +6766,8 @@ public:
         return std::pair<std::int64_t, std::uint32_t>{uid ? std::int64_t{*uid} : -1, kTtyGid};
     }
     [[nodiscard]] bool privileged() { return creds::capable(me(), creds::kCapDacOverride); }
+    // The calling task's real uid: what a signal it sends carries as si_uid.
+    [[nodiscard]] std::uint32_t sender_uid() { return me().uids[0]; }
 
     // A translated host path at or over PATH_MAX fails on the host even when
     // the guest named it relative to a dirfd or its cwd, which have no length
@@ -6789,6 +6870,7 @@ public:
         k_.files().clear_whiteout_if_any(abs);
         k_.files().meta().set_mode(abs, mode & 07777u & ~guest_umask());
         k_.files().meta().set_fifo(abs);
+        note_created(abs, false);   // its maker's, like any new name
         return val(0);
     }
 
@@ -7160,6 +7242,24 @@ public:
     // Root creating as root is the default view, so that records nothing.
     void note_created(const std::string& guest, bool is_dir) {
         const auto& p = me();
+        // The host needs to read (and search) what linuxity stores, but the
+        // create took the guest's mode: open(O_CREAT, 0) or mkdir(d, 0444)
+        // left files linuxity itself couldn't copy (snapshots failed). Keep
+        // the guest's mode in the shadow store and owner rw(x) on the host,
+        // as chmod does.
+        {
+            const auto pc = k_.files().classify(guest);
+            struct ::stat st{};
+            const std::uint32_t need = is_dir ? 0700u : 0600u;
+            if (pc.realm == kernel::Realm2::host_backed && !pc.host_path.empty() &&
+                ::lstat(pc.host_path.c_str(), &st) == 0 && !S_ISLNK(st.st_mode) &&
+                (st.st_mode & need) != need) {
+                auto rec = k_.files().meta().lookup(guest);
+                if (!rec || !(rec->have & kernel::MetaRecord::kMode))
+                    k_.files().meta().set_mode(guest, st.st_mode & 07777u);
+                (void)::chmod(pc.host_path.c_str(), static_cast<mode_t>((st.st_mode & 07777u) | need));
+            }
+        }
         const std::string parent = guest.substr(0, std::max<std::size_t>(guest.rfind('/'), 1));
         std::uint32_t gid = p.gids[3];
         bool sgid_parent = false;

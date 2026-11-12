@@ -1711,11 +1711,20 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
     return [&procs, inner](std::string_view abs) -> Result<kernel::VirtualFile> {
         auto r = inner(abs);
         if (!r) return r;
-        // numeric /proc/<pid> only: /proc/self is a link, resolved first
-        auto [pid, tail] = detail::split_pid(abs);
+        // /proc/self and /proc/thread-self are the reader's own
+        std::string_view tail_of = abs;
+        std::string folded;
+        for (const std::string_view s : {std::string_view{"/proc/self"}, std::string_view{"/proc/thread-self"}})
+            if (abs.size() > s.size() && abs.starts_with(s) && abs[s.size()] == '/' && procs.reader() > 0) {
+                folded = "/proc/" + std::to_string(procs.reader()) + std::string{abs.substr(s.size())};
+                tail_of = folded;
+            }
+        // numeric /proc/<pid> only: /proc/self itself is a link
+        auto [pid, tail] = detail::split_pid(tail_of);
         if (pid <= 0) return r;
         std::int32_t g = static_cast<std::int32_t>(pid);
-        if (const auto pns = procs.reader_pid_ns(); pns) g = procs.pid_from(pns, g);
+        if (folded.empty())
+            if (const auto pns = procs.reader_pid_ns(); pns) g = procs.pid_from(pns, g);
         const kernel::ProcInfo* pi = g > 0 ? procs.find(g) : nullptr;
         if (!pi && g > 0)
             if (const auto tg = procs.thread_group_of(g)) pi = procs.find(tg);

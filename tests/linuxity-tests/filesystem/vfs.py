@@ -106,6 +106,26 @@ def links_and_unlinked_files():
     eq((rc, ctypes.get_errno() if rc else 0), (0, 0), "linkat(AT_SYMLINK_FOLLOW) of an O_TMPFILE")
     with open("materialized", "rb") as f:
         eq(f.read(), b"born anonymous", "O_TMPFILE given a name")
+    # linking never replaces a name, including one the image provides
+    # (pacman's tmpfiles hook once replaced /etc/passwd this way)
+    t2 = os.open(".", os.O_TMPFILE | os.O_RDWR, 0o600)
+    rc = libc.linkat(-100, f"/proc/self/fd/{t2}".encode(), -100, b"materialized", 0x400)
+    eq((rc, ctypes.get_errno() if rc else 0), (-1, errno.EEXIST), "linkat over an existing name")
+    os.close(t2)
+    # the name may be the image's alone, its directory not yet copied up
+    image_file = next((os.path.join(d, n) for d in ("/usr/share/doc/bash", "/usr/share/doc/acl", "/etc")
+                       if os.path.isdir(d) for n in sorted(os.listdir(d))
+                       if os.path.isfile(os.path.join(d, n)) and not os.path.islink(os.path.join(d, n))), None)
+    if os.getuid() == 0 and image_file:
+        # a file created beside it copies the directory up, as pacman's does
+        side = os.path.join(os.path.dirname(image_file), ".lxt-copyup")
+        open(side, "w").close()
+        t3 = os.open(os.path.dirname(image_file), os.O_TMPFILE | os.O_RDWR, 0o600)
+        rc = libc.linkat(-100, f"/proc/self/fd/{t3}".encode(), -100, image_file.encode(), 0x400)
+        os.unlink(side)
+        eq((rc, ctypes.get_errno() if rc else 0), (-1, errno.EEXIST), f"linkat over {image_file}")
+        os.close(t3)
+    eq(os.stat("materialized").st_uid, os.getuid(), "a named O_TMPFILE is the caller's")
     return "nlink, shared writes, rename no-op, deleted-but-open, O_TMPFILE"
 
 

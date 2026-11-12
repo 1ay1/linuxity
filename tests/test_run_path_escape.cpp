@@ -61,8 +61,9 @@ int main() {
     return 0;
 #else
     // An overlay, so a guest write has a legitimate home (the upper) and we
-    // can tell "landed in the sandbox" from "landed on the host".
-    const auto tree = lxtest::make_tree("escape", /*overlay=*/true);
+    // can tell "landed in the sandbox" from "landed on the host". The rootfs
+    // needs a /tmp for the guest's create to have a parent.
+    const auto tree = lxtest::make_tree("escape", /*overlay=*/true, "mkdir -p /tmp/lx_escape_root/tmp");
     if (!lxtest::compile_guest("run_path_escape", tree, kSrc)) return 0;
 
     // The exact host paths a failed translation would hit. The guest asks for

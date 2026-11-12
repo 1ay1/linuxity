@@ -83,12 +83,14 @@ static const char* kSrc =
     "  close(xf);\n"
     "  if (chmod(\"/base/cwd/script\", 0755) != 0) return 27;\n"
     "  if (access(\"/base/cwd/script\", X_OK) != 0) return 28;\n"
-    // OVERWRITE a lower-only file with O_CREAT|O_EXCL (the libarchive /
-    // pacman extraction pattern): it existed only in the read-only lower, and
-    // an exclusive create MUST succeed by materializing a fresh file in the
-    // upper. A copy-up-then-O_EXCL would resurrect the leaf in the upper and
-    // fail EEXIST ("Can't create <path>" on every package overwrite).
+    // O_CREAT|O_EXCL over a file only the read-only lower has: the guest
+    // sees it, so the name is taken, as on Linux (an exclusive create that
+    // "succeeded" here truncated it: systemd-tmpfiles wiped /etc/passwd).
+    // The libarchive / pacman pattern is unlink first, then O_EXCL: that
+    // must create, even though the lower still holds the bytes.
     "  if (access(\"/excl_lower\", F_OK) != 0) return 29;\n"
+    "  if (open(\"/excl_lower\", O_WRONLY|O_CREAT|O_EXCL, 0644) >= 0 || errno != EEXIST) return 30;\n"
+    "  if (unlink(\"/excl_lower\") != 0) return 30;\n"
     "  int ef = open(\"/excl_lower\", O_WRONLY|O_CREAT|O_EXCL, 0644);\n"
     "  if (ef < 0) return 30;\n"
     "  if (write(ef, \"new\\n\", 4) != 4) return 31;\n"
@@ -136,6 +138,15 @@ static const char* kSrc =
     "  if (uf2 < 0) return 47;\n"
     "  if (write(uf2, \"again\\n\", 6) != 6) return 48;\n"
     "  close(uf2);\n"
+    // A lower-only SYMLINK replaced by a regular file, as pacman does when a
+    // package turns a link into a file: O_EXCL over the link is EEXIST, and
+    // after unlink it creates a file at the NAME, leaving the target alone.
+    "  if (open(\"/lower_link\", O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW, 0644) >= 0 || errno != EEXIST) return 50;\n"
+    "  if (unlink(\"/lower_link\") != 0) return 51;\n"
+    "  int lf = open(\"/lower_link\", O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW, 0644);\n"
+    "  if (lf < 0) return 52;\n"
+    "  if (write(lf, \"file\\n\", 5) != 5) return 52;\n"
+    "  close(lf);\n"
     // Writing under a lower-only directory MIRRORS its ancestors into the
     // upper layer. They must arrive with the mode they have in the LOWER
     // layer, not a hardcoded 0755 masked by whatever umask the host happens
@@ -160,7 +171,9 @@ int main() {
         " && mkdir -p -m 750 /tmp/lx_mutate_root/priv/sub"
         " && printf lower > /tmp/lx_mutate_root/lower_only"
         " && printf old > /tmp/lx_mutate_root/excl_lower"
-        " && printf pristine > /tmp/lx_mutate_root/unlink_excl_lower");
+        " && printf pristine > /tmp/lx_mutate_root/unlink_excl_lower"
+        " && printf target > /tmp/lx_mutate_root/link_target"
+        " && ln -s link_target /tmp/lx_mutate_root/lower_link");
     if (!lxtest::compile_guest("run_mutate", tree, kSrc)) return 0;
 
     const std::string root  = tree.root;
@@ -197,6 +210,12 @@ int main() {
     // contents in the upper, and the pristine lower untouched throughout.
     bool unlink_excl_new   = read1(upper + "/unlink_excl_lower") == "again\n";
     bool unlink_excl_lower = read1(root  + "/unlink_excl_lower") == "pristine";
+    const bool link_replaced = read1(upper + "/lower_link") == "file\n" &&
+                               read1(root + "/link_target") == "target";
+    if (!link_replaced) {
+        std::puts("run_mutate: FAIL replacing a lower symlink with a file wrote the wrong place");
+        return 1;
+    }
     // The mirrored ancestors must carry the LOWER layer's mode, exactly.
     auto mode_of = [](const std::string& p) -> unsigned {
         struct ::stat st{};
