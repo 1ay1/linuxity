@@ -1,9 +1,12 @@
 // linuxity -- the one entry point, on every host.
 //
-//   linuxity                          a shell in your default environment
-//   linuxity <verb> ...               manage environments (cli.cpp)
-//   linuxity up|run <env> ...         run an environment (here)
-//   linuxity [OPTIONS] <program> ...  run one program
+//   lx [...] [CMD]                     run things in an environment (cli.cpp)
+//   linuxity VERB ...                  manage environments (cli.cpp)
+//   linuxity --root DIR [FLAGS] PROG   the engine on its own (here)
+//
+// `lx` is the same binary under another name (a symlink); argv[0] picks the
+// front door. Re-runs of ourselves use hidden verbs: `__up ENV` runs an
+// instance, `__run ENV FLAGS -- CMD` a one-off foreground run.
 //
 // One command line for every host: one flag parser, one usage text, one set
 // of verbs, one Options. What differs per host is only how the guest runs --
@@ -38,8 +41,8 @@
 #include <vector>
 
 #if !defined(_WIN32)
-int lx_cli_main(int argc, char** argv);   // cli.cpp: new, list, shell, set, ...
-std::vector<std::string> lx_with_default_env(int argc, char** argv);
+int lx_cli_main(int argc, char** argv);   // cli.cpp: the linuxity verbs
+int lx_main(int argc, char** argv);       // cli.cpp: lx
 #endif
 
 namespace {
@@ -48,11 +51,11 @@ using lx::cli::Options;
 
 void usage(const char* argv0) {
     std::fprintf(stderr,
+        "The engine on its own: one program, no environment.\n"
+        "\n"
         "usage: %s [OPTIONS] <program> [args...]\n"
 #if !defined(_WIN32)
-        "       %s run <env> [OPTIONS] [-- program args...]\n"
-        "       %s up <env> [--foreground]      start an environment in the background\n"
-        "       %s <command> ...                 see `linuxity help`\n"
+        "       (environments: lx, and `linuxity help`)\n"
 #endif
         "\n"
         "  Runs a native Linux binary; its syscalls are serviced by the\n"
@@ -89,11 +92,7 @@ void usage(const char* argv0) {
         "  The resource bounds are enforced by the HOST kernel where it can\n"
         "  (cgroup v2 or setrlimit on Linux) and the guest's /proc, /sys and\n"
         "  sysinfo are derived to MATCH them.\n",
-#if !defined(_WIN32)
-        argv0, argv0, argv0, argv0,
-#else
         argv0,
-#endif
         lx::cli::host_name());
 }
 
@@ -104,7 +103,7 @@ bool load_env(const std::string& name, Options& o) {
     if (std::string why; !store.ensure_storage(false, why))
         std::fprintf(stderr, "linuxity: %s\n", why.c_str());
     if (!store.has(name)) {
-        std::fprintf(stderr, "linuxity: no environment '%s' (see `linuxity list`)\n", name.c_str());
+        std::fprintf(stderr, "linuxity: no environment '%s' (see `linuxity ls`)\n", name.c_str());
         return false;
     }
     auto r = store.load(name);
@@ -245,10 +244,10 @@ void setup_status(const Options& o) {
 }
 
 #if !defined(_WIN32)
-// `linuxity up <env>`: run the instance. In the background unless
+// `__up ENV`: run the instance. In the background unless
 // --foreground; the launcher returns once the control socket is live.
 int cmd_up(int argc, char** argv) {
-    if (argc < 3) { std::fprintf(stderr, "usage: linuxity up <env> [--foreground] [--status-fd N]\n"); return 2; }
+    if (argc < 3) { std::fprintf(stderr, "usage: linuxity __up ENV [--foreground] [--status-fd N]\n"); return 2; }
     Options o;
     o.flags = {"--env", argv[2]};
     if (!load_env(argv[2], o)) return 1;
@@ -304,10 +303,10 @@ int cmd_up(int argc, char** argv) {
     return WIFEXITED(stc) && WEXITSTATUS(stc) ? WEXITSTATUS(stc) : 1;
 }
 
-// `linuxity run <env> [flags] [-- program...]`: one program as pid 1 with
+// `__run ENV [--fresh] [flags] [-- program...]`: one program as pid 1 with
 // the environment's settings (the user's login shell if none is given).
 int cmd_run(int argc, char** argv) {
-    if (argc < 3) { std::fprintf(stderr, "usage: linuxity run [env] [--fresh] [-v host:guest] [-e K=V] [-- program args...]\n"); return 2; }
+    if (argc < 3) { std::fprintf(stderr, "usage: linuxity __run ENV [--fresh] [-v host:guest] [-e K=V] [-- program args...]\n"); return 2; }
     Options o;
     o.flags = {"--env", argv[2]};
     if (!load_env(argv[2], o)) return 1;
@@ -385,30 +384,11 @@ int with_args(int (*fn)(int, char**), std::vector<std::string> a) {
     return fn(static_cast<int>(a.size()), av.data());
 }
 
-// Words that are commands, not programs to run (src/verbs.hpp).
-bool is_verb(std::string_view s) { return lx::cli::find_verb(s) != nullptr; }
-
-// A bare word that is no verb and no program: almost always a typo'd verb
-// (`linuxity shel`). Say so, instead of trying to run it as a program. A
-// word the host or guest has a program for (`linuxity uname`) is not a typo.
-[[nodiscard]] std::string verb_suggestion(std::string_view s) {
-    if (s.empty() || s.find('/') != std::string_view::npos || s.front() == '-') return {};
-    auto on_path = [&](const std::string& root) {
-        for (const char* d : {"/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"})
-            if (::access((root + d + "/" + std::string{s}).c_str(), F_OK) == 0) return true;
-        return false;
-    };
-    if (on_path("")) return {};
-    lx::env::Store store;
-    if (const auto def = store.default_env(); !def.empty() && store.has(def))
-        if (on_path(store.load(def).config.rootfs)) return {};
-    std::string best;
-    std::size_t best_d = s.size() <= 3 ? 2 : 3;
-    for (const auto& v : lx::cli::kVerbTable) {
-        if (!lx::cli::verb_listed(v, lx::cli::host_runs_instances())) continue;
-        if (const auto d = lx::env::edit_distance(s, v.name); d < best_d) { best_d = d; best = std::string{v.name}; }
-    }
-    return best;
+// Called as `lx` (or lx.exe): argv[0]'s last part, without a suffix.
+bool called_as_lx(const char* argv0) {
+    std::string_view n = argv0;
+    if (const auto s = n.find_last_of('/'); s != std::string_view::npos) n.remove_prefix(s + 1);
+    return n == "lx";
 }
 #endif
 
@@ -416,23 +396,21 @@ bool is_verb(std::string_view s) { return lx::cli::find_verb(s) != nullptr; }
 
 int main(int argc, char** argv) {
 #if !defined(_WIN32)
-    // `linuxity` alone opens the default environment
+    if (called_as_lx(argv[0])) return lx_main(argc, argv);
     if (argc < 2) return lx_cli_main(argc, argv);
     const std::string_view sub = argv[1];
     if (sub == "help" && argc > 2 && std::string_view{argv[2]} == "--all") { usage(argv[0]); return 0; }
-    // the server side: an environment running in the background
-    if (sub == "up" || sub == "start") {
-        auto a = lx_with_default_env(argc, argv);
-        a[1] = "up";
-        return with_args(cmd_up, a);
+    // our own re-runs: an instance, a one-off run
+    if (sub == "__up") return cmd_up(argc, argv);
+    if (sub == "__run") return cmd_run(argc, argv);
+    // `linuxity lx ...` works where there's no lx symlink
+    if (sub == "lx") {
+        std::vector<std::string> a(argv + 1, argv + argc);
+        return with_args(lx_main, a);
     }
-    if (sub == "run") return with_args(cmd_run, lx_with_default_env(argc, argv));
-    if (is_verb(sub)) return lx_cli_main(argc, argv);
-    if (const auto s = verb_suggestion(sub); !s.empty()) {
-        std::fprintf(stderr, "linuxity: '%s' is not a command. Did you mean `linuxity %s`?  (linuxity help)\n",
-                     argv[1], s.c_str());
-        return 2;
-    }
+    // a flag or a path starts the engine on its own (linuxity --root DIR PROG,
+    // linuxity /bin/sh); a plain word is a verb. Verbs never contain '/'.
+    if (!sub.empty() && sub[0] != '-' && sub.find('/') == std::string_view::npos) return lx_cli_main(argc, argv);
 #endif
     // anything else: run one program, as linuxity always has
     Options o;
@@ -445,21 +423,6 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (i >= argc) { usage(argv[0]); return 2; }
-#if !defined(_WIN32)
-    // On a host that isn't Linux there is no "the host's /" to run a Linux
-    // program in, so `linuxity uname -a` means: in my default environment.
-    // (On Linux, no --root still means the host's own tree.)
-    if (o.root.empty() && o.env_name.empty() && !lx::cli::host_runs_instances()) {
-        const auto def = lx::env::Store{}.default_env();
-        if (!def.empty() && lx::env::Store{}.has(def)) {
-            std::vector<std::string> a = {argv[0], "run", def};
-            for (int j = 1; j < i; ++j) a.emplace_back(argv[j]);   // flags given
-            a.emplace_back("--");
-            for (int j = i; j < argc; ++j) a.emplace_back(argv[j]);
-            return with_args(cmd_run, a);
-        }
-    }
-#endif
     for (int j = i; j < argc; ++j) o.argv.emplace_back(argv[j]);
     setup_status(o);
     return lx::cli::host_run(o, argc, argv);

@@ -130,7 +130,7 @@ struct Field {
     std::string_view def;       // default as text, "" = none / automatic
     std::string_view doc;
     std::string_view choices;   // Type::choice: "a|b|c"
-    bool live;                  // `linuxity reload` applies it to a running instance
+    bool live;                  // a running instance applies it as soon as it's saved
     void (*set)(EnvConfig&, const Val&);
 };
 

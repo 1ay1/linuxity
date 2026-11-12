@@ -175,12 +175,12 @@ struct GuestEnv {
     if (!who && o.instance && o.user != "root") {
         // the instance itself runs fine without it; sessions say why
         g.notice = "login user " + o.user + " isn't in this environment; "
-                   "add it back with `linuxity adduser " + o.user + "`";
+                   "add it back with `linuxity user add " + o.user + "`";
         who = env::resolve_user(g.layers, "root");
     }
     if (!who) {
         g.error = "there's no user '" + o.user + "' in this environment (a reset removes users). "
-                  "Add it back with `linuxity adduser " + o.user + "`, or use `--user root`";
+                  "Add it back with `linuxity user add " + o.user + "`, or use `-u root`";
         return g;
     }
     g.login = *who;

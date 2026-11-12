@@ -1,9 +1,9 @@
 #!/bin/bash
 # linuxity smoke test: everything a user does in the first hour.
 # Run it as root inside an environment, e.g. on the phone through the app's
-# instance: `linuxity exec <env> -T --user root -- /bin/bash smoke.sh`.
+# instance: `lx @<env> -T -u root /bin/bash smoke.sh`.
 # Needs network; installs git python sqlite tmux vim, and expects a user
-# `ayush` with sudo (`linuxity env adduser <env> ayush`).
+# `ayush` with sudo (`linuxity user @<env> add ayush`).
 pass=0; fail=0
 t() {  # t "name" cmd...
   local name=$1; shift

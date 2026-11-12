@@ -23,11 +23,19 @@ done
 for v in $("$L" __complete ""); do
     "$L" help | grep -q "^  linuxity $v\b" || { echo "FAIL: completion offers '$v', help doesn't list it"; fail=1; }
 done
-check "typo"        "Did you mean \`linuxity shell\`" "$L" shel
-check "bad verb help" "no command 'nope'" "$L" help nope
+check "help has lx"   "lx @ENV"                           "$L" help
+check "old verb"      "is now \`lx\`"                     "$L" shell
+check "old set"       "linuxity config KEY=VALUE"         "$L" set
+check "typo"          "Did you mean \`linuxity config\`"  "$L" confg
+check "program"       "lx sh"                             "$L" sh
+check "bad verb help" "no command 'nope'"                 "$L" help nope
 check "images complete" "alpine" "$L" __complete new ""
-check "keys complete" "system.hostname" "$L" __complete set system.h
-check "no env yet" "linuxity new alpine" "$L" list
+check "keys complete" "system.hostname=" "$L" __complete config system.h
+check "lx flags complete" "--temp" "$L" __complete lx -
+check "no env yet"    "linuxity new alpine" "$L" ls
+check "lx no env"     "linuxity new alpine" "$L" lx
+check "rm needs name" "the name is required" "$L" rm
+check "version"       "linuxity " "$L" version
 for sh in bash zsh fish; do
     check "completion $sh" "__complete" "$L" completion "$sh"
 done

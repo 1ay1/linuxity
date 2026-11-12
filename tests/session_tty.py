@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A login shell from `linuxity shell` must survive what people do in one.
+"""A login shell from `lx` must survive what people do in one.
 
 Regression for the Mac "logs out on its own" bug: after any external
 command, bash handed the terminal back to a process group the host didn't
@@ -11,12 +11,12 @@ usage: session_tty.py LINUXITY ENV      (skips, exit 77, without an env)
 import os, pty, re, select, signal, struct, subprocess, sys, termios, fcntl, time
 
 lx, env = sys.argv[1], sys.argv[2]
-if subprocess.run([lx, "path", env], capture_output=True).returncode != 0:
+if subprocess.run([lx, "info", env], capture_output=True).returncode != 0:
     print(f"session_tty: skipped (no environment '{env}')"); sys.exit(77)
 
 pid, fd = pty.fork()
 if pid == 0:
-    os.execvp(lx, [lx, "shell", env, "-u", "root"])
+    os.execvp(lx, [lx, "lx", "@" + env, "-u", "root"])
 fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
 buf = b""
 def pump(t):

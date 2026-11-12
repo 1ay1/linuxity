@@ -4,14 +4,14 @@ An environment is a rootfs plus everything you'd want to tune about the
 Linux system on top of it: hostname, user, shell, DNS, limits, mounts,
 services. It's described by one file, `env.vibe`, written in
 [VIBE](https://github.com/1ay1/vibe). Frontends (the Android app, a settings
-UI) edit the same file through `linuxity env set` or the JSON schema.
+UI) edit the same file through `linuxity config` or the JSON schema.
 
 ```sh
-linuxity env create arch ~/arch/root.x86_64
-linuxity env adduser arch ayush
-linuxity env set arch login.user ayush
-linuxity env set arch system.hostname pixel
-linuxity shell arch            # starts it if needed, opens a login shell
+linuxity new ~/arch/root.x86_64 arch
+linuxity user @arch add ayush
+linuxity config @arch login.user=ayush
+linuxity config @arch system.hostname=pixel
+lx @arch                       # starts it if needed, opens a login shell
 ```
 
 ## Layout
@@ -32,9 +32,9 @@ Because the rootfs is read-only and all writes land in `upper/`, these are
 cheap and safe:
 
 ```sh
-linuxity env snapshot arch before-upgrade
-linuxity env restore arch before-upgrade
-linuxity env reset arch          # back to the clean image
+linuxity snap @arch save before-upgrade
+linuxity snap @arch restore before-upgrade
+linuxity reset arch              # back to the clean image
 ```
 
 ## env.vibe
@@ -79,13 +79,13 @@ service {
 }
 ```
 
-`linuxity env check <name>` validates it. Unknown keys are warnings with a
+`linuxity info <name>` validates it. Unknown keys are warnings with a
 "did you mean" hint; a wrong type is an error, and an env with errors won't
-start. `linuxity env set` edits the file in place and keeps your comments.
+start. `linuxity config` edits the file in place and keeps your comments.
 
 ## Keys
 
-`linuxity env schema` prints all of this as JSON (type, default, doc,
+`linuxity config --schema` prints all of this as JSON (type, default, doc,
 choices, and whether it applies live). That output is what a settings
 screen should be built from.
 
@@ -147,34 +147,36 @@ Every key also has a flag for one-off runs: `--hostname`, `--user`,
 
 There are two ways to run an environment.
 
-`linuxity run <env> [-- cmd ...]` runs one program as pid 1 in the
-foreground, the same way plain `linuxity --root ...` always has.
+`lx --temp [@env] [cmd ...]` runs one program as pid 1 in a run of its own,
+in the foreground, the same way plain `linuxity --root ...` always has.
+Changes are discarded at exit. `lx -v HOST:GUEST [cmd ...]` is also a run
+of its own, with a host folder mounted.
 
-`linuxity up <env>` starts an **instance**: one linuxity kernel that keeps
+`linuxity start <env>` starts an **instance**: one linuxity kernel that keeps
 running in the background. It has its own pid 1, and every session and
 service shares one process table, one set of SysV IPC, one hostname. So two
 terminal tabs see each other's processes, and a server started in one keeps
 running when the tab closes.
 
 ```sh
-linuxity up arch
-linuxity shell arch                 # a login shell on a fresh pty
-linuxity exec arch -- make -j8      # a command, output on your terminal
+linuxity start arch
+lx @arch                            # a login shell on a fresh pty
+lx @arch make -j8                   # a command, output on your terminal
 linuxity ps arch
-linuxity kill arch 42 TERM
-linuxity svc arch restart sshd
-linuxity logs arch sshd -f
-linuxity status arch
-linuxity down arch
+lx @arch kill -TERM 42              # guest pids are the env's own
+linuxity svc @arch restart sshd
+linuxity logs @arch sshd -f
+linuxity info arch
+linuxity stop arch
 ```
 
-`shell` and `exec` start the instance if it isn't running. Exit codes come
-back from the session. `-t`/`-T` force a pty on or off.
+`lx` starts the instance if it isn't running; later `lx` calls join it.
+Exit codes come back from the session. `-t`/`-T` force a pty on or off.
 
 ### Reload
 
-After an edit (`env set` does this for you), `linuxity reload <env>`
-applies what it can to the running instance: the hostname, DNS, and
+After an edit (`linuxity config` does this for you), `linuxity start <env>`
+on a running env applies what it can to it: the hostname, DNS, and
 services (new ones start, removed ones stop). Anything else is reported as
 needing a restart.
 
@@ -253,7 +255,7 @@ Answer every bridge event with `bridge-reply` (for `paste`, put the text in
 
 ## Status events
 
-`--status-fd N` (on any run, `up` or `run`) writes what the runtime
+`--status-fd N` (on any run, `start` or `lx --temp`) writes what the runtime
 decided as JSON lines to fd N, so a frontend doesn't have to scrape
 stderr. Each has `event` and a human `text`:
 
@@ -269,17 +271,17 @@ stderr. Each has `event` and a human `text`:
 ```
 
 `--quiet` drops the stderr copies. A running instance also replays them in
-`status` under `notes`.
+`linuxity info` under `notes`.
 
 ## Users
 
 ```sh
-linuxity env adduser arch ayush              # sudo without a password
-linuxity env adduser arch ayush --password   # asks; sudo asks for it too
-linuxity env users arch
+linuxity user @arch add ayush                # sudo without a password
+linuxity user @arch add ayush --password     # asks; sudo asks for it too
+linuxity user @arch
 ```
 
-`adduser` does the whole job in one step, inside the running instance:
+`user add` does the whole job in one step, inside the running instance:
 
 - creates the user with the image's own `useradd` (or busybox `adduser`),
   with a home dir and their own group. Running it again for an existing user

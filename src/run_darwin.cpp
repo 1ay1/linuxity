@@ -1160,9 +1160,8 @@ int cli::host_run(Options& o, int, char**) {
     process_start();
     if (o.instance) {
         // The CLI never asks for one here (host_runs_instances); a direct
-        // `linuxity up` on a Mac lands here.
-        std::fputs("linuxity: environments run in the foreground on macOS: "
-                   "`linuxity shell` or `linuxity run` (no `up` needed)\n", stderr);
+        // `linuxity __up` on a Mac lands here.
+        std::fputs("linuxity: environments run in the foreground on macOS: just use lx\n", stderr);
         return 2;
     }
     if (o.root.empty()) {
@@ -1170,7 +1169,7 @@ int cli::host_run(Options& o, int, char**) {
         // a distro to run them in.
         std::fprintf(stderr,
             "linuxity: '%s' needs a Linux environment to run in, and you don't have one yet:\n"
-            "  linuxity new alpine        a 4 MB distro; then `linuxity %s` just works\n"
+            "  linuxity new alpine        a 4 MB distro; then `lx %s` just works\n"
             "  linuxity --root DIR %s     or use an extracted aarch64 rootfs\n",
             o.argv[0].c_str(), o.argv[0].c_str(), o.argv[0].c_str());
         return 2;

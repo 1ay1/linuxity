@@ -377,8 +377,8 @@ private:
         auto u = env::resolve_user(h_.layers, who);
         if (!u) {
             close_fds();
-            why = "there's no user '" + who + "' in " + o_.env_name + " (a reset removes users). Add it back with `linuxity adduser " +
-                  o_.env_name + " " + who + "`, or log in as root with `-u root`";
+            why = "there's no user '" + who + "' in " + o_.env_name + " (a reset removes users). Add it back with `linuxity user @" +
+                  o_.env_name + " add " + who + "`, or log in as root with `-u root`";
             return 0;
         }
         const std::string shell = !o_.shell.empty() && spec.user.empty() ? o_.shell : u->shell;

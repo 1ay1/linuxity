@@ -165,7 +165,7 @@ Run as root, it runs everything twice -- as root, then as an ordinary user --
 because permission rules are half the kernel:
 
 ```sh
-linuxity run ubuntu --user root --bind "$PWD/tests:/mnt/t" -- python3 /mnt/t/oracle.py
+lx @ubuntu -u root -v "$PWD/tests:/mnt/t" python3 /mnt/t/oracle.py
 # inside the guest:
 python3 /mnt/t/oracle.py net tty -v     # some suites, with tracebacks
 python3 /mnt/t/fs_torture.py rename     # one suite, checks matching a word
@@ -337,7 +337,7 @@ linuxity's subsystems or **forwarded** to the host kernel acting on the guest.
   Android, and every command.
 - **[doc/ENVIRONMENTS.md](doc/ENVIRONMENTS.md)** — named environments:
   `env.vibe` (hostname, user, shell, DNS, limits, mounts, services), snapshots
-  and reset, the long-running instance (`up`, `shell`, `exec`, `ps`, `svc`),
+  and reset, the long-running instance (`start`, `lx`, `ps`, `svc`),
   the host bridge, and the JSON control protocol frontends use.
 - **[doc/ARCHITECTURE.md](doc/ARCHITECTURE.md)** — the internals: the trap
   backend, syscall fates, the seccomp filter, the filesystem namespace and

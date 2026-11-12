@@ -6,8 +6,10 @@ run at full native speed on your CPU; linuxity sits between them and the
 kernel, so they see their own `/`, their own users, their own hostname and
 their own process list.
 
-It's one binary, `linuxity`. It's the command you type and also the thing
-that keeps an environment running in the background.
+It's one binary with two names. `lx` runs things in an environment;
+`linuxity` manages environments. The same binary also keeps an environment
+running in the background. Where there's no `lx` symlink, `linuxity lx ...`
+does the same thing.
 
 ---
 
@@ -38,7 +40,7 @@ that keeps an environment running in the background.
 
 ```sh
 linuxity new ubuntu          # download, verify, unpack; asks for your user name
-linuxity                     # a shell in it
+lx                           # a shell in it
 ```
 
 That's it. Inside you're a normal user with `sudo`, `apt` works, and the
@@ -46,7 +48,7 @@ hostname is `ubuntu`. Leave with `exit`; the environment keeps running in the
 background so a second terminal joins the same system:
 
 ```sh
-linuxity exec -- htop        # in another terminal: same processes, same files
+lx htop                      # in another terminal: same processes, same files
 linuxity stop                # when you're done
 ```
 
@@ -56,9 +58,13 @@ linuxity stop                # when you're done
 
 **Environment.** A distro plus its settings. It has a name (`ubuntu`, `dev`,
 `arch`), a root filesystem, and a config file `env.vibe`. You can have as
-many as you like. One of them is the **default**: plain `linuxity` opens it,
-and any command that takes an environment name uses it when you leave the
-name out.
+many as you like. One of them is the **default**: plain `lx` opens it, and
+any command that takes an environment uses it when you leave the name out.
+`linuxity use NAME` changes the default.
+
+**`@NAME`.** To pick another environment, put `@NAME` in the command:
+`lx @dev` opens a shell in `dev`, `lx @dev make` runs `make` there, and
+`linuxity config @dev` shows its settings. `@NAME` works on any command.
 
 **Image and changes.** The distro's files (the image) are never modified.
 Everything you change, install or delete is recorded in a separate layer next
@@ -67,8 +73,8 @@ to it. That's why reset and snapshots are instant and safe.
 **Instance.** When you open a shell, linuxity starts the environment once in
 the background. Every shell, command and service after that joins the same
 running system: they share one process list, one hostname, one set of IPC.
-`linuxity stop` ends it. `linuxity run` is the exception: it runs one program
-on its own, in the foreground, and ends with it.
+`linuxity stop` ends it. `lx --temp` and `lx -v` are the exception: they run
+one program on its own, in the foreground, and end with it.
 
 **Root without root.** Inside, you can be root, install packages, `chown`
 files and run `sudo`, but none of it needs or gets real root on your machine.
@@ -82,7 +88,7 @@ they'd expect.
 ### From the catalog
 
 ```sh
-linuxity images              # what's available for this CPU
+linuxity new                 # what's available for this CPU
 linuxity new alpine          # named "alpine"
 linuxity new ubuntu dev      # named "dev"
 ```
@@ -117,11 +123,11 @@ The first environment you make becomes the default.
 ### Your own rootfs
 
 ```sh
-linuxity import mydistro rootfs.tar.gz      # .tar, .tar.gz, .tar.xz, .tar.zst
-linuxity import work ~/some/extracted/root  # a directory is used in place, never written to
+linuxity new rootfs.tar.gz mydistro         # .tar, .tar.gz, .tar.xz, .tar.zst
+linuxity new ~/some/extracted/root work     # a directory is used in place, never written to
 ```
 
-`import` accepts a tarball that wraps everything in one top directory, and
+`new FILE|DIR [NAME]` accepts a tarball that wraps everything in one top directory, and
 takes `--user NAME` or `--root` like `new`. The CPU has to match: an aarch64
 rootfs won't run on an x86-64 machine (linuxity runs code natively and has no
 emulator).
@@ -129,28 +135,28 @@ emulator).
 ### Managing them
 
 ```sh
-linuxity list                # all of them, running or stopped
-linuxity default dev         # what plain `linuxity` opens
-linuxity rename dev work
+linuxity ls                  # all of them, running or stopped
+linuxity use dev             # what plain `lx` opens
+linuxity mv dev work
 linuxity rm work             # asks first; --yes to skip
 ```
 
 `rm` deletes the environment and everything in it. If it was imported from a
-directory, that directory itself is kept. `rm`, `reset`, `restore` and
-`rename` always need the name typed out; they never fall back to the default.
+directory, that directory itself is kept. `rm`, `reset` and `mv` always need
+the name typed out; they never fall back to the default.
 
 ---
 
 ## 4. Using an environment
 
 ```sh
-linuxity                          # login shell in the default env
-linuxity shell dev                # in a specific one
-linuxity exec -- make -j8         # run a command, output in your terminal
-linuxity exec dev -- python3 app.py
+lx                                # login shell in the default env
+lx @dev                           # in a specific one
+lx make -j8                       # run a command, output in your terminal
+lx @dev python3 app.py
 ```
 
-`exec` options:
+`lx` options:
 
 | | |
 |---|---|
@@ -159,45 +165,50 @@ linuxity exec dev -- python3 app.py
 | `-e KEY=VALUE` | set a variable (repeatable) |
 | `-t` / `-T` | force a terminal on / off (default: a terminal if you're in one) |
 
+Options come before the command. The first word that isn't an option starts
+the command, so `lx ls -la` works as is. For a command that starts with `-`,
+use `lx -- CMD`.
+
 A bare command name (`htop`) is looked up on the guest's `PATH`. The exit
-code is the program's, so `linuxity exec -- false` exits 1.
+code is the program's, so `lx false` exits 1.
 
 ### Background and status
 
 ```sh
 linuxity start               # start without opening a shell (services come up)
-linuxity status              # what's running, how limits are held, DNS, notes
+linuxity info                # what's running, how limits are held, DNS, notes
 linuxity ps                  # processes inside
-linuxity kill 1234           # signal one (TERM by default)
-linuxity kill 1234 KILL
+lx kill 1234                 # signal one (guest pids are the env's own)
+lx kill -KILL 1234
 linuxity stop                # stop everything in it
 ```
 
-`shell` and `exec` start the environment if it isn't running.
+The first `lx` starts the environment if it isn't running; later `lx` calls
+join it.
 
 ### One program on its own
 
 ```sh
-linuxity run -- uname -a          # pid 1, foreground, ends with the program
-linuxity run --fresh -- sh        # throwaway: changes are discarded at exit
-linuxity run -v ~/proj:/work -- make
+lx --temp uname -a                # throwaway: pid 1, foreground, changes discarded at exit
+lx --temp sh
+lx -v ~/proj:/work make           # a host folder mounted, foreground
 ```
 
-`run` is like `docker run`: it doesn't use or need the background instance.
-`--fresh` starts from the clean image (users you added later aren't in it,
-so it runs as root then).
+`--temp` and `-v` are like `docker run`: they don't use or need the
+background instance. `--temp` starts from the clean image (users you added
+later aren't in it, so it runs as root).
 
 ---
 
 ## 5. Users and sudo
 
 ```sh
-linuxity adduser ayush               # sudo, no password; new shells log in as ayush
-linuxity adduser ayush --password    # sudo asks for the password you set
-linuxity users                       # who can log in, who has sudo, the default
+linuxity user add ayush              # sudo, no password; new shells log in as ayush
+linuxity user add ayush --password   # sudo asks for the password you set
+linuxity user                        # who can log in, who has sudo, the default
 ```
 
-`adduser` does the whole job inside the environment:
+`user add` does the whole job inside the environment:
 
 - creates the user with a home directory and their own group, using the
   distro's own tools;
@@ -214,8 +225,8 @@ Running it again for an existing user updates that user.
 Switch who new shells log in as:
 
 ```sh
-linuxity set user=root
-linuxity exec -u root -- id          # just once
+linuxity config user=root
+lx -u root id                        # just once
 ```
 
 Inside, a normal user is held to normal permissions: `touch /etc/x` fails,
@@ -228,25 +239,25 @@ Inside, a normal user is held to normal permissions: `touch /etc/x` fails,
 Each environment's settings live in `env.vibe`. You rarely need to open it.
 
 ```sh
-linuxity get                         # every setting and its value
-linuxity get hostname
-linuxity set hostname=devbox
-linuxity set memory=2G cpus=2 timezone=Europe/Berlin
-linuxity set dns 1.1.1.1 9.9.9.9     # a list
-linuxity set env.EDITOR=nvim         # an environment variable
-linuxity set timezone=               # empty = back to the default
-linuxity edit                        # open env.vibe in $EDITOR
+linuxity config                      # every setting and its value
+linuxity config hostname
+linuxity config hostname=devbox
+linuxity config memory=2G cpus=2 timezone=Europe/Berlin
+linuxity config "dns=1.1.1.1 9.9.9.9"  # a list
+linuxity config env.EDITOR=nvim      # an environment variable
+linuxity config timezone=            # empty = back to the default
+linuxity config --edit               # open env.vibe in $EDITOR
 ```
 
 Short names work when they're unique (`hostname` = `system.hostname`,
 `memory` = `limits.memory`, `user` = `login.user`). Values are checked: a
-typo gets "did you mean", a wrong type is refused. `set` edits the file in
+typo gets "did you mean", a wrong type is refused. `config` edits the file in
 place and keeps your comments.
 
 **Live or restart.** Changes to hostname, DNS, the login user/shell/dir/
 command and services apply to the running environment immediately. Anything
-else says "restart it for this to take effect": `linuxity stop` then use it
-again.
+else says it applies the next time it starts: `linuxity stop` then use it
+again. After editing `env.vibe` by hand, `linuxity start` applies it.
 
 `env.vibe` looks like this:
 
@@ -286,7 +297,7 @@ service {
 }
 ```
 
-`linuxity check` validates it; an environment with errors won't start.
+`linuxity info` validates it; an environment with errors won't start.
 
 ---
 
@@ -335,7 +346,7 @@ Named entries:
 | `service.NAME.command` | a background program (see below) |
 | `service.NAME.user`, `.cwd`, `.autostart`, `.restart`, `.env.NAME` | its options |
 
-`linuxity schema` prints all of this as JSON.
+`linuxity config --schema` prints all of this as JSON.
 
 ---
 
@@ -345,8 +356,8 @@ A service is a program that runs in the background while the environment is
 up: a web server, `sshd`, a database.
 
 ```sh
-linuxity set service.web.command="python3 -m http.server 8000"
-linuxity set service.web.restart=always
+linuxity config service.web.command="python3 -m http.server 8000"
+linuxity config service.web.restart=always
 linuxity svc                    # list with state, pid, restarts
 linuxity svc restart web
 linuxity svc stop web
@@ -364,10 +375,10 @@ starting with the environment. Adding or removing a service applies live.
 ## 9. Snapshots, reset, export
 
 ```sh
-linuxity snapshot before-upgrade     # save the current state
-linuxity snapshots                   # list them
-linuxity restore dev before-upgrade  # go back (stop the env first)
-linuxity drop-snapshot dev before-upgrade
+linuxity snap save before-upgrade    # save the current state
+linuxity snap                        # list them
+linuxity snap @dev restore before-upgrade  # go back (stops the env first)
+linuxity snap @dev rm before-upgrade
 linuxity reset dev                   # back to the freshly made state
 ```
 
@@ -377,8 +388,8 @@ A snapshot saves your changes and settings, not the image, so it's small.
 Move an environment somewhere else, or make a template:
 
 ```sh
-linuxity export dev dev.tar.gz       # everything as it looks inside
-linuxity import dev2 dev.tar.gz      # anywhere with the same CPU
+linuxity export @dev dev.tar.gz      # everything as it looks inside
+linuxity new dev.tar.gz dev2         # anywhere with the same CPU
 ```
 
 ---
@@ -386,12 +397,12 @@ linuxity import dev2 dev.tar.gz      # anywhere with the same CPU
 ## 10. Sharing files with the host
 
 ```sh
-linuxity set mount.code.host=/home/ayush/code mount.code.at=/code
-linuxity exec -- ls /code
+linuxity config mount.code.host=/home/ayush/code mount.code.at=/code
+lx ls /code
 ```
 
 A mount shows a host folder inside the environment. Writes go straight to
-the real files. For one run, `linuxity run -v ~/proj:/work -- make`.
+the real files. For one run, `lx -v ~/proj:/work make`.
 
 Everything else inside is kept apart from your system: a program writing to
 `/etc` or `/usr` changes the environment's copy only.
@@ -413,20 +424,20 @@ notify-send "build done" "all green"
 On a desktop they use the host's `xdg-open`, `wl-copy`, `wl-paste` and
 `notify-send`. In the Android app they open the phone's chooser, use its
 clipboard and post real notifications. Turn it off with
-`linuxity set bridge.enabled=false`.
+`linuxity config bridge.enabled=false`.
 
 ---
 
 ## 12. Resource limits
 
 ```sh
-linuxity set memory=2G cpus=1.5 pids=512 cpuset=0-3
+linuxity config memory=2G cpus=1.5 pids=512 cpuset=0-3
 ```
 
 Programs inside are told the same numbers (`nproc`, `free`, `/proc/meminfo`),
 so they size themselves to the limit.
 
-How each limit is held depends on the host. `linuxity status` says which:
+How each limit is held depends on the host. `linuxity info` says which:
 
 | limit | with cgroups (most Linux desktops) | without (Android, some containers) |
 |---|---|---|
@@ -436,8 +447,8 @@ How each limit is held depends on the host. `linuxity status` says which:
 | `pids` | exact | enforced by linuxity |
 | `cpuset` | exact | enforced (CPU affinity) |
 
-`linuxity run` gets exact cgroup limits through `systemd-run` where
-available. A background environment started with `start`/`shell` uses them
+`lx --temp` and `lx -v` get exact cgroup limits through `systemd-run` where
+available. A background environment started with `start`/`lx` uses them
 only if your own session already delegates the controllers.
 
 ---
@@ -493,8 +504,8 @@ answers their syscalls (no Linux kernel, no Docker). Pick the aarch64
 images: `linuxity new alpine` does.
 
     linuxity new alpine
-    linuxity                   # a shell
-    linuxity uname -a          # any command: runs in your default environment
+    lx                         # a shell
+    lx uname -a                # any command: runs in your default environment
 
 Things that are different on a Mac:
 
@@ -504,11 +515,11 @@ Things that are different on a Mac:
   (no root, a few seconds, grows as needed) and attached at
   `$LINUXITY_HOME/envs` whenever it isn't -- invisible in Finder. Existing
   environments are moved onto it the first time.
-- An environment runs while a `shell`, `exec` or `run` is open; there's no
+- An environment runs while an `lx` is open; there's no
   background instance, so `start`, `ps`, `svc` and `logs` don't apply and
-  `list` shows it as `ready`. Files and settings persist exactly the same.
+  `ls` shows it as `ready`. Files and settings persist exactly the same.
 - Users, `su` and `sudo` work as on Linux: `--user`, `login.user` and
-  `linuxity adduser` give a real unprivileged user, and a setuid `sudo`
+  `linuxity user add` give a real unprivileged user, and a setuid `sudo`
   raises it to root.
 - The binary must carry the `com.apple.security.hypervisor` entitlement
   (the build signs it ad hoc); without it linuxity says how to sign it.
@@ -531,24 +542,24 @@ Things that are different on a Mac:
     run/                            control socket, pid (while running)
 ```
 
-`linuxity path dev` prints an environment's directory, `linuxity info dev`
-shows its size, snapshots and state. Scratch files go in `/tmp`, or in
+`linuxity info dev` shows an environment's config path, rootfs, size,
+snapshots and state. Scratch files go in `/tmp`, or in
 `$LINUXITY_TMPDIR` if set.
 
 ---
 
 ## 16. Scripting and JSON
 
-Most read commands take `--json`: `list`, `status`, `ps`, `users`, `info`,
-`check`, `images`, `snapshots`. `linuxity schema` describes every setting.
+Most read commands take `--json`: `ls`, `info`, `ps`, `user`, `config`,
+`new`, `snap`. `linuxity config --schema` describes every setting.
 
 ```sh
-linuxity status --json | jq .services
-linuxity exec -T -- sh -c 'cat /etc/os-release' > os.txt
-printf 'secret\n' | linuxity adduser bob --password-stdin
+linuxity info --json | jq .live.services
+lx -T sh -c 'cat /etc/os-release' > os.txt
+printf 'secret\n' | linuxity user add bob --password-stdin
 ```
 
-`--status-fd N` on `run`/`start` writes what the runtime decided (DNS
+`--status-fd N` on `lx --temp`/`start` writes what the runtime decided (DNS
 source, how limits are held, compat fallbacks, ready, service state changes)
 as JSON lines to file descriptor N.
 
@@ -563,18 +574,19 @@ Frontends drive a running environment over its control socket
 | you see | do |
 |---|---|
 | `No Linux environments yet` | `linuxity new ubuntu` |
-| `which environment?` | name it, or `linuxity default NAME` |
-| `restart it for this to take effect` | `linuxity stop`, then use it again |
-| `no user 'X' in the guest's /etc/passwd` | `linuxity adduser X`, or `linuxity set user=root` |
+| `which environment?` | name it, or `linuxity use NAME` |
+| `applies the next time it starts` | `linuxity stop`, then use it again |
+| `no user 'X' in the guest's /etc/passwd` | `linuxity user add X`, or `linuxity config user=root` |
 | `foreign-architecture binary` | the rootfs is for another CPU; use one built for this machine |
 | `this system has no curl or wget` | install one, or download the image yourself and pass `--file` |
 | `...is zstd-compressed and this system has no zstd` | install `zstd` |
 | `doesn't match its checksum` | the download was damaged; run `new` again |
-| `sudo: unable to resolve host` | `linuxity set network.manage-hosts=true` |
-| a command hangs or misbehaves | `linuxity logs`, then `linuxity set debug.trace=/tmp/trace.txt`, restart, reproduce |
-| something's broken beyond repair | `linuxity reset NAME` (or `restore` a snapshot) |
+| `sudo: unable to resolve host` | `linuxity config network.manage-hosts=true` |
+| a command hangs or misbehaves | `linuxity logs`, then `linuxity config debug.trace=/tmp/trace.txt`, restart, reproduce |
+| something's broken beyond repair | `linuxity reset NAME` (or `linuxity snap @NAME restore SNAP`) |
+| an old command (`shell`, `exec`, `run`, `list`, `set`, ...) | it prints the command that replaced it; use that |
 
-`linuxity status` shows notes about what the runtime had to work around on
+`linuxity info` shows notes about what the runtime had to work around on
 this host (no FIFOs, abstract sockets, refused syscalls), which usually
 explains odd behaviour.
 
@@ -582,10 +594,12 @@ explains odd behaviour.
 
 ## 18. Command reference
 
-`[ENV]` can be left out to use the default environment. `linuxity help` lists
-every command this host supports; `linuxity help VERB` shows one.
+`[ENV]` can be left out to use the default environment. `@ENV` picks another
+one on any command. `linuxity help` lists every command this host supports;
+`linuxity help VERB` shows one, and `linuxity help lx` shows `lx`.
 
-Tab completion (verbs, environments, settings, snapshots, distros):
+Tab completion (verbs, environments, settings, snapshots, distros). It
+covers both `linuxity` and `lx`:
 
     echo 'source <(linuxity completion bash)' >> ~/.bashrc
     echo 'source <(linuxity completion zsh)'  >> ~/.zshrc
@@ -593,29 +607,37 @@ Tab completion (verbs, environments, settings, snapshots, distros):
 
 | command | |
 |---|---|
-| `linuxity` | shell in the default environment |
+| `lx` | login shell in the default environment |
+| `lx [OPTIONS] CMD [ARGS]` | run a command; options `-u USER`, `-C DIR`, `-e K=V`, `-t`/`-T`; `lx -- CMD` if it starts with `-` |
+| `lx @ENV [CMD ...]` | the same, in another environment |
+| `lx --temp [CMD ...]` | throwaway run: pid 1, foreground, changes discarded, clean image as root |
+| `lx -v HOST:GUEST [CMD ...]` | a run of its own with a host folder mounted |
+| `lx kill PID` | signal a process (guest pids) |
+| `new` | list downloadable distros |
 | `new DISTRO[:VERSION] [NAME]` | download and set up (`--user`, `--root`, `--password`, `--file`, `--checksum`, `--no-verify`) |
-| `import NAME FILE\|DIR` | from your own rootfs (`--user`, `--root`) |
-| `export [ENV] FILE` | write it out as a tarball (`.gz` compresses) |
-| `images` | the catalog |
-| `list` | environments |
-| `default [ENV]` | show or set the default |
-| `rename OLD NEW` | |
+| `new FILE\|DIR [NAME]` | from your own rootfs (`--user`, `--root`) |
+| `ls` | environments |
+| `info [ENV]` | config path, rootfs, size, settings, errors, snapshots; when running: uptime, processes, limits, bridge, notes |
+| `use ENV` | set the default |
+| `mv OLD NEW` | rename |
 | `rm ENV` | delete (`--yes`) |
-| `shell [ENV]` | login shell (`-u USER`) |
-| `exec [ENV] [-u U] [-C DIR] [-e K=V] [-t\|-T] -- CMD` | run a command |
-| `run [ENV] [--fresh] [-v H:G] [-e K=V] [-- CMD]` | one program, foreground |
-| `start [ENV]` / `stop [ENV]` | background on / off |
-| `status [ENV]` / `ps [ENV]` / `kill [ENV] PID [SIG]` | |
-| `get [ENV] [KEY]` / `set [ENV] K=V ...` / `unset [ENV] KEY` | settings |
-| `edit [ENV]` / `check [ENV]` / `info [ENV]` / `path [ENV]` | |
-| `reload [ENV]` | apply `env.vibe` edits made by hand |
-| `adduser [ENV] USER` | user with sudo (`--password`, `--password-stdin`, `--no-sudo`, `--no-default`, `--shell`) |
-| `users [ENV]` | login users |
-| `svc [ENV] [list\|start\|stop\|restart NAME]` | services |
-| `logs [ENV] [SERVICE] [-f]` | |
-| `snapshot [ENV] NAME` / `snapshots [ENV]` | |
-| `restore ENV NAME` / `drop-snapshot ENV NAME` / `reset ENV` | |
-| `schema` | every setting, as JSON |
-| `help` / `help --all` / `version` | |
-| `linuxity [FLAGS] PROGRAM [ARGS]` | one-off run (section 13) |
+| `export [@ENV] FILE` | write it out as a tarball (`.gz` compresses) |
+| `config [@ENV]` | list every setting |
+| `config KEY` / `config KEY=VALUE ...` / `config KEY=` | show one / set / reset to default |
+| `config --edit` / `config --schema` | open `env.vibe` in `$EDITOR` / every setting as JSON |
+| `user [@ENV]` | login users |
+| `user [@ENV] add NAME` | user with sudo (`--password`, `--password-stdin`, `--no-sudo`, `--no-default`, `--shell PATH`) |
+| `snap [@ENV]` | list snapshots |
+| `snap [@ENV] save\|restore\|rm NAME` | save, restore (stops the env first), delete |
+| `reset ENV` | back to the clean image |
+| `start [ENV]` | start in the background; on a running env, apply `env.vibe` edits |
+| `stop [ENV]` | stop it |
+| `ps [ENV]` | processes |
+| `svc [@ENV] [start\|stop\|restart NAME]` | services |
+| `logs [@ENV] [SERVICE] [-f]` | |
+| `help` / `help VERB` / `help lx` / `help --all` | `--all` adds engine flags |
+| `completion bash\|zsh\|fish` / `version` | |
+| `linuxity [FLAGS] PROGRAM [ARGS]` | one-off engine run (section 13) |
+
+Old commands (`shell`, `exec`, `run`, `list`, `set`, ...) print the command
+that replaced them.

@@ -1,13 +1,14 @@
-// src/cli.cpp -- the commands that don't run a guest themselves:
+// src/cli.cpp -- the two front doors, on the POSIX hosts:
 //
-//   linuxity env ...            manage environments (env.vibe, upper, snapshots)
-//   linuxity shell <env>        a login shell in a running instance
-//   linuxity exec <env> -- cmd  run a command there
-//   linuxity ps|kill|status|svc|logs|reload|down <env>
+//   lx [@ENV] [-u U] [-C DIR] [-e K=V] [--temp] [-v H:G] [CMD...]   run things
+//   linuxity VERB ...                                                manage environments
 //
-// shell/exec start the instance if it isn't running. Everything here talks
-// to the instance through its control socket (env/control.hpp); no kernel
-// headers, so this file builds fast.
+// The verbs are listed once, in verbs.hpp. `lx` starts the instance if it
+// isn't running and joins it; everything talks to the instance through its
+// control socket (env/control.hpp). No kernel headers, so this builds fast.
+//
+// Re-runs of ourselves use hidden verbs that main.cpp handles: `__up ENV`
+// (the instance) and `__run ENV FLAGS -- CMD` (a one-off foreground run).
 #include "linuxity/env/archive.hpp"
 #include "linuxity/env/catalog.hpp"
 #include "linuxity/env/config.hpp"
@@ -82,38 +83,56 @@ bool has_flag(int argc, char** argv, std::string_view f) {
 
 using lx::host::self_exe;
 
+void help_lx() {
+    static constexpr std::pair<const char*, const char*> kRun[] = {
+        {"lx", "a shell in your default environment"},
+        {"lx CMD [ARGS...]", "run a command in it"},
+        {"lx @ENV [CMD...]", "the same, in another environment"},
+        {"lx -u USER -C DIR -e K=V ...", "as USER, in DIR, with K=V set (-t/-T: tty or not)"},
+        {"lx --temp [CMD...]", "a throwaway run: its changes are gone when it exits"},
+        {"lx -v HOST:GUEST [CMD...]", "a run of its own with a host folder mounted"},
+    };
+    std::printf("%s\n", bold("Run").c_str());
+    for (const auto& [u, s] : kRun) std::printf("  %-36s %s\n", u, dim(s).c_str());
+}
+
 // Help, from the verb table (src/verbs.hpp): grouped, aligned, and only
 // what this host can do.
 void help() {
     using namespace lx::cli;
     const bool bg = host_runs_instances();
     std::printf("%s\n\n", bold("linuxity: Linux, without a VM.").c_str());
-    std::printf("  %-34s %s\n", "linuxity", dim("a shell in your default environment").c_str());
-    if (!bg) std::printf("  %-34s %s\n", "linuxity CMD [ARGS...]", dim("run CMD in it (e.g. linuxity uname -a)").c_str());
+    help_lx();
     static constexpr std::pair<VerbGroup, const char*> kGroups[] = {
-        {VerbGroup::environments, "Environments"}, {VerbGroup::use, "Using one"},
-        {VerbGroup::running, "In the background"}, {VerbGroup::settings, "Settings and users"},
-        {VerbGroup::state, "Snapshots"}, {VerbGroup::other, "Other"}};
+        {VerbGroup::environments, "Environments"}, {VerbGroup::settings, "Settings"},
+        {VerbGroup::state, "Snapshots"}, {VerbGroup::running, "In the background"},
+        {VerbGroup::other, "Other"}};
     for (const auto& [g, title] : kGroups) {
         bool any = false;
         for (const auto& v : kVerbTable) {
             if (v.group != g || !verb_listed(v, bg)) continue;
             if (!any) { std::printf("\n%s\n", bold(title).c_str()); any = true; }
-            std::printf("  linuxity %-25s %s\n", std::string{v.usage}.c_str(), dim(v.summary).c_str());
+            const std::string u{v.usage};
+            if (u.size() <= 27) std::printf("  linuxity %-27s %s\n", u.c_str(), dim(v.summary).c_str());
+            else std::printf("  linuxity %s\n  %-36s %s\n", u.c_str(), "", dim(v.summary).c_str());
         }
     }
     std::puts(
         "\n"
-        "ENV can be left out when you have a default (the first env you make is).\n"
-        "Run one program without an environment: linuxity --root DIR PROGRAM  (linuxity help --all).\n"
+        "@ENV picks an environment for any command; one that takes nothing else also takes\n"
+        "a bare ENV. Leave it out and the default is used (the first one you make).\n"
+        "The engine on its own, without an environment: linuxity help --all\n"
         "Environments live in $LINUXITY_HOME (default ~/.local/share/linuxity).");
 }
 
 // `linuxity help VERB`: that verb's line, and what it stands for.
 int help_verb(std::string_view name) {
     using namespace lx::cli;
-    const Verb* v = canonical_verb(name);
-    if (!v || v->usage.empty()) return fail("no command '" + std::string{name} + "' (linuxity help)");
+    if (name == "lx") { help_lx(); return 0; }
+    if (const auto to = moved_verb(name); !to.empty())
+        return fail("`linuxity " + std::string{name} + "` is now `" + std::string{to} + "`");
+    const Verb* v = find_verb(name);
+    if (!v) return fail("no command '" + std::string{name} + "' (linuxity help)");
     std::printf("linuxity %s\n    %s\n", std::string{v->usage}.c_str(), std::string{v->summary}.c_str());
     if (v->instances_only && !host_runs_instances())
         std::printf("    (needs background environments, which %s doesn't have)\n", host_name());
@@ -163,7 +182,7 @@ bool ensure_up(const std::string& name, Conn& c) {
     const ::pid_t pid = ::fork();
     if (pid < 0) { fail("fork failed"); return false; }
     if (pid == 0) {
-        ::execl(exe.c_str(), exe.c_str(), "up", name.c_str(), "--quiet", static_cast<char*>(nullptr));
+        ::execl(exe.c_str(), exe.c_str(), "__up", name.c_str(), "--quiet", static_cast<char*>(nullptr));
         ::_exit(127);
     }
     int st = 0;
@@ -177,10 +196,10 @@ bool need_running(const std::string& name, Conn& c) {
     if (!Store{}.has(name)) return false;
     if (!lx::cli::host_runs_instances())
         fail("on " + std::string{lx::cli::host_name()} + ", " + name +
-             " runs only while a `linuxity shell` or `exec` is open, so there is "
+             " runs only while an `lx` is open, so there is "
              "no live instance to ask");
     else
-        fail(name + " is not running (start it with `linuxity up " + name + "`)");
+        fail(name + " is not running (start it with `linuxity start " + name + "`)");
     return false;
 }
 
@@ -198,7 +217,7 @@ int run_foreground(const std::string& name, const std::vector<std::string>& argv
                    const std::string& user, const std::string& cwd,
                    const std::vector<std::pair<std::string, std::string>>& env,
                    int in_fd, int out_fd) {
-    std::vector<std::string> a = {self_exe(), "run", name, "--quiet"};
+    std::vector<std::string> a = {self_exe(), "__run", name, "--quiet"};
     if (!user.empty()) a.insert(a.end(), {"--user", user});
     if (!cwd.empty())  a.insert(a.end(), {"--cwd", cwd});
     for (const auto& [k, v] : env) a.insert(a.end(), {"-e", k + "=" + v});
@@ -364,12 +383,15 @@ int run_session(Conn& c, std::vector<std::string> argv, const std::string& user,
     return code;
 }
 
-// Shared by shell and exec: --user, --cwd, -e K=V, -t/-T, then [--] cmd.
+// What `lx` was asked: @ENV, -u, -C, -e K=V, -t/-T, --temp, -v H:G, then CMD.
+// Options end at the first word that isn't one, so `lx ls -la` is plain.
 struct SessionArgs {
-    std::string user, cwd;
-    std::vector<std::pair<std::string, std::string>> env;
+    std::string env, user, cwd;
+    std::vector<std::pair<std::string, std::string>> env_vars;
+    std::vector<std::string> volumes;
     std::vector<std::string> argv;
     int tty{-1};   // -1 auto
+    bool temp{false}, help{false};
 };
 
 bool parse_session_args(int argc, char** argv, int i, SessionArgs& a) {
@@ -380,35 +402,33 @@ bool parse_session_args(int argc, char** argv, int i, SessionArgs& a) {
             return argv[++i];
         };
         if (f == "--") { ++i; break; }
-        if (f == "--user" || f == "-u") { const char* v = need(); if (!v) return false; a.user = v; }
+        if (f.size() > 1 && f[0] == '@') {
+            if (!a.env.empty()) { fail("two environments: @" + a.env + " and " + std::string{f}); return false; }
+            a.env = f.substr(1);
+        }
+        else if (f == "--user" || f == "-u") { const char* v = need(); if (!v) return false; a.user = v; }
         else if (f == "--cwd" || f == "-C") { const char* v = need(); if (!v) return false; a.cwd = v; }
-        else if (f == "-e" || f == "--setenv") {
+        else if (f == "-v" || f == "--volume") { const char* v = need(); if (!v) return false; a.volumes.emplace_back(v); }
+        else if (f == "--temp") a.temp = true;
+        else if (f == "-h" || f == "--help") a.help = true;
+        else if (f == "-e" || f == "--env") {
             const char* v = need();
             if (!v) return false;
             const std::string kv = v;
             const auto eq = kv.find('=');
-            if (eq == std::string::npos || eq == 0) { fail("bad -e '" + kv + "'"); return false; }
-            a.env.emplace_back(kv.substr(0, eq), kv.substr(eq + 1));
+            if (eq == std::string::npos || eq == 0) { fail("bad -e '" + kv + "' (want NAME=value)"); return false; }
+            a.env_vars.emplace_back(kv.substr(0, eq), kv.substr(eq + 1));
         }
         else if (f == "-t") a.tty = 1;
         else if (f == "-T") a.tty = 0;
-        else if (!f.empty() && f[0] == '-') { fail("unknown option '" + std::string{f} + "'"); return false; }
+        else if (f.size() > 1 && f[0] == '-') {
+            fail("unknown option '" + std::string{f} + "' (lx --help). A command that starts with '-': lx -- CMD");
+            return false;
+        }
         else break;
     }
     for (; i < argc; ++i) a.argv.emplace_back(argv[i]);
     return true;
-}
-
-int cmd_shell(int argc, char** argv, bool exec) {
-    if (argc < 3) return fail(exec ? "usage: linuxity exec <env> [options] -- cmd ..."
-                                   : "usage: linuxity shell <env> [--user U]");
-    SessionArgs a;
-    if (!parse_session_args(argc, argv, 3, a)) return 2;
-    if (exec && a.argv.empty()) return fail("exec needs a command");
-    Conn c;
-    if (!ensure_up(argv[2], c)) return fail("cannot start " + std::string{argv[2]});
-    const bool tty = a.tty >= 0 ? a.tty == 1 : (::isatty(0) && ::isatty(1));
-    return run_session(c, a.argv, a.user, a.cwd, a.env, tty);
 }
 
 // ---- simple requests -----------------------------------------------------------
@@ -436,29 +456,6 @@ int cmd_ps(int argc, char** argv) {
     return 0;
 }
 
-int signal_number(std::string_view s) {
-    if (s.starts_with("SIG")) s.remove_prefix(3);
-    if (!s.empty() && s.find_first_not_of("0123456789") == std::string_view::npos)
-        return std::atoi(std::string{s}.c_str());
-    static constexpr std::pair<std::string_view, int> kNames[] = {
-        {"HUP", SIGHUP}, {"INT", SIGINT}, {"QUIT", SIGQUIT}, {"KILL", SIGKILL}, {"USR1", SIGUSR1},
-        {"USR2", SIGUSR2}, {"TERM", SIGTERM}, {"CONT", SIGCONT}, {"STOP", SIGSTOP}, {"WINCH", SIGWINCH},
-    };
-    for (const auto& [n, v] : kNames) if (n == s) return v;
-    return -1;
-}
-
-int cmd_kill(int argc, char** argv) {
-    if (argc < 4) return fail("usage: linuxity kill <env> <pid> [signal]");
-    const int sig = argc > 4 ? signal_number(argv[4]) : SIGTERM;
-    if (sig < 0) return fail("unknown signal '" + std::string{argv[4]} + "'");
-    Conn c;
-    if (!need_running(argv[2], c)) return 1;
-    Json j;
-    j.obj().kv("op", "kill").kv("pid", static_cast<std::int64_t>(std::atoll(argv[3]))).kv("signal", sig).end();
-    return print_reply(request(c, j.text()));
-}
-
 std::string human_bytes(std::uint64_t b) {
     char buf[32];
     const char* u[] = {"B", "K", "M", "G", "T"};
@@ -469,30 +466,20 @@ std::string human_bytes(std::uint64_t b) {
     return buf;
 }
 
-int cmd_status(int argc, char** argv) {
-    if (argc < 3) return fail("usage: linuxity status <env> [--json]");
-    const bool json = has_flag(argc, argv, "--json");
+// The running instance's status reply (one JSON line), if it is running.
+std::optional<std::string> live_status(const std::string& name) {
     Conn c;
-    if (!connect_env(argv[2], c)) {
-        if (!Store{}.has(argv[2])) return 1;
-        if (json) std::puts(R"({"ok":true,"running":false})");
-        else if (!lx::cli::host_runs_instances())
-            std::printf("%s: ready (each `linuxity shell` runs it in the foreground)\n", argv[2]);
-        else std::printf("%s: not running\n", argv[2]);
-        return 0;
-    }
-    if (!control::send_line(c.fd, R"({"op":"status"})")) return fail("lost the connection");
+    if (!connect_env(name, c)) return std::nullopt;
+    if (!control::send_line(c.fd, R"({"op":"status"})")) return std::nullopt;
     std::string line;
-    if (!c.in.read_line(line)) return fail("lost the connection");
-    if (json) { std::puts(line.c_str()); return 0; }
-    const auto r = parse_json(line);
-    if (print_reply(r)) return 1;
-    std::printf("%s: running (pid %lld, up %llds)\n", r->str("env").c_str(),
-                static_cast<long long>(r->num("pid")), static_cast<long long>(r->num("uptime_s")));
-    std::printf("  hostname   %s\n  user       %s\n  rootfs     %s\n  processes  %lld\n",
-                r->str("hostname").c_str(), r->str("user").c_str(), r->str("rootfs").c_str(),
+    if (!c.in.read_line(line)) return std::nullopt;
+    return line;
+}
+
+// The live half of `linuxity info`: what only a running instance knows.
+void print_live(const JValue* r) {
+    std::printf("  up         %llds, %lld processes\n", static_cast<long long>(r->num("uptime_s")),
                 static_cast<long long>(r->num("processes")));
-    if (const auto l = r->str("limits"); !l.empty()) std::printf("  limits     %s\n", l.c_str());
     if (const auto b = r->str("bridge"); !b.empty()) std::printf("  bridge     %s\n", b.c_str());
     if (const JValue* ss = r->get("sessions"); ss && !ss->a.empty()) {
         std::puts("  sessions");
@@ -514,7 +501,6 @@ int cmd_status(int argc, char** argv) {
         for (const auto& e : n->a)
             if (const auto t = e.str("text"); !t.empty()) std::printf("    %s\n", t.c_str());
     }
-    return 0;
 }
 
 int cmd_svc(int argc, char** argv) {
@@ -529,7 +515,7 @@ int cmd_svc(int argc, char** argv) {
     const auto r = request(c, j.text());
     if (print_reply(r)) return 1;
     if (action == "list") {
-        if (has_flag(argc, argv, "--json")) { std::puts(R"(see `linuxity status --json`)"); return 0; }
+        if (has_flag(argc, argv, "--json")) { std::puts(R"(see `linuxity info --json`)"); return 0; }
         const JValue* sv = r->get("services");
         if (!sv || sv->a.empty()) { std::puts("no services (add one under `service` in env.vibe)"); return 0; }
         for (const auto& s : sv->a)
@@ -548,20 +534,6 @@ int cmd_down(int argc, char** argv) {
     // the instance closes the socket once it is gone
     std::string line;
     while (c.in.read_line(line)) {}
-    return 0;
-}
-
-int cmd_reload(int argc, char** argv) {
-    if (argc < 3) return fail("usage: linuxity reload <env>");
-    Conn c;
-    if (!need_running(argv[2], c)) return 1;
-    const auto r = request(c, R"({"op":"reload"})");
-    if (print_reply(r)) return 1;
-    const auto applied = r->strs("applied");
-    if (applied.empty()) std::puts("nothing changed that applies live");
-    for (const auto& a : applied) std::printf("applied %s\n", a.c_str());
-    if (r->flag("restart_needed"))
-        std::printf("other changes need a restart: linuxity stop %s, then use it again\n", argv[2]);
     return 0;
 }
 
@@ -878,7 +850,7 @@ std::optional<std::string> prompt_password(const char* what) {
 //                                   [--shell PATH] [--no-default]
 int cmd_adduser(const Store& s, const std::string& name, int argc, char** argv) {
     if (argc < 5)
-        return fail("usage: linuxity adduser <env> <user> [--no-sudo] [--password | --password-stdin] "
+        return fail("usage: linuxity user [@ENV] add NAME [--no-sudo] [--password | --password-stdin] "
                     "[--shell PATH] [--no-default]");
     const std::string user = argv[4];
     if (!valid_user_name(user))
@@ -1135,12 +1107,10 @@ int finish_env(const Store& s, const std::string& name, std::string_view setup,
     const bool first = !exists(s.home() + "/default") || s.default_env().empty();
     if (first) (void)s.set_default(name);
     const bool is_def = s.default_env() == name;
+    const std::string at = is_def ? std::string{} : "@" + name + " ";
     std::printf("\n%s %s is ready.\n", green("✓").c_str(), bold(name).c_str());
-    std::printf("  %-28s %s\n", is_def ? "linuxity" : ("linuxity shell " + name).c_str(), dim("a shell in it").c_str());
-    const bool bare = is_def && !lx::cli::host_runs_instances();   // `linuxity CMD` runs in it
-    std::printf("  %-28s %s\n", bare ? "linuxity uname -a"
-                                      : ("linuxity exec " + (is_def ? std::string{} : name + " ") + "-- uname -a").c_str(),
-                dim("run one command").c_str());
+    std::printf("  %-28s %s\n", ("lx " + at).c_str(), dim("a shell in it").c_str());
+    std::printf("  %-28s %s\n", ("lx " + at + "uname -a").c_str(), dim("run one command").c_str());
     return 0;
 }
 
@@ -1169,7 +1139,7 @@ int cmd_new(int argc, char** argv) {
         std::string list;
         for (const auto& i : kImages)
             if (i.arch == kHostArch) std::printf("  %-8s %-24s %s\n", std::string{i.distro}.c_str(), std::string{i.title}.c_str(), std::string{i.note}.c_str());
-        std::puts("\nOr bring your own: linuxity import <name> <rootfs.tar.gz>");
+        std::puts("\nOr bring your own: linuxity new ROOTFS.tar.gz|DIR NAME");
         return 2;
     }
     const Image* img = find_image(ref);
@@ -1177,7 +1147,7 @@ int cmd_new(int argc, char** argv) {
         std::string avail;
         for (const auto& i : kImages) if (i.arch == kHostArch) avail += " " + std::string{i.distro};
         return fail("no image '" + ref + "' for " + std::string{kHostArch} + ". Available:" + avail +
-                    ". Or: linuxity import <name> <rootfs.tar.gz>");
+                    ". Or: linuxity new ROOTFS.tar.gz|DIR NAME");
     }
     if (name.empty()) name = std::string{img->distro};
     if (!valid_name(name)) return fail("bad name '" + name + "' (letters, digits, . _ -)");
@@ -1235,7 +1205,7 @@ int cmd_new(int argc, char** argv) {
 
 // linuxity import <name> <rootfs.tar[.gz|.xz|.zst] | directory> [--user U | --root]
 int cmd_import(int argc, char** argv) {
-    if (argc < 4) return fail("usage: linuxity import <name> <rootfs tarball or directory> [--user U]");
+    if (argc < 4) return fail("usage: linuxity new ROOTFS.tar.gz|DIR NAME [--user U]");
     Store s;
     const std::string name = argv[2], src = argv[3];
     std::string user;
@@ -1279,7 +1249,7 @@ int cmd_export(int argc, char** argv) {
     if (rc != 0 || ::rename(part.c_str(), to.c_str()) != 0) { ::unlink(part.c_str()); return fail("export failed"); }
     struct ::stat st{};
     (void)::stat(to.c_str(), &st);
-    std::printf("wrote %s (%s). Bring it back with: linuxity import <name> %s\n", to.c_str(),
+    std::printf("wrote %s (%s). Bring it back with: linuxity new %s NAME\n", to.c_str(),
                 human_bytes(static_cast<std::uint64_t>(st.st_size)).c_str(), to.c_str());
     return 0;
 }
@@ -1291,7 +1261,7 @@ int cmd_images(bool json) {
         std::printf("%-8s %-22s ~%4d MB  %s\n", std::string{i.distro}.c_str(), std::string{i.title}.c_str(),
                     i.size_mb, std::string{i.note}.c_str());
     }
-    std::puts("\nlinuxity new <distro> [name]      or bring your own: linuxity import <name> <tarball>");
+    std::puts("\nlinuxity new DISTRO [NAME]      or bring your own: linuxity new ROOTFS.tar.gz|DIR NAME");
     return 0;
 }
 
@@ -1325,7 +1295,7 @@ int cmd_env(int argc, char** argv) {
             std::puts(j.end().end().take().c_str());
             return 0;
         }
-        if (names.empty()) { std::puts("no environments yet: linuxity new alpine  (see `linuxity images`)"); return 0; }
+        if (names.empty()) { std::puts("no environments yet: linuxity new alpine  (`linuxity new` lists them all)"); return 0; }
         // NAME (the default starred), STATE, USER, how much it has changed
         // from its image, and the distro. Columns sized to the data.
         const std::string def = s.default_env();
@@ -1351,13 +1321,13 @@ int cmd_env(int argc, char** argv) {
             if (up) st = green(st);
             std::printf("%s %s  %s %-10s %-9s %s%s\n", n == def ? "*" : " ", bold(label).c_str(), st.c_str(),
                         r.config.user.c_str(), human_bytes(tree_bytes(r.config.upper)).c_str(),
-                        dim(distro).c_str(), r.ok() ? "" : "  (config has errors: linuxity check)");
+                        dim(distro).c_str(), r.ok() ? "" : "  (config has errors: linuxity info)");
         }
         return 0;
     }
 
     if (sub == "create" || sub == "new") {
-        if (argc < 5) return fail("usage: linuxity env create <name> <rootfs> [--set key=value ...]");
+        if (argc < 5) return fail("usage: linuxity new DIR NAME");
         std::string extra;
         std::string body;
         for (int i = 5; i < argc; ++i) {
@@ -1486,7 +1456,7 @@ int cmd_env(int argc, char** argv) {
 
     if (sub == "set") {
         // `set ENV key value...` or `set ENV key=value key=value ...`
-        if (argc < 5) return fail("usage: linuxity set [env] key=value ...   (or: set [env] key value)");
+        if (argc < 5) return fail("usage: linuxity config [@ENV] KEY=VALUE ...");
         std::vector<std::pair<std::string, std::vector<std::string>>> edits;
         if (std::string_view{argv[4]}.find('=') != std::string_view::npos) {
             for (int i = 4; i < argc; ++i) {
@@ -1496,7 +1466,7 @@ int cmd_env(int argc, char** argv) {
                 edits.push_back({resolve_key(kv.substr(0, eq)), {kv.substr(eq + 1)}});
             }
         } else {
-            if (argc < 6) return fail("usage: linuxity set [env] key value");
+            if (argc < 6) return fail("usage: linuxity config [@ENV] KEY=VALUE");
             std::vector<std::string> words;
             for (int i = 5; i < argc; ++i) words.emplace_back(argv[i]);
             edits.push_back({resolve_key(argv[4]), words});
@@ -1511,17 +1481,17 @@ int cmd_env(int argc, char** argv) {
                 if (!v) return fail(why);
                 next = vibe_edit::set(text, key, *v);
             }
-            if (!next) return fail("cannot edit " + s.config_path(name) + " automatically; use `linuxity edit`");
+            if (!next) return fail("cannot edit " + s.config_path(name) + " automatically; use `linuxity config --edit`");
             text = *next;
         }
         return save_config(s, name, text);
     }
 
     if (sub == "unset") {
-        if (argc < 5) return fail("usage: linuxity env unset <name> <key>");
+        if (argc < 5) return fail("usage: linuxity config [@ENV] KEY=");
         const auto cur = slurp(s.config_path(name)).value_or("");
         const auto next = vibe_edit::unset(cur, resolve_key(argv[4]));
-        if (!next) return fail("cannot edit " + s.config_path(name) + " automatically; use `linuxity edit`");
+        if (!next) return fail("cannot edit " + s.config_path(name) + " automatically; use `linuxity config --edit`");
         return save_config(s, name, *next);
     }
 
@@ -1579,13 +1549,13 @@ int cmd_env(int argc, char** argv) {
             std::vector<char*> av;
             for (auto& x : a) av.push_back(x.data());
             if (cmd_adduser(s, name, static_cast<int>(av.size()), av.data()) != 0)
-                return fail("couldn't set up " + r.config.user + " again; log in as root: linuxity shell " + name + " -u root");
+                return fail("couldn't set up " + r.config.user + " again; log in as root: lx @" + name + " -u root");
         }
         return 0;
     }
 
     if (sub == "snapshot") {
-        if (argc < 5) return fail("usage: linuxity env snapshot <name> <snapshot>");
+        if (argc < 5) return fail("usage: linuxity snap [@ENV] save NAME");
         if (s.running_pid(name) > 0)
             std::fprintf(stderr, "linuxity: %s is running; the snapshot may catch files mid-write\n", name.c_str());
         if (const auto e = s.snapshot(name, argv[4]); !e.empty()) return fail(e);
@@ -1594,7 +1564,7 @@ int cmd_env(int argc, char** argv) {
     }
 
     if (sub == "restore") {
-        if (argc < 5) return fail("usage: linuxity restore <env> <snapshot>");
+        if (argc < 5) return fail("usage: linuxity snap [@ENV] restore NAME");
         stop_env();
         if (const auto e = s.restore(name, argv[4]); !e.empty()) return fail(e);
         std::printf("%s restored to %s\n", name.c_str(), argv[4]);
@@ -1615,7 +1585,7 @@ int cmd_env(int argc, char** argv) {
     }
 
     if (sub == "drop-snapshot") {
-        if (argc < 5) return fail("usage: linuxity env drop-snapshot <name> <snapshot>");
+        if (argc < 5) return fail("usage: linuxity snap [@ENV] rm NAME");
         if (const auto e = s.drop_snapshot(name, argv[4]); !e.empty()) return fail(e);
         return 0;
     }
@@ -1641,7 +1611,7 @@ int cmd_env(int argc, char** argv) {
     }
 
     if (sub == "rename") {
-        if (argc < 5) return fail("usage: linuxity rename <old> <new>");
+        if (argc < 5) return fail("usage: linuxity mv OLD NEW");
         stop_env();
         const bool was_default = s.default_env() == name;
         if (const auto e = s.rename(name, argv[4]); !e.empty()) return fail(e);
@@ -1658,239 +1628,4 @@ int cmd_env(int argc, char** argv) {
 
 }  // namespace
 
-// Commands that act on one environment take its name first; leave it out and
-// the default is used (`linuxity set memory=2G`, `linuxity exec -- ls`).
-// Only when that's unambiguous: a word that isn't an environment is an error,
-// never a reason to act on a different one, and commands that destroy data
-// always need the name spelled out.
-std::vector<std::string> lx_with_default_env(int argc, char** argv) {
-    std::vector<std::string> a(argv, argv + argc);
-    if (argc < 2) return a;
-    Store s;
-    if (argc >= 3 && s.has(argv[2])) return a;
-    const std::string_view verb = argv[1];
-    for (const char* v : {"rm", "remove", "reset", "restore", "rename", "drop-snapshot", "import"})
-        if (verb == v) return a;
-    const std::string d = s.default_env();
-    if (d.empty()) return a;
-    bool insert = argc < 3;
-    if (!insert) {
-        const std::string_view next = argv[2];
-        if (next.starts_with("-")) insert = true;                       // flags or `--`
-        else if (verb == "set" || verb == "get" || verb == "unset")
-            insert = next.find('=') != std::string_view::npos || find_field(resolve_key(std::string{next})) ||
-                     find_dyn_field(std::string{next});
-        else if (verb == "snapshot" || verb == "adduser" || verb == "export" || verb == "kill" ||
-                 verb == "logs" || verb == "svc")
-            insert = true;   // their first word is a user, file, pid or service, never an env
-    }
-    if (insert) a.insert(a.begin() + 2, d);
-    return a;
-}
-
-namespace {
-
-int no_env_yet() {
-    std::puts("No Linux environments yet. Make one:\n");
-    for (const auto& i : kImages)
-        if (i.arch == kHostArch)
-            std::printf("  linuxity new %-8s %s\n", std::string{i.distro}.c_str(), std::string{i.title}.c_str());
-    std::puts("\nor bring your own:  linuxity import <name> <rootfs.tar.gz>");
-    return 1;
-}
-
-int run_argv(int (*fn)(int, char**), std::vector<std::string> a) {
-    std::vector<char*> av;
-    for (auto& x : a) av.push_back(x.data());
-    av.push_back(nullptr);
-    return fn(static_cast<int>(a.size()), av.data());
-}
-
-}  // namespace
-
-// ---- shell completion --------------------------------------------------
-// `linuxity __complete W1 W2 ... CUR` prints the candidates for CUR, one
-// per line. The shell scripts below only forward their words, so every
-// shell completes exactly the same things -- from the verb table, the
-// environments, the settings schema and the image catalog.
-int cmd_complete(int argc, char** argv) {
-    using namespace lx::cli;
-    std::vector<std::string> w(argv + 2, argv + argc);
-    if (w.empty()) w.emplace_back();
-    const std::string cur = w.back();
-    w.pop_back();
-    const bool bg = host_runs_instances();
-    auto emit = [&](std::string_view c) {
-        if (std::string_view{c}.starts_with(cur)) std::printf("%.*s\n", static_cast<int>(c.size()), c.data());
-    };
-    if (w.empty()) {   // the verb itself
-        for (const auto& v : kVerbTable) if (verb_listed(v, bg)) emit(v.name);
-        return 0;
-    }
-    const Verb* v = canonical_verb(w[0]);
-    if (!v) return 0;
-    std::vector<std::string> pos;   // positionals typed so far (flags skipped)
-    for (std::size_t i = 1; i < w.size(); ++i) {
-        if (w[i] == "--") return 0;  // a guest command line: the shell's own files
-        if (!w[i].starts_with("-")) pos.push_back(w[i]);
-    }
-    Store s;
-    const auto names = s.names();
-    auto envs = [&] { for (const auto& n : names) emit(n); };
-    auto keys = [&] { for (const auto& f : kFields) emit(f.path); };
-    const bool named = !pos.empty() && s.has(pos[0]);
-    switch (v->arg) {
-        case VerbArg::env:
-            if (pos.empty()) envs();
-            break;
-        case VerbArg::env_key:
-            if (pos.empty()) { envs(); keys(); }
-            else if (pos.size() == 1 && named) keys();
-            break;
-        case VerbArg::env_snapshot: {
-            const std::string env = named ? pos[0] : s.default_env();
-            if (pos.empty()) envs();
-            if (pos.size() == (named ? 1u : 0u) && !env.empty())
-                for (const auto& snap : s.snapshots(env)) emit(snap);
-            break;
-        }
-        case VerbArg::image:
-            if (pos.empty())
-                for (const auto& i : kImages)
-                    if (i.arch == kHostArch) emit(i.distro);
-            break;
-        case VerbArg::verb:
-            if (pos.empty()) for (const auto& x : kVerbTable) if (verb_listed(x, bg)) emit(x.name);
-            break;
-        case VerbArg::shell:
-            if (pos.empty()) for (const char* sh : {"bash", "zsh", "fish"}) emit(sh);
-            break;
-        case VerbArg::none:
-            break;
-    }
-    return 0;
-}
-
-int cmd_completion(std::string_view shell) {
-    if (shell == "bash") {
-        std::puts(
-            "# linuxity bash completion: source <(linuxity completion bash)\n"
-            "_linuxity() {\n"
-            "    local IFS=$'\\n'\n"
-            "    COMPREPLY=($(command linuxity __complete \"${COMP_WORDS[@]:1:COMP_CWORD}\" 2>/dev/null))\n"
-            "}\n"
-            "complete -o default -o bashdefault -F _linuxity linuxity");
-        return 0;
-    }
-    if (shell == "zsh") {
-        std::puts(
-            "#compdef linuxity\n"
-            "# linuxity zsh completion: source <(linuxity completion zsh), or save as _linuxity in $fpath\n"
-            "_linuxity() {\n"
-            "    local -a c\n"
-            "    c=(${(f)\"$(command linuxity __complete \"${(@)words[2,CURRENT]}\" 2>/dev/null)\"})\n"
-            "    (( ${#c} )) && compadd -a c || _files\n"
-            "}\n"
-            "if (( $+functions[compdef] )); then compdef _linuxity linuxity; else _linuxity \"$@\"; fi");
-        return 0;
-    }
-    if (shell == "fish") {
-        std::puts(
-            "# linuxity fish completion: linuxity completion fish > ~/.config/fish/completions/linuxity.fish\n"
-            "function __linuxity_complete\n"
-            "    set -l words (commandline -opc)\n"
-            "    set -l cur (commandline -ct)\n"
-            "    command linuxity __complete $words[2..-1] \"$cur\" 2>/dev/null\n"
-            "end\n"
-            "complete -c linuxity -f -a '(__linuxity_complete)'\n"
-            "complete -c linuxity -n '__fish_seen_subcommand_from import export' -F");
-        return 0;
-    }
-    std::fputs(
-        "usage: linuxity completion bash|zsh|fish\n"
-        "\n"
-        "  bash   echo 'source <(linuxity completion bash)' >> ~/.bashrc\n"
-        "  zsh    echo 'source <(linuxity completion zsh)' >> ~/.zshrc\n"
-        "  fish   linuxity completion fish > ~/.config/fish/completions/linuxity.fish\n", stderr);
-    return shell.empty() ? 0 : 2;
-}
-
-int lx_cli_main(int argc, char** argv) {
-    Store s;
-    {
-        // case-sensitive storage (host/case_volume.hpp): made by the first
-        // `new`/`import`, attached for everything else
-        const std::string_view v = argc > 1 ? std::string_view{argv[1]} : std::string_view{};
-        std::string why;
-        if (!s.ensure_storage(v == "new" || v == "import", why))
-            std::fprintf(stderr, "linuxity: %s; environments stay case-insensitive "
-                                 "(some packages won't install)\n", why.c_str());
-    }
-    // `linuxity` alone: a shell in the default environment
-    if (argc < 2) {
-        const std::string d = s.default_env();
-        if (d.empty()) {
-            if (s.names().empty()) return no_env_yet();
-            std::puts("Which one? Pick a default with: linuxity default <name>\n");
-            return run_argv(cmd_env, {argv[0], "env", "list"});
-        }
-        return run_argv([](int c, char** v) { return cmd_shell(c, v, false); }, {argv[0], "shell", d});
-    }
-    const std::string sub = argv[1];
-    if (sub == "help" || sub == "--help" || sub == "-h") {
-        if (argc > 2 && std::string_view{argv[2]} != "--all") return help_verb(argv[2]);
-        help();
-        return 0;
-    }
-    if (sub == "completion") return cmd_completion(argc > 2 ? argv[2] : "");
-    if (sub == "__complete") return cmd_complete(argc, argv);
-    if (sub == "version" || sub == "--version") { std::puts("linuxity 0.1.0"); return 0; }
-    if (sub == "env") return cmd_env(argc, argv);
-    if (sub == "new") return cmd_new(argc, argv);
-    if (sub == "import") return cmd_import(argc, argv);
-    if (sub == "images") return cmd_images(has_flag(argc, argv, "--json"));
-    if (sub == "schema") { std::puts(schema_json().c_str()); return 0; }
-    if (sub == "list" || sub == "ls") {
-        if (s.names().empty() && !has_flag(argc, argv, "--json")) return no_env_yet();
-        std::vector<std::string> a = {argv[0], "env", "list"};
-        for (int i = 2; i < argc; ++i) a.emplace_back(argv[i]);
-        return run_argv(cmd_env, a);
-    }
-    if (sub == "default") {
-        if (argc < 3) {
-            const auto d = s.default_env();
-            if (d.empty()) return fail("no default environment; set one with: linuxity default <name>");
-            std::puts(d.c_str());
-            return 0;
-        }
-        if (!s.has(argv[2])) return fail("no environment '" + std::string{argv[2]} + "'");
-        if (!s.set_default(argv[2])) return fail("cannot write the default");
-        std::printf("`linuxity` now opens %s\n", argv[2]);
-        return 0;
-    }
-
-    // everything below acts on one environment, the default if not named
-    auto a = lx_with_default_env(argc, argv);
-    if (a.size() < 3 || !s.has(a[2])) {
-        if (s.names().empty()) return no_env_yet();
-        if (a.size() >= 3 && !a[2].starts_with("-"))
-            return fail("no environment '" + a[2] + "' (see `linuxity list`)");
-        return fail("which environment? (see `linuxity list`, or set one with `linuxity default <name>`)");
-    }
-    if (const auto* v = lx::cli::find_verb(sub); v && v->via_env) {
-        a.insert(a.begin() + 1, "env");
-        return run_argv(cmd_env, a);
-    }
-    if (sub == "export") return run_argv(cmd_export, a);
-    if (sub == "shell") return run_argv([](int c, char** v) { return cmd_shell(c, v, false); }, a);
-    if (sub == "exec") return run_argv([](int c, char** v) { return cmd_shell(c, v, true); }, a);
-    if (sub == "ps") return run_argv(cmd_ps, a);
-    if (sub == "kill") return run_argv(cmd_kill, a);
-    if (sub == "status") return run_argv(cmd_status, a);
-    if (sub == "svc") return run_argv(cmd_svc, a);
-    if (sub == "down" || sub == "stop") return run_argv(cmd_down, a);
-    if (sub == "reload") return run_argv(cmd_reload, a);
-    if (sub == "logs") return run_argv(cmd_logs, a);
-    help();
-    return 2;
-}
+#include "front.inc"

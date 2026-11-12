@@ -312,8 +312,8 @@ public:
     // most commented out at its default so the file documents itself.
     [[nodiscard]] static std::string template_text(std::string_view n, const std::string& rootfs) {
         std::string t;
-        t += "# linuxity environment. Edit by hand or with `linuxity env set`.\n";
-        t += "# Every key: `linuxity env schema`.\n\n";
+        t += "# linuxity environment. Edit by hand or with `linuxity config KEY=VALUE`.\n";
+        t += "# Every key: `linuxity config --schema`.\n\n";
         t += "name " + vibe_edit::string_text(n) + "\n";
         t += "rootfs " + vibe_edit::string_text(rootfs) + "\n\n";
         t += "system {\n  hostname " + vibe_edit::string_text(n) + "\n"

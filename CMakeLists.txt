@@ -74,6 +74,8 @@ target_link_libraries(linuxity_core INTERFACE linuxity_vibe)
 # (src/host_run.hpp is the seam).
 set(LX_MAIN_SOURCES src/main.cpp)
 set(LX_MAIN_LIBS linuxity_core)
+set_source_files_properties(src/cli.cpp PROPERTIES
+    COMPILE_DEFINITIONS LINUXITY_VERSION="${PROJECT_VERSION}")
 if(NOT WIN32)
     list(APPEND LX_MAIN_SOURCES src/cli.cpp)
     list(APPEND LX_MAIN_LIBS z)          # env import/export (archive.hpp)
@@ -185,6 +187,17 @@ elseif(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
 else()
     message(STATUS "linuxity: no trap backend for ${CMAKE_SYSTEM_NAME} yet; "
                    "building the portable core + tests only")
+endif()
+
+# `lx` is linuxity under another name: argv[0] picks the front door.
+if(TARGET linuxity AND NOT WIN32)
+    add_custom_command(TARGET linuxity POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E create_symlink linuxity ${CMAKE_BINARY_DIR}/lx
+        VERBATIM)
+    include(GNUInstallDirs)
+    install(TARGETS linuxity RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    install(CODE "execute_process(COMMAND ${CMAKE_COMMAND} -E create_symlink linuxity
+        \$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}/lx)")
 endif()
 
 # ---- Tests ---------------------------------------------------------------

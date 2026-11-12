@@ -1,10 +1,10 @@
 // tests/test_run_instance.cpp
 //
-// The long-running mode, end to end through the real binary: create an env
-// over a tiny static rootfs, `up` it, run sessions with `exec`, check that
+// The long-running mode, end to end through the real binary: make an env
+// over a tiny static rootfs, start it, run sessions with `lx`, check that
 // they share one kernel (one process table, one hostname), that a service
-// starts and restarts, that reload applies the hostname live, and that
-// `down` leaves nothing behind.
+// starts and restarts, that a config change applies live, and that `stop`
+// leaves nothing behind.
 #include "guest_harness.hpp"
 
 #include <sys/wait.h>
@@ -28,7 +28,7 @@ void check(bool ok, const char* what) {
 std::string g_bin;
 std::string g_home;
 
-// Run `linuxity <args>` with LINUXITY_HOME set; capture stdout.
+// Run `linuxity <args>` with LINUXITY_HOME set; capture stdout. `lx ...` is the lx door.
 int run_cli(const std::string& args, std::string* out = nullptr) {
     const std::string cmd = "LINUXITY_HOME=" + g_home + " timeout 30 " + g_bin + " " + args + " 2>/dev/null";
     std::FILE* p = ::popen(cmd.c_str(), "r");
@@ -87,8 +87,8 @@ int main() {
         "printf 'root:x:0:0:root:/:/bin/prog\\n' > /tmp/lx_instance_root/etc/passwd");
     if (!lxtest::compile_guest("run_instance", tree, kProbe)) return 0;
 
-    check(run_cli("env create box " + tree.root) == 0, "env create");
-    check(run_cli("env set box system.hostname first") == 0, "env set hostname");
+    check(run_cli("new " + tree.root + " box") == 0, "new from a directory");
+    check(run_cli("config @box system.hostname=first") == 0, "config sets the hostname");
 
     // a service that restarts on failure, and one that runs
     {
@@ -100,19 +100,19 @@ int main() {
         std::fclose(f);
     }
     std::string out;
-    check(run_cli("env check box") == 0, "the config with services is valid");
-    check(run_cli("up box") == 0, "up");
-    check(run_cli("up box") == 0, "up again is a no-op");
+    check(run_cli("info box", &out) == 0 && out.find("error") == std::string::npos, "the config with services is valid");
+    check(run_cli("start box") == 0, "start");
+    check(run_cli("start box") == 0, "start again is a no-op");
 
-    check(run_cli("exec box -T -- /bin/prog name", &out) == 0 && out == "first\n", "a session sees the hostname");
-    check(run_cli("exec box -T -- /bin/prog code 42") == 42, "a session's exit code comes back");
-    check(run_cli("exec box -T -- prog", &out) == 0 && out.starts_with("pid="), "a bare name is found on PATH");
-    check(run_cli("exec box -T -- nosuchprog") != 0, "a name that isn't on PATH fails cleanly");
+    check(run_cli("lx @box -T /bin/prog name", &out) == 0 && out == "first\n", "a session sees the hostname");
+    check(run_cli("lx @box -T /bin/prog code 42") == 42, "a session's exit code comes back");
+    check(run_cli("lx -T prog", &out) == 0 && out.starts_with("pid="), "the default env, a bare name found on PATH");
+    check(run_cli("lx @box -T nosuchprog") != 0, "a name that isn't on PATH fails cleanly");
 
     // two sessions, one kernel: guest pids keep counting up across sessions
     std::string a, b;
-    (void)run_cli("exec box -T -- /bin/prog", &a);
-    (void)run_cli("exec box -T -- /bin/prog", &b);
+    (void)run_cli("lx @box -T /bin/prog", &a);
+    (void)run_cli("lx @box -T /bin/prog", &b);
     check(a.starts_with("pid=") && b.starts_with("pid=") &&
               std::atoi(b.c_str() + 4) > std::atoi(a.c_str() + 4),
           "sessions share one pid space");
@@ -124,23 +124,23 @@ int main() {
     // the crasher gives up after its quick exits; wait for that, bounded
     bool failed = false;
     for (int i = 0; i < 4000 && !failed; ++i) {
-        (void)run_cli("svc box", &out);
+        (void)run_cli("svc @box", &out);
         failed = out.find("crasher      failed") != std::string::npos;
     }
     check(failed, "a crash-looping service is marked failed");
     check(out.find("ticker       running") != std::string::npos, "the healthy service keeps running");
 
-    check(run_cli("env set box system.hostname second") == 0, "set while running");
-    check(run_cli("exec box -T -- /bin/prog name", &out) == 0 && out == "second\n", "reload applies the hostname live");
+    check(run_cli("config @box hostname=second") == 0, "config while running");
+    check(run_cli("lx @box -T /bin/prog name", &out) == 0 && out == "second\n", "the hostname applies live");
 
-    check(run_cli("status box --json", &out) == 0 && out.find("\"ok\":true") != std::string::npos, "status --json");
-    check(run_cli("down box") == 0, "down");
-    check(run_cli("status box", &out) == 0 && out.find("not running") != std::string::npos, "down really stopped it");
+    check(run_cli("info box --json", &out) == 0 && out.find("\"ok\":true") != std::string::npos, "info --json has the live state");
+    check(run_cli("stop box") == 0, "stop");
+    check(run_cli("info box", &out) == 0 && out.find("stopped") != std::string::npos, "stop really stopped it");
     check(!lxtest::host_exists(g_home + "/envs/box/run/control.sock") &&
               !lxtest::host_exists(g_home + "/envs/box/run/pid"),
-          "down removes the socket and pid file");
+          "stop removes the socket and pid file");
 
-    check(run_cli("env rm box --yes") == 0, "env rm");
+    check(run_cli("rm box --yes") == 0, "rm");
     lxtest::remove_tree(tree);
     std::system(("rm -rf " + g_home).c_str());
     if (failures) {
