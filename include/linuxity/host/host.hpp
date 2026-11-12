@@ -90,7 +90,7 @@ struct HStat {
     HFileType     type{HFileType::regular};
     std::uint64_t size{};
     std::uint32_t mode{};        // host permission bits (st_mode & 0777)
-    std::uint64_t mtime_ns{};
+    std::int64_t  mtime_ns{};    // signed: before 1970 is negative
 
     // Added for the single-stop stat path; defaulted so existing producers
     // and consumers are unaffected.
@@ -103,8 +103,8 @@ struct HStat {
     std::uint64_t rdev{0};
     std::int64_t  blksize{4096};
     std::int64_t  blocks{0};
-    std::uint64_t atime_ns{0};
-    std::uint64_t ctime_ns{0};
+    std::int64_t  atime_ns{0};
+    std::int64_t  ctime_ns{0};
 };
 
 struct HDirent {

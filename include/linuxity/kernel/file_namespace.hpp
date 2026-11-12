@@ -1533,7 +1533,9 @@ private:
 
     PathClass follow_from(const Mount& m, std::string host, std::string pre,
                           bool for_write, WriteIntent wi, int depth) const {
-        for (int hops = 0; hops < 40; ++hops) {
+        // Linux follows at most 40 links (MAXSYMLINKS); each iteration either
+        // finds the end of the chain or follows one, so allow 41.
+        for (int hops = 0; hops <= 40; ++hops) {
             std::string target;
             if (!pre.empty()) {
                 target = std::move(pre);

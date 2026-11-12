@@ -33,6 +33,17 @@
 
 namespace lx::abi::wire {
 
+// Signed nanoseconds since 1970 -> {seconds, 0..999999999 ns}, the way a
+// struct timespec holds a time before 1970: -0.5s is {-1, 500000000}.
+struct SecNsec { std::int64_t sec; std::int64_t nsec; };
+[[nodiscard]] constexpr SecNsec split_ns(std::int64_t ns) noexcept {
+    std::int64_t s = ns / 1'000'000'000, r = ns % 1'000'000'000;
+    if (r < 0) { r += 1'000'000'000; --s; }
+    return {s, r};
+}
+static_assert(split_ns(-500'000'000).sec == -1 && split_ns(-500'000'000).nsec == 500'000'000);
+static_assert(split_ns(-86'400'000'000'000).sec == -86400 && split_ns(-86'400'000'000'000).nsec == 0);
+
 // What a stat YIELDS, host-neutral.
 //
 // Lives HERE, in abi/, because the portable dispatcher encodes it and abi/ is
@@ -59,9 +70,11 @@ struct StatFields {
     std::uint64_t size{0};
     std::int64_t  blksize{4096};
     std::int64_t  blocks{0};
-    std::uint64_t atime_ns{0};
-    std::uint64_t mtime_ns{0};
-    std::uint64_t ctime_ns{0};
+    // Signed nanoseconds since 1970: a file from before then is negative
+    // (tar, git and backups keep such times). int64 covers 1678-2262.
+    std::int64_t  atime_ns{0};
+    std::int64_t  mtime_ns{0};
+    std::int64_t  ctime_ns{0};
     // the owner as the GUEST sees it (already mapped into the reader's user
     // namespace). 0 for a host file, whose owner the scrub overlays.
     std::uint32_t uid{0};

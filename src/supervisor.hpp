@@ -26,6 +26,7 @@
 #include "linuxity/env/status.hpp"
 #include "linuxity/env/store.hpp"
 #include "linuxity/host/posix_host.hpp"
+#include "linuxity/host/self_exe.hpp"
 #include "linuxity/kernel/kernel.hpp"
 #include "linuxity/runtime/linux/ptrace_trap.hpp"
 
@@ -88,6 +89,7 @@ public:
     // Listen, start services, tell the launcher we're up.
     bool start(std::string& why) {
         started_ = std::chrono::steady_clock::now();
+        binary_id_ = host::binary_id(host::self_exe());
         if (!env::mkdirs(o_.run_dir) || !env::mkdirs(o_.logs_dir)) {
             why = "cannot create " + o_.run_dir;
             return false;
@@ -529,6 +531,7 @@ private:
             .kv("uptime_s", static_cast<std::int64_t>(up)).kv("rootfs", o_.root).kv("upper", o_.persist)
             .kv("hostname", k_.machine().nodename).kv("user", o_.user)
             .kv("limits", h_.limits_text).kv("bridge", bridge_name_)
+            .kv("binary", binary_id_)
             .kv("processes", static_cast<std::int64_t>(k_.procs().pids().size()))
             .key("sessions").arr();
         for (const auto& [gp, s] : sessions_) {
@@ -1015,6 +1018,7 @@ private:
     std::map<std::int32_t, Session> sessions_;
     std::map<std::string, Svc> services_;
     std::chrono::steady_clock::time_point started_;
+    std::string binary_id_;   // the build this instance runs (host::binary_id)
     bool stopping_{false};
     bool stop_{false};
     bool cleaned_{false};

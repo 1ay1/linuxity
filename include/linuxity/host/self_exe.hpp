@@ -25,8 +25,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #else
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
+
+#include <string>
 
 namespace lx::host {
 
@@ -101,6 +104,20 @@ namespace lx::host {
 #endif
     }();
     return pinned;
+}
+
+// Which build a binary is: its path, size and mtime. A running instance
+// reports the one it started from, so the CLI can tell it's out of date
+// after linuxity was rebuilt or updated.
+[[nodiscard]] inline std::string binary_id(const std::string& path) {
+#if defined(_WIN32)
+    return path;
+#else
+    struct ::stat st{};
+    if (::stat(path.c_str(), &st) != 0) return path;
+    return path + ":" + std::to_string(static_cast<long long>(st.st_size)) + ":" +
+           std::to_string(static_cast<long long>(st.st_mtime));
+#endif
 }
 
 }  // namespace lx::host

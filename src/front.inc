@@ -120,6 +120,17 @@ int lx_own_run(const std::string& env, const SessionArgs& a) {
     return fail("cannot run " + v[0] + ": " + std::strerror(errno));
 }
 
+// The running instance is a build other than this binary (rebuilt or
+// updated since it started): it keeps the old behaviour until restarted.
+[[nodiscard]] bool instance_is_stale(const std::string& env) {
+    const auto live = live_status(env);
+    if (!live) return false;
+    const auto r = parse_json(*live);
+    if (!r) return false;
+    const std::string id = r->str("binary");
+    return !id.empty() && id != lx::host::binary_id(self_exe());
+}
+
 }  // namespace
 
 int lx_main(int argc, char** argv) {
@@ -136,6 +147,9 @@ int lx_main(int argc, char** argv) {
     if (a.temp || !a.volumes.empty()) return lx_own_run(*env, a);
     Conn c;
     if (!ensure_up(*env, c)) return fail("cannot start " + *env + " (linuxity logs @" + *env + ")");
+    if (lx::cli::host_runs_instances() && instance_is_stale(*env))
+        std::fprintf(stderr, "linuxity: %s is running an older linuxity; `linuxity stop %s` to use this one\n",
+                     env->c_str(), env->c_str());
     const bool tty = a.tty >= 0 ? a.tty == 1 : (::isatty(0) && ::isatty(1));
     return run_session(c, a.argv, a.user, a.cwd, a.env_vars, tty);
 }
@@ -264,6 +278,8 @@ int v_info(Words& w) {
     }
     const auto r = parse_json(*live);
     if (r && r->flag("ok")) print_live(&*r);
+    if (instance_is_stale(*env))
+        std::printf("  note       running an older linuxity build; `linuxity stop %s` to update\n", env->c_str());
     return 0;
 }
 

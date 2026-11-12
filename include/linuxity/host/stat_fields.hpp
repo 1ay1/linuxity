@@ -23,18 +23,19 @@
 namespace lx::host {
 
 struct StatTimes {
-    std::uint64_t atime_ns{0}, mtime_ns{0}, ctime_ns{0};
+    std::int64_t atime_ns{0}, mtime_ns{0}, ctime_ns{0};
 };
 
 [[nodiscard]] inline StatTimes stat_times(const struct ::stat& st) noexcept {
 #if defined(_WIN32)
     // The CRT keeps whole seconds only.
-    auto s = [](std::time_t t) { return static_cast<std::uint64_t>(t) * 1'000'000'000ull; };
+    auto s = [](std::time_t t) { return static_cast<std::int64_t>(t) * 1'000'000'000; };
     return {s(st.st_atime), s(st.st_mtime), s(st.st_ctime)};
 #else
+    // signed: a time before 1970 has a negative tv_sec
     auto ns = [](const struct ::timespec& t) {
-        return static_cast<std::uint64_t>(t.tv_sec) * 1'000'000'000ull +
-               static_cast<std::uint64_t>(t.tv_nsec);
+        return static_cast<std::int64_t>(t.tv_sec) * 1'000'000'000 +
+               static_cast<std::int64_t>(t.tv_nsec);
     };
 #if defined(__APPLE__)
     return {ns(st.st_atimespec), ns(st.st_mtimespec), ns(st.st_ctimespec)};

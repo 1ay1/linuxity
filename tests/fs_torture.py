@@ -807,7 +807,9 @@ def hard_links():
     eq(libc.linkat(AT_FDCWD, b"s", AT_FDCWD, b"s3", 0x400), 0, "linkat(AT_SYMLINK_FOLLOW)")
     ok(not os.path.islink("s3") and os.stat("s3").st_ino == os.stat("b").st_ino,
        "linkat with FOLLOW links the target")
-    os.link("s", "s4")
+    # link(2) never follows (os.link uses linkat(AT_SYMLINK_FOLLOW), so
+    # call link itself)
+    eq(libc.link(b"s", b"s4"), 0, "link()")
     ok(os.path.islink("s4"), "link() links a symlink itself (Linux)")
 
 

@@ -3252,6 +3252,13 @@ private:
                 extra = {"--overwrite", "*"};
         }
         if (pc.realm == kernel::Realm2::host_backed) {
+            // execve needs x on the file (and search on the way there) in the
+            // GUEST's terms. The host can't judge it: linuxity owns every
+            // file, and a script or dynamic binary is handed to its
+            // interpreter, which only needs read. CAP_DAC_OVERRIDE still needs
+            // some x bit on a file (guest_may handles both).
+            if (guest_search_denied(abs)) return eno(Errno::eacces);
+            if (!guest_may(k_.files().resolve_links(abs), 1)) return eno(Errno::eacces);
             // A set-user/group-ID program raises the caller's effective id, and
             // the guest's ids are ours to keep, so note the owner here for
             // creds::on_exec to apply once the image is in. Without this a
@@ -3893,7 +3900,11 @@ private:
             if (pc.host_path.empty()) return val(0);
         }
         if (pc.host_path.empty()) return eno(pc.error);
-        if (create_taken && pc.realm == kernel::Realm2::host_backed) return eno(Errno::eexist);
+        // the lookup's EACCES comes before the name's EEXIST
+        if (create_taken && pc.realm == kernel::Realm2::host_backed) {
+            if (guest_search_denied(abs)) return eno(Errno::eacces);
+            return eno(Errno::eexist);
+        }
         // Creating or removing a name writes the parent directory, and in a
         // sticky one only the file's or the directory's owner may remove it.
         if ((wi == Wi::remove || wi == Wi::parents_only) && !privileged()) {
@@ -4696,6 +4707,17 @@ private:
             if (::lstat(ps.host_path.c_str(), &sst) != 0)
                 return eno(static_cast<Errno>(errno));
             if (S_ISDIR(sst.st_mode)) return eno(Errno::eperm);
+            // a hard link to a symlink is a symlink with the same target
+            if (S_ISLNK(sst.st_mode)) {
+                std::string tgt(static_cast<std::size_t>(sst.st_size) + 1, '\0');
+                const ::ssize_t n = ::readlink(ps.host_path.c_str(), tgt.data(), tgt.size());
+                if (n < 0) return eno(static_cast<Errno>(errno));
+                tgt.resize(static_cast<std::size_t>(n));
+                if (::symlink(tgt.c_str(), pd.host_path.c_str()) != 0) return eno(static_cast<Errno>(errno));
+                k_.files().clear_whiteout_if_any(dst);
+                note_linked(src, dst);
+                return val(0);
+            }
             const int fd = ::open(pd.host_path.c_str(),
                                   O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
             if (fd < 0) return eno(static_cast<Errno>(errno));
@@ -5346,12 +5368,13 @@ private:
         sx.stx_ino     = h.ino;
         sx.stx_size    = h.size;
         sx.stx_blocks  = static_cast<std::uint64_t>(h.blocks);
-        sx.stx_mtime   = {static_cast<std::int64_t>(h.mtime_ns / 1'000'000'000ull),
-                          static_cast<std::uint32_t>(h.mtime_ns % 1'000'000'000ull), 0};
-        sx.stx_atime   = {static_cast<std::int64_t>(h.atime_ns / 1'000'000'000ull),
-                          static_cast<std::uint32_t>(h.atime_ns % 1'000'000'000ull), 0};
-        sx.stx_ctime   = {static_cast<std::int64_t>(h.ctime_ns / 1'000'000'000ull),
-                          static_cast<std::uint32_t>(h.ctime_ns % 1'000'000'000ull), 0};
+        auto ts = [](std::int64_t ns) {
+            const auto t = wire::split_ns(ns);
+            return decltype(sx.stx_mtime){t.sec, static_cast<std::uint32_t>(t.nsec), 0};
+        };
+        sx.stx_mtime   = ts(h.mtime_ns);
+        sx.stx_atime   = ts(h.atime_ns);
+        sx.stx_ctime   = ts(h.ctime_ns);
         sx.stx_btime   = sx.stx_ctime;
         // Device numbers. statx carries them split into major/minor, and
         // these were simply never written -- so the one-stop stat reported
@@ -5429,12 +5452,11 @@ private:
             st.st_size = static_cast<std::int64_t>(size);
             st.st_blksize = static_cast<std::int32_t>(h.blksize);
             st.st_blocks = blocks;
-            st.mtime = static_cast<std::int64_t>(h.mtime_ns / 1'000'000'000ull);
-            st.mtime_ns = static_cast<std::int64_t>(h.mtime_ns % 1'000'000'000ull);
-            st.atime = static_cast<std::int64_t>(h.atime_ns / 1'000'000'000ull);
-            st.atime_ns = static_cast<std::int64_t>(h.atime_ns % 1'000'000'000ull);
-            st.ctime = static_cast<std::int64_t>(h.ctime_ns / 1'000'000'000ull);
-            st.ctime_ns = static_cast<std::int64_t>(h.ctime_ns % 1'000'000'000ull);
+            const auto m = wire::split_ns(h.mtime_ns), a = wire::split_ns(h.atime_ns),
+                       c = wire::split_ns(h.ctime_ns);
+            st.mtime = m.sec; st.mtime_ns = m.nsec;
+            st.atime = a.sec; st.atime_ns = a.nsec;
+            st.ctime = c.sec; st.ctime_ns = c.nsec;
             if (!mem_.copy_out(buf, {reinterpret_cast<const std::byte*>(&st), sizeof st}))
                 return eno(Errno::efault);
             return val(0);
@@ -5444,7 +5466,7 @@ private:
             std::uint32_t st_mode; std::uint32_t st_uid; std::uint32_t st_gid;
             std::uint32_t __pad0; std::uint64_t st_rdev; std::int64_t st_size;
             std::int64_t st_blksize; std::int64_t st_blocks;
-            std::uint64_t atime, atime_ns, mtime, mtime_ns, ctime, ctime_ns;
+            std::int64_t atime, atime_ns, mtime, mtime_ns, ctime, ctime_ns;
             std::int64_t reserved_[3];
         } st{};
         static_assert(sizeof(Stat64) == 144);
@@ -5458,12 +5480,11 @@ private:
         st.st_size    = static_cast<std::int64_t>(size);
         st.st_blksize = h.blksize;
         st.st_blocks  = blocks;
-        st.mtime      = h.mtime_ns / 1'000'000'000ull;
-        st.mtime_ns   = h.mtime_ns % 1'000'000'000ull;
-        st.atime      = h.atime_ns / 1'000'000'000ull;
-        st.atime_ns   = h.atime_ns % 1'000'000'000ull;
-        st.ctime      = h.ctime_ns / 1'000'000'000ull;
-        st.ctime_ns   = h.ctime_ns % 1'000'000'000ull;
+        const auto m = wire::split_ns(h.mtime_ns), a = wire::split_ns(h.atime_ns),
+                   c = wire::split_ns(h.ctime_ns);
+        st.mtime = m.sec; st.mtime_ns = m.nsec;
+        st.atime = a.sec; st.atime_ns = a.nsec;
+        st.ctime = c.sec; st.ctime_ns = c.nsec;
         if (!mem_.copy_out(buf, {reinterpret_cast<const std::byte*>(&st), sizeof st}))
             return eno(Errno::efault);
         return val(0);

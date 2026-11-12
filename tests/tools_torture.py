@@ -84,7 +84,7 @@ def coreutils_pipelines():
     eq(run("printf '1:x\\n2:y\\n' | cut -d: -f2 | tac | paste -sd,").strip(), "y,x", "cut | tac | paste")
     eq(run("date -u -d @0 +%Y-%m-%dT%H:%M:%S").strip(), "1970-01-01T00:00:00", "date -d @0")
     eq(run("expr 6 \\* 7").strip(), "42", "expr")
-    ok(int(run("nproc").strip()) == os.cpu_count(), "nproc")
+    ok(int(run("nproc").strip()) == len(os.sched_getaffinity(0)), "nproc")
 
 
 @check(timeout=90)

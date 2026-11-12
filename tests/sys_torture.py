@@ -224,10 +224,16 @@ def sys_and_sysconf_agree():
     online = read("/sys/devices/system/cpu/online").strip()
     eq(online, "0" if n == 1 else f"0-{n - 1}", "/sys/.../cpu/online")
     eq(os.sysconf("SC_NPROCESSORS_ONLN"), n, "SC_NPROCESSORS_ONLN")
-    eq(len(os.sched_getaffinity(0)), n, "affinity covers every cpu")
+    # pinned (taskset, or linuxity keeping a phone on its fast cores) the
+    # affinity is a subset, natively too
+    aff = os.sched_getaffinity(0)
+    ok(aff and aff <= set(range(n)), "affinity is a set of online cpus")
     eq(os.sysconf("SC_CLK_TCK"), 100, "USER_HZ")
     ok(os.path.exists("/sys/class/net/lo"), "/sys/class/net/lo")
-    eq(read("/sys/class/net/lo/address").strip(), "00:00:00:00:00:00", "lo's address")
+    try:
+        eq(read("/sys/class/net/lo/address").strip(), "00:00:00:00:00:00", "lo's address")
+    except PermissionError:
+        pass   # the host refuses it (Android's SELinux), natively too
     ok(os.path.isdir("/sys/fs/cgroup"), "/sys/fs/cgroup")
     ok(os.listdir("/sys/devices/system/cpu/cpu0"), "cpu0 has attributes")
 

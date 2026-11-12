@@ -45,7 +45,7 @@ struct Stat {
     Gid      gid{};
     std::uint64_t size{};
     std::uint64_t nlink{1};
-    std::uint64_t mtime_ns{};
+    std::int64_t  mtime_ns{};   // signed: before 1970 is negative
 };
 
 // Open flags (O_RDONLY, O_CREAT, ...). Strong bitset.

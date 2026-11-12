@@ -2347,24 +2347,12 @@ public:
         }
     }
 
-    // sigqueue fills siginfo with SI_QUEUE and si_pid/si_uid = the guest's
-    // getpid/getuid. The host refuses a queued signal whose si_pid isn't the
-    // caller's own (EPERM), so restate them as the host's for the call and
-    // put the guest's back after; the receiver's copy is translated on
-    // delivery like any other sender.
-    void fix_queued_siginfo(::pid_t w, std::uint64_t info, Task& t) {
-        if (!info) return;
-        errno = 0;
-        const long word = ::ptrace(PTRACE_PEEKDATA, w, reinterpret_cast<void*>(info + 16), 0);
-        if (errno) return;
-        const auto hp = static_cast<std::uint32_t>(host_tgid_of(w));
-        const auto hu = static_cast<std::uint32_t>(::getuid());
-        const auto nw = static_cast<std::uint64_t>(hp) | (static_cast<std::uint64_t>(hu) << 32);
-        ::ptrace(PTRACE_POKEDATA, w, reinterpret_cast<void*>(info + 16), reinterpret_cast<void*>(nw));
-        t.on_exit = [w, info, word](std::int64_t) {
-            ::ptrace(PTRACE_POKEDATA, w, reinterpret_cast<void*>(info + 16), reinterpret_cast<void*>(word));
-        };
-    }
+    // The siginfo a guest queues names its sender as the guest sees it, and
+    // the kernel passes si_pid/si_uid through untouched for SI_QUEUE, to
+    // itself or another process (measured on x86-64 and Android). It used
+    // to be rewritten to the host pid and uid, so sigtimedwait saw a pid
+    // that doesn't exist in the guest. Nothing to fix.
+    void fix_queued_siginfo(::pid_t, std::uint64_t, Task&) {}
 
     // clone/clone3 with CLONE_PARENT_SETTID store the child's tid in the
     // parent's memory, and that's what glibc keeps as the thread's tid
