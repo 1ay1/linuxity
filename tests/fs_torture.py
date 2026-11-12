@@ -322,10 +322,14 @@ def device_nodes():
     fd = os.open("/dev/zero", os.O_RDONLY)
     eq(os.read(fd, 4096), b"\0" * 4096, "/dev/zero")
     os.close(fd)
-    fd = os.open("/dev/full", os.O_RDWR)
-    expect_errno(errno.ENOSPC, "write to /dev/full", os.write, fd, b"x")
-    eq(os.read(fd, 8), b"\0" * 8, "/dev/full reads zeros")
-    os.close(fd)
+    try:
+        fd = os.open("/dev/full", os.O_RDWR)
+    except PermissionError:
+        fd = -1   # the host refuses it (Android's SELinux), natively too
+    if fd >= 0:
+        expect_errno(errno.ENOSPC, "write to /dev/full", os.write, fd, b"x")
+        eq(os.read(fd, 8), b"\0" * 8, "/dev/full reads zeros")
+        os.close(fd)
     fd = os.open("/dev/urandom", os.O_RDONLY)
     a, b = os.read(fd, 32), os.read(fd, 32)
     os.close(fd)
