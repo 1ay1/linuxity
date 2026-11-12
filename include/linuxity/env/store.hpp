@@ -27,6 +27,13 @@
 #include <signal.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <linux/fs.h>     // FICLONE
+#include <sys/ioctl.h>
+#elif defined(__APPLE__)
+#include <sys/clonefile.h>
+#include <sys/mount.h>   // statfs
+#endif
 
 #include <algorithm>
 #include <cerrno>
@@ -111,33 +118,55 @@ inline bool remove_tree(const std::string& p) {
     return ::unlink(p.c_str()) == 0;
 }
 
-// Copy a tree, keeping symlinks as symlinks and modes as modes. Hard links
-// become separate files; that is fine for an overlay upper.
+// Copy a tree, keeping symlinks, modes and times. Files are cloned where the
+// filesystem can (btrfs, xfs, APFS): instant, and no space until one changes.
+// Hard links become separate files; that is fine for an overlay upper.
 inline bool copy_tree(const std::string& from, const std::string& to) {
     struct ::stat st{};
     if (::lstat(from.c_str(), &st) != 0) return false;
+#if defined(__APPLE__)
+    const ::timespec times[2] = {st.st_atimespec, st.st_mtimespec};
+#else
+    const ::timespec times[2] = {st.st_atim, st.st_mtim};
+#endif
+    auto keep_times = [&] { (void)::utimensat(AT_FDCWD, to.c_str(), times, AT_SYMLINK_NOFOLLOW); };
     if (S_ISLNK(st.st_mode)) {
         std::string target(static_cast<std::size_t>(st.st_size) + 1, '\0');
         const ::ssize_t n = ::readlink(from.c_str(), target.data(), target.size());
         if (n < 0) return false;
         target.resize(static_cast<std::size_t>(n));
-        return ::symlink(target.c_str(), to.c_str()) == 0;
+        if (::symlink(target.c_str(), to.c_str()) != 0) return false;
+        keep_times();
+        return true;
     }
     if (S_ISDIR(st.st_mode)) {
+#if defined(__APPLE__)
+        // APFS clones a whole tree in one call
+        if (!exists(to) && ::clonefile(from.c_str(), to.c_str(), CLONE_NOFOLLOW) == 0) return true;
+#endif
         if (::mkdir(to.c_str(), 0700) != 0 && errno != EEXIST) return false;
         bool ok = true;
         for (const auto& n : list_dir(from)) ok = copy_tree(from + "/" + n, to + "/" + n) && ok;
         (void)::chmod(to.c_str(), st.st_mode & 07777);
+        keep_times();   // after the children, which touch it
         return ok;
     }
     if (S_ISREG(st.st_mode)) {
+#if defined(__APPLE__)
+        if (::clonefile(from.c_str(), to.c_str(), CLONE_NOFOLLOW) == 0) return true;   // keeps mode and times
+#endif
         const int in = ::open(from.c_str(), O_RDONLY | O_CLOEXEC);
         if (in < 0) return false;
         const int out = ::open(to.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
         if (out < 0) { ::close(in); return false; }
-        char buf[1 << 16];
         bool ok = true;
-        for (;;) {
+#if defined(__linux__)
+        const bool cloned = ::ioctl(out, FICLONE, in) == 0;
+#else
+        const bool cloned = false;
+#endif
+        char buf[1 << 16];
+        while (!cloned) {
             const ::ssize_t n = ::read(in, buf, sizeof buf);
             if (n == 0) break;
             if (n < 0) { if (errno == EINTR) continue; ok = false; break; }
@@ -150,11 +179,35 @@ inline bool copy_tree(const std::string& from, const std::string& to) {
         }
         ::close(in);
         (void)::fchmod(out, st.st_mode & 07777);
+        (void)::futimens(out, times);
         ::close(out);
         return ok;
     }
     // FIFOs and sockets in an upper are leftovers of a run; skip them
     return true;
+}
+
+// Can files in `dir` be cloned (reflinked) instead of copied? Then copy_tree
+// of a whole upper is instant and takes no space.
+[[nodiscard]] inline bool can_clone(const std::string& dir) {
+#if defined(__APPLE__)
+    struct ::statfs fs{};
+    return ::statfs(dir.c_str(), &fs) == 0 && std::string_view{fs.f_fstypename} == "apfs";
+#elif defined(__linux__)
+    const std::string a = dir + "/.clone-probe." + std::to_string(::getpid()), b = a + ".b";
+    const int in = ::open(a.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (in < 0) return false;
+    const int out = ::open(b.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    const bool ok = out >= 0 && ::write(in, "x", 1) == 1 && ::ioctl(out, FICLONE, in) == 0;
+    if (out >= 0) ::close(out);
+    ::close(in);
+    (void)::unlink(a.c_str());
+    (void)::unlink(b.c_str());
+    return ok;
+#else
+    (void)dir;
+    return false;
+#endif
 }
 
 [[nodiscard]] inline std::uint64_t tree_bytes(const std::string& p) {

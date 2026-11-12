@@ -195,8 +195,11 @@ lx -v ~/proj:/work make           # a host folder mounted, foreground
 ```
 
 `--temp` and `-v` are like `docker run`: they don't use or need the
-background instance. `--temp` starts from the clean image (users you added
-later aren't in it, so it runs as root).
+background instance. `--temp` starts from your environment as it is now
+(your users, your installed packages) and throws away whatever the run
+changes. On a filesystem that can clone files (btrfs, xfs, APFS) that's
+instant at any size. Elsewhere it copies changes up to 256 MB; past that it
+starts from the clean image instead, as root, and says so.
 
 ---
 
@@ -383,6 +386,8 @@ linuxity reset dev                   # back to the freshly made state
 ```
 
 A snapshot saves your changes and settings, not the image, so it's small.
+On btrfs, xfs or APFS it's a clone: instant, and it takes no space until
+the files change. Elsewhere it's a copy of your changes.
 `reset` throws away every change; users you added go with it.
 
 Move an environment somewhere else, or make a template:
@@ -610,7 +615,7 @@ covers both `linuxity` and `lx`:
 | `lx` | login shell in the default environment |
 | `lx [OPTIONS] CMD [ARGS]` | run a command; options `-u USER`, `-C DIR`, `-e K=V`, `-t`/`-T`; `lx -- CMD` if it starts with `-` |
 | `lx @ENV [CMD ...]` | the same, in another environment |
-| `lx --temp [CMD ...]` | throwaway run: pid 1, foreground, changes discarded, clean image as root |
+| `lx --temp [CMD ...]` | throwaway run from your current state: pid 1, foreground, its changes discarded |
 | `lx -v HOST:GUEST [CMD ...]` | a run of its own with a host folder mounted |
 | `lx kill PID` | signal a process (guest pids) |
 | `new` | list downloadable distros |

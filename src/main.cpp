@@ -324,11 +324,30 @@ int cmd_run(int argc, char** argv) {
         // a re-exec under systemd-run (for exact limits) reuses the same dir
         if (const char* d = std::getenv("LINUXITY_FRESH_DIR"); d && *d) scratch = d;
         else {
-            scratch = lx::host::tmp_path("linuxity-fresh-" + std::to_string(::getpid()));
-            (void)lx::env::mkdirs(scratch);
-            // the image's own owners and modes still apply
-            if (const auto m = lx::env::slurp(store.dir(o.env_name) + "/image.meta"))
-                (void)lx::env::write_file_atomic(scratch + "/.linuxity-meta", *m);
+            // Next to the env, so a clone stays on one filesystem. Leftovers of
+            // runs that died (their pid is gone) are cleared first.
+            const std::string tdir = store.dir(o.env_name) + "/temp";
+            (void)lx::env::mkdirs(tdir);
+            for (const auto& n : lx::env::list_dir(tdir))
+                if (const int p = std::atoi(n.c_str()); p > 0 && ::kill(p, 0) != 0 && errno == ESRCH)
+                    (void)lx::env::remove_tree(tdir + "/" + n);
+            scratch = tdir + "/" + std::to_string(::getpid());
+            // Start from what you have now when that's cheap: a clone, or a
+            // small enough copy. Otherwise from the clean image.
+            const std::string upper = o.cfg.upper;
+            constexpr std::uint64_t kCopyMax = 256ull << 20;
+            const bool from_now = lx::env::is_dir(upper) &&
+                (lx::env::can_clone(tdir) || lx::env::tree_bytes(upper) <= kCopyMax) &&
+                lx::env::copy_tree(upper, scratch);
+            if (!from_now) {
+                (void)lx::env::remove_tree(scratch);
+                (void)lx::env::mkdirs(scratch);
+                // the image's own owners and modes still apply
+                if (const auto m = lx::env::slurp(store.dir(o.env_name) + "/image.meta"))
+                    (void)lx::env::write_file_atomic(scratch + "/.linuxity-meta", *m);
+                std::fprintf(stderr, "linuxity: --temp starts from the clean image (your changes are too big "
+                                     "to copy, and this filesystem can't clone them)\n");
+            }
             ::setenv("LINUXITY_FRESH_DIR", scratch.c_str(), 1);
         }
         o.persist = scratch;
@@ -343,7 +362,7 @@ int cmd_run(int argc, char** argv) {
     layers.push_back(o.root);
     auto u = lx::env::resolve_user(layers, o.user);
     if (!u && fresh) {
-        // --fresh starts from the clean image, which predates users added later
+        // a clean-image run predates users added later
         if (!std::getenv("LINUXITY_DELEGATED"))
             std::fprintf(stderr, "linuxity: %s isn't in the clean image; running as root\n", o.user.c_str());
         o.user = "root";
