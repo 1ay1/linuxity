@@ -405,6 +405,9 @@ public:
                     // by next() on a later iteration.
                     std::int64_t ret =
                         -static_cast<std::int64_t>(Errno::eperm);
+                    // si_uid is the sender's real uid, a guest fact
+                    if constexpr (requires { trap_.set_sender_uid(0u); })
+                        locked([&] { trap_.set_sender_uid(sys.sender_uid()); });
                     if constexpr (runtime::DeliversSignals<T>) {
                         if (k.grouped) {
                             // A group, already resolved to its members by the

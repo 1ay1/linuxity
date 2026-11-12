@@ -786,6 +786,7 @@ int lx::cli::host_run(lx::cli::Options& o, int argc, char** argv) {
     };
     sweep(private_tmp_dir);
     sweep(ephemeral_upper);
+    if (shm_dir != "/dev/shm") sweep(shm_dir);   // Android has no /dev/shm: one per run
 
     if (!rc) {
         std::fprintf(stderr, "linuxity: runtime error %d\n", int(rc.error()));

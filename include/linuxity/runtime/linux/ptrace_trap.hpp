@@ -367,6 +367,12 @@ public:
                 if (w == root_pid_) exit_code_ = code;
                 gt_on_exit(w, st);
                 const std::int32_t exited_g = exited_gpid(w);
+                // A child can exit before its parent's fork event is seen.
+                // Remember it, so that event doesn't bring it back to life.
+                if (w != root_pid_ && !announced_.erase(w)) {
+                    if (exited_early_.size() > 4096) exited_early_.clear();
+                    exited_early_.insert(w);
+                }
                 if (const std::int32_t g = exited_g) {
                     proc_events_.push_back({ProcEvent::reap, g, 0, {}, {}});
                     reparent_orphans_of(g);
@@ -417,8 +423,14 @@ public:
                 unsigned long np = 0;
                 ::ptrace(PTRACE_GETEVENTMSG, w, 0, &np);
                 auto child = static_cast<::pid_t>(np);
-                if (np && tasks_.emplace(child, Task{}).second)
-                    ++live_;   // may already be counted if it stopped first
+                // Already exited: its reap event went out, so announcing it now
+                // would leave a dead row in ps and /proc. The pid can't have
+                // been reused: its parent is stopped right here, unable to reap.
+                const bool gone = np && exited_early_.erase(child);
+                if (np && !gone) {
+                    announced_.insert(child);
+                    if (tasks_.emplace(child, Task{}).second) ++live_;   // may already be counted if it stopped first
+                }
                 // A fork/vfork is a new PROCESS in the guest's world; a
                 // CLONE (thread) shares the tgid and is NOT a distinct pid to
                 // a process monitor. Record only real processes, and map the
@@ -437,8 +449,9 @@ public:
                 // creator's thread group; clone3() for a plain fork (what
                 // glibc's posix_spawn and subprocess use) reports CLONE too.
                 const bool is_thread = np && event == PTRACE_EVENT_CLONE &&
-                                       tgid_of(child) == host_tgid_of(w);
-                if (np && !is_thread) {
+                                       !gone && tgid_of(child) == host_tgid_of(w);
+                if (gone) {
+                } else if (np && !is_thread) {
                     std::int32_t gpid = gpid_of(child);
                     std::int32_t gppid = gpid_of(host_tgid_of(w));   // a thread's child belongs to its process
                     gppid_[gpid] = gppid;
@@ -2210,7 +2223,7 @@ public:
         si.si_signo = signum;
         si.si_code  = SI_QUEUE;
         si.si_pid   = gpid_of(cur_);
-        si.si_uid   = 0;                 // the guest runs as root
+        si.si_uid   = sender_uid_;       // the sender's real uid in the guest
         // marks it as a kill(2), turned back into SI_USER at delivery
         si.si_value.sival_int = kKillMark;
 
@@ -2889,6 +2902,11 @@ private:
 
     // A known guest pid for a host id we have ALREADY seen, or 0.
     static constexpr int kKillMark = 0x4c58eb1d;
+public:
+    // The guest uid of the task about to send a signal (set per kill).
+    void set_sender_uid(std::uint32_t u) noexcept { sender_uid_ = u; }
+private:
+    std::uint32_t sender_uid_{0};
 
     // The guest pid for a host id we have ALREADY seen, or 0. Pure lookup, so
     // it cannot perturb the pid allocator the way gpid_of does.
@@ -2974,6 +2992,8 @@ private:
     std::unordered_set<::pid_t> stopped_;
     // SIGSTOPs we sent that the task hasn't taken yet (see the attach stop)
     std::unordered_set<::pid_t> stop_owed_;
+    // children whose fork event has been handled, and ones that exited first
+    std::unordered_set<::pid_t> announced_, exited_early_;
     std::unordered_map<::pid_t, std::int32_t> gpid_;   // host tid -> guest pid
     std::unordered_map<std::int32_t, ::pid_t> host_of_gpid_; // guest pid -> host tid
     std::unordered_map<std::int32_t, std::int32_t> gppid_; // guest pid -> ppid
