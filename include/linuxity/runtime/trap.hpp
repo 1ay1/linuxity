@@ -151,6 +151,8 @@ public:
             // The dispatcher classifies the trapped syscall: service it from
             // our subsystems, forward it to the host kernel, or exit.
             abi::Outcome o = locked([&] { return sys.dispatch(f.regs); });
+            if constexpr (requires { trap_.set_strict(::pid_t{}); trap_.current_tid(); })
+                if (locked([&] { return sys.take_strict(); })) trap_.set_strict(trap_.current_tgid());
             // An open's pending state, taken with the dispatch: the open runs
             // unlocked and a sibling thread's dispatch would clobber it. Only
             // the outcomes that open something carry it.
@@ -477,6 +479,17 @@ public:
                                         trap_.ig_note_fd(kernel_, static_cast<int>(ret),
                                                          std::string{kernel_.files().path_of_fd(static_cast<int>(ret))});
                                     });
+                            });
+                            if (!fr) return recover(fr.error());
+                            return Step::next;
+                        }
+                    }
+                    // A forward that borrowed the guest's buffer (prlimit's
+                    // clamped limit) puts it back once the call has run.
+                    if constexpr (runtime::ForwardsSynchronously<T>) {
+                        if (auto rb = locked([&] { return sys.take_restore(); })) {
+                            auto fr = trap_.forward_sync([&](std::int64_t) {
+                                locked([&] { sys.put_back(*rb); });
                             });
                             if (!fr) return recover(fr.error());
                             return Step::next;
@@ -878,6 +891,15 @@ private:
                     case EV::reparent:
                         if (auto* p = kernel_.procs().find_mut(static_cast<std::int32_t>(e.pid)))
                             p->ppid = static_cast<std::int32_t>(e.ppid);
+                        break;
+                    case EV::zombie:
+                        // exited, not yet waited for: /proc shows it as Z
+                        if (auto* p = kernel_.procs().find_mut(static_cast<std::int32_t>(e.pid))) {
+                            p->state = 'Z';
+                            p->threads.clear();
+                            p->rss_pages = 0;
+                            p->vsize_bytes = 0;
+                        }
                         break;
                     case EV::reap:
                         kernel_.procs().drop_thread(static_cast<std::int32_t>(e.pid));

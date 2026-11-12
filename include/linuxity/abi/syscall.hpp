@@ -220,6 +220,12 @@ public:
             // no handler (setpgid, a comm write) creates a default, root one.
             if (!k_.procs().find_mut(id.pid)) (void)me();
         }
+        // SECCOMP_MODE_STRICT allows read, write, exit (not exit_group) and
+        // sigreturn; anything trapped is something else, so it dies
+        if (const auto* sp = k_.procs().find(ids().pid); sp && sp->seccomp_strict &&
+            sc != Sysno::exit && sc != Sysno::rt_sigreturn &&
+            sc != Sysno::read && sc != Sysno::write)
+            return Outcome::raise_at(0, SIGKILL);
         // a process under a landlock domain linuxity keeps (no host Landlock)
         if (ll_layers_ > 0)
             if (const Errno e = ll_gate(sc, r); e != Errno::ok) return eno(e);
@@ -360,7 +366,7 @@ private:
                         return Outcome::raise_group(pid, signum, std::move(m));
                     }
                 }
-                return sig(pid, signum);
+                return sig_checked(pid, signum);
             }
             // tkill/tgkill address a THREAD, so unlike kill they have no
             // process-group form: a non-positive id is EINVAL, not a group.
@@ -1076,6 +1082,13 @@ private:
                 const int op = static_cast<int>(r.arg[0]);
                 if (auto a = prctl_creds(op, r)) return *a;
                 if (op == 4 /*PR_SET_DUMPABLE*/) return val(0);
+                // PR_SET_SECCOMP(22), SECCOMP_MODE_STRICT(1): the host applies
+                // it to native calls, we to the ones we answer
+                if (op == 22 && r.arg[1] == 1) {
+                    me().seccomp_strict = true;
+                    strict_pending_ = true;
+                    return val(0);
+                }
                 // PR_SET_NAME(15) renames the thread, and /proc/<pid>/comm is
                 // the SAME FACT read back. procfs answers comm from our own
                 // process table, which never learned about the rename, so the
@@ -1151,6 +1164,16 @@ private:
             case Sysno::vfork:
                 if (const auto lim = machine().task_limit; lim && task_count() >= lim)
                     return eno(Errno::eagain);
+                return fwd();
+
+            case Sysno::prlimit64: return do_prlimit(r);
+            // seccomp(SECCOMP_SET_MODE_STRICT=0, 0, NULL): like the prctl
+            case Sysno::seccomp:
+                if (r.arg[0] == 0 && r.arg[1] == 0) {
+                    me().seccomp_strict = true;
+                    strict_pending_ = true;
+                    return val(0);
+                }
                 return fwd();
 
             // -- everything else: FORWARD to the real host kernel. -------
@@ -1293,6 +1316,94 @@ private:
     static Outcome fwd() { return Outcome::forward(); }
     static Outcome sig(std::int32_t pid, std::int32_t signum) {
         return Outcome::raise_at(pid, signum);
+    }
+    // prlimit64(pid, res, new, old). The host enforces limits, but linuxity's
+    // host user can't raise a hard limit, which a guest root (CAP_SYS_RESOURCE)
+    // may. So a raise past the host's hard limit is recorded per process and
+    // read back; the host keeps the most it allows. Other targets forward.
+    //
+    // The host part runs one of two ways: prlimit64 on the task from here, or
+    // (Android, where SELinux refuses that even for our own tracee) the
+    // guest's own call with its buffer clamped, then put back.
+    [[nodiscard]] Outcome do_prlimit(const Regs& r) {
+        const auto res = static_cast<std::uint32_t>(r.arg[1]);
+        const std::uint64_t nu = r.arg[2], old = r.arg[3];
+        if (res >= 16 || (r.arg[0] != 0 && static_cast<std::int32_t>(r.arg[0]) != ids().pid)) return fwd();
+        if constexpr (!requires { mem_.host_tid(); }) {
+            return fwd();
+        } else {
+            auto& p = me();
+            if (!p.hard_over[res] && (!nu || !creds::capable(p, creds::kCapSysResource)))
+                return fwd();   // nothing of ours involved: the host answers
+            const ::pid_t task = static_cast<::pid_t>(mem_.host_tid());
+            struct ::rlimit64 host{};
+            if (::syscall(SYS_prlimit64, task, static_cast<int>(res), nullptr, &host) != 0) {
+                // can't look: the task holds what we last gave it, which began
+                // as linuxity's own (inherited across the guest's start)
+                if (::syscall(SYS_prlimit64, 0, static_cast<int>(res), nullptr, &host) != 0) return fwd();
+                if (p.host_cur[res]) host.rlim_cur = p.host_cur[res] - 1;
+                if (p.host_max[res]) host.rlim_max = p.host_max[res] - 1;
+            }
+            const std::uint64_t over = p.hard_over[res];
+            const std::uint64_t cur = host.rlim_cur, max = over ? over - 1 : host.rlim_max;
+            if (!nu) {
+                if (old) {
+                    std::array<std::byte, 16> b{};
+                    std::memcpy(b.data(), &cur, 8);
+                    std::memcpy(b.data() + 8, &max, 8);
+                    if (!mem_.copy_out(uaddr(old), b)) return eno(Errno::efault);
+                }
+                return val(0);
+            }
+            std::array<std::byte, 16> want{};
+            if (!mem_.copy_in(uaddr(nu), want)) return eno(Errno::efault);
+            std::uint64_t ncur = 0, nmax = 0;
+            std::memcpy(&ncur, want.data(), 8);
+            std::memcpy(&nmax, want.data() + 8, 8);
+            if (ncur > nmax) return eno(Errno::einval);
+            if (nmax > max && !creds::capable(p, creds::kCapSysResource)) return eno(Errno::eperm);
+            if (old) {
+                std::array<std::byte, 16> b{};
+                std::memcpy(b.data(), &cur, 8);
+                std::memcpy(b.data() + 8, &max, 8);
+                if (!mem_.copy_out(uaddr(old), b)) return eno(Errno::efault);
+            }
+            // the host takes what it allows; the rest is ours to report
+            const std::uint64_t hmax = std::min<std::uint64_t>(nmax, host.rlim_max), hcur = std::min(ncur, hmax);
+            p.hard_over[res] = nmax > hmax ? nmax + 1 : 0;
+            p.host_cur[res] = hcur + 1;
+            p.host_max[res] = hmax + 1;
+            struct ::rlimit64 apply{hcur, hmax};
+            if (::syscall(SYS_prlimit64, task, static_cast<int>(res), &apply, nullptr) == 0) return val(0);
+            // clamp the guest's own buffer, let its call apply it, put it back
+            std::array<std::byte, 16> clamped{};
+            std::memcpy(clamped.data(), &hcur, 8);
+            std::memcpy(clamped.data() + 8, &hmax, 8);
+            if (!mem_.copy_out(uaddr(nu), clamped)) return eno(Errno::efault);
+            restore_after_ = {nu, want};
+            return fwd();
+        }
+    }
+
+    // kill(2) to one process, with the kernel's permission rule in the
+    // guest's ids (kill_ok_by_cred): the host can't judge it, linuxity owns
+    // every task. Signal 0 probes the same rule.
+    Outcome sig_checked(std::int32_t pid, std::int32_t signum) {
+        if (pid > 0 && signum >= 0) {
+            const auto pns = kernel::ProcessTable::pid_ns(k_.procs().ns_of(ids().pid));
+            const std::int32_t g = pns ? k_.procs().pid_from(pns, pid) : pid;
+            const auto* t = g > 0 ? k_.procs().find(g) : nullptr;
+            if (!t && g != ids().pid && !k_.procs().thread_group_of(g)) return eno(Errno::esrch);
+            if (t && g != ids().pid) {
+                const auto me_ = me();
+                const bool same = me_.uids[0] == t->uids[0] || me_.uids[0] == t->uids[2] ||
+                                  me_.uids[1] == t->uids[0] || me_.uids[1] == t->uids[2];
+                // SIGCONT within a session is always allowed
+                const bool cont = signum == SIGCONT && k_.procs().sid_of(g) == k_.procs().sid_of(ids().pid);
+                if (!same && !cont && !creds::capable(me_, creds::kCapKill)) return eno(Errno::eperm);
+            }
+        }
+        return sig(pid, signum);
     }
     static Outcome eno(Errno e) { return Outcome::error(e); }
 
@@ -2057,6 +2168,18 @@ private:
         const auto set = k_.procs().ns_of(owner);
         for (const auto id : set.id) if (id) return abs;
         if (set.pid_for_children || set.time_for_children) return abs;
+        // the host's links only when it has them all (Android lacks pid/user
+        // in /proc/self/ns): else procfs lists the full set from the registry
+        static const bool host_full = [] {
+            for (const char* n : {"pid", "user", "mnt", "net", "uts", "ipc"}) {
+                char l[64];
+                std::snprintf(l, sizeof l, "/proc/self/ns/%s", n);
+                struct ::stat st{};
+                if (::lstat(l, &st) != 0) return false;
+            }
+            return true;
+        }();
+        if (!host_full) return abs;
         return "/proc/self" + std::string{v};
     }
     [[nodiscard]] std::string expand_proc_links(std::string abs, bool follow_leaf) {
@@ -6478,6 +6601,18 @@ private:
     std::uint64_t kmsg_seq_{0}, kmsg_cleared_{0};
     std::vector<int> kmsg_writers_;   // read ends of pipes guest writers hold
     bool pending_new_{false};    // the pending O_CREAT open makes a new name
+    bool strict_pending_{false}; // the call just put its task in strict seccomp
+public:
+    // Guest bytes a forwarded call borrowed (prlimit's clamped limit), to be
+    // written back after it runs.
+    struct Restore { std::uint64_t addr{0}; std::array<std::byte, 16> bytes{}; };
+    [[nodiscard]] std::optional<Restore> take_restore() noexcept {
+        if (!restore_after_.addr) return std::nullopt;
+        return std::exchange(restore_after_, Restore{});
+    }
+    void put_back(const Restore& r) { (void)mem_.copy_out(uaddr(r.addr), r.bytes); }
+private:
+    Restore restore_after_{};
     // guest paths of abstract-socket placeholders (see do_sockaddr_un)
     std::unordered_set<std::string> sock_placeholders_;
     std::unordered_map<std::uint64_t, std::string> sock_names_, sock_peers_;
@@ -6789,6 +6924,8 @@ public:
     [[nodiscard]] bool privileged() { return creds::capable(me(), creds::kCapDacOverride); }
     // The calling task's real uid: what a signal it sends carries as si_uid.
     [[nodiscard]] std::uint32_t sender_uid() { return me().uids[0]; }
+    // Did the call just dispatched enter SECCOMP_MODE_STRICT? (once)
+    [[nodiscard]] bool take_strict() noexcept { return std::exchange(strict_pending_, false); }
 
     // A translated host path at or over PATH_MAX fails on the host even when
     // the guest named it relative to a dirfd or its cwd, which have no length

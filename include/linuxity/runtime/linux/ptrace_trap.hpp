@@ -365,6 +365,7 @@ public:
                 int code = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
                 if (WIFSIGNALED(st)) trace_killed(w, WTERMSIG(st));
                 if (w == root_pid_) exit_code_ = code;
+                if (!strict_tgids_.empty()) strict_tgids_.erase(w);
                 gt_on_exit(w, st);
                 const std::int32_t exited_g = exited_gpid(w);
                 // A child can exit before its parent's fork event is seen.
@@ -374,7 +375,16 @@ public:
                     exited_early_.insert(w);
                 }
                 if (const std::int32_t g = exited_g) {
-                    proc_events_.push_back({ProcEvent::reap, g, 0, {}, {}});
+                    // A process stays a zombie until its parent waits for it;
+                    // a thread just goes.
+                    const auto tc = tgid_cache_.find(w);
+                    const bool leader = tc == tgid_cache_.end() || tc->second == w;
+                    if (leader && w != root_pid_) {
+                        proc_events_.push_back({ProcEvent::zombie, g, 0, {}, {}});
+                        zombies_[g] = w;
+                    } else {
+                        proc_events_.push_back({ProcEvent::reap, g, 0, {}, {}});
+                    }
                     reparent_orphans_of(g);
                 }
                 // NB: do NOT erase gpid_[w] here. The parent's wait4() has not
@@ -626,6 +636,20 @@ public:
                 // x0 is the first argument at entry, so on the phone every
                 // entry read as an exit and nothing was ever dispatched.
                 const int op = syscall_stop_op(w);
+                // a strict-seccomp task (see set_strict) stops on every call
+                if (seccomp_ && op == 1 && is_strict(w)) {
+                    const abi::Sysno s = abi::decode(kTraceeArch, rr.nr());
+                    using S = abi::Sysno;
+                    if (s != S::read && s != S::write && s != S::exit &&
+                        s != S::rt_sigreturn) {
+                        ::kill(host_tgid_of(w), SIGKILL);
+                        ::ptrace(PTRACE_CONT, w, 0, 0);
+                        continue;
+                    }
+                    ::ptrace(PTRACE_SYSCALL, w, 0, 0);
+                    continue;
+                }
+                if (seccomp_ && op == 2 && is_strict(w)) { ::ptrace(PTRACE_SYSCALL, w, 0, 0); continue; }
                 bool is_entry = !seccomp_ &&
                     (op > 0 ? op == 1 /*ENTRY*/
                             : static_cast<long long>(rr.ret()) == -38 /*ENOSYS*/ && !t.in_call);
@@ -665,10 +689,23 @@ public:
             if (gt_on_signal_stop(w, sig)) continue;   // its tracer decides
             if (sig == SIGCHLD) {
                 siginfo_t csi{};
-                if (::ptrace(PTRACE_GETSIGINFO, w, 0, &csi) == 0 && gt_fix_chld(w, csi)) {
-                    ::ptrace(PTRACE_SETSIGINFO, w, 0, &csi);
-                    resume_run(w, sig);
-                    continue;
+                if (::ptrace(PTRACE_GETSIGINFO, w, 0, &csi) == 0) {
+                    if (gt_fix_chld(w, csi)) {
+                        ::ptrace(PTRACE_SETSIGINFO, w, 0, &csi);
+                        resume_run(w, sig);
+                        continue;
+                    }
+                    // the kernel's own SIGCHLD (exited, killed, stopped...)
+                    // names the child by its host pid
+                    if (csi.si_code >= CLD_EXITED && csi.si_code <= CLD_CONTINUED && csi.si_pid > 0) {
+                        const std::int32_t g = chld_gpid(w, csi.si_pid);
+                        if (g > 0 && g != csi.si_pid) {
+                            csi.si_pid = g;
+                            ::ptrace(PTRACE_SETSIGINFO, w, 0, &csi);
+                        }
+                        resume_run(w, sig);
+                        continue;
+                    }
                 }
             }
             if (sig == SIGSYS) {
@@ -965,8 +1002,12 @@ public:
             gt_plain_resume(w, sig);
             return;
         }
-        ::ptrace(seccomp_ ? PTRACE_CONT : PTRACE_SYSCALL, w, 0, sig);
+        ::ptrace(seccomp_ && !strict_tgids_.count(host_tgid_of(w)) ? PTRACE_CONT : PTRACE_SYSCALL, w, 0, sig);
     }
+    // SECCOMP_MODE_STRICT can't stack on our filter in the kernel, so we
+    // enforce it: the task stops on every call and anything not allowed dies.
+    [[nodiscard]] bool is_strict(::pid_t w) { return !strict_tgids_.empty() && strict_tgids_.count(host_tgid_of(w)); }
+    std::unordered_set<::pid_t> strict_tgids_;
 
     // Resume after a fork/exec EVENT stop. If the task is still inside a
     // syscall WE are servicing (clone/fork/execve), it owes us its EXIT stop,
@@ -1064,8 +1105,8 @@ public:
     // lgetxattr, close and getdents64 alone are 77K of the 150K traps in one
     // `ls -lR /usr/include`.
     [[nodiscard]] static bool owes_exit_stop(unsigned long long nr) {
-        return returns_pid(nr) || abi::decode(kTraceeArch, nr) ==
-                                      abi::Sysno::waitid;
+        const auto s = abi::decode(kTraceeArch, nr);
+        return returns_pid(nr) || s == abi::Sysno::waitid || s == abi::Sysno::rt_sigtimedwait;
     }
 
     // fcntl(F_GETLK) fills struct flock's l_pid with the HOST pid of the
@@ -1095,6 +1136,12 @@ public:
         if (sc == abi::Sysno::shmctl && (cmd == 2 || cmd == 13 || cmd == 15) && r.arg(2)) return 2;
         if (sc == abi::Sysno::semctl && cmd == 11) return 3;
         return 0;
+    }
+    // A host pid as the calling guest names it; 0 when it isn't a guest's.
+    // A child the parent hears about in SIGCHLD, by the parent's numbering.
+    [[nodiscard]] std::int32_t chld_gpid(::pid_t parent, std::int32_t host) {
+        if (host_pids_) return host;
+        return guest_view_of_host(parent, host);
     }
     // A host pid as the calling guest names it; 0 when it isn't a guest's.
     [[nodiscard]] std::int32_t guest_view_of_host(::pid_t w, std::int32_t host) {
@@ -1959,7 +2006,7 @@ public:
     // linuxity's real, live process list. The trap stays decoupled from the
     // kernel: it only emits events, it never touches ProcessTable itself.
     struct ProcEvent {
-        enum Kind { spawn, exec, reap, thread, stop, cont, reparent } kind;
+        enum Kind { spawn, exec, reap, thread, stop, cont, reparent, zombie } kind;
         ::pid_t pid;          // the affected task's tid (== pid for a process)
         ::pid_t ppid;         // parent (spawn), owning process (thread)
         std::string comm;     // program name (exec only)
@@ -1967,13 +2014,30 @@ public:
         std::uint64_t ns_flags{0};   // spawn: the CLONE_NEW* the clone asked for
     };
     [[nodiscard]] std::vector<ProcEvent> drain_proc_events() {
+        // A zombie lives as long as the host keeps it: once its parent's wait
+        // (or an auto-reap: SIGCHLD ignored, parent gone) frees it, the host
+        // drops /proc/<pid>, and so do we. Every wait form works the same.
+        if (!zombies_.empty()) {
+            for (auto it = zombies_.begin(); it != zombies_.end();) {
+                char p[32];
+                std::snprintf(p, sizeof p, "/proc/%d", static_cast<int>(it->second));
+                if (::access(p, F_OK) != 0) {
+                    proc_events_.push_back({ProcEvent::reap, it->first, 0, {}, {}});
+                    it = zombies_.erase(it);
+                } else ++it;
+            }
+        }
         return std::exchange(proc_events_, {});
     }
+    // Zombies keyed by guest pid -> host pid, until the host reaps them.
+    std::unordered_map<std::int32_t, ::pid_t> zombies_;
     // CLONE_NEW* flags of a clone a task is in, by host tid
     std::unordered_map<::pid_t, std::uint64_t> pending_clone_ns_;
 
     // The current guest tid, so the loop can attribute a syscall to a pid.
     [[nodiscard]] ::pid_t current_tid() const noexcept { return cur_; }
+    [[nodiscard]] ::pid_t current_tgid() { return host_tgid_of(cur_); }
+    void set_strict(::pid_t host_tgid) { strict_tgids_.insert(host_tgid); }
 
     // Stat a REAL host path, so the dispatcher can answer a host-backed guest
     // stat in the SAME trap stop instead of redirecting the call and stepping
@@ -2692,6 +2756,25 @@ private:
                         }
                     }
                 }
+            } else if (abi::decode(kTraceeArch, r.nr()) == abi::Sysno::rt_sigtimedwait) {
+                // the returned siginfo (arg 1) of a SIGCHLD names the child by
+                // its host pid; other senders already carry a guest pid
+                const auto ret = static_cast<long long>(r.ret());
+                const std::uint64_t infop = r.arg(1);
+                if (ret == SIGCHLD && infop != 0) {
+                    errno = 0;
+                    const long word = ::ptrace(PTRACE_PEEKDATA, w, reinterpret_cast<void*>(infop + 16), 0);
+                    const long code = ::ptrace(PTRACE_PEEKDATA, w, reinterpret_cast<void*>(infop + 8), 0);
+                    const auto c = static_cast<std::int32_t>(code & 0xffffffff);
+                    if (errno == 0 && c >= CLD_EXITED && c <= CLD_CONTINUED) {
+                        const auto host = static_cast<std::int32_t>(static_cast<std::uint32_t>(word & 0xffffffffu));
+                        if (const std::int32_t g = host > 0 ? chld_gpid(w, host) : 0; g > 0 && g != host) {
+                            auto uw = static_cast<std::uint64_t>(word);
+                            uw = (uw & ~0xffffffffull) | static_cast<std::uint32_t>(g);
+                            ::ptrace(PTRACE_POKEDATA, w, reinterpret_cast<void*>(infop + 16), reinterpret_cast<void*>(uw));
+                        }
+                    }
+                }
             } else if (is_getlk(r)) {
                 translate_getlk(w, r);
             } else if (is_peercred(r)) {
@@ -2770,9 +2853,17 @@ private:
             if (WIFEXITED(st) || WIFSIGNALED(st)) {
                 int code = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
                 if (w == root_pid_) exit_code_ = code;
+                if (!strict_tgids_.empty()) strict_tgids_.erase(w);
                 gt_on_exit(w, st);
                 if (const std::int32_t g = exited_gpid(w)) {
-                    proc_events_.push_back({ProcEvent::reap, g, 0, {}, {}});
+                    const auto tc = tgid_cache_.find(w);
+                    const bool leader = tc == tgid_cache_.end() || tc->second == w;
+                    if (leader && w != root_pid_) {
+                        proc_events_.push_back({ProcEvent::zombie, g, 0, {}, {}});
+                        zombies_[g] = w;
+                    } else {
+                        proc_events_.push_back({ProcEvent::reap, g, 0, {}, {}});
+                    }
                     reparent_orphans_of(g);
                 }
                 // Retained past exit — see the note in next(): the parent's

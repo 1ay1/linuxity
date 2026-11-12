@@ -136,6 +136,8 @@ inline constexpr int kTrappedX86_64[] = {
     61,                          // wait4                 (pid translated both ways)
     101,                         // ptrace (a guest tracing a guest is emulated)
     247,                         // waitid    (id in, siginfo.si_pid out, both xlated)
+    128,                         // rt_sigtimedwait (siginfo.si_pid out, xlated)
+    317,                         // seccomp (STRICT mode is ours to keep too)
     62,                          // kill                  (signal to guest pid)
     // tkill(200)/tgkill(234) ARE trapped. The old note claimed "a guest tgkill
     // targets a thread that shares the host tgid, so running it natively is

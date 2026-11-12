@@ -199,7 +199,14 @@ def large_sparse_reservation_costs_only_what_is_touched():
     for i in range(0, size, step):
         poke(a + i, b"t")
     after = rss()
-    ok(after - before < 64 * 1024, f"RSS grew {after - before} KiB for 32 touched pages of {size >> 20} MiB")
+    # with transparent huge pages on "always" each touch can fault in 2 MiB
+    try:
+        thp = "[always]" in open("/sys/kernel/mm/transparent_hugepage/enabled").read()
+    except OSError:
+        thp = False
+    per_touch = 2048 if thp else 4
+    ok(after - before < 32 * per_touch + 32 * 1024,
+       f"RSS grew {after - before} KiB for 32 touched pages of {size >> 20} MiB")
     eq(peek(a + step, 1), b"t", "a far page holds its byte")
     with open("/proc/self/status") as f:
         vm = next(int(l.split()[1]) for l in f if l.startswith("VmSize:"))

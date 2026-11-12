@@ -562,10 +562,19 @@ make_procfs(const kernel::ProcessTable& procs, const kernel::MachineSpec& mach) 
             // fdinfo per task below; only an fd LINK goes to the backend,
             // which resolves /proc/self/fd/N against its own fd table.
             const bool own = procs.has_host_facts();
+            // the host's ns links only when it has every one (Android has no
+            // pid or user link); else the registry answers below
+            static const bool host_ns_full = [] {
+                for (const char* n : {"pid", "user", "mnt", "net", "uts", "ipc"}) {
+                    struct ::stat st{};
+                    if (::lstat((std::string{"/proc/self/ns/"} + n).c_str(), &st) != 0) return false;
+                }
+                return true;
+            }();
             if (own ? (q.starts_with("/proc/self/fd/") || q.starts_with("/proc/thread-self/fd/"))
                     : (host_dir("/proc/self/fd") || host_dir("/proc/thread-self/fd") ||
                        host_dir("/proc/self/fdinfo") || host_dir("/proc/thread-self/fdinfo") ||
-                       host_dir("/proc/self/ns"))) {
+                       (host_ns_full && host_dir("/proc/self/ns")))) {
                 kernel::VirtualFile vf; vf.redirect_host = std::move(q);
                 return ok(std::move(vf));
             }

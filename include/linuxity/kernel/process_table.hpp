@@ -59,6 +59,17 @@ struct Creds {
     // shared with a fork, replaced by a new restriction
     landlock::Domain landlock{};
     std::int32_t nice{0};
+    // A hard rlimit the guest raised past what the host lets linuxity hold
+    // (root has CAP_SYS_RESOURCE, linuxity's host user doesn't). Indexed by
+    // RLIMIT_*; 0 = none recorded, else value+1. The host still enforces its
+    // own, lower limit; this is what the guest reads back.
+    std::array<std::uint64_t, 16> hard_over{};
+    // What the host holds for this task, as we last set it (value+1), for
+    // hosts where we can't read another task's limits (Android).
+    std::array<std::uint64_t, 16> host_cur{}, host_max{};
+    // SECCOMP_MODE_STRICT. The host enforces it on calls that run natively;
+    // linuxity must on the ones it answers itself. Kept across fork and exec.
+    bool seccomp_strict{false};
 
     [[nodiscard]] Creds& creds() noexcept { return *this; }
     [[nodiscard]] const Creds& creds() const noexcept { return *this; }
@@ -283,7 +294,7 @@ public:
         w.pod(c.groups_set);
         w.pod(c.uids); w.pod(c.gids);
         w.pod(c.cap_eff); w.pod(c.cap_prm); w.pod(c.cap_inh); w.pod(c.cap_bnd); w.pod(c.cap_amb);
-        w.pod(c.keepcaps); w.pod(c.no_new_privs); w.pod(c.nice);
+        w.pod(c.keepcaps); w.pod(c.no_new_privs); w.pod(c.nice); w.pod(c.hard_over); w.pod(c.host_cur); w.pod(c.host_max); w.pod(c.seccomp_strict);
         // The namespaces (a fresh-process child must land in the same ones,
         // its pid-for-children made current) and the pid-namespace chain
         // above them with each one's numbering so far.
@@ -316,6 +327,10 @@ public:
         c.cap_inh = r.pod<std::uint64_t>(); c.cap_bnd = r.pod<std::uint64_t>();
         c.cap_amb = r.pod<std::uint64_t>();
         c.keepcaps = r.pod<bool>(); c.no_new_privs = r.pod<bool>(); c.nice = r.pod<std::int32_t>();
+        c.hard_over = r.pod<decltype(c.hard_over)>();
+        c.host_cur = r.pod<decltype(c.host_cur)>();
+        c.host_max = r.pod<decltype(c.host_max)>();
+        c.seccomp_strict = r.pod<bool>();
         inherited_creds_ = std::move(c);
         inherited_ns_ = r.pod<NsSet>();
         const auto n = r.pod<std::uint32_t>();

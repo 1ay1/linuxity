@@ -292,6 +292,13 @@ def seccomp_strict_and_filter():
         os.getpid()                                  # not on the list: SIGKILL
         return 1
     eq(run_in_child(strict), -signal.SIGKILL, "strict mode kills on any other syscall")
+    exit_nr = 60 if os.uname().machine == "x86_64" else 93
+
+    def strict_ok():
+        libc.prctl(PR_SET_SECCOMP, SECCOMP_MODE_STRICT, 0, 0, 0)
+        os.write(1, b"")
+        libc.syscall(exit_nr, 0)                     # exit(2) is allowed
+    eq(run_in_child(strict_ok), 0, "write and exit(2) survive strict mode")
     eq(status_field("Seccomp"), "0", "and we ourselves are unfiltered")
 
 
