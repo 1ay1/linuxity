@@ -149,7 +149,7 @@ public:
         for (const auto& j : jobs_) p.push_back({j.out_fd, POLLIN, 0});
 
         int timeout = block ? next_timer_ms() : 0;
-        const int n = ::poll(p.data(), p.size(), timeout);
+        const int n = ::poll(p.data(), static_cast<nfds_t>(p.size()), timeout);
         if (n < 0 && errno != EINTR) return false;
 
         if (p[2].revents & POLLIN) on_signal();

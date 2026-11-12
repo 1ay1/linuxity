@@ -5,20 +5,28 @@ import signal
 import subprocess
 import time
 
+import lxt
 from lxt import check, eq, skip, test
 
 
 def host_pids():
-    # under linuxity without the flag the runner is the tree's pid 1. The
-    # process count alone misleads: -j8 makes our own tree bigger than 20
-    try:
-        with open("/proc/1/cmdline", "rb") as f:
-            if b"run.py" in f.read():
-                return False
-    except OSError:
-        pass
-    # natively every process is visible; under linuxity only with the flag
-    return len([p for p in os.listdir("/proc") if p.isdigit()]) > 20
+    # Natively every process is visible. Under linuxity the pids are shared
+    # only with --host-pids, and then linuxity itself shows up in /proc; in its
+    # own pid space it never does. (Counting processes misleads: -j8 alone
+    # makes our tree bigger than any threshold.)
+    if lxt.ENV["kind"] != "linuxity":
+        return True
+    for p in os.listdir("/proc"):
+        if not p.isdigit():
+            continue
+        try:
+            with open(f"/proc/{p}/cmdline", "rb") as f:
+                argv0 = f.read().split(b"\0")[0]
+        except OSError:
+            continue
+        if os.path.basename(argv0).startswith((b"linuxity", b"liblinuxity")):
+            return True
+    return False
 
 
 @test

@@ -123,6 +123,11 @@ int lx_own_run(const std::string& env, const SessionArgs& a) {
 }  // namespace
 
 int lx_main(int argc, char** argv) {
+    {
+        Store s;
+        if (std::string why; !s.ensure_storage(false, why))
+            std::fprintf(stderr, "linuxity: %s\n", why.c_str());
+    }
     SessionArgs a;
     if (!parse_session_args(argc, argv, 1, a)) return 2;
     if (a.help) { help_lx(); return 0; }
@@ -474,12 +479,20 @@ int cmd_completion(std::string_view shell) {
     return fail("usage: linuxity completion bash|zsh|fish");
 }
 
+// Case-sensitive storage (host/case_volume.hpp): made by the first `new`,
+// attached for everything else. Not being able to is a warning, never fatal.
+void prepare_storage(Store& s, bool create) {
+    if (std::string why; !s.ensure_storage(create, why))
+        std::fprintf(stderr, "linuxity: %s; environments stay case-insensitive "
+                             "(some packages won't install)\n", why.c_str());
+}
+
 }  // namespace
 
 int lx_cli_main(int argc, char** argv) {
     using namespace lx::cli;
     Store s;
-    if (std::string why; !s.ensure_storage(true, why)) return fail(why);
+    prepare_storage(s, argc > 1 && std::string_view{argv[1]} == "new");
     if (argc < 2) { help(); return 0; }
     const std::string sub = argv[1];
     if (sub == "__complete") return cmd_complete(argc, argv);
