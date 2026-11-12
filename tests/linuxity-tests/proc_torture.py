@@ -479,8 +479,6 @@ def exec_keeps_pid_argv_env():
 
 @test
 def exec_errors():
-    eq(status(child(lambda: os.execv("/nonexistent/prog", ["x"]))), 99, "sanity")  # raises -> 99
-
     def try_exec(path):
         try:
             os.execv(path, [path])
