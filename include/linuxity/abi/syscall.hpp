@@ -4240,10 +4240,10 @@ private:
             std::uint32_t m = 0;
             bool have = false, dir = false;
             if (rec && (rec->have & kernel::MetaRecord::kMode)) { m = rec->mode; have = true; }
-            const auto pc = k_.files().classify(target, false, follow);
+            const auto tpc = k_.files().classify(target, false, follow);
             struct ::stat st{};
-            if (pc.realm == kernel::Realm2::host_backed && !pc.host_path.empty() &&
-                ::lstat(pc.host_path.c_str(), &st) == 0) {
+            if (tpc.realm == kernel::Realm2::host_backed && !tpc.host_path.empty() &&
+                ::lstat(tpc.host_path.c_str(), &st) == 0) {
                 dir = S_ISDIR(st.st_mode);
                 if (!have) { m = st.st_mode & 07777u; have = true; }
                 if (S_ISLNK(st.st_mode)) have = false;
@@ -4252,9 +4252,9 @@ private:
                 std::uint32_t nm = m & ~04000u;
                 if (nm & 010u) nm &= ~02000u;
                 if (nm != m) {
-                    if (pc.realm == kernel::Realm2::host_backed && !pc.host_path.empty())
-                        (void)::chmod(pc.host_path.c_str(), static_cast<mode_t>(nm & 0777u) |
-                                      (host_path_is_regular(pc.host_path) ? 0600u : 0u));
+                    if (tpc.realm == kernel::Realm2::host_backed && !tpc.host_path.empty())
+                        (void)::chmod(tpc.host_path.c_str(), static_cast<mode_t>(nm & 0777u) |
+                                      (host_path_is_regular(tpc.host_path) ? 0600u : 0u));
                     k_.files().meta().set_mode(target, nm);
                 }
             }
@@ -5524,7 +5524,7 @@ private:
                 std::vector<std::byte> clip(bytes, std::byte{0});
                 bool any = false;
                 for (long c = 0; c < ncpu && c < CPU_SETSIZE; ++c)
-                    if (CPU_ISSET(static_cast<int>(c), &real)) {
+                    if (CPU_ISSET(static_cast<std::size_t>(c), &real)) {
                         clip[static_cast<std::size_t>(c) / 8] |=
                             static_cast<std::byte>(1u << (static_cast<unsigned>(c) & 7u));
                         any = true;
@@ -6563,20 +6563,36 @@ public:
         ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
         if (::send(s, &q, sizeof q, 0) == static_cast<ssize_t>(sizeof q)) {
             std::vector<char> b(65536);
+            // Walked by hand: the NLMSG_/RTA_ macros mix int and unsigned.
+            const auto al = [](std::size_t x) { return (x + 3) & ~std::size_t{3}; };
             for (bool more = true; more && !found;) {
                 const ssize_t n = ::recv(s, b.data(), b.size(), 0);
                 if (n <= 0) break;
-                int left = static_cast<int>(n);
-                for (auto* h = reinterpret_cast<nlmsghdr*>(b.data()); NLMSG_OK(h, left);
-                     h = NLMSG_NEXT(h, left)) {
-                    if (h->nlmsg_type == NLMSG_DONE || h->nlmsg_type == NLMSG_ERROR) { more = false; break; }
-                    if (h->nlmsg_type != RTM_NEWLINK) continue;
-                    const auto* ifi = static_cast<const ifinfomsg*>(NLMSG_DATA(h));
-                    int alen = static_cast<int>(IFLA_PAYLOAD(h));
-                    for (auto* a = IFLA_RTA(ifi); RTA_OK(a, alen); a = RTA_NEXT(a, alen))
-                        if (a->rta_type == IFLA_IFNAME &&
-                            name == static_cast<const char*>(RTA_DATA(a)))
-                            found = static_cast<std::uint32_t>(ifi->ifi_index);
+                const std::size_t len = static_cast<std::size_t>(n);
+                for (std::size_t off = 0; off + sizeof(nlmsghdr) <= len;) {
+                    nlmsghdr h;
+                    std::memcpy(&h, b.data() + off, sizeof h);
+                    if (h.nlmsg_len < sizeof h || off + h.nlmsg_len > len) break;
+                    if (h.nlmsg_type == NLMSG_DONE || h.nlmsg_type == NLMSG_ERROR) { more = false; break; }
+                    const std::size_t end = off + h.nlmsg_len;
+                    const std::size_t ifo = off + al(sizeof(nlmsghdr));
+                    if (h.nlmsg_type == RTM_NEWLINK && ifo + sizeof(ifinfomsg) <= end) {
+                        ifinfomsg ifi;
+                        std::memcpy(&ifi, b.data() + ifo, sizeof ifi);
+                        for (std::size_t a = ifo + al(sizeof(ifinfomsg)); a + sizeof(rtattr) <= end;) {
+                            rtattr ra;
+                            std::memcpy(&ra, b.data() + a, sizeof ra);
+                            if (ra.rta_len < sizeof ra || a + ra.rta_len > end) break;
+                            if (ra.rta_type == IFLA_IFNAME) {
+                                const char* d = b.data() + a + al(sizeof(rtattr));
+                                const std::size_t dl = ra.rta_len - al(sizeof(rtattr));
+                                if (name == std::string_view(d, ::strnlen(d, dl)))
+                                    found = static_cast<std::uint32_t>(ifi.ifi_index);
+                            }
+                            a += al(ra.rta_len);
+                        }
+                    }
+                    off += al(h.nlmsg_len);
                 }
             }
         }

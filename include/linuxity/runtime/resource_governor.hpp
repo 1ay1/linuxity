@@ -122,10 +122,10 @@ public:
         if (::sched_getaffinity(0, sizeof allowed, &allowed) != 0) return;
         int cap[CPU_SETSIZE] = {};
         int top = 0;
-        for (int c = 0; c < CPU_SETSIZE; ++c) {
+        for (std::size_t c = 0; c < CPU_SETSIZE; ++c) {
             if (!CPU_ISSET(c, &allowed)) continue;
             char path[96];
-            std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpu_capacity", c);
+            std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%zu/cpu_capacity", c);
             const int fd = ::open(path, O_RDONLY | O_CLOEXEC);
             if (fd < 0) return;   // no capacity info: leave it to the scheduler
             char buf[16] = {};
@@ -137,7 +137,7 @@ public:
         }
         ::cpu_set_t fast;
         CPU_ZERO(&fast);
-        for (int c = 0; c < CPU_SETSIZE; ++c)
+        for (std::size_t c = 0; c < CPU_SETSIZE; ++c)
             if (CPU_ISSET(c, &allowed) && cap[c] * 3 >= top) CPU_SET(c, &fast);
         if (CPU_COUNT(&fast) > 0 && CPU_COUNT(&fast) < CPU_COUNT(&allowed))
             (void)::sched_setaffinity(0, sizeof fast, &fast);

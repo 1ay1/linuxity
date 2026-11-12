@@ -211,14 +211,21 @@ struct lx_ig_header {
     uint32_t pad;
 };
 
+/* static_cast under C++ so the header stays clean with -Wold-style-cast. */
+#ifdef __cplusplus
+#define LX_IG_CAST(T, x) static_cast<T>(x)
+#else
+#define LX_IG_CAST(T, x) ((T)(x))
+#endif
+
 /* FNV-1a, never 0 (0 marks an empty slot). */
 static inline uint64_t lx_ig_hash(const char* s, uint32_t n) {
     uint64_t h = 1469598103934665603ULL;
     for (uint32_t i = 0; i < n; ++i) {
-        h ^= (unsigned char)s[i];
+        h ^= LX_IG_CAST(unsigned char, s[i]);
         h *= 1099511628211ULL;
     }
-    h ^= (uint64_t)n << 56;
+    h ^= LX_IG_CAST(uint64_t, n) << 56;
     return h ? h : 1;
 }
 
