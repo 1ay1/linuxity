@@ -18,6 +18,7 @@
 #include <string_view>
 
 #include <sys/stat.h>
+#include <dirent.h>
 #include <unistd.h>
 
 namespace lx::display {
@@ -44,6 +45,40 @@ std::string default_socket() {
     const std::string dir = base + "/linuxity-display-" + std::to_string(::getuid());
     ::mkdir(dir.c_str(), 0700);
     return dir + "/wayland-0";
+}
+
+// Sessions that are already running reach us through a hard link to our
+// socket in their runtime dir (<root>/runtime/<env>/<uid>/wayland-0, see
+// src/display_attach.hpp). A restarted server binds a NEW socket, so those
+// links would still name the dead one -- "no compositor running?" in every
+// open shell until the next lx. Point them all at us.
+void relink_sessions(const std::string& socket) {
+    const auto slash = socket.rfind('/');
+    if (slash == std::string::npos) return;
+    const std::string dir = socket.substr(0, slash);             // <root>/wayland
+    const auto up = dir.rfind('/');
+    if (up == std::string::npos) return;
+    const std::string runtime = dir.substr(0, up) + "/runtime";
+    const std::string name = socket.substr(slash + 1);
+    DIR* envs = ::opendir(runtime.c_str());
+    if (!envs) return;
+    while (dirent* e = ::readdir(envs)) {
+        if (e->d_name[0] == '.') continue;
+        const std::string env = runtime + "/" + e->d_name;
+        DIR* users = ::opendir(env.c_str());
+        if (!users) continue;
+        while (dirent* u = ::readdir(users)) {
+            if (u->d_name[0] == '.') continue;
+            const std::string link = env + "/" + u->d_name + "/" + name;
+            struct ::stat st{};
+            if (::lstat(link.c_str(), &st) != 0) continue;            // that session has no display
+            const std::string tmp = link + ".new";
+            ::unlink(tmp.c_str());
+            if (::link(socket.c_str(), tmp.c_str()) == 0) ::rename(tmp.c_str(), link.c_str());
+        }
+        ::closedir(users);
+    }
+    ::closedir(envs);
 }
 
 void usage() {
@@ -96,6 +131,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     Compositor comp{server, *host, opts};
+    relink_sessions(socket);
 
     // Exit once nobody has used us for a while (linuxity restarts us).
     std::unique_ptr<EventLoop::Source> idle_timer;

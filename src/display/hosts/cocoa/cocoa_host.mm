@@ -958,7 +958,7 @@ CocoaHost::CocoaHost() {
     [am addItemWithTitle:@"Show All" action:@selector(unhideAllApplications:) keyEquivalent:@""];
     [am addItem:[NSMenuItem separatorItem]];
     [am addItemWithTitle:@"Quit App" action:@selector(lxQuitApp:) keyEquivalent:@"q"];
-    [am addItemWithTitle:@"Close All Linux Windows" action:@selector(terminate:) keyEquivalent:@""];
+    [am addItemWithTitle:@"Close All Linux Windows" action:@selector(lxCloseAll:) keyEquivalent:@""];
     NSMenu* fm = submenu(@"File");
     [fm addItemWithTitle:@"Close Window" action:@selector(performClose:) keyEquivalent:@"w"];
     NSMenu* wm = submenu(@"Window");
@@ -970,6 +970,11 @@ CocoaHost::CocoaHost() {
     [wm addItemWithTitle:@"Bring All to Front" action:@selector(arrangeInFront:) keyEquivalent:@""];
     NSApp.mainMenu = bar;
     NSApp.windowsMenu = wm;   // AppKit fills in the window list and Cmd-`
+    // The display server outlives its windows: every open Linux shell
+    // needs it for the next GUI app. AppKit must never retire it for being
+    // windowless (automatic termination) or kill it unannounced.
+    [[NSProcessInfo processInfo] disableAutomaticTermination:@"serves Linux sessions"];
+    [[NSProcessInfo processInfo] disableSuddenTermination];
     [NSApp finishLaunching];
 }
 
@@ -1196,10 +1201,15 @@ void CocoaHost::set_has_windows(bool any) {
 @end
 
 @implementation LXAppDelegate
+// Close every Linux window (apps may ask to save) -- but keep serving: the
+// shells that opened them will open more.
+- (void)lxCloseAll:(id)sender {
+    if (self.host && self.host->sink()) self.host->sink()->host_quit();
+}
+// Only logout, restart or shutdown get here now (no menu item quits): close
+// the windows, give the requests a moment to go out, then go. Never refuse:
+// a compositor that cancels termination blocks logout.
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication*)app {
-    // The menu's Quit, or logout/shutdown: ask every Linux window to close
-    // (apps may save), give the requests a moment to go out, then go.
-    // Never refuse: a compositor that cancels termination blocks logout.
     if (self.host && self.host->sink()) self.host->sink()->host_quit();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
         [NSApp replyToApplicationShouldTerminate:YES];
