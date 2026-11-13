@@ -431,6 +431,28 @@ On a desktop they use the host's `xdg-open`, `wl-copy`, `wl-paste` and
 clipboard and post real notifications. Turn it off with
 `linuxity config bridge.enabled=false`.
 
+### GUI apps
+
+Graphical Linux programs open real windows on the host:
+
+```sh
+lx @ubuntu gtk4-demo
+lx @ubuntu foot              # a Linux terminal, as a Mac window
+lx @ubuntu firefox
+```
+
+On a Linux desktop the guest joins your Wayland session. On macOS linuxity
+starts `linuxity-display`, its own compositor, the first time an
+environment runs: each Linux window becomes a Mac window with a native
+title bar (unless the app draws its own, as GTK apps do), Retina pixels,
+fullscreen and Mission Control, and the clipboard works both ways. The
+Command key acts as Control, so Cmd-C and Cmd-V copy and paste. Apps need
+Wayland support (GTK 3/4, Qt 5/6, SDL, Electron, Firefox, foot); install
+them with the distro's package manager as usual. OpenGL apps render in
+software. Turn it off per environment with
+`linuxity config display.wayland=off`. How it works:
+[DISPLAY.md](DISPLAY.md).
+
 ---
 
 ## 12. Resource limits

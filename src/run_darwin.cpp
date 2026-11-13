@@ -51,6 +51,7 @@
 #include "linuxity/host/environ.hpp"
 #include "linuxity/host/self_exe.hpp"
 
+#include "display_attach.hpp"
 #include "guest_env.hpp"
 #include "guest_files.hpp"
 #include "host_run.hpp"
@@ -1208,6 +1209,14 @@ int cli::host_run(Options& o, int, char**) {
     if (!ge.notice.empty() && !o.quiet) std::fprintf(stderr, "linuxity: %s\n", ge.notice.c_str());
     std::vector<std::string> env = std::move(ge.vars);
     (void)::umask(static_cast<mode_t>(o.umask));
+
+    // GUI apps: a Wayland compositor whose windows are Mac windows
+    // (src/display_attach.hpp). Before Machine: it mounts the socket.
+    {
+        std::string why;
+        if (const auto d = cli::display::attach(o, why)) cli::display::apply(*d, o, env, ge.login.uid);
+        else if (!why.empty() && !o.quiet) std::fprintf(stderr, "linuxity: no display: %s\n", why.c_str());
+    }
 
     Machine m{o};
     // the host's terminfo for this terminal, mounted by Machine

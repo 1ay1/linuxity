@@ -106,6 +106,9 @@ struct EnvConfig {
     bool bridge{true};
     bool bridge_host_fallback{true};
 
+    // display
+    bool wayland{true};
+
     // debug
     std::string trace;
     std::string log;
@@ -209,6 +212,9 @@ inline constexpr Field kFields[] = {
         [](EnvConfig& c, const Val& v) { c.bridge = v.b; }},
     {"bridge.host-fallback", Type::boolean, "true", "With no app attached, use host tools (xdg-open, wl-copy, notify-send).", "", false,
         [](EnvConfig& c, const Val& v) { c.bridge_host_fallback = v.b; }},
+
+    {"display.wayland", Type::choice, "auto", "Show the guest's Wayland apps as host windows: the host's compositor, or linuxity-display where there is none.", "auto|off", false,
+        [](EnvConfig& c, const Val& v) { c.wayland = v.s != "off"; }},
 
     {"debug.trace", Type::string, "", "Log every syscall decision: a file path, or stderr.", "", false,
         [](EnvConfig& c, const Val& v) { c.trace = v.s; }},
@@ -645,6 +651,7 @@ inline void check_runnable(const EnvConfig& c, std::vector<Diag>& diags) {
             .kv("pacman-overwrite", c.pacman_overwrite)
         .end()
         .key("bridge").obj().kv("enabled", c.bridge).kv("host-fallback", c.bridge_host_fallback).end()
+        .key("display").obj().kv("wayland", c.wayland ? "auto" : "off").end()
         .key("debug").obj().kv("trace", c.trace).kv("log", c.log).end()
         .key("env").obj();
     for (const auto& [k, v] : c.env) j.kv(k, v);

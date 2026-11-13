@@ -41,6 +41,9 @@ struct Options {
     bool manage_dns{true};
     bool manage_hosts{false};
 
+    // display: give the guest a Wayland compositor (display_attach.hpp)
+    bool wayland{true};
+
     // compat / debug (become the LINUXITY_* variables the runtime reads)
     bool emulate_fifos{false}, emulate_sysv{false}, emulate_nl80211{false}, emulate_hardlinks{false};
     std::string trace;
@@ -101,6 +104,7 @@ inline void apply_config(const env::EnvConfig& c, Options& o) {
     o.emulate_nl80211 = c.emulate_nl80211;
     o.emulate_hardlinks = c.emulate_hardlinks;
     o.trace = c.trace;
+    o.wayland = c.wayland;
     o.cfg = c;
 }
 

@@ -123,6 +123,7 @@ screen should be built from.
 | `compat.pacman-overwrite` | boolean | `true` | Pass `--overwrite "*"` to pacman so bootstrap images can install packages. |
 | `bridge.enabled` | boolean | `true` | Let the guest open links, use the clipboard and post notifications on the host. |
 | `bridge.host-fallback` | boolean | `true` | With no app attached, use host tools (`xdg-open`, `wl-copy`, `notify-send`). |
+| `display.wayland` | choice | `auto` | Show the guest's Wayland apps as host windows: the host's compositor, or linuxity-display where there is none (`auto`, `off`). See [DISPLAY.md](DISPLAY.md). |
 | `debug.trace` | string | - | Log every syscall decision: a file path, or stderr. |
 | `debug.log` | string | - | Where a running instance logs (default: `<env>/logs/linuxity.log`). |
 

@@ -202,4 +202,16 @@ endif()
 
 # ---- Tests ---------------------------------------------------------------
 enable_testing()
+
+# ---- The display server ------------------------------------------------------
+# Guest GUI apps as native host windows (src/display/). POSIX hosts for now.
+option(LX_DISPLAY "Build linuxity-display, the native Wayland compositor" ON)
+if(LX_DISPLAY AND NOT WIN32)
+    include(GNUInstallDirs)
+    add_subdirectory(src/display)
+    if(TARGET linuxity)
+        add_dependencies(linuxity linuxity-display)
+    endif()
+endif()
+
 add_subdirectory(tests)
