@@ -276,6 +276,10 @@ inline void apply(const Attachment& a, Options& o, std::vector<std::string>& env
     // free(): invalid pointer). A host compositor is the host's business.
     if (a.source == "linuxity-display" && !has("LIBGL_ALWAYS_SOFTWARE") && !has("GALLIUM_DRIVER"))
         set("LIBGL_ALWAYS_SOFTWARE", "1");
+    // llvmpipe rasterizes on one thread per core. With 4+ threads GTK4
+    // apps crash at renderer start-up on the macOS backend (a multi-vCPU
+    // race still being chased; 1-2 threads never do), so cap it until then.
+    if (a.source == "linuxity-display" && !has("LP_NUM_THREADS")) set("LP_NUM_THREADS", "2");
 }
 
 #else

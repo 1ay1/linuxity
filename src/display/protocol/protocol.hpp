@@ -10,6 +10,38 @@
 namespace lx::display::proto {
 
 
+// wp_content_type_manager_v1 v1 (content-type-v1.xml)
+struct WpContentTypeManagerV1 {
+    static const wire::Interface iface;
+    static constexpr std::uint32_t version = 1;
+    struct Req { enum : std::uint16_t { destroy, get_surface_content_type }; };
+    enum class Error : std::uint32_t { already_constructed = 0 };
+};
+
+// wp_content_type_v1 v1 (content-type-v1.xml)
+struct WpContentTypeV1 {
+    static const wire::Interface iface;
+    static constexpr std::uint32_t version = 1;
+    struct Req { enum : std::uint16_t { destroy, set_content_type }; };
+    enum class Type : std::uint32_t { none = 0, photo = 1, video = 2, game = 3 };
+};
+
+// wp_cursor_shape_manager_v1 v2 (cursor-shape-v1.xml)
+struct WpCursorShapeManagerV1 {
+    static const wire::Interface iface;
+    static constexpr std::uint32_t version = 2;
+    struct Req { enum : std::uint16_t { destroy, get_pointer, get_tablet_tool_v2 }; };
+};
+
+// wp_cursor_shape_device_v1 v2 (cursor-shape-v1.xml)
+struct WpCursorShapeDeviceV1 {
+    static const wire::Interface iface;
+    static constexpr std::uint32_t version = 2;
+    struct Req { enum : std::uint16_t { destroy, set_shape }; };
+    enum class Shape : std::uint32_t { default_ = 1, context_menu = 2, help = 3, pointer = 4, progress = 5, wait = 6, cell = 7, crosshair = 8, text = 9, vertical_text = 10, alias = 11, copy = 12, move = 13, no_drop = 14, not_allowed = 15, grab = 16, grabbing = 17, e_resize = 18, n_resize = 19, ne_resize = 20, nw_resize = 21, s_resize = 22, se_resize = 23, sw_resize = 24, w_resize = 25, ew_resize = 26, ns_resize = 27, nesw_resize = 28, nwse_resize = 29, col_resize = 30, row_resize = 31, all_scroll = 32, zoom_in = 33, zoom_out = 34, dnd_ask = 35, all_resize = 36 };
+    enum class Error : std::uint32_t { invalid_shape = 1 };
+};
+
 // wp_fractional_scale_manager_v1 v1 (fractional-scale-v1.xml)
 struct WpFractionalScaleManagerV1 {
     static const wire::Interface iface;
@@ -24,6 +56,203 @@ struct WpFractionalScaleV1 {
     static constexpr std::uint32_t version = 1;
     struct Req { enum : std::uint16_t { destroy }; };
     struct Ev { enum : std::uint16_t { preferred_scale }; };
+};
+
+// zwp_pointer_constraints_v1 v1 (pointer-constraints-unstable-v1.xml)
+struct ZwpPointerConstraintsV1 {
+    static const wire::Interface iface;
+    static constexpr std::uint32_t version = 1;
+    struct Req { enum : std::uint16_t { destroy, lock_pointer, confine_pointer }; };
+    enum class Error : std::uint32_t { already_constrained = 1 };
+    enum class Lifetime : std::uint32_t { oneshot = 1, persistent = 2 };
+};
+
+// zwp_locked_pointer_v1 v1 (pointer-constraints-unstable-v1.xml)
+struct ZwpLockedPointerV1 {
+    static const wire::Interface iface;
+    static constexpr std::uint32_t version = 1;
+    struct Req { enum : std::uint16_t { destroy, set_cursor_position_hint, set_region }; };
+    struct Ev { enum : std::uint16_t { locked, unlocked }; };
+};
+
+// zwp_confined_pointer_v1 v1 (pointer-constraints-unstable-v1.xml)
+struct ZwpConfinedPointerV1 {
+    static const wire::Interface iface;
+    static constexpr std::uint32_t version = 1;
+    struct Req { enum : std::uint16_t { destroy, set_region }; };
+    struct Ev { enum : std::uint16_t { confined, unconfined }; };
+};
+
+// zwp_pointer_gestures_v1 v3 (pointer-gestures-unstable-v1.xml)
+struct ZwpPointerGesturesV1 {
+    static const wire::Interface iface;
+    static constexpr std::uint32_t version = 3;
+    struct Req { enum : std::uint16_t { get_swipe_gesture, get_pinch_gesture, release, get_hold_gesture }; };
+};
+
+// zwp_pointer_gesture_swipe_v1 v2 (pointer-gestures-unstable-v1.xml)
+struct ZwpPointerGestureSwipeV1 {
+    static const wire::Interface iface;
+    static constexpr std::uint32_t version = 2;
+    struct Req { enum : std::uint16_t { destroy }; };
+    struct Ev { enum : std::uint16_t { begin, update, end }; };
+};
+
+// zwp_pointer_gesture_pinch_v1 v2 (pointer-gestures-unstable-v1.xml)
+struct ZwpPointerGesturePinchV1 {
+    static const wire::Interface iface;
+    static constexpr std::uint32_t version = 2;
+    struct Req { enum : std::uint16_t { destroy }; };
+    struct Ev { enum : std::uint16_t { begin, update, end }; };
+};
+
+// zwp_pointer_gesture_hold_v1 v3 (pointer-gestures-unstable-v1.xml)
+struct ZwpPointerGestureHoldV1 {
+    static const wire::Interface iface;
+    static constexpr std::uint32_t version = 3;
+    struct Req { enum : std::uint16_t { destroy }; };
+    struct Ev { enum : std::uint16_t { begin, end }; };
+};
+
+// zwp_primary_selection_device_manager_v1 v1 (primary-selection-unstable-v1.xml)
+struct ZwpPrimarySelectionDeviceManagerV1 {
+    static const wire::Interface iface;
+    static constexpr std::uint32_t version = 1;
+    struct Req { enum : std::uint16_t { create_source, get_device, destroy }; };
+};
+
+// zwp_primary_selection_device_v1 v1 (primary-selection-unstable-v1.xml)
+struct ZwpPrimarySelectionDeviceV1 {
+    static const wire::Interface iface;
+    static constexpr std::uint32_t version = 1;
+    struct Req { enum : std::uint16_t { set_selection, destroy }; };
+    struct Ev { enum : std::uint16_t { data_offer, selection }; };
+};
+
+// zwp_primary_selection_offer_v1 v1 (primary-selection-unstable-v1.xml)
+struct ZwpPrimarySelectionOfferV1 {
+    static const wire::Interface iface;
+    static constexpr std::uint32_t version = 1;
+    struct Req { enum : std::uint16_t { receive, destroy }; };
+    struct Ev { enum : std::uint16_t { offer }; };
+};
+
+// zwp_primary_selection_source_v1 v1 (primary-selection-unstable-v1.xml)
+struct ZwpPrimarySelectionSourceV1 {
+    static const wire::Interface iface;
+    static constexpr std::uint32_t version = 1;
+    struct Req { enum : std::uint16_t { offer, destroy }; };
+    struct Ev { enum : std::uint16_t { send, cancelled }; };
+};
+
+// zwp_relative_pointer_manager_v1 v1 (relative-pointer-unstable-v1.xml)
+struct ZwpRelativePointerManagerV1 {
+    static const wire::Interface iface;
+    static constexpr std::uint32_t version = 1;
+    struct Req { enum : std::uint16_t { destroy, get_relative_pointer }; };
+};
+
+// zwp_relative_pointer_v1 v1 (relative-pointer-unstable-v1.xml)
+struct ZwpRelativePointerV1 {
+    static const wire::Interface iface;
+    static constexpr std::uint32_t version = 1;
+    struct Req { enum : std::uint16_t { destroy }; };
+    struct Ev { enum : std::uint16_t { relative_motion }; };
+};
+
+// wp_single_pixel_buffer_manager_v1 v1 (single-pixel-buffer-v1.xml)
+struct WpSinglePixelBufferManagerV1 {
+    static const wire::Interface iface;
+    static constexpr std::uint32_t version = 1;
+    struct Req { enum : std::uint16_t { destroy, create_u32_rgba_buffer }; };
+};
+
+// zwp_tablet_manager_v2 v1 (tablet-unstable-v2.xml)
+struct ZwpTabletManagerV2 {
+    static const wire::Interface iface;
+    static constexpr std::uint32_t version = 1;
+    struct Req { enum : std::uint16_t { get_tablet_seat, destroy }; };
+};
+
+// zwp_tablet_seat_v2 v1 (tablet-unstable-v2.xml)
+struct ZwpTabletSeatV2 {
+    static const wire::Interface iface;
+    static constexpr std::uint32_t version = 1;
+    struct Req { enum : std::uint16_t { destroy }; };
+    struct Ev { enum : std::uint16_t { tablet_added, tool_added, pad_added }; };
+};
+
+// zwp_tablet_tool_v2 v1 (tablet-unstable-v2.xml)
+struct ZwpTabletToolV2 {
+    static const wire::Interface iface;
+    static constexpr std::uint32_t version = 1;
+    struct Req { enum : std::uint16_t { set_cursor, destroy }; };
+    struct Ev { enum : std::uint16_t { type, hardware_serial, hardware_id_wacom, capability, done, removed, proximity_in, proximity_out, down, up, motion, pressure, distance, tilt, rotation, slider, wheel, button, frame }; };
+    enum class Type : std::uint32_t { pen = 0x140, eraser = 0x141, brush = 0x142, pencil = 0x143, airbrush = 0x144, finger = 0x145, mouse = 0x146, lens = 0x147 };
+    enum class Capability : std::uint32_t { tilt = 1, pressure = 2, distance = 3, rotation = 4, slider = 5, wheel = 6 };
+    enum class ButtonState : std::uint32_t { released = 0, pressed = 1 };
+    enum class Error : std::uint32_t { role = 0 };
+};
+
+// zwp_tablet_v2 v1 (tablet-unstable-v2.xml)
+struct ZwpTabletV2 {
+    static const wire::Interface iface;
+    static constexpr std::uint32_t version = 1;
+    struct Req { enum : std::uint16_t { destroy }; };
+    struct Ev { enum : std::uint16_t { name, id, path, done, removed }; };
+};
+
+// zwp_tablet_pad_ring_v2 v1 (tablet-unstable-v2.xml)
+struct ZwpTabletPadRingV2 {
+    static const wire::Interface iface;
+    static constexpr std::uint32_t version = 1;
+    struct Req { enum : std::uint16_t { set_feedback, destroy }; };
+    struct Ev { enum : std::uint16_t { source, angle, stop, frame }; };
+    enum class Source : std::uint32_t { finger = 1 };
+};
+
+// zwp_tablet_pad_strip_v2 v1 (tablet-unstable-v2.xml)
+struct ZwpTabletPadStripV2 {
+    static const wire::Interface iface;
+    static constexpr std::uint32_t version = 1;
+    struct Req { enum : std::uint16_t { set_feedback, destroy }; };
+    struct Ev { enum : std::uint16_t { source, position, stop, frame }; };
+    enum class Source : std::uint32_t { finger = 1 };
+};
+
+// zwp_tablet_pad_group_v2 v1 (tablet-unstable-v2.xml)
+struct ZwpTabletPadGroupV2 {
+    static const wire::Interface iface;
+    static constexpr std::uint32_t version = 1;
+    struct Req { enum : std::uint16_t { destroy }; };
+    struct Ev { enum : std::uint16_t { buttons, ring, strip, modes, done, mode_switch }; };
+};
+
+// zwp_tablet_pad_v2 v1 (tablet-unstable-v2.xml)
+struct ZwpTabletPadV2 {
+    static const wire::Interface iface;
+    static constexpr std::uint32_t version = 1;
+    struct Req { enum : std::uint16_t { set_feedback, destroy }; };
+    struct Ev { enum : std::uint16_t { group, path, buttons, done, button, enter, leave, removed }; };
+    enum class ButtonState : std::uint32_t { released = 0, pressed = 1 };
+};
+
+// zwp_text_input_v3 v1 (text-input-unstable-v3.xml)
+struct ZwpTextInputV3 {
+    static const wire::Interface iface;
+    static constexpr std::uint32_t version = 1;
+    struct Req { enum : std::uint16_t { destroy, enable, disable, set_surrounding_text, set_text_change_cause, set_content_type, set_cursor_rectangle, commit }; };
+    struct Ev { enum : std::uint16_t { enter, leave, preedit_string, commit_string, delete_surrounding_text, done }; };
+    enum class ChangeCause : std::uint32_t { input_method = 0, other = 1 };
+    struct ContentHint { enum : std::uint32_t { none = 0x0, completion = 0x1, spellcheck = 0x2, auto_capitalization = 0x4, lowercase = 0x8, uppercase = 0x10, titlecase = 0x20, hidden_text = 0x40, sensitive_data = 0x80, latin = 0x100, multiline = 0x200 }; };
+    enum class ContentPurpose : std::uint32_t { normal = 0, alpha = 1, digits = 2, number = 3, phone = 4, url = 5, email = 6, name = 7, password = 8, pin = 9, date = 10, time = 11, datetime = 12, terminal = 13 };
+};
+
+// zwp_text_input_manager_v3 v1 (text-input-unstable-v3.xml)
+struct ZwpTextInputManagerV3 {
+    static const wire::Interface iface;
+    static constexpr std::uint32_t version = 1;
+    struct Req { enum : std::uint16_t { destroy, get_text_input }; };
 };
 
 // wp_viewporter v1 (viewporter.xml)
@@ -236,6 +465,22 @@ struct WlSubsurface {
     enum class Error : std::uint32_t { bad_surface = 0 };
 };
 
+// xdg_activation_v1 v1 (xdg-activation-v1.xml)
+struct XdgActivationV1 {
+    static const wire::Interface iface;
+    static constexpr std::uint32_t version = 1;
+    struct Req { enum : std::uint16_t { destroy, get_activation_token, activate }; };
+};
+
+// xdg_activation_token_v1 v1 (xdg-activation-v1.xml)
+struct XdgActivationTokenV1 {
+    static const wire::Interface iface;
+    static constexpr std::uint32_t version = 1;
+    struct Req { enum : std::uint16_t { set_serial, set_app_id, set_surface, commit, destroy }; };
+    struct Ev { enum : std::uint16_t { done }; };
+    enum class Error : std::uint32_t { already_used = 0 };
+};
+
 // zxdg_decoration_manager_v1 v1 (xdg-decoration-unstable-v1.xml)
 struct ZxdgDecorationManagerV1 {
     static const wire::Interface iface;
@@ -316,6 +561,13 @@ struct XdgPopup {
     struct Req { enum : std::uint16_t { destroy, grab, reposition }; };
     struct Ev { enum : std::uint16_t { configure, popup_done, repositioned }; };
     enum class Error : std::uint32_t { invalid_grab = 0 };
+};
+
+// xdg_system_bell_v1 v1 (xdg-system-bell-v1.xml)
+struct XdgSystemBellV1 {
+    static const wire::Interface iface;
+    static constexpr std::uint32_t version = 1;
+    struct Req { enum : std::uint16_t { destroy, ring }; };
 };
 
 // xwayland_shell_v1 v1 (xwayland-shell-v1.xml)

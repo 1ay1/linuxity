@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 
@@ -289,6 +290,10 @@ bool Server::listen(const std::string& path, std::string& why) {
         return false;
     }
     path_ = path;
+    // Guest users are not the host user; who may reach the socket is
+    // decided by the directory it lives in (display_attach keeps that
+    // private to the host user), so the node itself is open.
+    (void)::chmod(path.c_str(), 0777);
     listen_src_ = loop_->on_readable(listen_fd_.get(), [this] { accept_clients(); });
     return true;
 }
@@ -337,6 +342,13 @@ void Server::flush_all() {
 
 std::uint32_t Server::add_global(const wire::Interface& iface, std::uint32_t version,
                                  std::function<void(Client&, std::uint32_t, ObjectId)> bind) {
+    // LINUXITY_DISPLAY_HIDE=a,b: don't advertise these interfaces. When an
+    // app misbehaves, hiding protocols one by one finds the one it trips on.
+    static const std::string hide = [] {
+        const char* h = std::getenv("LINUXITY_DISPLAY_HIDE");
+        return h ? "," + std::string{h} + "," : std::string{};
+    }();
+    if (!hide.empty() && hide.find("," + std::string{iface.name} + ",") != std::string::npos) return 0;
     const std::uint32_t name = next_global_++;
     globals_.push_back({name, &iface, version, std::move(bind)});
     for (auto& w : registries_)

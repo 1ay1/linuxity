@@ -127,6 +127,10 @@ The core never sees an `NSWindow`, an `HWND`, or a `Surface` from
   `value120` detents.
 - The pasteboard is two-way: a Linux app's copy lands on the Mac clipboard,
   a Mac copy is offered to the focused Linux app.
+- Text fields get the Mac's input methods (Pinyin, Kotoeri, dead keys,
+  press-and-hold accents) through `zwp_text_input_v3`; plain typing still
+  arrives as keys, so shortcuts and the guest's layout are unchanged.
+- Every surface is an IOSurface-backed layer, updated only where it changed.
 - The server is an accessory app (no Dock icon) until it has a window.
 
 ### Android (planned)
@@ -177,19 +181,52 @@ clipboard.
 
 | Interface | Version | Notes |
 |-----------|---------|-------|
-| wl_compositor, wl_surface | 6 | buffer scale, offset, frame callbacks, input regions, enter/leave, preferred_buffer_scale |
-| wl_subcompositor, wl_subsurface | 1 | sync/desync, restacking |
-| wl_shm | 1 | ARGB/XRGB/ABGR/XBGR 8888; pixels copied at commit, buffer released at once; SIGBUS-safe |
+| wl_compositor, wl_surface | 6 | damage (both kinds), buffer scale, offset, frame callbacks, input regions, enter/leave, preferred_buffer_scale |
+| wl_subcompositor, wl_subsurface | 1 | sync/desync (staged frames), restacking |
+| wl_shm | 1 | ARGB/XRGB/ABGR/XBGR 8888; damage-only copies, buffer released at once; SIGBUS-safe |
+| wp_viewporter | 1 | crop and scale (fractional source rects) |
+| wp_fractional_scale_v1 | 1 | exact scale in 120ths; integer clients round up |
+| wp_single_pixel_buffer_v1 | 1 | solid colours with no memory |
 | xdg_wm_base, xdg_surface, xdg_toplevel, xdg_popup, xdg_positioner | 6 | full configure/ack protocol, wm_capabilities, configure_bounds, popup grabs, reposition, flip/slide/resize constraints |
 | zxdg_decoration_manager_v1 | 1 | native title bars unless the client draws its own |
+| xdg_activation_v1 | 1 | focus with a fresh input serial, attention (Dock bounce) without |
+| xdg_system_bell_v1 | 1 | the platform alert; attention when unfocused |
 | wl_seat, wl_pointer, wl_keyboard | 8 | XKB keymap by RMLVO, repeat info, axis_value120, axis_stop |
+| wp_cursor_shape_v1 | 1 | the platform's own cursors |
+| zwp_text_input_v3 | 1 | the host's input methods: IME composition, dead keys, press-and-hold |
 | wl_data_device_manager | 3 | clipboard both ways with the host; drag and drop not yet |
-| wl_output | 4 | one per screen, scale, refresh, name/description |
+| zwp_primary_selection_v1 | 1 | select / middle-click paste between guest apps |
+| wl_output, zxdg_output_manager_v1 | 4, 3 | one per screen, scale, refresh, logical geometry |
+| wp_content_type_v1 | 1 | accepted (a hint) |
 
-Next protocols, in order of what apps notice: `wp_viewporter`,
-`wp_fractional_scale_v1` (sharp text at non-integer scale), `xdg_output`,
-`zwp_primary_selection`, `zwp_text_input_v3` (IME), `wp_cursor_shape`,
-`xdg_activation`, drag and drop, `linux-dmabuf` (once a GPU path exists).
+Next, in order of what apps notice: drag and drop, `xdg_toplevel_icon`,
+`wp_presentation` (frame timing), `linux-dmabuf` (once a GPU path exists).
+
+When an app misbehaves, `LINUXITY_DISPLAY_HIDE=iface,iface` (in the
+server's environment) stops advertising protocols, to find the one it
+trips on.
+
+## How pixels move
+
+A client draws into its shm buffer and commits with damage. The core keeps
+one copy of each surface's content and copies **only the damaged rows**
+into it, then releases the buffer at once (the client never waits on us).
+The scene handed to the host names each layer's damage and a generation
+counter; the bytes are only valid during `present()`. The Cocoa host keeps a
+small pool of IOSurfaces per layer, each remembering what it lacks, and
+copies just that into one the window server isn't reading -- Core Animation
+composites IOSurfaces directly on the GPU. A blinking cursor in a terminal
+moves a few hundred bytes per frame end to end; an unchanged surface moves
+none.
+
+## Known issues
+
+- Mesa's llvmpipe is capped at two raster threads (`LP_NUM_THREADS=2`):
+  with more, GTK4 apps intermittently crash at renderer start-up on macOS.
+  A multi-vCPU memory race in the runtime is suspected; the mmap race found
+  on the way is fixed (ProcessState::mmap_lock).
+- gtk4-demo still crashes intermittently at start-up (heap corruption,
+  not display-related; reproduces with the earlier compositor too).
 
 ## X11
 

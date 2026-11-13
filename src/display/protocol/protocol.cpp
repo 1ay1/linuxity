@@ -8,6 +8,26 @@ namespace lx::display::proto {
 namespace {
 using wire::Interface;
 using wire::Message;
+const Interface* const WpContentTypeManagerV1_requests_1_types[] = { &WpContentTypeV1::iface, &WlSurface::iface };
+const Message WpContentTypeManagerV1_requests[] = {
+    {"destroy", "", 1, true, {}},
+    {"get_surface_content_type", "no", 1, false, WpContentTypeManagerV1_requests_1_types},
+};
+const Message WpContentTypeV1_requests[] = {
+    {"destroy", "", 1, true, {}},
+    {"set_content_type", "u", 1, false, {}},
+};
+const Interface* const WpCursorShapeManagerV1_requests_1_types[] = { &WpCursorShapeDeviceV1::iface, &WlPointer::iface };
+const Interface* const WpCursorShapeManagerV1_requests_2_types[] = { &WpCursorShapeDeviceV1::iface, &ZwpTabletToolV2::iface };
+const Message WpCursorShapeManagerV1_requests[] = {
+    {"destroy", "", 1, true, {}},
+    {"get_pointer", "no", 1, false, WpCursorShapeManagerV1_requests_1_types},
+    {"get_tablet_tool_v2", "no", 1, false, WpCursorShapeManagerV1_requests_2_types},
+};
+const Message WpCursorShapeDeviceV1_requests[] = {
+    {"destroy", "", 1, true, {}},
+    {"set_shape", "uu", 1, false, {}},
+};
 const Interface* const WpFractionalScaleManagerV1_requests_1_types[] = { &WpFractionalScaleV1::iface, &WlSurface::iface };
 const Message WpFractionalScaleManagerV1_requests[] = {
     {"destroy", "", 1, true, {}},
@@ -18,6 +38,244 @@ const Message WpFractionalScaleV1_requests[] = {
 };
 const Message WpFractionalScaleV1_events[] = {
     {"preferred_scale", "u", 1, false, {}},
+};
+const Interface* const ZwpPointerConstraintsV1_requests_1_types[] = { &ZwpLockedPointerV1::iface, &WlSurface::iface, &WlPointer::iface, &WlRegion::iface, nullptr };
+const Interface* const ZwpPointerConstraintsV1_requests_2_types[] = { &ZwpConfinedPointerV1::iface, &WlSurface::iface, &WlPointer::iface, &WlRegion::iface, nullptr };
+const Message ZwpPointerConstraintsV1_requests[] = {
+    {"destroy", "", 1, true, {}},
+    {"lock_pointer", "noo?ou", 1, false, ZwpPointerConstraintsV1_requests_1_types},
+    {"confine_pointer", "noo?ou", 1, false, ZwpPointerConstraintsV1_requests_2_types},
+};
+const Interface* const ZwpLockedPointerV1_requests_2_types[] = { &WlRegion::iface };
+const Message ZwpLockedPointerV1_requests[] = {
+    {"destroy", "", 1, true, {}},
+    {"set_cursor_position_hint", "ff", 1, false, {}},
+    {"set_region", "?o", 1, false, ZwpLockedPointerV1_requests_2_types},
+};
+const Message ZwpLockedPointerV1_events[] = {
+    {"locked", "", 1, false, {}},
+    {"unlocked", "", 1, false, {}},
+};
+const Interface* const ZwpConfinedPointerV1_requests_1_types[] = { &WlRegion::iface };
+const Message ZwpConfinedPointerV1_requests[] = {
+    {"destroy", "", 1, true, {}},
+    {"set_region", "?o", 1, false, ZwpConfinedPointerV1_requests_1_types},
+};
+const Message ZwpConfinedPointerV1_events[] = {
+    {"confined", "", 1, false, {}},
+    {"unconfined", "", 1, false, {}},
+};
+const Interface* const ZwpPointerGesturesV1_requests_0_types[] = { &ZwpPointerGestureSwipeV1::iface, &WlPointer::iface };
+const Interface* const ZwpPointerGesturesV1_requests_1_types[] = { &ZwpPointerGesturePinchV1::iface, &WlPointer::iface };
+const Interface* const ZwpPointerGesturesV1_requests_3_types[] = { &ZwpPointerGestureHoldV1::iface, &WlPointer::iface };
+const Message ZwpPointerGesturesV1_requests[] = {
+    {"get_swipe_gesture", "no", 1, false, ZwpPointerGesturesV1_requests_0_types},
+    {"get_pinch_gesture", "no", 1, false, ZwpPointerGesturesV1_requests_1_types},
+    {"release", "", 2, true, {}},
+    {"get_hold_gesture", "no", 3, false, ZwpPointerGesturesV1_requests_3_types},
+};
+const Interface* const ZwpPointerGestureSwipeV1_events_0_types[] = { nullptr, nullptr, &WlSurface::iface, nullptr };
+const Message ZwpPointerGestureSwipeV1_requests[] = {
+    {"destroy", "", 1, true, {}},
+};
+const Message ZwpPointerGestureSwipeV1_events[] = {
+    {"begin", "uuou", 1, false, ZwpPointerGestureSwipeV1_events_0_types},
+    {"update", "uff", 1, false, {}},
+    {"end", "uui", 1, false, {}},
+};
+const Interface* const ZwpPointerGesturePinchV1_events_0_types[] = { nullptr, nullptr, &WlSurface::iface, nullptr };
+const Message ZwpPointerGesturePinchV1_requests[] = {
+    {"destroy", "", 1, true, {}},
+};
+const Message ZwpPointerGesturePinchV1_events[] = {
+    {"begin", "uuou", 1, false, ZwpPointerGesturePinchV1_events_0_types},
+    {"update", "uffff", 1, false, {}},
+    {"end", "uui", 1, false, {}},
+};
+const Interface* const ZwpPointerGestureHoldV1_events_0_types[] = { nullptr, nullptr, &WlSurface::iface, nullptr };
+const Message ZwpPointerGestureHoldV1_requests[] = {
+    {"destroy", "", 3, true, {}},
+};
+const Message ZwpPointerGestureHoldV1_events[] = {
+    {"begin", "uuou", 3, false, ZwpPointerGestureHoldV1_events_0_types},
+    {"end", "uui", 3, false, {}},
+};
+const Interface* const ZwpPrimarySelectionDeviceManagerV1_requests_0_types[] = { &ZwpPrimarySelectionSourceV1::iface };
+const Interface* const ZwpPrimarySelectionDeviceManagerV1_requests_1_types[] = { &ZwpPrimarySelectionDeviceV1::iface, &WlSeat::iface };
+const Message ZwpPrimarySelectionDeviceManagerV1_requests[] = {
+    {"create_source", "n", 1, false, ZwpPrimarySelectionDeviceManagerV1_requests_0_types},
+    {"get_device", "no", 1, false, ZwpPrimarySelectionDeviceManagerV1_requests_1_types},
+    {"destroy", "", 1, true, {}},
+};
+const Interface* const ZwpPrimarySelectionDeviceV1_requests_0_types[] = { &ZwpPrimarySelectionSourceV1::iface, nullptr };
+const Interface* const ZwpPrimarySelectionDeviceV1_events_0_types[] = { &ZwpPrimarySelectionOfferV1::iface };
+const Interface* const ZwpPrimarySelectionDeviceV1_events_1_types[] = { &ZwpPrimarySelectionOfferV1::iface };
+const Message ZwpPrimarySelectionDeviceV1_requests[] = {
+    {"set_selection", "?ou", 1, false, ZwpPrimarySelectionDeviceV1_requests_0_types},
+    {"destroy", "", 1, true, {}},
+};
+const Message ZwpPrimarySelectionDeviceV1_events[] = {
+    {"data_offer", "n", 1, false, ZwpPrimarySelectionDeviceV1_events_0_types},
+    {"selection", "?o", 1, false, ZwpPrimarySelectionDeviceV1_events_1_types},
+};
+const Message ZwpPrimarySelectionOfferV1_requests[] = {
+    {"receive", "sh", 1, false, {}},
+    {"destroy", "", 1, true, {}},
+};
+const Message ZwpPrimarySelectionOfferV1_events[] = {
+    {"offer", "s", 1, false, {}},
+};
+const Message ZwpPrimarySelectionSourceV1_requests[] = {
+    {"offer", "s", 1, false, {}},
+    {"destroy", "", 1, true, {}},
+};
+const Message ZwpPrimarySelectionSourceV1_events[] = {
+    {"send", "sh", 1, false, {}},
+    {"cancelled", "", 1, false, {}},
+};
+const Interface* const ZwpRelativePointerManagerV1_requests_1_types[] = { &ZwpRelativePointerV1::iface, &WlPointer::iface };
+const Message ZwpRelativePointerManagerV1_requests[] = {
+    {"destroy", "", 1, true, {}},
+    {"get_relative_pointer", "no", 1, false, ZwpRelativePointerManagerV1_requests_1_types},
+};
+const Message ZwpRelativePointerV1_requests[] = {
+    {"destroy", "", 1, true, {}},
+};
+const Message ZwpRelativePointerV1_events[] = {
+    {"relative_motion", "uuffff", 1, false, {}},
+};
+const Interface* const WpSinglePixelBufferManagerV1_requests_1_types[] = { &WlBuffer::iface, nullptr, nullptr, nullptr, nullptr };
+const Message WpSinglePixelBufferManagerV1_requests[] = {
+    {"destroy", "", 1, true, {}},
+    {"create_u32_rgba_buffer", "nuuuu", 1, false, WpSinglePixelBufferManagerV1_requests_1_types},
+};
+const Interface* const ZwpTabletManagerV2_requests_0_types[] = { &ZwpTabletSeatV2::iface, &WlSeat::iface };
+const Message ZwpTabletManagerV2_requests[] = {
+    {"get_tablet_seat", "no", 1, false, ZwpTabletManagerV2_requests_0_types},
+    {"destroy", "", 1, true, {}},
+};
+const Interface* const ZwpTabletSeatV2_events_0_types[] = { &ZwpTabletV2::iface };
+const Interface* const ZwpTabletSeatV2_events_1_types[] = { &ZwpTabletToolV2::iface };
+const Interface* const ZwpTabletSeatV2_events_2_types[] = { &ZwpTabletPadV2::iface };
+const Message ZwpTabletSeatV2_requests[] = {
+    {"destroy", "", 1, true, {}},
+};
+const Message ZwpTabletSeatV2_events[] = {
+    {"tablet_added", "n", 1, false, ZwpTabletSeatV2_events_0_types},
+    {"tool_added", "n", 1, false, ZwpTabletSeatV2_events_1_types},
+    {"pad_added", "n", 1, false, ZwpTabletSeatV2_events_2_types},
+};
+const Interface* const ZwpTabletToolV2_requests_0_types[] = { nullptr, &WlSurface::iface, nullptr, nullptr };
+const Interface* const ZwpTabletToolV2_events_6_types[] = { nullptr, &ZwpTabletV2::iface, &WlSurface::iface };
+const Message ZwpTabletToolV2_requests[] = {
+    {"set_cursor", "u?oii", 1, false, ZwpTabletToolV2_requests_0_types},
+    {"destroy", "", 1, true, {}},
+};
+const Message ZwpTabletToolV2_events[] = {
+    {"type", "u", 1, false, {}},
+    {"hardware_serial", "uu", 1, false, {}},
+    {"hardware_id_wacom", "uu", 1, false, {}},
+    {"capability", "u", 1, false, {}},
+    {"done", "", 1, false, {}},
+    {"removed", "", 1, false, {}},
+    {"proximity_in", "uoo", 1, false, ZwpTabletToolV2_events_6_types},
+    {"proximity_out", "", 1, false, {}},
+    {"down", "u", 1, false, {}},
+    {"up", "", 1, false, {}},
+    {"motion", "ff", 1, false, {}},
+    {"pressure", "u", 1, false, {}},
+    {"distance", "u", 1, false, {}},
+    {"tilt", "ff", 1, false, {}},
+    {"rotation", "f", 1, false, {}},
+    {"slider", "i", 1, false, {}},
+    {"wheel", "fi", 1, false, {}},
+    {"button", "uuu", 1, false, {}},
+    {"frame", "u", 1, false, {}},
+};
+const Message ZwpTabletV2_requests[] = {
+    {"destroy", "", 1, true, {}},
+};
+const Message ZwpTabletV2_events[] = {
+    {"name", "s", 1, false, {}},
+    {"id", "uu", 1, false, {}},
+    {"path", "s", 1, false, {}},
+    {"done", "", 1, false, {}},
+    {"removed", "", 1, false, {}},
+};
+const Message ZwpTabletPadRingV2_requests[] = {
+    {"set_feedback", "su", 1, false, {}},
+    {"destroy", "", 1, true, {}},
+};
+const Message ZwpTabletPadRingV2_events[] = {
+    {"source", "u", 1, false, {}},
+    {"angle", "f", 1, false, {}},
+    {"stop", "", 1, false, {}},
+    {"frame", "u", 1, false, {}},
+};
+const Message ZwpTabletPadStripV2_requests[] = {
+    {"set_feedback", "su", 1, false, {}},
+    {"destroy", "", 1, true, {}},
+};
+const Message ZwpTabletPadStripV2_events[] = {
+    {"source", "u", 1, false, {}},
+    {"position", "u", 1, false, {}},
+    {"stop", "", 1, false, {}},
+    {"frame", "u", 1, false, {}},
+};
+const Interface* const ZwpTabletPadGroupV2_events_1_types[] = { &ZwpTabletPadRingV2::iface };
+const Interface* const ZwpTabletPadGroupV2_events_2_types[] = { &ZwpTabletPadStripV2::iface };
+const Message ZwpTabletPadGroupV2_requests[] = {
+    {"destroy", "", 1, true, {}},
+};
+const Message ZwpTabletPadGroupV2_events[] = {
+    {"buttons", "a", 1, false, {}},
+    {"ring", "n", 1, false, ZwpTabletPadGroupV2_events_1_types},
+    {"strip", "n", 1, false, ZwpTabletPadGroupV2_events_2_types},
+    {"modes", "u", 1, false, {}},
+    {"done", "", 1, false, {}},
+    {"mode_switch", "uuu", 1, false, {}},
+};
+const Interface* const ZwpTabletPadV2_events_0_types[] = { &ZwpTabletPadGroupV2::iface };
+const Interface* const ZwpTabletPadV2_events_5_types[] = { nullptr, &ZwpTabletV2::iface, &WlSurface::iface };
+const Interface* const ZwpTabletPadV2_events_6_types[] = { nullptr, &WlSurface::iface };
+const Message ZwpTabletPadV2_requests[] = {
+    {"set_feedback", "usu", 1, false, {}},
+    {"destroy", "", 1, true, {}},
+};
+const Message ZwpTabletPadV2_events[] = {
+    {"group", "n", 1, false, ZwpTabletPadV2_events_0_types},
+    {"path", "s", 1, false, {}},
+    {"buttons", "u", 1, false, {}},
+    {"done", "", 1, false, {}},
+    {"button", "uuu", 1, false, {}},
+    {"enter", "uoo", 1, false, ZwpTabletPadV2_events_5_types},
+    {"leave", "uo", 1, false, ZwpTabletPadV2_events_6_types},
+    {"removed", "", 1, false, {}},
+};
+const Interface* const ZwpTextInputV3_events_0_types[] = { &WlSurface::iface };
+const Interface* const ZwpTextInputV3_events_1_types[] = { &WlSurface::iface };
+const Message ZwpTextInputV3_requests[] = {
+    {"destroy", "", 1, true, {}},
+    {"enable", "", 1, false, {}},
+    {"disable", "", 1, false, {}},
+    {"set_surrounding_text", "sii", 1, false, {}},
+    {"set_text_change_cause", "u", 1, false, {}},
+    {"set_content_type", "uu", 1, false, {}},
+    {"set_cursor_rectangle", "iiii", 1, false, {}},
+    {"commit", "", 1, false, {}},
+};
+const Message ZwpTextInputV3_events[] = {
+    {"enter", "o", 1, false, ZwpTextInputV3_events_0_types},
+    {"leave", "o", 1, false, ZwpTextInputV3_events_1_types},
+    {"preedit_string", "?sii", 1, false, {}},
+    {"commit_string", "?s", 1, false, {}},
+    {"delete_surrounding_text", "uu", 1, false, {}},
+    {"done", "u", 1, false, {}},
+};
+const Interface* const ZwpTextInputManagerV3_requests_1_types[] = { &ZwpTextInputV3::iface, &WlSeat::iface };
+const Message ZwpTextInputManagerV3_requests[] = {
+    {"destroy", "", 1, true, {}},
+    {"get_text_input", "no", 1, false, ZwpTextInputManagerV3_requests_1_types},
 };
 const Interface* const WpViewporter_requests_1_types[] = { &WpViewport::iface, &WlSurface::iface };
 const Message WpViewporter_requests[] = {
@@ -265,6 +523,25 @@ const Message WlSubsurface_requests[] = {
     {"set_sync", "", 1, false, {}},
     {"set_desync", "", 1, false, {}},
 };
+const Interface* const XdgActivationV1_requests_1_types[] = { &XdgActivationTokenV1::iface };
+const Interface* const XdgActivationV1_requests_2_types[] = { nullptr, &WlSurface::iface };
+const Message XdgActivationV1_requests[] = {
+    {"destroy", "", 1, true, {}},
+    {"get_activation_token", "n", 1, false, XdgActivationV1_requests_1_types},
+    {"activate", "so", 1, false, XdgActivationV1_requests_2_types},
+};
+const Interface* const XdgActivationTokenV1_requests_0_types[] = { nullptr, &WlSeat::iface };
+const Interface* const XdgActivationTokenV1_requests_2_types[] = { &WlSurface::iface };
+const Message XdgActivationTokenV1_requests[] = {
+    {"set_serial", "uo", 1, false, XdgActivationTokenV1_requests_0_types},
+    {"set_app_id", "s", 1, false, {}},
+    {"set_surface", "o", 1, false, XdgActivationTokenV1_requests_2_types},
+    {"commit", "", 1, false, {}},
+    {"destroy", "", 1, true, {}},
+};
+const Message XdgActivationTokenV1_events[] = {
+    {"done", "s", 1, false, {}},
+};
 const Interface* const ZxdgDecorationManagerV1_requests_1_types[] = { &ZxdgToplevelDecorationV1::iface, &XdgToplevel::iface };
 const Message ZxdgDecorationManagerV1_requests[] = {
     {"destroy", "", 1, true, {}},
@@ -367,6 +644,11 @@ const Message XdgPopup_events[] = {
     {"popup_done", "", 1, false, {}},
     {"repositioned", "u", 3, false, {}},
 };
+const Interface* const XdgSystemBellV1_requests_1_types[] = { &WlSurface::iface };
+const Message XdgSystemBellV1_requests[] = {
+    {"destroy", "", 1, true, {}},
+    {"ring", "?o", 1, false, XdgSystemBellV1_requests_1_types},
+};
 const Interface* const XwaylandShellV1_requests_1_types[] = { &XwaylandSurfaceV1::iface, &WlSurface::iface };
 const Message XwaylandShellV1_requests[] = {
     {"destroy", "", 1, true, {}},
@@ -378,8 +660,36 @@ const Message XwaylandSurfaceV1_requests[] = {
 };
 }  // namespace
 
+const Interface WpContentTypeManagerV1::iface{"wp_content_type_manager_v1", 1, WpContentTypeManagerV1_requests, {}};
+const Interface WpContentTypeV1::iface{"wp_content_type_v1", 1, WpContentTypeV1_requests, {}};
+const Interface WpCursorShapeManagerV1::iface{"wp_cursor_shape_manager_v1", 2, WpCursorShapeManagerV1_requests, {}};
+const Interface WpCursorShapeDeviceV1::iface{"wp_cursor_shape_device_v1", 2, WpCursorShapeDeviceV1_requests, {}};
 const Interface WpFractionalScaleManagerV1::iface{"wp_fractional_scale_manager_v1", 1, WpFractionalScaleManagerV1_requests, {}};
 const Interface WpFractionalScaleV1::iface{"wp_fractional_scale_v1", 1, WpFractionalScaleV1_requests, WpFractionalScaleV1_events};
+const Interface ZwpPointerConstraintsV1::iface{"zwp_pointer_constraints_v1", 1, ZwpPointerConstraintsV1_requests, {}};
+const Interface ZwpLockedPointerV1::iface{"zwp_locked_pointer_v1", 1, ZwpLockedPointerV1_requests, ZwpLockedPointerV1_events};
+const Interface ZwpConfinedPointerV1::iface{"zwp_confined_pointer_v1", 1, ZwpConfinedPointerV1_requests, ZwpConfinedPointerV1_events};
+const Interface ZwpPointerGesturesV1::iface{"zwp_pointer_gestures_v1", 3, ZwpPointerGesturesV1_requests, {}};
+const Interface ZwpPointerGestureSwipeV1::iface{"zwp_pointer_gesture_swipe_v1", 2, ZwpPointerGestureSwipeV1_requests, ZwpPointerGestureSwipeV1_events};
+const Interface ZwpPointerGesturePinchV1::iface{"zwp_pointer_gesture_pinch_v1", 2, ZwpPointerGesturePinchV1_requests, ZwpPointerGesturePinchV1_events};
+const Interface ZwpPointerGestureHoldV1::iface{"zwp_pointer_gesture_hold_v1", 3, ZwpPointerGestureHoldV1_requests, ZwpPointerGestureHoldV1_events};
+const Interface ZwpPrimarySelectionDeviceManagerV1::iface{"zwp_primary_selection_device_manager_v1", 1, ZwpPrimarySelectionDeviceManagerV1_requests, {}};
+const Interface ZwpPrimarySelectionDeviceV1::iface{"zwp_primary_selection_device_v1", 1, ZwpPrimarySelectionDeviceV1_requests, ZwpPrimarySelectionDeviceV1_events};
+const Interface ZwpPrimarySelectionOfferV1::iface{"zwp_primary_selection_offer_v1", 1, ZwpPrimarySelectionOfferV1_requests, ZwpPrimarySelectionOfferV1_events};
+const Interface ZwpPrimarySelectionSourceV1::iface{"zwp_primary_selection_source_v1", 1, ZwpPrimarySelectionSourceV1_requests, ZwpPrimarySelectionSourceV1_events};
+const Interface ZwpRelativePointerManagerV1::iface{"zwp_relative_pointer_manager_v1", 1, ZwpRelativePointerManagerV1_requests, {}};
+const Interface ZwpRelativePointerV1::iface{"zwp_relative_pointer_v1", 1, ZwpRelativePointerV1_requests, ZwpRelativePointerV1_events};
+const Interface WpSinglePixelBufferManagerV1::iface{"wp_single_pixel_buffer_manager_v1", 1, WpSinglePixelBufferManagerV1_requests, {}};
+const Interface ZwpTabletManagerV2::iface{"zwp_tablet_manager_v2", 1, ZwpTabletManagerV2_requests, {}};
+const Interface ZwpTabletSeatV2::iface{"zwp_tablet_seat_v2", 1, ZwpTabletSeatV2_requests, ZwpTabletSeatV2_events};
+const Interface ZwpTabletToolV2::iface{"zwp_tablet_tool_v2", 1, ZwpTabletToolV2_requests, ZwpTabletToolV2_events};
+const Interface ZwpTabletV2::iface{"zwp_tablet_v2", 1, ZwpTabletV2_requests, ZwpTabletV2_events};
+const Interface ZwpTabletPadRingV2::iface{"zwp_tablet_pad_ring_v2", 1, ZwpTabletPadRingV2_requests, ZwpTabletPadRingV2_events};
+const Interface ZwpTabletPadStripV2::iface{"zwp_tablet_pad_strip_v2", 1, ZwpTabletPadStripV2_requests, ZwpTabletPadStripV2_events};
+const Interface ZwpTabletPadGroupV2::iface{"zwp_tablet_pad_group_v2", 1, ZwpTabletPadGroupV2_requests, ZwpTabletPadGroupV2_events};
+const Interface ZwpTabletPadV2::iface{"zwp_tablet_pad_v2", 1, ZwpTabletPadV2_requests, ZwpTabletPadV2_events};
+const Interface ZwpTextInputV3::iface{"zwp_text_input_v3", 1, ZwpTextInputV3_requests, ZwpTextInputV3_events};
+const Interface ZwpTextInputManagerV3::iface{"zwp_text_input_manager_v3", 1, ZwpTextInputManagerV3_requests, {}};
 const Interface WpViewporter::iface{"wp_viewporter", 1, WpViewporter_requests, {}};
 const Interface WpViewport::iface{"wp_viewport", 1, WpViewport_requests, {}};
 const Interface WlDisplay::iface{"wl_display", 1, WlDisplay_requests, WlDisplay_events};
@@ -404,6 +714,8 @@ const Interface WlOutput::iface{"wl_output", 4, WlOutput_requests, WlOutput_even
 const Interface WlRegion::iface{"wl_region", 1, WlRegion_requests, {}};
 const Interface WlSubcompositor::iface{"wl_subcompositor", 1, WlSubcompositor_requests, {}};
 const Interface WlSubsurface::iface{"wl_subsurface", 1, WlSubsurface_requests, {}};
+const Interface XdgActivationV1::iface{"xdg_activation_v1", 1, XdgActivationV1_requests, {}};
+const Interface XdgActivationTokenV1::iface{"xdg_activation_token_v1", 1, XdgActivationTokenV1_requests, XdgActivationTokenV1_events};
 const Interface ZxdgDecorationManagerV1::iface{"zxdg_decoration_manager_v1", 1, ZxdgDecorationManagerV1_requests, {}};
 const Interface ZxdgToplevelDecorationV1::iface{"zxdg_toplevel_decoration_v1", 1, ZxdgToplevelDecorationV1_requests, ZxdgToplevelDecorationV1_events};
 const Interface ZxdgOutputManagerV1::iface{"zxdg_output_manager_v1", 3, ZxdgOutputManagerV1_requests, {}};
@@ -413,6 +725,7 @@ const Interface XdgPositioner::iface{"xdg_positioner", 7, XdgPositioner_requests
 const Interface XdgSurface::iface{"xdg_surface", 7, XdgSurface_requests, XdgSurface_events};
 const Interface XdgToplevel::iface{"xdg_toplevel", 7, XdgToplevel_requests, XdgToplevel_events};
 const Interface XdgPopup::iface{"xdg_popup", 7, XdgPopup_requests, XdgPopup_events};
+const Interface XdgSystemBellV1::iface{"xdg_system_bell_v1", 1, XdgSystemBellV1_requests, {}};
 const Interface XwaylandShellV1::iface{"xwayland_shell_v1", 1, XwaylandShellV1_requests, {}};
 const Interface XwaylandSurfaceV1::iface{"xwayland_surface_v1", 1, XwaylandSurfaceV1_requests, {}};
 

@@ -10,6 +10,8 @@ add_library(linuxity_display_core STATIC
     core/surface.cpp
     core/shell.cpp
     core/seat.cpp
+    core/scale.cpp
+    core/extras.cpp
     core/compositor.cpp
     core/poll_loop.cpp
     hosts/headless.cpp)
@@ -26,10 +28,10 @@ if(APPLE)
     enable_language(OBJCXX)
     target_sources(linuxity-display PRIVATE hosts/cocoa/cocoa_host.mm)
     set_source_files_properties(hosts/cocoa/cocoa_host.mm PROPERTIES
-        COMPILE_OPTIONS "-fobjc-arc;-Wno-old-style-cast;-Wno-sign-conversion;-Wno-shorten-64-to-32")
+        COMPILE_OPTIONS "-fobjc-arc;-Wno-old-style-cast;-Wno-sign-conversion;-Wno-shorten-64-to-32;-Wno-gnu-conditional-omitted-operand")
     target_compile_definitions(linuxity-display PRIVATE LX_DISPLAY_COCOA=1)
     target_link_libraries(linuxity-display PRIVATE
-        "-framework AppKit" "-framework QuartzCore" "-framework Carbon" "-framework CoreVideo")
+        "-framework AppKit" "-framework QuartzCore" "-framework Carbon" "-framework CoreVideo" "-framework IOSurface")
 endif()
 
 install(TARGETS linuxity-display RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

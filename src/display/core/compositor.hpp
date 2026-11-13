@@ -12,7 +12,10 @@
 #include "host.hpp"
 #include "server.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -40,12 +43,18 @@ struct ShmMapping {
 
 class Buffer final : public Object<proto::WlBuffer> {
 public:
+    // cut from a wl_shm_pool
     Buffer(Client& c, std::uint32_t v, ObjectId id, std::shared_ptr<ShmMapping> m,
            std::int32_t offset, std::int32_t w, std::int32_t h, std::int32_t stride, PixelFormat f)
         : Object(c, v, id), map_(std::move(m)), offset_(offset), w_(w), h_(h), stride_(stride), fmt_(f) {}
-    // Copy the pixels out (guarded against the client shrinking the pool
-    // under us); null if the memory is gone.
-    [[nodiscard]] PixelsRef snapshot() const;
+    // wp_single_pixel_buffer: one premultiplied colour, 1x1 (stretched by a viewport)
+    Buffer(Client& c, std::uint32_t v, ObjectId id, std::array<std::uint8_t, 4> bgra)
+        : Object(c, v, id), offset_(0), w_(1), h_(1), stride_(4), fmt_(PixelFormat::argb8888), solid_(bgra) {}
+    // Bring `content` up to date with this buffer: only `damage` (buffer
+    // pixels) when the shapes match, all of it otherwise (a new store).
+    // Guarded against the client shrinking its pool under us; false if the
+    // memory can't be read.
+    [[nodiscard]] bool copy_into(std::shared_ptr<Pixels>& content, std::optional<Rect> damage) const;
     void release() { send(proto::WlBuffer::Ev::release); }
     [[nodiscard]] Size size() const noexcept { return {w_, h_}; }
 protected:
@@ -54,6 +63,7 @@ private:
     std::shared_ptr<ShmMapping> map_;
     std::int32_t offset_, w_, h_, stride_;
     PixelFormat fmt_;
+    std::optional<std::array<std::uint8_t, 4>> solid_;
 };
 
 // -- Surfaces -----------------------------------------------------------------
@@ -70,17 +80,37 @@ public:
     virtual void role_surface_gone() {}
 };
 
+// wp_viewport's crop and scale: source in surface coordinates before the
+// crop (fractional), destination size in surface coordinates.
+struct Viewport {
+    std::optional<SourceRect> src;
+    std::optional<Size> dst;
+    friend bool operator==(const Viewport&, const Viewport&) = default;
+};
+
 // Double-buffered surface state (wl_surface's "pending" and "cached").
 struct SurfaceState {
     bool attached{false};          // attach seen this cycle
-    PixelsRef pixels;              // copied at commit; null = no buffer
+    // A synchronized subsurface's cached frame: its own full copy, applied
+    // on the parent's commit. Unsynchronized commits update the surface's
+    // content in place instead and never set this.
+    std::shared_ptr<Pixels> staged;
+    bool unmap{false};             // attach(null)
+    Rect damage;                   // buffer pixels, union
+    bool damage_all{false};
     Point delta;
     std::optional<std::int32_t> scale;
     std::optional<std::optional<Region>> input, opaque;   // set: nullopt inner = infinite
+    std::optional<Viewport> viewport;
     std::vector<std::shared_ptr<Callback>> frames;
-    std::optional<Point> offset;
     void merge_into(SurfaceState& dst);
 };
+
+class FractionalScale;
+class ViewportObj;
+
+// wp_fractional_scale_v1.preferred_scale, in 120ths
+void send_fractional_scale(FractionalScale& f, double scale);
 
 class Surface final : public Object<proto::WlSurface> {
 public:
@@ -92,12 +122,29 @@ public:
     [[nodiscard]] std::shared_ptr<Surface> self() { return std::static_pointer_cast<Surface>(shared_from_this()); }
 
     // committed state
-    [[nodiscard]] const PixelsRef& pixels() const noexcept { return pixels_; }
-    [[nodiscard]] bool mapped_content() const noexcept { return pixels_ != nullptr; }
+    [[nodiscard]] PixelsRef pixels() const noexcept { return content_; }
+    [[nodiscard]] bool mapped_content() const noexcept { return content_ != nullptr; }
     [[nodiscard]] Size size() const noexcept { return size_; }        // logical
     [[nodiscard]] std::int32_t scale() const noexcept { return scale_; }
+    // the buffer region shown (the viewport's crop, in buffer pixels)
+    [[nodiscard]] SourceRect source() const noexcept;
+    // damage not yet shown by the host, and a counter of content changes
+    [[nodiscard]] Rect unpresented_damage() const noexcept { return present_damage_; }
+    [[nodiscard]] std::uint64_t generation() const noexcept { return generation_; }
+    void presented() noexcept { present_damage_ = {}; }
     [[nodiscard]] bool accepts_input(double x, double y) const noexcept;
     [[nodiscard]] Point take_delta() noexcept { return std::exchange(delta_, Point{}); }
+
+    // wp_viewport / wp_fractional_scale attach here (one each at most)
+    [[nodiscard]] bool has_viewport() const noexcept { return has_viewport_; }
+    void set_has_viewport(bool v) noexcept { has_viewport_ = v; }
+    void set_pending_viewport(Viewport v) { pending_.viewport = std::move(v); }
+    [[nodiscard]] const Viewport& pending_viewport_or_current() const noexcept {
+        return pending_.viewport ? *pending_.viewport : viewport_;
+    }
+    [[nodiscard]] FractionalScale* fractional() const noexcept { return fractional_; }
+    void set_fractional(FractionalScale* f) noexcept { fractional_ = f; }
+    void set_viewport_obj(ViewportObj* v) noexcept { viewport_obj_ = v; }
 
     // roles
     [[nodiscard]] SurfaceRole* role() const noexcept { return role_; }
@@ -123,8 +170,10 @@ public:
 
     void apply_cached();    // a synchronized child, on its parent's commit
 
-    // Outputs the surface is on (wl_surface.enter/leave), by output id.
-    void set_outputs(const std::vector<std::shared_ptr<Resource>>& outputs, std::int32_t scale);
+    // Outputs the surface is on (wl_surface.enter/leave), by output id;
+    // `scale` is the output's, fractional (1.5, 2.0 ...).
+    void set_outputs(const std::vector<std::shared_ptr<Resource>>& outputs, double scale);
+    [[nodiscard]] double output_scale() const noexcept { return output_scale_; }
 
 protected:
     void request(std::uint16_t op, wire::Args& a) override;
@@ -132,15 +181,24 @@ protected:
 
 private:
     void commit();
+    [[nodiscard]] bool take_buffer(SurfaceState& st);   // the attached buffer -> content
     void apply(SurfaceState& st);
     void children_commit();
+    void surface_gone_hooks();
 
     Compositor* comp_;
     std::uint64_t uid_;
     SurfaceState pending_, cached_;
     std::weak_ptr<Buffer> pending_buffer_;
     bool has_cached_{false};
-    PixelsRef pixels_;
+    std::shared_ptr<Pixels> content_;  // our copy of what the client drew
+    Rect present_damage_;
+    std::uint64_t generation_{0};
+    Viewport viewport_;
+    bool has_viewport_{false};
+    FractionalScale* fractional_{nullptr};
+    ViewportObj* viewport_obj_{nullptr};
+    double output_scale_{0};
     Size size_;
     std::int32_t scale_{1};
     std::optional<Region> input_;      // nullopt = infinite
@@ -230,6 +288,7 @@ protected:
 private:
     void map();
     void present_now();
+    void present_scene();
     void build_scene(Scene& out, std::vector<std::weak_ptr<Surface>>& who) const;
 
     Compositor* comp_;
@@ -365,6 +424,18 @@ public:
     // cursor
     void set_cursor(Pointer& from, std::uint32_t serial, std::shared_ptr<Surface> s, Point hotspot);
     void cursor_committed(Surface& s);
+    // wp_cursor_shape: a named platform cursor, from the client under the pointer
+    void set_cursor_shape(Client& from, CursorShape shape);
+
+    // For protocol extensions that follow the keyboard (text input, the
+    // primary selection): called with the old and new focused surface.
+    using FocusListener = std::function<void(Surface* before, Surface* now)>;
+    void add_focus_listener(FocusListener f) { focus_listeners_.push_back(std::move(f)); }
+    [[nodiscard]] Surface* keyboard_focus() const { return kb_focus_.lock().get(); }
+    [[nodiscard]] Surface* pointer_focus() const { return ptr_focus_.lock().get(); }
+    // the latest input serial a client may cite to ask for focus
+    [[nodiscard]] std::uint32_t last_input_serial() const noexcept { return std::max(press_serial_, key_serial_); }
+    [[nodiscard]] std::uint32_t last_enter_serial() const noexcept { return enter_serial_; }
 
     // selection (clipboard)
     void set_selection(Client& from, std::shared_ptr<DataSource> src);
@@ -396,7 +467,8 @@ private:
     std::weak_ptr<ShellSurface> ptr_window_;
     double ptr_x_{0}, ptr_y_{0};
     std::uint32_t buttons_down_{0};
-    std::uint32_t enter_serial_{0}, press_serial_{0};
+    std::uint32_t enter_serial_{0}, press_serial_{0}, key_serial_{0};
+    std::vector<FocusListener> focus_listeners_;
 
     std::weak_ptr<ShellSurface> focused_window_;
     std::weak_ptr<Surface> kb_focus_;
@@ -453,10 +525,26 @@ public:
     // HostSink
     void host_key(std::uint32_t code, bool pressed, std::uint32_t t) override;
     void host_modifiers(Modifiers m) override;
+    void host_text_preedit(std::string text, std::int32_t begin, std::int32_t end) override {
+        if (on_text_preedit) on_text_preedit(std::move(text), begin, end);
+    }
+    void host_text_commit(std::string text) override {
+        if (on_text_commit) on_text_commit(std::move(text));
+    }
     void host_outputs_changed() override;
     void host_keyboard_changed() override;
     void host_app_active(bool active) override;
     void host_quit() override;
+
+    // set by the text-input extension (extras.cpp)
+    std::function<void(std::string, std::int32_t, std::int32_t)> on_text_preedit;
+    std::function<void(std::string)> on_text_commit;
+    // which output a bound wl_output resource describes
+    [[nodiscard]] std::optional<std::size_t> output_index_of(const Resource& r) const;
+    // the mapped window whose tree `s` belongs to
+    [[nodiscard]] ShellSurface* window_of(Surface* s) const;
+    // Somewhere for an extension to keep compositor-wide state (extras.cpp)
+    std::shared_ptr<void> extras;
 
 private:
     void add_globals();

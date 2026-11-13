@@ -256,7 +256,15 @@ void ShellSurface::build_scene(Scene& out, std::vector<std::weak_ptr<Surface>>& 
     auto visit = [&](auto&& self_fn, Surface& s, Point at) -> void {
         auto add_self = [&] {
             if (!s.pixels()) return;
-            out.layers.push_back({s.uid(), {at.x, at.y, s.size().w, s.size().h}, s.pixels(), s.scale(), false});
+            Layer l;
+            l.id = s.uid();
+            l.rect = {at.x, at.y, s.size().w, s.size().h};
+            l.pixels = s.pixels();
+            l.scale = s.scale();
+            l.source = s.source();
+            l.damage = s.unpresented_damage();
+            l.generation = s.generation();
+            out.layers.push_back(std::move(l));
             who.push_back(s.self());
         };
         if (s.stack().empty()) { add_self(); return; }
@@ -300,7 +308,14 @@ void ShellSurface::present_now() {
     const Rect old_view = scene_.view, old_geom = scene_.geometry;
     build_scene(scene_, scene_surfaces_);
     if (popup_ && (old_view != scene_.view || old_geom != scene_.geometry)) window_->move_popup(popup_->window_offset());
+    present_scene();
+}
+
+// Hand the scene to the host; its damage is then shown.
+void ShellSurface::present_scene() {
     window_->present(scene_);
+    for (auto& w : scene_surfaces_)
+        if (auto s = w.lock()) s->presented();
 }
 
 void ShellSurface::map() {
@@ -330,7 +345,7 @@ void ShellSurface::map() {
                      scene_.view.w, scene_.view.h, scene_.view.x, scene_.view.y, scene_.layers.size(),
                      window_ ? "" : " (host refused)");
     if (!window_) return;
-    window_->present(scene_);
+    present_scene();
     comp_->window_mapped(*this);
     host_output(output_);
     if (toplevel_) toplevel_->on_mapped();
@@ -396,7 +411,8 @@ void ShellSurface::host_output(std::size_t index) {
     output_ = index;
     Surface* s = surface();
     if (!s || comp_->outputs().empty()) return;
-    s->set_outputs(comp_->output_resources(client(), index), comp_->outputs()[index].scale);
+    const OutputInfo& o = comp_->outputs()[index];
+    s->set_outputs(comp_->output_resources(client(), index), o.fractional_scale > 0 ? o.fractional_scale : o.scale);
 }
 
 void ShellSurface::on_destroy() {

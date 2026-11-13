@@ -8,6 +8,7 @@
 // instance serves every environment of the user, the way one compositor
 // serves a desktop session.
 #include "core/compositor.hpp"
+#include "hosts/headless.hpp"
 
 #include <csignal>
 #include <cstdio>
@@ -20,7 +21,6 @@
 #include <unistd.h>
 
 namespace lx::display {
-std::unique_ptr<Host> make_headless_host(std::string dump_dir);
 #if defined(LX_DISPLAY_COCOA)
 std::unique_ptr<Host> make_cocoa_host();
 #endif

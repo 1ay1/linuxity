@@ -467,6 +467,13 @@ void Seat::cursor_committed(Surface& s) {
     comp_->host().set_cursor({s.pixels(), s.scale(), cursor_hotspot_});
 }
 
+void Seat::set_cursor_shape(Client& from, CursorShape shape) {
+    auto focus = ptr_focus_.lock();
+    if (!focus || &focus->client() != &from) return;   // only the client under the pointer
+    cursor_surface_.reset();
+    comp_->host().set_cursor_shape(shape);
+}
+
 // -- keyboard ----------------------------------------------------------------------
 
 void Seat::send_modifiers(Client* only) {
@@ -489,7 +496,12 @@ void Seat::keyboard_enter(Surface* s) {
         const std::uint32_t serial = comp_->server().next_serial();
         each_keyboard(old->client(), [&](Keyboard& k) { k.send(WlKeyboard::Ev::leave, serial, wire::Object{old->id()}); });
     }
-    if (!s) { kb_focus_.reset(); return; }
+    Surface* before = old && old->alive() ? old.get() : nullptr;
+    if (!s) {
+        kb_focus_.reset();
+        for (auto& f : focus_listeners_) f(before, nullptr);
+        return;
+    }
     kb_focus_ = s->self();
     const std::uint32_t serial = comp_->server().next_serial();
     each_keyboard(s->client(), [&](Keyboard& k) {
@@ -500,6 +512,7 @@ void Seat::keyboard_enter(Surface* s) {
         host_clipboard_check();
         offer_selection(s->client());
     }
+    for (auto& f : focus_listeners_) f(before, s);
 }
 
 void Seat::focus_window(ShellSurface* win) {
@@ -525,11 +538,15 @@ void Seat::key(std::uint32_t code, bool pressed, std::uint32_t t) {
         if (std::find(keys_down_.begin(), keys_down_.end(), code) != keys_down_.end()) return;   // host auto-repeat
         keys_down_.push_back(code);
     } else {
+        // a release the client never saw pressed (an input method took
+        // the press) is not news to it
+        if (std::find(keys_down_.begin(), keys_down_.end(), code) == keys_down_.end()) return;
         std::erase(keys_down_, code);
     }
     auto s = kb_focus_.lock();
     if (!s || !s->alive()) return;
     const std::uint32_t serial = comp_->server().next_serial();
+    if (pressed) key_serial_ = serial;
     each_keyboard(s->client(), [&](Keyboard& k) {
         k.send(WlKeyboard::Ev::key, serial, t, code, pressed ? WlKeyboard::KeyState::pressed : WlKeyboard::KeyState::released);
     });

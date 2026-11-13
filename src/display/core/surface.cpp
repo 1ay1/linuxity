@@ -7,6 +7,7 @@
 // holds a reference into guest memory past the request that named it.
 #include "compositor.hpp"
 
+#include <cmath>
 #include <csetjmp>
 #include <csignal>
 #include <cstdio>
@@ -54,7 +55,7 @@ bool guarded_rows(std::byte* dst, std::size_t dst_stride, const std::byte* src, 
         return false;
     }
     t_copy_jmp = &jb;
-    if (dst_stride == src_stride) {
+    if (dst_stride == src_stride && row_bytes == src_stride) {
         std::memcpy(dst, src, src_stride * rows);
     } else {
         for (std::size_t r = 0; r < rows; ++r) std::memcpy(dst + r * dst_stride, src + r * src_stride, row_bytes);
@@ -155,24 +156,45 @@ bool ShmMapping::remap(std::size_t new_size) {
     return true;
 }
 
-PixelsRef Buffer::snapshot() const {
-    auto px = std::make_shared<Pixels>();
-    px->width = w_;
-    px->height = h_;
-    px->stride = w_ * 4;
-    px->format = fmt_;
-    const auto rows = static_cast<std::size_t>(h_);
-    const auto row = static_cast<std::size_t>(w_) * 4;
-    if (static_cast<std::size_t>(offset_) + static_cast<std::size_t>(stride_) * rows > map_->size) return nullptr;
+bool Buffer::copy_into(std::shared_ptr<Pixels>& content, std::optional<Rect> damage) const {
+    // a fresh store when there is none or the shape changed: copy it all
+    if (!content || content->width != w_ || content->height != h_ || content->format != fmt_) {
+        auto px = std::make_shared<Pixels>();
+        px->width = w_;
+        px->height = h_;
+        px->stride = w_ * 4;
+        px->format = fmt_;
+        px->data.resize(static_cast<std::size_t>(px->stride) * static_cast<std::size_t>(h_));
+        content = std::move(px);
+        damage.reset();
+    }
+    Rect d{0, 0, w_, h_};
+    if (damage) {
+        const auto l = std::max(0, damage->x), t = std::max(0, damage->y);
+        const auto r = std::min(w_, damage->x + damage->w), b = std::min(h_, damage->y + damage->h);
+        if (r <= l || b <= t) return true;   // nothing changed
+        d = {l, t, r - l, b - t};
+    }
+    const auto row = static_cast<std::size_t>(d.w) * 4;
+    std::byte* dst = content->data.data() + static_cast<std::size_t>(d.y) * static_cast<std::size_t>(content->stride) +
+                     static_cast<std::size_t>(d.x) * 4;
+    if (solid_) {
+        for (int y = 0; y < d.h; ++y)
+            for (int x = 0; x < d.w; ++x)
+                std::memcpy(dst + static_cast<std::size_t>(y) * static_cast<std::size_t>(content->stride) + static_cast<std::size_t>(x) * 4,
+                            &*solid_, 4);
+        return true;
+    }
+    const auto stride = static_cast<std::size_t>(stride_);
+    const std::uint64_t first = static_cast<std::uint64_t>(offset_) + static_cast<std::uint64_t>(d.y) * stride +
+                                static_cast<std::uint64_t>(d.x) * 4;
+    const std::uint64_t end = first + static_cast<std::uint64_t>(d.h - 1) * stride + row;
+    if (end > map_->size) return false;
     // never read past the file's current end, even if the pool says we may
     struct ::stat st{};
-    if (::fstat(map_->fd.get(), &st) == 0 &&
-        static_cast<std::uint64_t>(st.st_size) < static_cast<std::uint64_t>(offset_) + static_cast<std::uint64_t>(stride_) * (rows - 1) + row)
-        return nullptr;
-    px->data.resize(row * rows);
-    const auto* src = static_cast<const std::byte*>(map_->base) + offset_;
-    if (!guarded_rows(px->data.data(), row, src, static_cast<std::size_t>(stride_), row, rows)) return nullptr;
-    return px;
+    if (::fstat(map_->fd.get(), &st) == 0 && static_cast<std::uint64_t>(st.st_size) < end) return false;
+    const auto* src = static_cast<const std::byte*>(map_->base) + first;
+    return guarded_rows(dst, static_cast<std::size_t>(content->stride), src, stride, row, static_cast<std::size_t>(d.h));
 }
 
 // -- Surface ------------------------------------------------------------------
@@ -279,11 +301,18 @@ void bind_surface_globals(Compositor& comp) {
 }
 
 void SurfaceState::merge_into(SurfaceState& dst) {
-    if (attached) { dst.attached = true; dst.pixels = std::move(pixels); }
+    if (attached) {
+        dst.attached = true;
+        dst.unmap = unmap;
+        if (staged) dst.staged = std::move(staged);
+    }
+    dst.damage = dst.damage.united(damage);
+    dst.damage_all = dst.damage_all || damage_all;
     dst.delta = dst.delta + delta;
     if (scale) dst.scale = scale;
     if (input) dst.input = std::move(input);
     if (opaque) dst.opaque = std::move(opaque);
+    if (viewport) dst.viewport = std::move(viewport);
     for (auto& f : frames) dst.frames.push_back(std::move(f));
     *this = SurfaceState{};
 }
@@ -292,6 +321,16 @@ Surface::Surface(Client& c, std::uint32_t v, ObjectId id, Compositor& comp)
     : Object(c, v, id), comp_(&comp), uid_(comp.next_uid()) {}
 
 Surface::~Surface() = default;
+
+SourceRect Surface::source() const noexcept {
+    if (!content_) return {};
+    // the viewport's source is in surface coordinates before the crop,
+    // i.e. after buffer_scale: back to buffer pixels
+    if (viewport_.src)
+        return {viewport_.src->x * scale_, viewport_.src->y * scale_, viewport_.src->w * scale_,
+                viewport_.src->h * scale_};
+    return {0, 0, static_cast<double>(content_->width), static_cast<double>(content_->height)};
+}
 
 bool Surface::accepts_input(double x, double y) const noexcept {
     if (!Rect{0, 0, size_.w, size_.h}.contains(x, y)) return false;
@@ -355,13 +394,30 @@ Surface* Surface::root() {
 void Surface::request(std::uint16_t op, wire::Args& a) {
     switch (op) {
         case WlSurface::Req::attach: {
-            pending_.attached = true;
-            pending_buffer_ = client().get<Buffer>(a.obj(0));
             if (version() >= 5 && (a.i(1) || a.i(2))) {
                 post_error(WlSurface::Error::invalid_offset, "attach offset must be 0 since v5");
                 return;
             }
+            pending_.attached = true;
+            auto b = a.obj(0) ? client().get<Buffer>(a.obj(0)) : nullptr;
+            pending_buffer_ = b;
+            pending_.unmap = !b;
             pending_.delta = pending_.delta + Point{a.i(1), a.i(2)};
+            break;
+        }
+        case WlSurface::Req::damage_buffer:
+            pending_.damage = pending_.damage.united({a.i(0), a.i(1), a.i(2), a.i(3)});
+            break;
+        case WlSurface::Req::damage: {
+            // surface coordinates: to buffer pixels at the scale the buffer
+            // will have (rounding outward), unless a viewport makes the
+            // mapping non-integral -- then the whole buffer
+            if (has_viewport_) { pending_.damage_all = true; break; }
+            const std::int32_t s = pending_.scale.value_or(scale_);
+            const auto big = [](std::int32_t v, std::int32_t k) {
+                return static_cast<std::int32_t>(std::clamp<std::int64_t>(std::int64_t{v} * k, -(1 << 30), 1 << 30));
+            };
+            pending_.damage = pending_.damage.united({big(a.i(0), s), big(a.i(1), s), big(a.i(2), s), big(a.i(3), s)});
             break;
         }
         case WlSurface::Req::frame:
@@ -390,24 +446,44 @@ void Surface::request(std::uint16_t op, wire::Args& a) {
         case WlSurface::Req::commit:
             commit();
             break;
-        default: break;   // damage, damage_buffer: we copy whole buffers
+        default: break;
     }
 }
 
+// The attached buffer into our copy, then give the buffer straight back.
+// Unsynchronized: straight into the surface's content, damage only.
+// Synchronized (a subsurface waiting for its parent): into a staged copy,
+// so the content on screen stays the old frame until the parent commits.
+bool Surface::take_buffer(SurfaceState& st) {
+    auto b = pending_buffer_.lock();
+    pending_buffer_.reset();
+    if (!b) return true;
+    const bool sync = effectively_sync();
+    std::optional<Rect> damage;
+    if (!st.damage_all) damage = st.damage;
+    bool ok;
+    if (sync) {
+        // start from the newest frame this surface would show: one already
+        // cached for the parent's commit, else what is on screen
+        const auto& base = has_cached_ && cached_.staged ? cached_.staged : content_;
+        st.staged = base ? std::make_shared<Pixels>(*base) : nullptr;
+        ok = b->copy_into(st.staged, damage);
+    } else {
+        const auto before = content_;
+        ok = b->copy_into(content_, damage);
+        if (content_ != before) st.damage_all = true;   // a new store: all of it is new
+    }
+    b->release();
+    if (!ok && comp_->options().verbose)
+        std::fprintf(stderr, "linuxity-display: wl_surface@%u: buffer %dx%d unreadable, frame dropped\n",
+                     id(), b->size().w, b->size().h);
+    return ok;
+}
+
 void Surface::commit() {
-    // Copy the buffer now, whatever happens to the state next, and give
-    // it back: the copy is ours.
-    if (pending_.attached) {
-        auto b = pending_buffer_.lock();
-        pending_.pixels = b ? b->snapshot() : nullptr;
-        if (b) b->release();
-        pending_buffer_.reset();
-        if (b && !pending_.pixels) {
-            pending_.attached = false;   // unreadable: keep the old frame
-            if (comp_->options().verbose)
-                std::fprintf(stderr, "linuxity-display: wl_surface@%u: buffer %dx%d unreadable, frame dropped\n",
-                             id(), b->size().w, b->size().h);
-        }
+    if (pending_.attached && !pending_.unmap && !take_buffer(pending_)) {
+        pending_.attached = false;   // unreadable: keep the old frame
+        pending_.staged.reset();
     }
     if (effectively_sync()) {
         pending_.merge_into(cached_);
@@ -420,12 +496,38 @@ void Surface::commit() {
 }
 
 void Surface::apply(SurfaceState& st) {
-    if (st.attached) pixels_ = std::move(st.pixels);
+    if (st.attached) {
+        if (st.unmap) {
+            content_.reset();
+        } else if (st.staged) {
+            content_ = std::move(st.staged);
+            st.damage_all = true;
+        }
+        if (!st.unmap) {
+            ++generation_;
+            const Rect all{0, 0, content_ ? content_->width : 0, content_ ? content_->height : 0};
+            present_damage_ = present_damage_.united(st.damage_all ? all : st.damage);
+            // clip to the buffer: a client may damage generously
+            const auto l = std::max(0, present_damage_.x), t = std::max(0, present_damage_.y);
+            const auto r = std::min(all.w, present_damage_.x + present_damage_.w);
+            const auto b = std::min(all.h, present_damage_.y + present_damage_.h);
+            present_damage_ = r > l && b > t ? Rect{l, t, r - l, b - t} : Rect{};
+        }
+    }
     delta_ = delta_ + st.delta;
     if (st.scale) scale_ = *st.scale;
     if (st.input) input_ = std::move(*st.input);
+    if (st.viewport) {
+        if (*st.viewport != viewport_) ++generation_;
+        viewport_ = std::move(*st.viewport);
+    }
     for (auto& f : st.frames) comp_->queue_frame(std::move(f));
-    size_ = pixels_ ? Size{pixels_->width / scale_, pixels_->height / scale_} : Size{};
+    // the surface size: the viewport's destination, else its crop, else
+    // the buffer at its scale
+    if (!content_) size_ = {};
+    else if (viewport_.dst) size_ = *viewport_.dst;
+    else if (viewport_.src) size_ = {static_cast<std::int32_t>(viewport_.src->w), static_cast<std::int32_t>(viewport_.src->h)};
+    else size_ = {content_->width / scale_, content_->height / scale_};
     st = SurfaceState{};
 }
 
@@ -454,7 +556,7 @@ void Surface::children_commit() {
     }
 }
 
-void Surface::set_outputs(const std::vector<std::shared_ptr<Resource>>& outs, std::int32_t scale) {
+void Surface::set_outputs(const std::vector<std::shared_ptr<Resource>>& outs, double scale) {
     for (auto& w : entered_) {
         auto o = w.lock();
         if (!o) continue;
@@ -465,9 +567,16 @@ void Surface::set_outputs(const std::vector<std::shared_ptr<Resource>>& outs, st
         if (!had) send(WlSurface::Ev::enter, wire::Object{o->id()});
     }
     entered_.assign(outs.begin(), outs.end());
-    if (scale != preferred_scale_) {
-        preferred_scale_ = scale;
-        send(WlSurface::Ev::preferred_buffer_scale, scale);
+    // integer clients round up (render sharp, the host scales down);
+    // fractional-scale clients get the exact value
+    const auto whole = static_cast<std::int32_t>(std::ceil(scale - 1e-6));
+    if (whole != preferred_scale_) {
+        preferred_scale_ = whole;
+        send(WlSurface::Ev::preferred_buffer_scale, whole);
+    }
+    if (scale != output_scale_) {
+        output_scale_ = scale;
+        if (fractional_) send_fractional_scale(*fractional_, scale);
     }
     for (auto& w : stack_)
         if (auto c = w.lock(); c && c.get() != this) c->set_outputs(outs, scale);
@@ -481,6 +590,8 @@ void Surface::on_destroy() {
     stack_.clear();
     if (role_) role_->role_surface_gone();
     role_ = nullptr;
+    // the viewport and fractional-scale objects outlive us inertly
+    surface_gone_hooks();
 }
 
 }  // namespace lx::display

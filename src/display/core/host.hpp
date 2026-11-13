@@ -42,8 +42,15 @@ enum class PixelFormat : std::uint8_t {
     xbgr8888,   // R G B x
 };
 
-// Pixels copied out of a client buffer at commit (so the buffer is released
-// at once). Immutable and shared: a host may wrap them without copying.
+// A surface's content: the compositor's own copy of what the client drew,
+// kept per surface and updated in place, only where the client said it
+// changed (damage). The buffer is released at once.
+//
+// THE CONTRACT: the bytes are only stable during the HostWindow::present()
+// (or set_cursor) call that hands them over. A host copies what it needs
+// then -- just Layer::damage, into its own GPU-visible store -- and never
+// keeps a pointer into them. That is what makes a terminal's keystroke
+// cost a few hundred bytes, not a window's worth of pixels.
 struct Pixels {
     std::int32_t width{0}, height{0}, stride{0};
     PixelFormat format{PixelFormat::argb8888};
@@ -51,12 +58,29 @@ struct Pixels {
 };
 using PixelsRef = std::shared_ptr<const Pixels>;
 
-// One surface of a window's tree.
+// A rectangle of a buffer, in buffer pixels (wp_viewport.set_source is
+// fractional). Empty: the whole buffer.
+struct SourceRect {
+    double x{0}, y{0}, w{0}, h{0};
+    [[nodiscard]] constexpr bool whole() const noexcept { return w <= 0 || h <= 0; }
+    friend constexpr bool operator==(SourceRect, SourceRect) noexcept = default;
+};
+
+// One surface of a window's tree. The part `source` of `pixels` is shown
+// stretched over `rect`: with no viewport that is the whole buffer at
+// 1/scale, with one it is any crop at any size.
 struct Layer {
     std::uint64_t id{0};       // stable for the surface's life
     Rect rect;                 // logical, in root-surface coordinates
-    PixelsRef pixels;          // unchanged content keeps the same pointer
-    std::int32_t scale{1};     // buffer pixels per logical pixel
+    PixelsRef pixels;          // the surface's content (stable for the call)
+    std::int32_t scale{1};     // buffer pixels per logical pixel (no viewport)
+    SourceRect source;         // crop, in buffer pixels
+    // What changed since the last present of this layer, in buffer pixels;
+    // `generation` bumps with every change, so an unchanged layer costs
+    // nothing. A host that has never seen this layer (or sees a new size)
+    // copies it all.
+    Rect damage;
+    std::uint64_t generation{0};
     bool opaque{false};
 };
 
@@ -134,6 +158,15 @@ public:
     virtual void begin_resize(std::uint32_t edges) = 0;
     virtual void move_popup(Point at) = 0;
     virtual void activate() = 0;
+    // Ask for the user's attention without taking focus (the Dock icon
+    // bounces, the taskbar entry flashes): a terminal's urgent bell, an
+    // app that wanted focus it wasn't entitled to.
+    virtual void request_attention() {}
+    // A text field of this window has the keyboard (zwp_text_input_v3):
+    // route typing through the platform's input methods (IME, dead keys,
+    // press-and-hold accents) and put their candidate window by `cursor`
+    // (view coordinates). nullopt: plain keys again.
+    virtual void set_text_input(std::optional<Rect> cursor) { (void)cursor; }
     // The usable screen area, relative to this window's view origin.
     [[nodiscard]] virtual Rect work_area() const = 0;
 };
@@ -146,6 +179,7 @@ struct OutputInfo {
     Size pixels;                   // native mode
     Size physical_mm;
     std::int32_t scale{1};
+    double fractional_scale{0};    // e.g. 1.5; 0 = exactly `scale`
     std::int32_t refresh_mhz{60000};
     friend bool operator==(const OutputInfo&, const OutputInfo&) = default;
 };
@@ -168,6 +202,16 @@ struct CursorImage {
     Point hotspot;                 // logical
 };
 
+// The named cursors of wp_cursor_shape_v1 (same numbering): the platform's
+// own cursor art, crisp at every scale, instead of the client's bitmap.
+enum class CursorShape : std::uint32_t {
+    default_ = 1, context_menu, help, pointer, progress, wait, cell, crosshair, text, vertical_text,
+    alias, copy, move, no_drop, not_allowed, grab, grabbing, e_resize, n_resize, ne_resize, nw_resize,
+    s_resize, se_resize, sw_resize, w_resize, ew_resize, ns_resize, nesw_resize, nwse_resize,
+    col_resize, row_resize, all_scroll, zoom_in, zoom_out, dnd_ask, all_resize,
+};
+inline constexpr std::uint32_t kLastCursorShape = static_cast<std::uint32_t>(CursorShape::all_resize);
+
 // Text on the platform clipboard, for the guest's copy and paste.
 class HostClipboard {
 public:
@@ -185,6 +229,14 @@ public:
     // Keyboard, for the window that has focus. Keys are Linux evdev codes.
     virtual void host_key(std::uint32_t evdev_code, bool pressed, std::uint32_t time_ms) = 0;
     virtual void host_modifiers(Modifiers m) = 0;
+    // Input-method text for the focused text field (see
+    // HostWindow::set_text_input): composition in progress, with the cursor
+    // as UTF-8 byte offsets into it (-1, -1: hidden); and text to insert,
+    // which replaces any composition.
+    virtual void host_text_preedit(std::string text, std::int32_t cursor_begin, std::int32_t cursor_end) {
+        (void)text; (void)cursor_begin; (void)cursor_end;
+    }
+    virtual void host_text_commit(std::string text) { (void)text; }
     virtual void host_outputs_changed() = 0;
     virtual void host_keyboard_changed() = 0;
     // The platform activated or deactivated us as a whole (popups close).
@@ -203,7 +255,9 @@ public:
     [[nodiscard]] virtual KeyboardInfo keyboard() = 0;
     [[nodiscard]] virtual std::unique_ptr<HostWindow> create_window(const WindowSpec& spec, WindowSink& sink) = 0;
     virtual void set_cursor(const CursorImage& c) = 0;
+    virtual void set_cursor_shape(CursorShape s) { (void)s; reset_cursor(); }
     virtual void reset_cursor() = 0;               // the platform's default arrow
+    virtual void bell() {}                         // the system alert sound
     [[nodiscard]] virtual HostClipboard* clipboard() { return nullptr; }
     // Windows exist (show us in the Dock / task switcher) or not.
     virtual void set_has_windows(bool any) { (void)any; }

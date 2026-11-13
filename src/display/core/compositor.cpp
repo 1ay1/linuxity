@@ -12,6 +12,8 @@ using namespace proto;
 void bind_surface_globals(Compositor& comp);
 void bind_shell_globals(Compositor& comp);
 void bind_seat_globals(Compositor& comp);
+void bind_scale_globals(Compositor& comp);
+void bind_extra_globals(Compositor& comp);
 
 class OutputResource final : public Object<WlOutput> {
 public:
@@ -51,6 +53,8 @@ void Compositor::add_globals() {
     bind_surface_globals(*this);
     bind_shell_globals(*this);
     bind_seat_globals(*this);
+    bind_scale_globals(*this);
+    bind_extra_globals(*this);
     sync_outputs();
 }
 
@@ -137,6 +141,20 @@ std::vector<std::shared_ptr<ShellSurface>> Compositor::windows() const {
     for (const auto& w : windows_)
         if (auto s = w.lock(); s && s->alive()) out.push_back(s);
     return out;
+}
+
+std::optional<std::size_t> Compositor::output_index_of(const Resource& r) const {
+    for (const auto& b : bound_outputs_)
+        if (b.r.lock().get() == &r) return b.index;
+    return std::nullopt;
+}
+
+ShellSurface* Compositor::window_of(Surface* s) const {
+    if (!s) return nullptr;
+    Surface* root = s->root();
+    for (const auto& w : windows_)
+        if (auto x = w.lock(); x && x->alive() && x->surface() == root) return x.get();
+    return nullptr;
 }
 
 // -- HostSink -----------------------------------------------------------------------------
