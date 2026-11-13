@@ -430,6 +430,40 @@ def a_passed_socket_keeps_its_data_in_flight():
 
 
 @check
+def seqpacket_hangup_reaches_another_process():
+    # Firefox's crash-helper daemon waits on a SOCK_SEQPACKET pair for the
+    # browser to go away, then exits. linuxity emulates SEQPACKET with a
+    # Darwin datagram pair, and XNU wakes no waiter when a datagram peer
+    # closes: every browser left its daemon behind, forever, holding a VM.
+    def waiter(how, a, b):
+        def body():
+            a.close()                                       # only the parent holds the peer
+            if how == "poll":
+                p = select.poll(); p.register(b, select.POLLIN)
+                ev = p.poll(5000)
+                return 0 if ev and ev[0][1] & select.POLLHUP else 3
+            if how == "epoll":
+                e = select.epoll(); e.register(b, select.EPOLLIN | select.EPOLLRDHUP)
+                ev = e.poll(5)
+                return 0 if ev and ev[0][1] & select.EPOLLHUP else 4
+            return 0 if b.recv(10) == b"" else 5         # read: EOF, not ECONNRESET
+        return body
+    for how in ("poll", "epoll", "read"):
+        a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        pid = child(waiter(how, a, b))
+        b.close()
+        time.sleep(0.2)
+        t = time.monotonic()
+        a.close()
+        eq(status(pid), 0, f"{how} in another process sees the peer close")
+        ok(time.monotonic() - t < 2, f"{how}: promptly")
+    a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    eq(b.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE), socket.SOCK_SEQPACKET, "SO_TYPE")
+    eq(status(child(lambda: 0 if b.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
+                    == socket.SOCK_SEQPACKET else 6)), 0, "SO_TYPE in a fork child")
+
+
+@check
 def broken_connections_sigpipe_and_epipe():
     a, b = socket.socketpair()
     b.close()

@@ -73,6 +73,38 @@ enum class LinuxAf : std::uint16_t {
 inline constexpr std::uint64_t kSockNonblock = 0x800;
 inline constexpr std::uint64_t kSockCloexec  = 0x80000;
 
+// -- Emulated SOCK_SEQPACKET ------------------------------------------------
+// Darwin has no AF_UNIX SEQPACKET, so a socketpair of that type is a Darwin
+// DATAGRAM pair (same contract: reliable, ordered, message edges kept). Which
+// datagram sockets are really SEQPACKET must be known wherever the socket
+// goes -- another thread, a fork child, an exec'd program, a process it was
+// passed to -- so it is marked ON THE SOCKET: Darwin's SO_TRAFFIC_CLASS, a
+// per-socket value no Linux option maps to, which dup, fork, exec and
+// SCM_RIGHTS all carry. (A per-thread set of inodes lost it everywhere but
+// the creating thread: a fork child's read at the peer's close said
+// ECONNRESET, not EOF, and SO_TYPE said SOCK_DGRAM.)
+inline constexpr int kSeqpacketTag = 400;          // SO_TC_OAM, never set otherwise
+#ifndef SO_TRAFFIC_CLASS
+#define SO_TRAFFIC_CLASS 0x1086
+#endif
+inline void mark_seqpacket(int h) noexcept {
+    (void)::setsockopt(h, SOL_SOCKET, SO_TRAFFIC_CLASS, &kSeqpacketTag, sizeof kSeqpacketTag);
+}
+[[nodiscard]] inline bool is_seqpacket(int h) noexcept {
+    int v = -1;
+    socklen_t n = sizeof v;
+    return ::getsockopt(h, SOL_SOCKET, SO_TRAFFIC_CLASS, &v, &n) == 0 && v == kSeqpacketTag;
+}
+// The peer of a connected datagram pair has gone. XNU never WAKES a waiter
+// for that -- poll, select and kqueue all sleep through it, though a fresh
+// poll then says readable -- so a waiter must ask: getpeername() turns
+// ENOTCONN the moment the peer is closed, and has no side effect.
+[[nodiscard]] inline bool peer_gone(int h) noexcept {
+    ::sockaddr_storage ss{};
+    socklen_t n = sizeof ss;
+    return ::getpeername(h, reinterpret_cast<::sockaddr*>(&ss), &n) != 0 && errno == ENOTCONN;
+}
+
 // A socket's inode number. Darwin reports st_ino 0 for every AF_INET/INET6
 // socket, so /proc/<pid>/fd's "socket:[N]" and fstat's st_ino named no
 // socket in particular; the kernel's socket id (soi_so) is unique per socket

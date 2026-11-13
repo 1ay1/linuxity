@@ -26,6 +26,8 @@
 
 #if defined(__APPLE__)
 
+#include "linuxity/runtime/darwin/net.hpp"
+
 #include <sys/event.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -107,7 +109,9 @@ public:
             struct ::stat st{};
             if (::fstat(host_fd, &st) == 0 && (S_ISREG(st.st_mode) || S_ISDIR(st.st_mode)))
                 return -1;                               // EPERM
-            fifo = S_ISFIFO(st.st_mode);
+            // FIFOs, and emulated SEQPACKET sockets: XNU wakes nobody when
+            // their other end goes, so the waiter asks (input_fifos).
+            fifo = S_ISFIFO(st.st_mode) || (S_ISSOCK(st.st_mode) && net::is_seqpacket(host_fd));
         }
         // EPOLLEXCLUSIVE may only be ADDed; MOD of (or to) it is EINVAL.
         if (op == kEpollCtlMod &&
@@ -133,8 +137,9 @@ public:
     }
 
     // wait(out, max, timeout_ms, hups) -> number of ready events, or -errno.
-    // `hups`: guest fds of FIFOs the caller saw hang up (input_fifos);
-    // each is reported EPOLLHUP.
+    // `hups`: guest fds the caller saw hang up (input_fifos: FIFOs and
+    // emulated SEQPACKET sockets); each is reported EPOLLHUP (and, for a
+    // socket, EPOLLIN|EPOLLRDHUP, as Linux does when the peer closes).
     [[nodiscard]] std::int64_t wait(std::vector<LinuxEpollEvent>& out, int max,
                                     int timeout_ms, const std::vector<int>& hups = {}) {
         if (max <= 0) return -22;
@@ -197,12 +202,16 @@ public:
             if (static_cast<int>(out.size()) >= max) break;
             auto it = regs_.find(gfd);
             if (it == regs_.end() || !it->second.mask) continue;
+            struct ::stat st{};
+            const bool sock = ::fstat(it->second.host_fd, &st) == 0 && S_ISSOCK(st.st_mode);
+            const std::uint32_t bits = epoll_bit::hup |
+                (sock ? (epoll_bit::in | epoll_bit::rdhup) & it->second.mask : 0);
             auto same = std::find(out_fd.begin(), out_fd.end(), gfd);
             if (same != out_fd.end()) {
-                out[static_cast<std::size_t>(same - out_fd.begin())].events |= epoll_bit::hup;
+                out[static_cast<std::size_t>(same - out_fd.begin())].events |= bits;
                 continue;
             }
-            out.push_back({epoll_bit::hup, 0, it->second.token});
+            out.push_back({bits, 0, it->second.token});
             out_fd.push_back(gfd);
             if (it->second.mask & epoll_bit::oneshot) {
                 (void)apply(gfd, it->second.host_fd, 0, it->second.mask);

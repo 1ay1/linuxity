@@ -1200,7 +1200,7 @@ private:
                     return darwin::fail();
                 for (int e : hp) finish_socket(e, a1);
                 if (seqpacket)
-                    for (int e : hp) seqpacket_.insert(sock_ino(e));
+                    for (int e : hp) net::mark_seqpacket(e);
                 // Linux fixes a socketpair's peer credentials at creation:
                 // both ends name the creating process for good, whoever holds
                 // them later. Darwin's LOCAL_PEERPID follows the last user.
@@ -1309,7 +1309,7 @@ private:
                                         slen);
                 // an emulated SEQPACKET peer that's gone: Darwin's datagram
                 // pair says EDESTADDRREQ/ECONNRESET, Linux EPIPE
-                if (n < 0 && (errno == EDESTADDRREQ || errno == ECONNRESET) && seqpacket_.count(sock_ino(h)))
+                if (n < 0 && (errno == EDESTADDRREQ || errno == ECONNRESET) && net::is_seqpacket(h))
                     return -32;
                 return n < 0 ? darwin::fail() : n;
             }
@@ -1331,6 +1331,7 @@ private:
                 }
                 ::sockaddr_storage ss{};
                 socklen_t slen = sizeof ss;
+                if (const auto eof = seqpacket_recv_gate(h, (a3 & 0x40) != 0)) return *eof;   // MSG_DONTWAIT
                 const auto n = ::recvfrom(h, buf.data(), buf.size(),
                                           net::msg_flags_to_darwin(a3),
                                           a4 ? reinterpret_cast<::sockaddr*>(&ss) : nullptr,
@@ -1338,7 +1339,7 @@ private:
                 if (n < 0) {
                     // An emulated SEQPACKET pair (a Darwin datagram pair):
                     // the peer closing is ECONNRESET there, EOF on Linux.
-                    if (errno == ECONNRESET && seqpacket_.count(sock_ino(h))) return 0;
+                    if (errno == ECONNRESET && net::is_seqpacket(h)) return 0;
                     return darwin::fail();
                 }
                 if (a4 && !write_sockaddr(ss, a4, regs_.arg(5))) return -14;
@@ -1415,7 +1416,7 @@ private:
                 }
                 if (a1 == 1 && (a2 == 3 || a2 == 16)) {
                     const auto ino = sock_ino(h);
-                    const bool ours = a2 == 3 ? seqpacket_.count(ino) != 0 : true;
+                    const bool ours = a2 == 3 ? net::is_seqpacket(h) : true;
                     if (ours) {
                         const std::int32_t v = a2 == 3 ? 5 : (passcred_.count(ino) ? 1 : 0);
                         std::uint32_t want = 0;
@@ -1739,9 +1740,21 @@ private:
             hm.msg_controllen = static_cast<socklen_t>(hctl.size());
         }
 
+        if (!sending)
+            if (const auto eof = seqpacket_recv_gate(h, (flags & 0x40) != 0)) {   // MSG_DONTWAIT
+                if (*eof == 0) {               // end of stream: no name, no control, no flags
+                    LinuxMsghdr out = m;
+                    out.controllen = 0;
+                    out.flags = 0;
+                    if (m.name) out.namelen = 0;
+                    if (!ram.put(msg_at, out)) return -14;
+                }
+                return *eof;
+            }
         const auto n = sending
             ? ::sendmsg(h, &hm, net::msg_flags_to_darwin(flags))
             : ::recvmsg(h, &hm, net::msg_flags_to_darwin(flags));
+        if (n < 0 && !sending && errno == ECONNRESET && net::is_seqpacket(h)) return 0;
         if (n < 0) return darwin::fail();
         if (sending && !fds_out.empty()) inflight::Holder::get().sent(fds_out);
         if (!sending) {
@@ -5593,8 +5606,9 @@ private:
                 }
                 if (const auto j = tty_job_control(*hfd, false)) return j;  // background reader
                 if (const auto w = wait_ready(*hfd, POLLIN)) return w;    // a signal came first
+                if (const auto eof = seqpacket_recv_gate(*hfd, true)) return *eof;
                 auto n = ::read(*hfd, win.data(), win.size());
-                if (n < 0 && errno == ECONNRESET && !seqpacket_.empty() && seqpacket_.count(sock_ino(*hfd)))
+                if (n < 0 && errno == ECONNRESET && net::is_seqpacket(*hfd))
                     return 0;                                          // SEQPACKET: the peer left
                 return n < 0 ? darwin::fail() : n;
             }
@@ -6408,6 +6422,23 @@ private:
     // EINTR; any other (SA_RESTART, or ignored / default) is a RESTART: the
     // guest re-issues the call once the signal has been dealt with, as the
     // kernel's -ERESTARTSYS does. A non-blocking fd never waits here.
+    // A receive on an emulated SEQPACKET socket (a Darwin datagram pair):
+    // once its peer has closed, a blocking host recv() sleeps forever where
+    // Linux returns 0 -- XNU neither wakes it nor fails it. So wait as Linux
+    // would (seqpacket_aware_poll: a signal, data, or the peer's close ends
+    // it), then answer end-of-stream ourselves when the peer is gone and
+    // nothing is queued. nullopt: not such a socket, or data is there -- go on.
+    [[nodiscard]] std::optional<std::int64_t> seqpacket_recv_gate(int h, bool dontwait) {
+        if (!net::is_seqpacket(h)) return std::nullopt;
+        if (!dontwait)
+            if (const auto w = wait_ready(h, POLLIN)) return w;
+        if (!net::peer_gone(h)) return std::nullopt;
+        int queued = 0;
+        socklen_t n = sizeof queued;
+        if (::getsockopt(h, SOL_SOCKET, SO_NREAD, &queued, &n) == 0 && queued == 0) return 0;
+        return std::nullopt;
+    }
+
     [[nodiscard]] std::int64_t wait_ready(int h, short events) {
         const int fl = ::fcntl(h, F_GETFL);
         if (fl < 0 || (fl & O_NONBLOCK)) return 0;
@@ -6579,7 +6610,7 @@ private:
                 p[i].events = static_cast<short>(p[i].events & ~kPri);
             }
         }
-        const int rc = signal_aware_poll_raw(p, timeout);
+        const int rc = seqpacket_aware_poll(p, timeout);
         if (!any) return rc;
         int n = 0;
         for (std::size_t i = 0; i < p.size(); ++i) {
@@ -6590,6 +6621,46 @@ private:
             if (e.revents) ++n;
         }
         return rc < 0 ? rc : n;
+    }
+
+    // An emulated SEQPACKET socket (a Darwin datagram pair, see
+    // net::mark_seqpacket) whose peer closes: Linux wakes the waiter with
+    // POLLIN|POLLHUP; XNU wakes nobody. Firefox's crash-helper daemon waits
+    // on exactly that for the browser to go, so every browser left it behind
+    // forever, holding a VM. A wait involving one is therefore cut into
+    // slices (20 ms, doubling to 250 ms) with the peer asked after each.
+    [[nodiscard]] int seqpacket_aware_poll(std::vector<struct ::pollfd>& p, int timeout) {
+        std::vector<std::size_t> seq;
+        for (std::size_t i = 0; i < p.size(); ++i)
+            if (p[i].fd >= 0 && (p[i].events & (POLLIN | POLLRDNORM)) && net::is_seqpacket(p[i].fd))
+                seq.push_back(i);
+        if (seq.empty()) return signal_aware_poll_raw(p, timeout);
+        using Clock = std::chrono::steady_clock;
+        const auto deadline = timeout >= 0 ? Clock::now() + std::chrono::milliseconds(timeout)
+                                           : Clock::time_point::max();
+        auto hangups = [&] {
+            std::vector<std::size_t> gone;
+            for (std::size_t i : seq)
+                if (net::peer_gone(p[i].fd)) gone.push_back(i);
+            return gone;
+        };
+        for (int step = 20;; step = std::min(step * 2, 250)) {
+            if (const auto gone = hangups(); !gone.empty()) {
+                const int rc = signal_aware_poll_raw(p, 0);        // whatever else is ready
+                if (rc < 0) return rc;
+                for (std::size_t i : gone) p[i].revents |= POLLIN | POLLHUP;
+                return static_cast<int>(std::count_if(p.begin(), p.end(),
+                                                      [](const auto& e) { return e.revents != 0; }));
+            }
+            int slice = step;
+            if (timeout >= 0) {
+                const auto ms = std::chrono::ceil<std::chrono::milliseconds>(deadline - Clock::now()).count();
+                slice = static_cast<int>(std::clamp<std::int64_t>(ms, 0, step));
+            }
+            const int rc = signal_aware_poll_raw(p, slice);
+            if (rc != 0) return rc;
+            if (timeout >= 0 && Clock::now() >= deadline) return hangups().empty() ? 0 : seqpacket_aware_poll(p, 0);
+        }
     }
 
     // A socket with TCP urgent (out-of-band) data waiting: what POLLPRI means.
@@ -7571,7 +7642,7 @@ private:
     // sender all read back the same), and the sockets that asked for
     // SO_PASSCRED / are emulated SEQPACKET, by host socket inode.
     std::unordered_map<std::string, std::string> bound_paths_;
-    std::unordered_set<std::uint64_t> passcred_, seqpacket_;
+    std::unordered_set<std::uint64_t> passcred_;
     // emulated rtnetlink sockets: the guest end's inode -> our (far) end
     std::unordered_map<std::uint64_t, int> rtnl_;
     // socketpair ends this process made (or inherited): inode -> creator pid
