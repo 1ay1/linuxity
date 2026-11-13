@@ -2381,6 +2381,8 @@ private:
     }
 
     void kill_with(int linux_sig) {
+        if (std::getenv("LINUXITY_DEBUG"))
+            std::fprintf(stderr, "linuxity: guest pid %d killed by signal %d\n", tgid_, linux_sig);
         route_host_signal(linux_sig, false);
         std::fflush(nullptr);
         // Dying by SIGSEGV/SIGABRT/... is the GUEST's death; without this
@@ -4568,6 +4570,8 @@ public:
     }
 
     [[noreturn]] void end_process(int status) {
+        if (std::getenv("LINUXITY_DEBUG") && (status & 0xff))
+            std::fprintf(stderr, "linuxity: guest pid %d exits %d\n", tgid_, status & 0xff);
         pids_.reparent_children_of(tgid_);
         pids_.post_exit(tgid_, (status & 0xff) << 8);
         proc_.request_group_exit(status);
@@ -6409,7 +6413,46 @@ private:
         }
     }
 
+    // poll/ppoll/select's wait, with Linux's meaning of POLLPRI. Darwin's
+    // poll reports POLLPRI (and POLLRDBAND) for ANY readable fd when asked
+    // -- a pipe with a byte in it -- where Linux reports it only for urgent
+    // data. Firefox polls its wakeup pipe for POLLIN|POLLPRI, took the bogus
+    // POLLPRI as an exception, "repaired" the pipe and spun forever, so its
+    // content processes never answered. The host is never asked for them;
+    // a socket that was asked gets them only with an urgent byte waiting.
     [[nodiscard]] int signal_aware_poll(std::vector<struct ::pollfd>& p, int timeout) {
+        constexpr short kPri = POLLPRI | POLLRDBAND;
+        std::vector<short> asked(p.size());
+        bool any = false;
+        for (std::size_t i = 0; i < p.size(); ++i) {
+            asked[i] = p[i].events;
+            if (p[i].events & kPri) {
+                any = true;
+                p[i].events = static_cast<short>(p[i].events & ~kPri);
+            }
+        }
+        const int rc = signal_aware_poll_raw(p, timeout);
+        if (!any) return rc;
+        int n = 0;
+        for (std::size_t i = 0; i < p.size(); ++i) {
+            auto& e = p[i];
+            e.revents = static_cast<short>(e.revents & ~kPri);
+            if ((asked[i] & POLLPRI) && e.fd >= 0 && urgent_waiting(e.fd)) e.revents |= POLLPRI;
+            e.events = asked[i];
+            if (e.revents) ++n;
+        }
+        return rc < 0 ? rc : n;
+    }
+
+    // A socket with TCP urgent (out-of-band) data waiting: what POLLPRI means.
+    [[nodiscard]] static bool urgent_waiting(int fd) {
+        struct ::stat st{};
+        if (::fstat(fd, &st) != 0 || !S_ISSOCK(st.st_mode)) return false;
+        char c;
+        return ::recv(fd, &c, 1, MSG_OOB | MSG_PEEK | MSG_DONTWAIT) > 0;
+    }
+
+    [[nodiscard]] int signal_aware_poll_raw(std::vector<struct ::pollfd>& p, int timeout) {
         g_pending.drain_wake();
         drain_mail();
         auto deliverable = [&] {

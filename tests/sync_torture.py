@@ -504,6 +504,29 @@ def forks_from_many_threads_at_once():
 
 
 @check
+def pollpri_means_urgent_data_only():
+    # A pipe with data is POLLIN, never POLLPRI (Linux sets that for urgent
+    # data alone). Darwin's poll says POLLPRI for any readable fd when asked;
+    # Firefox's socket thread took that as an error on its wakeup pipe and
+    # rebuilt the pipe in a tight loop, forever.
+    r, w = os.pipe()
+    os.write(w, b"x")
+    p = select.poll()
+    p.register(r, select.POLLIN | select.POLLPRI)
+    eq(p.poll(1000), [(r, select.POLLIN)], "a readable pipe is POLLIN only")
+    _, _, x = select.select([], [], [r], 0)
+    eq(x, [], "and is no select() exception")
+    os.close(r); os.close(w)
+    import socket
+    a, b = socket.socketpair()
+    b.send(b"y")
+    p = select.poll()
+    p.register(a, select.POLLIN | select.POLLPRI)
+    eq(p.poll(1000), [(a.fileno(), select.POLLIN)], "a readable socket is POLLIN only")
+    a.close(); b.close()
+
+
+@check
 def epoll_over_every_kind_of_fd():
     import socket
     ep = select.epoll()
