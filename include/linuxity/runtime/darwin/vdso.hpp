@@ -55,6 +55,16 @@ inline constexpr std::uint64_t kMagic = 0x31304f5344564c58ull;   // "LXVDSO01"
     return 0x1000 + ((kImageSize + 0xfff) & ~std::uint64_t{0xfff});
 }
 
+// The rt_sigreturn trampoline (`mov x8, #139; svc #0`), in the image's last
+// 16 bytes: executable memory the guest never writes -- Linux's
+// __kernel_rt_sigreturn. Signal delivery points x30 here for handlers
+// installed without SA_RESTORER (Go on arm64 never sets it).
+inline constexpr std::uint64_t kSigreturnOffset = 0x1000 + 0xff0;
+static_assert(kImageSize <= 0xff0, "the vDSO image grew into the sigreturn trampoline");
+[[nodiscard]] inline std::uint64_t sigreturn_addr(std::uint64_t mem_size) noexcept {
+    return base_for(mem_size) + kSigreturnOffset;
+}
+
 [[nodiscard]] inline std::uint64_t read_cntvct() noexcept {
     std::uint64_t v;
     __asm__ volatile("isb\n\tmrs %0, cntvct_el0" : "=r"(v) :: "memory");
@@ -72,7 +82,9 @@ inline void refresh(HvfMachine& vm);
     if (win.empty()) return 0;
     std::memset(win.data(), 0, win.size());
     std::memcpy(win.data() + 0x1000, kImage, kImageSize);
-    vm.publish_code(base + 0x1000, kImageSize);
+    constexpr std::uint32_t tramp[2] = {0xD2801168u, 0xD4000001u};   // mov x8,#139; svc #0
+    std::memcpy(win.data() + kSigreturnOffset, tramp, sizeof tramp);
+    vm.publish_code(base + 0x1000, 0x1000);
     refresh(vm);
     return base + 0x1000;
 }

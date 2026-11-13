@@ -782,7 +782,7 @@ void run_guest_thread(ThreadContext& ctx, runtime::HvfTrap::ThreadStart start) {
     wire_spawners(trap, ctx);
     runtime::HvfMem mem{ctx.machine, &trap};
 
-    ctx.proc.add_thread(task.tid, &cpu);
+    ctx.proc.add_thread(task.tid, &cpu, &task);
     ctx.pids.set_threads(start.tgid, static_cast<std::uint32_t>(ctx.proc.thread_count()));
     runtime::g_pending.register_cpu(cpu.handle());
 
@@ -849,7 +849,7 @@ void run_guest_thread(ThreadContext& ctx, runtime::HvfTrap::ThreadStart start) {
         return runtime::procinfo::fact(leaf, *h, nullptr, pids.nice_of(g), std::move(peer));
     });
 
-    proc.add_thread(task.tid, &cpu);
+    proc.add_thread(task.tid, &cpu, &task);
     pids.set_threads(task.tid, static_cast<std::uint32_t>(proc.thread_count()));
     pids.set_vsize(task.tid, runtime::procinfo::guest_vsize(proc));
     runtime::g_pending.register_cpu(cpu.handle());

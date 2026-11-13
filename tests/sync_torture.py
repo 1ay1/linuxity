@@ -14,7 +14,7 @@ import threading
 import time
 
 from torture import *  # noqa: F401,F403
-from torture import check, ok, eq, expect_errno, child, status, run_in_child, Skip, main, libc
+from torture import check, ok, eq, expect_errno, child, status, run_in_child, Skip, main, libc, ARCH
 
 CLOCK_REALTIME, CLOCK_MONOTONIC, CLOCK_PROCESS_CPUTIME_ID, CLOCK_THREAD_CPUTIME_ID = 0, 1, 2, 3
 CLOCK_MONOTONIC_RAW, CLOCK_REALTIME_COARSE, CLOCK_MONOTONIC_COARSE, CLOCK_BOOTTIME = 4, 5, 6, 7
@@ -346,6 +346,53 @@ def epoll_pwait_opens_its_sigmask_for_the_wait():
         ok(signal.SIGCHLD in blocked, "the caller's mask is back afterwards")
         _, st = os.waitpid(pid, 0)
         eq(os.waitstatus_to_exitcode(st), 4, "the child is reaped")
+        return 0
+    eq(run_in_child(run), 0, "in a child")
+
+
+@check
+def an_epoll_fd_works_from_every_thread():
+    # Go's netpoller makes its epoll fd on one thread and waits on it from
+    # another; fd objects are the process's, not a thread's. A runtime that
+    # kept them per thread answered EINVAL: "epollwait on fd 4 failed with
+    # 22", and every Go binary (snap, docker, gh) died.
+    ep = select.epoll()
+    r, w = os.pipe()
+    out = []
+    def other():
+        ep.register(r, select.EPOLLIN)
+        os.write(w, b"x")
+        out.append(ep.poll(2))
+    t = threading.Thread(target=other)
+    t.start(); t.join()
+    eq(len(out[0]), 1, "registered and waited on by a thread that didn't create it")
+    ep.close(); os.close(r); os.close(w)
+
+
+@check
+def a_handler_without_sa_restorer_returns_on_any_thread():
+    # Go on arm64 installs handlers with raw rt_sigaction and no
+    # SA_RESTORER; the kernel returns through the vDSO's rt_sigreturn. A
+    # trampoline written onto the stack ran only on the thread that
+    # published it -- signals on other threads crashed in it.
+    def run():
+        class Sigaction(ctypes.Structure):
+            _fields_ = [("handler", ctypes.c_void_p), ("flags", ctypes.c_ulong),
+                        ("restorer", ctypes.c_void_p), ("mask", ctypes.c_uint64)]
+        got = []
+        HANDLER = ctypes.CFUNCTYPE(None, ctypes.c_int)
+        h = HANDLER(lambda s: got.append(s))
+        sa = Sigaction(ctypes.cast(h, ctypes.c_void_p), 0, None, 0)
+        NR = 134 if ARCH == "aarch64" else 13
+        eq(libc.syscall(NR, signal.SIGUSR2, ctypes.byref(sa), None, 8), 0, "raw rt_sigaction, no SA_RESTORER")
+        def worker():
+            libc.syscall(131 if ARCH == "aarch64" else 234, os.getpid(), threading.get_native_id(), signal.SIGUSR2)
+            time.sleep(0.05)
+        ts = [threading.Thread(target=worker) for _ in range(4)]
+        for t in ts: t.start()
+        for t in ts: t.join()
+        time.sleep(0.1)
+        ok(len(got) == 4, f"each thread's handler returned ({len(got)} of 4)")
         return 0
     eq(run_in_child(run), 0, "in a child")
 

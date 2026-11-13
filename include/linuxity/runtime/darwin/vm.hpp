@@ -81,15 +81,20 @@ struct HvfLayout {
     [[nodiscard]] static constexpr std::uint64_t n_l2(std::uint64_t ram) noexcept {
         return (ram + gib - 1) / gib;
     }
-    // The classic NON-PIE (ET_EXEC) load address. An ET_EXEC program's
-    // p_vaddr is absolute -- it cannot be relocated -- and the aarch64
-    // toolchain default is 0x400000. gcc and anything built -no-pie land
-    // there, so the EL1-only private area must stay clear of it.
-    static constexpr std::uint64_t nonpie_base = 0x40'0000;      // 4 MiB
-    // Room for a large fixed-address image (text+data+bss) above that.
-    // Up to 128 MiB: big toolchain binaries are non-PIE too (cc1plus is a
+    // The classic NON-PIE (ET_EXEC) load addresses. An ET_EXEC program's
+    // p_vaddr is absolute -- it cannot be relocated. GNU ld's aarch64
+    // default is 0x400000 and lld's is 0x200000 (Firefox, Chromium, every
+    // LLVM-linked -no-pie binary), so the window starts at 2 MiB: the first
+    // 2 MiB block stays EL1-only (vectors, tables, and the null-page guard).
+    // Starting at 4 MiB made `firefox` fail exec with ENOMEM.
+    static constexpr std::uint64_t nonpie_base = 0x20'0000;      // 2 MiB
+    // Room for a large fixed-address image (text+data+bss) above that, up
+    // to 128 MiB: big toolchain binaries are non-PIE too (cc1plus is a
     // 42 MiB fixed image at 0x400000), and 28 MiB was not enough.
-    static constexpr std::uint64_t nonpie_size = 0x7c0'0000;      // 124 MiB
+    static constexpr std::uint64_t nonpie_size = 0x7e0'0000;      // 126 MiB
+    // vectors + L1 + L2 (one page per GiB, 64 GiB at most) + answers
+    static_assert(l2_tables + 64 * page + answers_bytes <= nonpie_base,
+                  "the private tables must fit below the non-PIE window");
 
     // The L3 array (one page per 2 MiB of RAM) starts ABOVE the reserved
     // non-PIE window rather than immediately after the L2 pages. Putting it

@@ -149,6 +149,17 @@ public:
     // handed, and the new owner's first store faulted. Recursive: the
     // syscalls nest (mmap -> zero/backing helpers that remap).
     [[nodiscard]] std::unique_lock<std::recursive_mutex> mmap_lock() { return std::unique_lock{mmap_mu_}; }
+    // The kernel objects behind fds (epoll sets, timerfds, signalfds,
+    // inotify, pidfds, directory streams), which -- like the fd table --
+    // belong to the PROCESS: one thread creates an epoll fd, another waits
+    // on it (Go's netpoller always does). Defined by the trap layer
+    // (HvfTrap::FdObjects); created once, shared by every thread's trap.
+    template <class T>
+    [[nodiscard]] std::shared_ptr<T> fd_objects() {
+        std::lock_guard g{mu_};
+        if (!fd_objects_) fd_objects_ = std::make_shared<T>();
+        return std::static_pointer_cast<T>(fd_objects_);
+    }
     template <class Fn>
     decltype(auto) with_signals(Fn&& fn) {
         std::lock_guard g{mu_};
@@ -160,11 +171,40 @@ public:
     struct Thread {
         std::int32_t tid;
         HvfCpu* cpu;                 // for kick(); owned by its own thread
+        TaskState* task;             // for thread-directed signals
     };
 
-    void add_thread(std::int32_t tid, HvfCpu* cpu) {
+    void add_thread(std::int32_t tid, HvfCpu* cpu, TaskState* task) {
         std::lock_guard g{mu_};
-        threads_.push_back({tid, cpu});
+        threads_.push_back({tid, cpu, task});
+    }
+    // tkill/tgkill to a sibling thread: pend `sig` on THAT thread and knock
+    // it out of the guest (or of a blocking wait) so it takes it at once.
+    // Linux delivers a thread-directed signal only to its target; sending it
+    // process-wide let any thread take it -- Go's preemption signal then
+    // landed on a thread with no signal stack yet and the runtime aborted
+    // ("signal 23 received but handler not on signal stack"). False if
+    // `tid` is not a thread of this process.
+    bool signal_thread(std::int32_t tid, int sig) {
+        std::lock_guard g{mu_};
+        for (const Thread& t : threads_) {
+            if (t.tid != tid || !t.task) continue;
+            if (sig) {
+                t.task->pending.fetch_or(sigbit(sig), std::memory_order_relaxed);
+                if (t.cpu) t.cpu->kick();
+                g_pending.poke();               // a thread blocked in a host wait
+                g_pending.notify_waiters();
+            }
+            return true;
+        }
+        return false;
+    }
+    // membarrier's expedited commands: push every OTHER thread's vCPU
+    // through a VM exit (a full barrier and, on re-entry, a context sync).
+    void kick_others(std::int32_t self) {
+        std::lock_guard g{mu_};
+        for (const Thread& t : threads_)
+            if (t.tid != self && t.cpu) t.cpu->kick();
     }
     void remove_thread(std::int32_t tid) {
         std::lock_guard g{mu_};
@@ -343,6 +383,7 @@ public:
 private:
     mutable std::mutex mu_;
     std::recursive_mutex mmap_mu_;
+    std::shared_ptr<void> fd_objects_;
     FdTable fds_;
     AddressSpace space_;
     SignalDispositions signals_;

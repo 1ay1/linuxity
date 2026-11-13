@@ -76,6 +76,7 @@
 #include "linuxity/runtime/darwin/mqueue.hpp"
 #include "linuxity/runtime/darwin/memsvc.hpp"
 #include "linuxity/runtime/darwin/regs.hpp"
+#include "linuxity/runtime/darwin/vdso.hpp"
 #include "linuxity/runtime/darwin/vm.hpp"
 #include "linuxity/runtime/shared/address_space.hpp"
 #include "linuxity/runtime/trap.hpp"
@@ -596,6 +597,7 @@ public:
     // so a read sees whole records, each with its sender and code.
     void feed_signalfds() {
         if (signalfds_.empty()) return;
+        std::lock_guard l{fdo_->mu};
         for (auto& [gfd, sf] : signalfds_) {
             const std::uint64_t want = sf.mask & task_.sig_mask;
             if (!want) continue;
@@ -1006,12 +1008,7 @@ private:
             sp = task_.alt_stack.ss_sp + task_.alt_stack.ss_size;
 
         std::uint64_t ret = act.restorer;
-        if (!(act.flags & sigflag::kRestorer) || !ret) {
-            sp -= 16;
-            if (!machine_.ram().put(sp, kSigreturnTrampoline)) return false;
-            machine_.publish_code(sp, 8);
-            ret = sp;
-        }
+        if (!(act.flags & sigflag::kRestorer) || !ret) ret = vdso::sigreturn_addr(machine_.mem_size());
         sp = (sp - sizeof(RtSigframe)) & ~std::uint64_t{15};
         const std::uint64_t frame_at = sp;
 
@@ -2253,13 +2250,12 @@ private:
         // LOWEST thing pushed. (Pushing the trampoline after the frame put
         // it at sp, and sigreturn read the trampoline as a ucontext: PC 0.)
         std::uint64_t ret = act.restorer;
-        const bool need_tramp = !(act.flags & sigflag::kRestorer) || !ret;
-        if (need_tramp) {
-            sp -= 16;
-            if (!machine_.ram().put(sp, kSigreturnTrampoline)) { kill_with(11); return true; }
-            machine_.publish_code(sp, 8);
-            ret = sp;
-        }
+        // No SA_RESTORER (Go on arm64): return through the vDSO page's
+        // rt_sigreturn, as Linux does. Code written onto the stack was
+        // executed by THIS vCPU only after a cache publish; other threads'
+        // stacks never saw one and faulted (instruction abort at the
+        // trampoline) -- every Go program with signals died that way.
+        if (!(act.flags & sigflag::kRestorer) || !ret) ret = vdso::sigreturn_addr(machine_.mem_size());
         sp = (sp - sizeof(RtSigframe)) & ~std::uint64_t{15};
         const std::uint64_t frame_at = sp;
 
@@ -2404,8 +2400,16 @@ private:
                 // broadcast signals inside the guest's process tree instead
                 // of letting them reach linuxity's host process group.
                 const bool tg = sc == S::tgkill;
-                return deliver_signal(static_cast<std::int32_t>(tg ? a1 : a0),
-                                      static_cast<std::int32_t>(tg ? a2 : a1));
+                const auto target = static_cast<std::int32_t>(tg ? a1 : a0);
+                const auto sig = static_cast<std::int32_t>(tg ? a2 : a1);
+                // A thread of this process (another than the caller): the
+                // signal is that thread's alone (ProcessState::signal_thread).
+                if (sc != S::kill && target != task_.tid && target != tgid_ && target > 0) {
+                    if (sig < 0 || sig > kLinuxNsig) return -22;
+                    if (tg && static_cast<std::int32_t>(a0) != tgid_) return deliver_signal(target, sig);
+                    if (sig != 9 && sig != 19 && proc_.signal_thread(target, sig)) return 0;
+                }
+                return deliver_signal(target, sig);
             }
 
             // Identity: pid/tid/ppid are this backend's own task facts (the
@@ -3425,12 +3429,36 @@ private:
                 return 0;
             case S::rseq:
                 return -38;       // glibc disables rseq when registration fails
-            case S::membarrier:
-                // Guest threads are host threads on real cores; a full
-                // barrier here orders this thread, and the host's own
-                // coherency does the rest.
-                std::atomic_thread_fence(std::memory_order_seq_cst);
-                return 0;
+            case S::membarrier: {
+                // membarrier(cmd, flags, cpu_id). QUERY must list what we
+                // support: answering 0 ("nothing") made SpiderMonkey refuse to
+                // start its JIT on arm64 (it needs PRIVATE_EXPEDITED_SYNC_CORE
+                // to make other threads drop stale instructions after it
+                // writes code), and Firefox died at startup.
+                //
+                // The expedited commands: every sibling thread must pass a
+                // full barrier -- and for SYNC_CORE a context-synchronizing
+                // event -- before we return. Kicking each sibling vCPU out of
+                // the guest does both (the VM exit, and the exception return
+                // when it re-enters); the global form is a fence on top, as
+                // guest threads are host threads on coherent cores.
+                constexpr std::uint64_t kQuery = 0, kGlobal = 1, kGlobalExpedited = 2,
+                                        kRegGlobalExpedited = 4, kPrivExpedited = 8,
+                                        kRegPrivExpedited = 16, kPrivSyncCore = 32,
+                                        kRegPrivSyncCore = 64;
+                constexpr std::uint64_t kSupported = kGlobal | kGlobalExpedited | kRegGlobalExpedited |
+                                                     kPrivExpedited | kRegPrivExpedited | kPrivSyncCore |
+                                                     kRegPrivSyncCore;
+                switch (a0) {
+                    case kQuery: return static_cast<std::int64_t>(kSupported);
+                    case kRegGlobalExpedited: case kRegPrivExpedited: case kRegPrivSyncCore: return 0;
+                    case kGlobal: case kGlobalExpedited: case kPrivExpedited: case kPrivSyncCore:
+                        std::atomic_thread_fence(std::memory_order_seq_cst);
+                        proc_.kick_others(task_.tid);
+                        return 0;
+                    default: return -22;
+                }
+            }
             case S::sched_yield:
                 ::sched_yield();
                 return 0;
@@ -3682,8 +3710,13 @@ private:
                 return do_guest_ptrace();
             case S::epoll_pwait2: {
                 // epoll_pwait with a timespec instead of milliseconds.
-                auto it = epolls_.find(static_cast<int>(a0));
-                if (it == epolls_.end()) return -22;
+                std::shared_ptr<EpollSet> set;
+                {
+                    std::lock_guard l{fdo_->mu};
+                    auto it = epolls_.find(static_cast<int>(a0));
+                    if (it == epolls_.end()) return -22;
+                    set = it->second;
+                }
                 int timeout_ms = -1;
                 if (a3) {
                     struct { std::int64_t sec, nsec; } ts{};
@@ -3692,7 +3725,7 @@ private:
                 }
                 std::vector<LinuxEpollEvent> ready;
                 const auto n = with_wait_mask(regs_.arg(4), regs_.arg(5), [&]() -> std::int64_t {
-                    return epoll_wait_guest(*it->second, ready, static_cast<int>(a2), timeout_ms);
+                    return epoll_wait_guest(*set, ready, static_cast<int>(a2), timeout_ms);
                 });
                 if (n < 0) return n;
                 for (std::size_t i = 0; i < ready.size(); ++i)
@@ -4997,12 +5030,18 @@ private:
                             a2 = regs_.arg(2), a3 = regs_.arg(3);
         const GuestRam ram = machine_.ram();
 
+        // fd-object syscalls of this process, one at a time (the maps are
+        // shared by its threads, FdObjects). Waits take their object out
+        // under the lock and block outside it.
+        auto fdo_lock = lock_fd_objects_for(sc);
         // /proc/<pid>/mem: positional access to a guest's memory
-        if (!mem_fds_.empty())
+        if (!mem_fds_.empty()) {
+            std::unique_lock ml{fdo_->mu};
             if (auto it = mem_fds_.find(gfd); it != mem_fds_.end()) {
                 if (sc == S::close) { mem_fds_.erase(it); }
                 else if (auto r = mem_io(sc, it->second)) return r;
             }
+        }
 
         // /dev/full (emulated over host /dev/zero): every write is ENOSPC.
         if (sc == S::write || sc == S::pwrite64 || sc == S::writev ||
@@ -5261,7 +5300,8 @@ private:
         // through made `write 5, write 7, read` return 5, not 12.
         if (sc == S::read || sc == S::write)
             if (const auto ev = proc_.with_fds([&](const FdTable& t) { return t.eventfd(gfd); })) {
-                if (sc == S::write && timerfds_.count(gfd)) return -22;   // a timerfd takes no writes
+                if (sc == S::write && [&] { std::lock_guard l{fdo_->mu}; return timerfds_.count(gfd) != 0; }())
+                    return -22;   // a timerfd takes no writes
                 return eventfd_io(*ev, sc == S::read, a1, a2);
             }
         switch (sc) {
@@ -5272,10 +5312,15 @@ private:
                 // An inotify fd: records from linuxity's own fsnotify (see
                 // InotifyFd); block like Linux unless the fd is nonblocking.
                 // (A raw read on the kqueue would be ENXIO.)
-                if (auto it = inotifies_.find(gfd); it != inotifies_.end()) {
+                std::shared_ptr<InotifyFd> in;
+                {
+                    std::lock_guard l{fdo_->mu};
+                    if (auto it = inotifies_.find(gfd); it != inotifies_.end()) in = it->second;
+                }
+                if (in) {
                     const bool nb = (::fcntl(*hfd, F_GETFL) & O_NONBLOCK) != 0;
                     for (;;) {
-                        const long n = it->second->drain(win);
+                        const long n = in->drain(win);
                         if (n != 0) return n;                                  // records, or -EINVAL
                         if (nb) return -11;                                    // EAGAIN
                         pollfd p{*hfd, POLLIN, 0};
@@ -5560,11 +5605,16 @@ private:
                 return it->second->ctl(static_cast<int>(a1), target_host, target, mask, token);
             }
             case S::epoll_pwait: {
-                auto it = epolls_.find(gfd);
-                if (it == epolls_.end()) return -22;
+                std::shared_ptr<EpollSet> set;
+                {
+                    std::lock_guard l{fdo_->mu};
+                    auto it = epolls_.find(gfd);
+                    if (it == epolls_.end()) return -22;
+                    set = it->second;
+                }
                 std::vector<LinuxEpollEvent> ready;
                 const auto n = with_wait_mask(regs_.arg(4), regs_.arg(5), [&]() -> std::int64_t {
-                    return epoll_wait_guest(*it->second, ready, static_cast<int>(a2),
+                    return epoll_wait_guest(*set, ready, static_cast<int>(a2),
                                             static_cast<int>(static_cast<std::int32_t>(a3)));
                 });
                 if (n < 0) return n;
@@ -6419,6 +6469,22 @@ private:
         return rc;
     }
 
+    // The fd-object syscalls that never block run whole under the
+    // process's FdObjects lock; everything else (reads, writes, waits)
+    // locks only its lookups, so a blocked read can't stall other threads.
+    [[nodiscard]] std::unique_lock<std::recursive_mutex> lock_fd_objects_for(abi::Sysno sc) {
+        using S = abi::Sysno;
+        switch (sc) {
+            case S::epoll_create1: case S::epoll_ctl:
+            case S::timerfd_create: case S::timerfd_settime: case S::timerfd_gettime:
+            case S::signalfd4: case S::inotify_init1: case S::inotify_add_watch: case S::inotify_rm_watch:
+            case S::pidfd_open: case S::pidfd_send_signal: case S::getdents64:
+                return std::unique_lock{fdo_->mu};
+            default:
+                return std::unique_lock{fdo_->mu, std::defer_lock};
+        }
+    }
+
     // Install a host fd into the guest table, closing it if the table is
     // full so the descriptor never leaks.
     [[nodiscard]] std::int64_t install_or_close(int h, bool cloexec) {
@@ -6436,6 +6502,7 @@ private:
     // then a window that never closes), and its timer kept firing into a
     // pipe nobody owned.
     void fd_gone(int g) {
+        std::lock_guard l{fdo_->mu};
         dirs_.erase(g);
         epolls_.erase(g);
         if (const auto it = timerfds_.find(g); it != timerfds_.end()) {
@@ -7228,9 +7295,7 @@ public:
     }
 private:
     std::int32_t memsvc_pid_{0};
-    // open /proc/<pid>/mem fds: guest fd -> (pid, file offset)
-    struct MemFd { std::int32_t pid; std::uint64_t off; };
-    std::unordered_map<int, MemFd> mem_fds_;
+    struct MemFd;
     [[nodiscard]] Maybe mem_io(abi::Sysno sc, MemFd& m) {
         using S = abi::Sysno;
         const GuestRam ram = machine_.ram();
@@ -7437,15 +7502,49 @@ private:
         seccomp_mode_ = 1;
         machine_.clear_all_guest_answers();
     }
-    TimerSet timers_;
-    // epoll sets, keyed by the guest fd that names them.
-    std::map<int, std::shared_ptr<EpollSet>> epolls_;
-    // timerfd/signalfd/inotify/pidfd state, keyed the same way.
-    std::map<int, int> timerfds_;                 // guest fd -> TimerSet id
+    // Open directory streams for getdents64, keyed by guest fd.
+    struct Entry {
+        std::uint64_t ino{};
+        std::uint8_t type{};
+        std::string name;
+    };
+    struct DirStream {
+        DIR* dir{nullptr};
+        std::optional<Entry> pending;   // read but not yet delivered
+        std::uint64_t index{0};         // d_off: a monotonically rising cookie
+        DirStream() = default;
+        DirStream(const DirStream&) = delete;
+        DirStream& operator=(const DirStream&) = delete;
+        ~DirStream() { if (dir) ::closedir(dir); }
+    };
     struct SignalFd { std::uint64_t mask; int write_end; };
-    std::map<int, SignalFd> signalfds_;
-    std::map<int, std::shared_ptr<InotifyFd>> inotifies_;
-    std::map<int, std::int32_t> pidfds_;          // guest fd -> guest pid
+    struct MemFd { std::int32_t pid; std::uint64_t off; };
+    // Everything keyed by guest fd number, plus the timers timerfds arm:
+    // the process's, not a thread's (ProcessState::fd_objects). A thread
+    // used to start with empty maps, so an epoll fd made on one thread was
+    // EINVAL on another -- Go's netpoller (snap, docker, gh, every Go
+    // binary) died with "epollwait on fd N failed with 22".
+    struct FdObjects {
+        std::recursive_mutex mu;      // one fd-object syscall at a time per process
+        TimerSet timers;
+        std::map<int, std::shared_ptr<EpollSet>> epolls;
+        std::map<int, int> timerfds;                 // guest fd -> TimerSet id
+        std::map<int, SignalFd> signalfds;
+        std::map<int, std::shared_ptr<InotifyFd>> inotifies;
+        std::map<int, std::int32_t> pidfds;          // guest fd -> guest pid
+        std::unordered_map<int, MemFd> mem_fds;      // /proc/<pid>/mem: guest fd -> (pid, offset)
+        std::map<int, DirStream> dirs;
+    };
+    std::shared_ptr<FdObjects> fdo_{proc_.fd_objects<FdObjects>()};
+    TimerSet& timers_{fdo_->timers};
+    // epoll sets, timerfd/signalfd/inotify/pidfd state, keyed by guest fd.
+    std::map<int, std::shared_ptr<EpollSet>>& epolls_{fdo_->epolls};
+    std::map<int, int>& timerfds_{fdo_->timerfds};
+    std::map<int, SignalFd>& signalfds_{fdo_->signalfds};
+    std::map<int, std::shared_ptr<InotifyFd>>& inotifies_{fdo_->inotifies};
+    std::map<int, std::int32_t>& pidfds_{fdo_->pidfds};
+    std::unordered_map<int, MemFd>& mem_fds_{fdo_->mem_fds};
+    std::map<int, DirStream>& dirs_{fdo_->dirs};
     // SysV shared-memory attachments: guest address -> segment. `span` is
     // the host-page-rounded size of a shared backing (0: the copy fallback);
     // `host` the Darwin attach held for nattch.
@@ -7468,22 +7567,6 @@ private:
         }
         return fd;
     }
-    // Open directory streams for getdents64, keyed by guest fd.
-    struct Entry {
-        std::uint64_t ino{};
-        std::uint8_t type{};
-        std::string name;
-    };
-    struct DirStream {
-        DIR* dir{nullptr};
-        std::optional<Entry> pending;   // read but not yet delivered
-        std::uint64_t index{0};         // d_off: a monotonically rising cookie
-        DirStream() = default;
-        DirStream(const DirStream&) = delete;
-        DirStream& operator=(const DirStream&) = delete;
-        ~DirStream() { if (dir) ::closedir(dir); }
-    };
-    std::map<int, DirStream> dirs_;
     GuestRegs regs_{};
     bool exited_{false};
     int code_{0};
