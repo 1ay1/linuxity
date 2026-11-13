@@ -244,17 +244,14 @@ int lx::cli::host_run(lx::cli::Options& o, int argc, char** argv) {
     }
     if (!ge.notice.empty()) st.event("login", ge.notice);
     std::vector<std::string> genvp = std::move(ge.vars);
-    // GUI apps join the desktop's compositor, or linuxity-display's
-    // (src/display_attach.hpp).
+    // A private XDG_RUNTIME_DIR, and GUI apps on the desktop's compositor
+    // or linuxity-display's (src/display_attach.hpp).
     {
         std::string why;
-        if (const auto d = cli::display::attach(o, why)) {
-            const std::size_t had = o.binds.size();
-            cli::display::apply(*d, o, genvp, ge.login.uid);
-            binds.insert(binds.end(), o.binds.begin() + static_cast<std::ptrdiff_t>(had), o.binds.end());
-        } else if (!why.empty()) {
-            st.event("display", "no display: " + why);
-        }
+        const std::size_t had = o.binds.size();
+        cli::display::setup(o, genvp, ge.login.uid, why);
+        binds.insert(binds.end(), o.binds.begin() + static_cast<std::ptrdiff_t>(had), o.binds.end());
+        if (!why.empty()) st.event("display", "no display: " + why);
     }
     std::vector<std::string> layers = std::move(ge.layers);   // host dirs, top first
     env::UserInfo login = std::move(ge.login);                 // who pid 1 / sessions run as

@@ -446,6 +446,7 @@ public:
         if (::bootstrap_register(bootstrap_port, const_cast<char*>(svc_name.c_str()), svc)
             != KERN_SUCCESS) {
 #pragma clang diagnostic pop
+            fork_failed("bootstrap_register", 0);
             ::posix_spawn_file_actions_destroy(&fa);
             return -1;
         }
@@ -468,7 +469,11 @@ public:
         ::posix_spawn_file_actions_destroy(&fa);
         ::posix_spawnattr_destroy(&attr);
         mark("spawned");
-        if (rc != 0) { ::mach_port_deallocate(::mach_task_self(), svc); return -1; }
+        if (rc != 0) {
+            fork_failed("posix_spawn", rc);
+            ::mach_port_deallocate(::mach_task_self(), svc);
+            return -1;
+        }
 
         // Wait for the child's hello (it carries the child's reply port),
         // then ship RAM + state. The child cannot run guest code until this
@@ -490,10 +495,11 @@ public:
             if (::waitpid(pid, &st, WNOHANG) == pid) { pid = -1; break; }   // died first
         }
         if (got != MACH_MSG_SUCCESS) {
+            int st = 0;
+            fork_failed(pid < 0 ? "the child died before its hello" : "no hello from the child", got);
             ::mach_port_mod_refs(::mach_task_self(), svc, MACH_PORT_RIGHT_RECEIVE, -1);
             if (pid > 0) {
                 ::kill(pid, SIGKILL);
-                int st = 0;
                 ::waitpid(pid, &st, 0);
             }
             return -1;
@@ -505,10 +511,17 @@ public:
                                                   machine_.mem_size(), runtime::wire::encode(img));
         mark("sent");
         ::mach_port_mod_refs(::mach_task_self(), svc, MACH_PORT_RIGHT_RECEIVE, -1);
+        if (!sent) fork_failed("sending the guest to the child", 0);
         return sent ? pid : -1;
     }
 
 private:
+    // A guest fork that fails says why on LINUXITY_DEBUG (the guest only
+    // sees EAGAIN).
+    static void fork_failed(const char* what, int code) {
+        if (std::getenv("LINUXITY_DEBUG"))
+            std::fprintf(stderr, "linuxity: fork failed: %s (%d)\n", what, code);
+    }
     // -- Zygotes ------------------------------------------------------------
     // A zygote is a linuxity started with `--zygote SERVICE`: it does all of
     // a fork child's process-level setup, looks up SERVICE, sends us its
@@ -767,9 +780,12 @@ void wire_spawners(runtime::HvfTrap& trap, ThreadContext& ctx) {
 void run_guest_thread(ThreadContext& ctx, runtime::HvfTrap::ThreadStart start) {
     runtime::HvfCpu cpu;
     if (!cpu.create()) {
-        std::fputs("linuxity: cannot create a vCPU for a guest thread\n", stderr);
+        // HVF's per-VM vCPU limit (64): clone answers EAGAIN, as Linux does
+        // at its thread limit, and the app copes (thread pools shrink).
+        start.started->set_value(false);
         return;
     }
+    start.started->set_value(true);
     cpu.load(start.cpu);
 
     runtime::TaskState task;
@@ -1210,12 +1226,12 @@ int cli::host_run(Options& o, int, char**) {
     std::vector<std::string> env = std::move(ge.vars);
     (void)::umask(static_cast<mode_t>(o.umask));
 
-    // GUI apps: a Wayland compositor whose windows are Mac windows
-    // (src/display_attach.hpp). Before Machine: it mounts the socket.
+    // A private XDG_RUNTIME_DIR, and GUI apps as Mac windows
+    // (src/display_attach.hpp). Before Machine: it mounts them.
     {
         std::string why;
-        if (const auto d = cli::display::attach(o, why)) cli::display::apply(*d, o, env, ge.login.uid);
-        else if (!why.empty() && !o.quiet) std::fprintf(stderr, "linuxity: no display: %s\n", why.c_str());
+        cli::display::setup(o, env, ge.login.uid, why);
+        if (!why.empty() && !o.quiet) std::fprintf(stderr, "linuxity: no display: %s\n", why.c_str());
     }
 
     Machine m{o};

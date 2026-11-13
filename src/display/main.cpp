@@ -16,6 +16,7 @@
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <sys/stat.h>
 #include <dirent.h>
@@ -48,37 +49,36 @@ std::string default_socket() {
 }
 
 // Sessions that are already running reach us through a hard link to our
-// socket in their runtime dir (<root>/runtime/<env>/<uid>/wayland-0, see
-// src/display_attach.hpp). A restarted server binds a NEW socket, so those
-// links would still name the dead one -- "no compositor running?" in every
-// open shell until the next lx. Point them all at us.
+// socket in their runtime dir (<root>/runtime/<env>/s<pid>/<uid>/wayland-0,
+// see src/display_attach.hpp). A restarted server binds a NEW socket, so
+// those links would still name the dead one -- "no compositor running?" in
+// every open shell until the next lx. Point them all at us.
 void relink_sessions(const std::string& socket) {
     const auto slash = socket.rfind('/');
     if (slash == std::string::npos) return;
     const std::string dir = socket.substr(0, slash);             // <root>/wayland
     const auto up = dir.rfind('/');
     if (up == std::string::npos) return;
-    const std::string runtime = dir.substr(0, up) + "/runtime";
     const std::string name = socket.substr(slash + 1);
-    DIR* envs = ::opendir(runtime.c_str());
-    if (!envs) return;
-    while (dirent* e = ::readdir(envs)) {
-        if (e->d_name[0] == '.') continue;
-        const std::string env = runtime + "/" + e->d_name;
-        DIR* users = ::opendir(env.c_str());
-        if (!users) continue;
-        while (dirent* u = ::readdir(users)) {
-            if (u->d_name[0] == '.') continue;
-            const std::string link = env + "/" + u->d_name + "/" + name;
-            struct ::stat st{};
-            if (::lstat(link.c_str(), &st) != 0) continue;            // that session has no display
-            const std::string tmp = link + ".new";
-            ::unlink(tmp.c_str());
-            if (::link(socket.c_str(), tmp.c_str()) == 0) ::rename(tmp.c_str(), link.c_str());
+    auto subdirs = [](const std::string& p) {
+        std::vector<std::string> out;
+        if (DIR* d = ::opendir(p.c_str())) {
+            while (dirent* e = ::readdir(d))
+                if (e->d_name[0] != '.') out.push_back(p + "/" + e->d_name);
+            ::closedir(d);
         }
-        ::closedir(users);
-    }
-    ::closedir(envs);
+        return out;
+    };
+    for (const auto& env : subdirs(dir.substr(0, up) + "/runtime"))
+        for (const auto& session : subdirs(env))
+            for (const auto& user : subdirs(session)) {
+                const std::string link = user + "/" + name;
+                struct ::stat st{};
+                if (::lstat(link.c_str(), &st) != 0) continue;    // that session has no display
+                const std::string tmp = link + ".new";
+                ::unlink(tmp.c_str());
+                if (::link(socket.c_str(), tmp.c_str()) == 0) ::rename(tmp.c_str(), link.c_str());
+            }
 }
 
 void usage() {
