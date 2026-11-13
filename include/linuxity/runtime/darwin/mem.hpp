@@ -28,9 +28,16 @@ namespace lx::runtime {
 // private area" holds by construction.
 class GuestRam {
 public:
+    // Maps the backing of [gpa, gpa+n) if it is not yet (darwin/vm.hpp: the
+    // window is populated in slabs); false if it cannot be.
+    using Ensure = bool (*)(const void* ctx, std::uint64_t gpa, std::uint64_t n);
+
     GuestRam() = default;
     GuestRam(std::byte* base, std::uint64_t size, std::uint64_t floor) noexcept
         : base_{base}, size_{size}, floor_{floor} {}
+    GuestRam(std::byte* base, std::uint64_t size, std::uint64_t floor,
+             const void* ctx, Ensure ensure) noexcept
+        : base_{base}, size_{size}, floor_{floor}, ctx_{ctx}, ensure_{ensure} {}
     // `hole` is a guest-owned range that lies BELOW floor_ (the non-PIE
     // window: the table array sits above it, so a fixed-address ET_EXEC
     // image loads there). Without it, loading gcc hit floor_ and failed
@@ -44,8 +51,8 @@ public:
     // wholly inside the carve-out hole. Subtraction order avoids overflow.
     [[nodiscard]] bool permits(std::uint64_t gpa, std::size_t n) const noexcept {
         if (gpa >= size_ || n > size_ - gpa) return false;
-        if (gpa >= floor_) return true;
-        return gpa >= hole_beg_ && n <= hole_end_ - gpa;
+        if (gpa < floor_ && !(gpa >= hole_beg_ && n <= hole_end_ - gpa)) return false;
+        return !ensure_ || ensure_(ctx_, gpa, n);
     }
 
     // The guest-visible range, or an empty span if [gpa, gpa+n) escapes it.
@@ -66,7 +73,9 @@ public:
             if (gpa < hole_beg_ || gpa >= hole_end_) return {};
             top = hole_end_;                    // clamp within the hole
         }
-        return {base_ + gpa, std::min<std::uint64_t>(n, top - gpa)};
+        const std::uint64_t len = std::min<std::uint64_t>(n, top - gpa);
+        if (ensure_ && !ensure_(ctx_, gpa, len)) return {};
+        return {base_ + gpa, len};
     }
 
     [[nodiscard]] bool valid() const noexcept { return base_ != nullptr; }
@@ -107,6 +116,8 @@ private:
     // A guest-owned carve-out BELOW floor_ (empty when hole_beg_==hole_end_).
     std::uint64_t hole_beg_{0};
     std::uint64_t hole_end_{0};
+    const void* ctx_{nullptr};
+    Ensure ensure_{nullptr};
 };
 
 // A guest iovec, as the Linux ABI lays it out.

@@ -44,40 +44,50 @@
 
 namespace lx::runtime::fork_ipc {
 
-// A COW snapshot of [addr, addr+size) as a send right. Pages are shared until
-// either side writes them, exactly like fork's own copy-on-write.
-[[nodiscard]] inline mach_port_t snapshot(void* addr, std::uint64_t size) {
-    memory_object_size_t s = size;
-    mach_port_t entry = MACH_PORT_NULL;
-    if (::mach_make_memory_entry_64(::mach_task_self(), &s,
-                                    reinterpret_cast<memory_object_offset_t>(addr),
-                                    VM_PROT_READ | VM_PROT_WRITE | MAP_MEM_VM_COPY,
-                                    &entry, MACH_PORT_NULL) != KERN_SUCCESS)
-        return MACH_PORT_NULL;
-    return entry;
-}
-
-// Map a snapshot as fresh, private, read-write memory.
-[[nodiscard]] inline void* map_snapshot(mach_port_t entry, std::uint64_t size) {
-    mach_vm_address_t a = 0;
-    if (::mach_vm_map(::mach_task_self(), &a, size, 0, VM_FLAGS_ANYWHERE, entry, 0,
-                      /*copy=*/FALSE, VM_PROT_READ | VM_PROT_WRITE,
-                      VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE) != KERN_SUCCESS)
-        return nullptr;
-    return reinterpret_cast<void*>(a);
-}
+// The guest's memory travels as copy-on-write snapshots, one memory entry
+// per extent of its address space (HvfMachine::snapshot); where each goes is
+// in the blob (ForkImage::extents), in the same order.
 
 // -- The handoff message ---------------------------------------------------
-// One Mach message carries the memory entry (a port descriptor) plus an
-// out-of-line blob with everything else. Using a message rather than a pipe
-// is what lets the PORT travel: a pipe can't carry a Mach right.
+// One Mach message carries the memory entries (an out-of-line port array)
+// plus an out-of-line blob with everything else. Using a message rather
+// than a pipe is what lets the PORTS travel: a pipe can't carry a Mach right.
 struct HandoffMsg {
     mach_msg_header_t header;
     mach_msg_body_t body;
-    mach_msg_port_descriptor_t memory;
+    mach_msg_ool_ports_descriptor_t memory;
     mach_msg_ool_descriptor_t blob;
-    std::uint64_t mem_size;
 };
+
+inline void fill_ports(mach_msg_ool_ports_descriptor_t& d, const std::vector<mach_port_t>& p) {
+    d.address = p.empty() ? nullptr : const_cast<mach_port_t*>(p.data());
+    d.count = static_cast<mach_msg_size_t>(p.size());
+    d.deallocate = FALSE;
+    d.copy = MACH_MSG_VIRTUAL_COPY;
+    d.disposition = MACH_MSG_TYPE_MOVE_SEND;
+    d.type = MACH_MSG_OOL_PORTS_DESCRIPTOR;
+}
+inline void fill_blob(mach_msg_ool_descriptor_t& d, const std::vector<std::byte>& b) {
+    d.address = const_cast<std::byte*>(b.data());
+    d.size = static_cast<mach_msg_size_t>(b.size());
+    d.deallocate = FALSE;
+    d.copy = MACH_MSG_VIRTUAL_COPY;
+    d.type = MACH_MSG_OOL_DESCRIPTOR;
+}
+// Take ownership of a received port array / blob, freeing the OOL memory.
+inline std::vector<mach_port_t> take_ports(const mach_msg_ool_ports_descriptor_t& d) {
+    auto* p = static_cast<mach_port_t*>(d.address);
+    std::vector<mach_port_t> out(p, p + d.count);
+    if (p) ::mach_vm_deallocate(::mach_task_self(), reinterpret_cast<mach_vm_address_t>(p),
+                                d.count * sizeof(mach_port_t));
+    return out;
+}
+inline std::vector<std::byte> take_blob(const mach_msg_ool_descriptor_t& d) {
+    auto* p = static_cast<std::byte*>(d.address);
+    std::vector<std::byte> out(p, p + d.size);
+    if (p) ::mach_vm_deallocate(::mach_task_self(), reinterpret_cast<mach_vm_address_t>(p), d.size);
+    return out;
+}
 struct HandoffRecv {
     HandoffMsg msg;
     mach_msg_trailer_t trailer;
@@ -113,8 +123,12 @@ struct HandoffRecv {
     return i > 0 && i < name.size() && name[i] == '.' ? pid : -1;
 }
 
-[[nodiscard]] inline bool send(mach_port_t dest, mach_port_t memory,
-                               std::uint64_t mem_size,
+inline void drop_ports(const std::vector<mach_port_t>& p) {
+    for (mach_port_t q : p) ::mach_port_deallocate(::mach_task_self(), q);
+}
+
+// Sends `memory` (consumed either way: moved on success, released on failure).
+[[nodiscard]] inline bool send(mach_port_t dest, const std::vector<mach_port_t>& memory,
                                const std::vector<std::byte>& blob) {
     HandoffMsg m{};
     m.header.msgh_bits = MACH_MSGH_BITS_COMPLEX | MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
@@ -122,24 +136,18 @@ struct HandoffRecv {
     m.header.msgh_remote_port = dest;
     m.header.msgh_id = 0x4c58;               // 'LX'
     m.body.msgh_descriptor_count = 2;
-    m.memory.name = memory;
-    m.memory.disposition = MACH_MSG_TYPE_MOVE_SEND;
-    m.memory.type = MACH_MSG_PORT_DESCRIPTOR;
-    m.blob.address = const_cast<std::byte*>(blob.data());
-    m.blob.size = static_cast<mach_msg_size_t>(blob.size());
-    m.blob.deallocate = FALSE;
-    m.blob.copy = MACH_MSG_VIRTUAL_COPY;
-    m.blob.type = MACH_MSG_OOL_DESCRIPTOR;
-    m.mem_size = mem_size;
-    return ::mach_msg(&m.header, MACH_SEND_MSG, sizeof m, 0, MACH_PORT_NULL,
-                      MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL) == MACH_MSG_SUCCESS;
+    fill_ports(m.memory, memory);
+    fill_blob(m.blob, blob);
+    const bool ok = ::mach_msg(&m.header, MACH_SEND_MSG, sizeof m, 0, MACH_PORT_NULL,
+                               MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL) == MACH_MSG_SUCCESS;
+    if (!ok) drop_ports(memory);
+    return ok;
 }
 
 struct Received {
-    mach_port_t memory{MACH_PORT_NULL};
-    std::uint64_t mem_size{};
+    std::vector<mach_port_t> memory;   // one per ForkImage extent
     std::vector<std::byte> blob;
-    std::vector<int> fds;          // fileports turned back into local fds
+    std::vector<int> fds;              // fileports turned back into local fds
 };
 
 // -- fds as Mach rights ------------------------------------------------------
@@ -155,18 +163,17 @@ struct Received {
 struct HandoffMsgFds {
     mach_msg_header_t header;
     mach_msg_body_t body;
-    mach_msg_port_descriptor_t memory;
+    mach_msg_ool_ports_descriptor_t memory;
     mach_msg_ool_descriptor_t blob;
     mach_msg_ool_ports_descriptor_t fds;
-    std::uint64_t mem_size;
 };
 struct HandoffRecvFds {
     HandoffMsgFds msg;
     mach_msg_trailer_t trailer;
 };
 
-[[nodiscard]] inline bool send_with_fds(mach_port_t dest, mach_port_t memory,
-                                        std::uint64_t mem_size,
+// Sends `memory` (consumed either way, like send()).
+[[nodiscard]] inline bool send_with_fds(mach_port_t dest, const std::vector<mach_port_t>& memory,
                                         const std::vector<std::byte>& blob,
                                         const std::vector<int>& fds) {
     std::vector<mach_port_t> ports;
@@ -174,7 +181,8 @@ struct HandoffRecvFds {
     for (int fd : fds) {
         const mach_port_t p = fd_to_port(fd);
         if (p == MACH_PORT_NULL) {
-            for (mach_port_t q : ports) ::mach_port_deallocate(::mach_task_self(), q);
+            drop_ports(ports);
+            drop_ports(memory);
             return false;
         }
         ports.push_back(p);
@@ -185,24 +193,12 @@ struct HandoffRecvFds {
     m.header.msgh_remote_port = dest;
     m.header.msgh_id = 0x4c59;               // 'LY'
     m.body.msgh_descriptor_count = 3;
-    m.memory.name = memory;
-    m.memory.disposition = MACH_MSG_TYPE_MOVE_SEND;
-    m.memory.type = MACH_MSG_PORT_DESCRIPTOR;
-    m.blob.address = const_cast<std::byte*>(blob.data());
-    m.blob.size = static_cast<mach_msg_size_t>(blob.size());
-    m.blob.deallocate = FALSE;
-    m.blob.copy = MACH_MSG_VIRTUAL_COPY;
-    m.blob.type = MACH_MSG_OOL_DESCRIPTOR;
-    m.fds.address = ports.empty() ? nullptr : ports.data();
-    m.fds.count = static_cast<mach_msg_size_t>(ports.size());
-    m.fds.deallocate = FALSE;
-    m.fds.copy = MACH_MSG_VIRTUAL_COPY;
-    m.fds.disposition = MACH_MSG_TYPE_MOVE_SEND;
-    m.fds.type = MACH_MSG_OOL_PORTS_DESCRIPTOR;
-    m.mem_size = mem_size;
+    fill_ports(m.memory, memory);
+    fill_blob(m.blob, blob);
+    fill_ports(m.fds, ports);
     const bool ok = ::mach_msg(&m.header, MACH_SEND_MSG, sizeof m, 0, MACH_PORT_NULL,
                                MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL) == MACH_MSG_SUCCESS;
-    if (!ok) for (mach_port_t q : ports) ::mach_port_deallocate(::mach_task_self(), q);
+    if (!ok) { drop_ports(ports); drop_ports(memory); }
     return ok;
 }
 
@@ -211,35 +207,20 @@ struct HandoffRecvFds {
     if (::mach_msg(&r.msg.header, MACH_RCV_MSG, 0, sizeof r, port,
                    MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL) != MACH_MSG_SUCCESS)
         return false;
-    out.memory = r.msg.memory.name;
-    out.mem_size = r.msg.mem_size;
-    auto* p = static_cast<std::byte*>(r.msg.blob.address);
-    out.blob.assign(p, p + r.msg.blob.size);
-    ::mach_vm_deallocate(::mach_task_self(),
-                         reinterpret_cast<mach_vm_address_t>(r.msg.blob.address),
-                         r.msg.blob.size);
-    auto* ports = static_cast<mach_port_t*>(r.msg.fds.address);
+    out.memory = take_ports(r.msg.memory);
+    out.blob = take_blob(r.msg.blob);
     out.fds.clear();
-    for (mach_msg_size_t i = 0; i < r.msg.fds.count; ++i) {
-        const int fd = ::fileport_makefd(ports[i]);
-        ::mach_port_deallocate(::mach_task_self(), ports[i]);
-        out.fds.push_back(fd);
+    for (mach_port_t p : take_ports(r.msg.fds)) {
+        out.fds.push_back(::fileport_makefd(p));
+        ::mach_port_deallocate(::mach_task_self(), p);
     }
-    if (ports)
-        ::mach_vm_deallocate(::mach_task_self(), reinterpret_cast<mach_vm_address_t>(ports),
-                             r.msg.fds.count * sizeof(mach_port_t));
     return true;
 }
 
 // A received handoff, unpacked.
 [[nodiscard]] inline bool unpack(HandoffRecv& r, Received& out) {
-    out.memory = r.msg.memory.name;
-    out.mem_size = r.msg.mem_size;
-    auto* p = static_cast<std::byte*>(r.msg.blob.address);
-    out.blob.assign(p, p + r.msg.blob.size);
-    ::mach_vm_deallocate(::mach_task_self(),
-                         reinterpret_cast<mach_vm_address_t>(r.msg.blob.address),
-                         r.msg.blob.size);
+    out.memory = take_ports(r.msg.memory);
+    out.blob = take_blob(r.msg.blob);
     return true;
 }
 

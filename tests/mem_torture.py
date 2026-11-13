@@ -312,6 +312,35 @@ def large_sparse_reservation_costs_only_what_is_touched():
 
 
 @check
+def reservations_far_beyond_ram():
+    # A 64-bit address space is not RAM: SpiderMonkey and WebAssembly
+    # reserve eleven 16 GiB PROT_NONE regions at Firefox's startup and
+    # commit pieces later. When guest memory was an identity map of a 2-4
+    # GiB RAM block every one was ENOMEM, and Firefox came up as a blank
+    # 122x38 window.
+    G = 1 << 30
+    regions = [anon(16 * G, prot=PROT_NONE, flags=MAP_PRIVATE | MAP_ANON | MAP_NORESERVE)
+               for _ in range(11)]
+    big = anon(64 * G, prot=PROT_NONE)
+    for i, r in enumerate(regions + [big]):
+        mid = r + (8 * G if r != big else 40 * G)
+        eq(libc.mprotect(mid, 1 << 20, PROT_READ | PROT_WRITE), 0, f"commit 1 MiB inside region {i}")
+        poke(mid + 4096, b"r%02d" % i)
+    eq(dies_of(lambda: peek(regions[3], 1)), -signal.SIGSEGV, "the uncommitted rest stays PROT_NONE")
+
+    def kid():
+        ok_all = all(peek(r + (8 * G if r != big else 40 * G) + 4096, 3) == b"r%02d" % i
+                     for i, r in enumerate(regions + [big]))
+        poke(regions[0] + 8 * G + 4096, b"kid")
+        return 0 if ok_all else 3
+    eq(run_in_child(kid), 0, "a fork child sees every committed page")
+    eq(peek(regions[0] + 8 * G + 4096, 3), b"r00", "and its stores are its own")
+    for r in regions:
+        eq(libc.munmap(r, 16 * G), 0, "munmap a 16 GiB region")
+    eq(libc.munmap(big, 64 * G), 0, "munmap 64 GiB")
+
+
+@check
 def file_mapping_follows_the_file():
     with open("f", "wb") as f:
         f.write(b"A" * (3 * PAGE))

@@ -32,16 +32,14 @@
 
 namespace lx::runtime {
 
-// Where things go in guest RAM. Programs and loaders are both PIEs on every
-// modern distro, so their placement is OUR choice -- and it must be computed,
-// not fixed: the hypervisor-private page tables grow with RAM size (8 MiB of
-// tables for 4 GiB), and a constant program base would collide with them at
-// some RAM size. The program goes just past the private area; the loader a
-// fixed distance above it, far enough that the program's brk heap can grow.
+// Where things go in guest memory. Programs and loaders are both PIEs on
+// every modern distro, so their placement is OUR choice: the program above
+// any fixed-address (ET_EXEC) image, the loader a fixed distance above it,
+// far enough that the program's brk heap can grow.
 struct ExecLayout {
     static constexpr std::uint64_t interp_gap = 0x1000'0000;     // 256 MiB
-    [[nodiscard]] static constexpr std::uint64_t program_base(std::uint64_t ram) noexcept {
-        return HvfLayout::priv_end(ram);
+    [[nodiscard]] static constexpr std::uint64_t program_base(std::uint64_t) noexcept {
+        return HvfLayout::program_base;
     }
     [[nodiscard]] static constexpr std::uint64_t interp_base(std::uint64_t ram) noexcept {
         return program_base(ram) + interp_gap;

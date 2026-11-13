@@ -44,14 +44,22 @@ inline constexpr std::size_t kTableBytes = kMaxNr * sizeof(Entry);
 //
 // Registers: x16/x17 are IP0/IP1 -- the procedure-call standard lets any
 // linker veneer clobber them across a call, so no guest code can hold a
-// live value in them at an `svc`. We use exactly those two and restore
-// nothing else. x8 holds the syscall number, x0 the first argument and the
-// return value, per the Linux aarch64 ABI.
+// live value in them at an `svc`. But this vector also takes every OTHER
+// synchronous exception from EL0 -- page faults above all, which with
+// memory populated on first touch happen at any instruction, including a
+// PLT stub that has just put the GOT slot's address in x16 for the lazy
+// resolver. So x16 is parked in TPIDR_EL1 (an EL1 register the guest
+// cannot see) before anything else, and put back on the non-svc path:
+// a fault must reach the host with every register exactly as the guest had
+// it. (Clobbering it made the resolver read address 0xb: EC 0x20 - 0x15.)
+// x8 holds the syscall number, x0 the first argument and the return value,
+// per the Linux aarch64 ABI.
 //
+//   msr  tpidr_el1, x16        park x16
 //   mrs  x16, esr_el1          what kind of exception?
 //   lsr  x16, x16, #26         EC
-//   cmp  x16, #0x15            SVC64?
-//   b.ne slow
+//   subs x16, x16, #0x15       SVC64?
+//   b.ne restore
 //   cmp  x8, #kMaxNr           in range?
 //   b.hs slow
 //   movz x16, #<table & 0xffff>
@@ -63,30 +71,38 @@ inline constexpr std::size_t kTableBytes = kMaxNr * sizeof(Entry);
 //   mov  x0, x16
 //   eret                       ELR already points past the svc
 // slow:
-//   hvc  #0
+//   hvc  #imm                  a syscall for the host (x16/x17 are scratch)
+// restore:
+//   mrs  x16, tpidr_el1        not a syscall: x16 as the guest left it
+//   hvc  #imm
+inline constexpr std::uint32_t kEretOffset = 0x38;      // see HvfCpu::unwind_el1
 [[nodiscard]] inline std::size_t emit_handler(std::uint32_t* out,
                                               std::uint64_t table_addr,
                                               std::uint32_t hvc_imm) {
     const auto lo = static_cast<std::uint32_t>(table_addr & 0xffff);
     const auto hi = static_cast<std::uint32_t>((table_addr >> 16) & 0xffff);
     std::uint32_t c[] = {
-        0xd5385210u,                               // 0x00 mrs  x16, esr_el1
-        0xd35afe10u,                               // 0x04 lsr  x16, x16, #26
-        0xf1005610u,                               // 0x08 subs x16, x16, #0x15
-        0x54000161u,                               // 0x0c b.ne  0x38 (slow)
-        0xf108011fu,                               // 0x10 cmp  x8, #512
-        0x54000122u,                               // 0x14 b.hs  0x38 (slow)
-        0xd2800010u | (lo << 5),                   // 0x18 movz x16, #lo
-        0xf2a00010u | (hi << 5),                   // 0x1c movk x16, #hi, lsl #16
-        0x8b081210u,                               // 0x20 add  x16, x16, x8, lsl #4
-        0xf9400611u,                               // 0x24 ldr  x17, [x16, #8]
-        0xb4000091u,                               // 0x28 cbz  x17, 0x38 (slow)
-        0xf9400210u,                               // 0x2c ldr  x16, [x16]
-        0xaa1003e0u,                               // 0x30 mov  x0, x16
-        0xd69f03e0u,                               // 0x34 eret
-        0xd4000002u | (hvc_imm << 5),              // 0x38 slow: hvc #imm
+        0xd518d090u,                               // 0x00 msr  tpidr_el1, x16
+        0xd5385210u,                               // 0x04 mrs  x16, esr_el1
+        0xd35afe10u,                               // 0x08 lsr  x16, x16, #26
+        0xf1005610u,                               // 0x0c subs x16, x16, #0x15
+        0x54000181u,                               // 0x10 b.ne  0x40 (restore)
+        0xf108011fu,                               // 0x14 cmp  x8, #512
+        0x54000122u,                               // 0x18 b.hs  0x3c (slow)
+        0xd2800010u | (lo << 5),                   // 0x1c movz x16, #lo
+        0xf2a00010u | (hi << 5),                   // 0x20 movk x16, #hi, lsl #16
+        0x8b081210u,                               // 0x24 add  x16, x16, x8, lsl #4
+        0xf9400611u,                               // 0x28 ldr  x17, [x16, #8]
+        0xb4000091u,                               // 0x2c cbz  x17, 0x3c (slow)
+        0xf9400210u,                               // 0x30 ldr  x16, [x16]
+        0xaa1003e0u,                               // 0x34 mov  x0, x16
+        0xd69f03e0u,                               // 0x38 eret
+        0xd4000002u | (hvc_imm << 5),              // 0x3c slow: hvc #imm
+        0xd538d090u,                               // 0x40 restore: mrs x16, tpidr_el1
+        0xd4000002u | (hvc_imm << 5),              // 0x44 hvc #imm
     };
     static_assert(kMaxNr == 512, "the cmp immediate below encodes 512");
+    static_assert(sizeof c <= 0x80, "one vector slot");
     std::memcpy(out, c, sizeof c);
     return sizeof c / sizeof c[0];
 }

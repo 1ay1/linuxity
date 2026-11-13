@@ -252,9 +252,6 @@ public:
         return cmdline_;
     }
     std::atomic<std::uint64_t> rchar{0}, wchar{0}, syscr{0}, syscw{0};
-    // The guest-address window whose page-table permissions were narrowed
-    // from the default RWX (mmap/mprotect); exec resets it. Empty: lo >= hi.
-    std::uint64_t pte_lo{~std::uint64_t{0}}, pte_hi{0};
     // RLIMIT_* as the guest set them (Linux numbering, 16 resources), kept
     // per process and inherited across fork and exec. Only NOFILE and STACK
     // shape this backend; the rest round-trip so a guest sees what it set.

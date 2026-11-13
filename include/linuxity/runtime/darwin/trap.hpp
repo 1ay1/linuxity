@@ -376,17 +376,6 @@ public:
     void set_arena(std::uint64_t image_end, std::uint64_t stack_floor) {
         sync_all_shared();                     // exec discards the old image
         proc_.with_space([&](AddressSpace& t) { return t.reset(image_end, stack_floor); });
-        // A non-PIE image sits in the low window BELOW the page tables, so
-        // its arena [image_end, ...) spans them. Reserve the table range as
-        // a no-access VMA: brk stops at it (ceiling_above) and mmap's gap
-        // search skips it, instead of handing the guest EL1-only memory.
-        const std::uint64_t ram = machine_.mem_size();
-        const std::uint64_t lo = HvfLayout::tables_lo(ram), hi = HvfLayout::priv_end(ram);
-        if (image_end < hi && lo < hi)
-            proc_.with_space([&](AddressSpace& t) {
-                t.adopt(Vma{lo, hi, GuestProt::none, false});
-                return 0;
-            });
     }
 
     // Record a region the LOADER mapped directly into guest RAM (ELF
@@ -418,6 +407,17 @@ public:
         proc_.set_environ(ex.environ);
         proc_.set_auxv(ex.auxv);
         proc_.set_cmdline(ex.cmdline);
+        // The vDSO: a data page the guest reads and an image it runs. They
+        // are mappings like any other (Linux lists [vvar] and [vdso]), and
+        // the page tables only show what the map holds.
+        const std::uint64_t vb = vdso::base_for(machine_.mem_size());
+        proc_.with_space([&](AddressSpace& t) {
+            t.adopt({vb, vb + 0x1000, GuestProt::read, false});
+            t.adopt({vb + 0x1000, vb + vdso::span(), GuestProt::read | GuestProt::exec, false});
+            return 0;
+        });
+        proc_.name(vb, vb + 0x1000, "[vvar]");
+        proc_.name(vb + 0x1000, vb + vdso::span(), "[vdso]");
     }
     // Room below the initial sp for the stack to grow (Linux's default
     // RLIMIT_STACK, which is what prlimit64 reports).
@@ -476,6 +476,7 @@ public:
                 // stale frame, write -EINVAL into x0 and reset PC to the
                 // faulting instruction -- clobbering the handler entry, so
                 // the fault recurred with x0=-22 and the program died.
+                if (repair_fault()) { cpu_.retry(regs_); continue; }
                 if (report_fault()) continue;
                 return ok(false);
             }
@@ -2671,8 +2672,6 @@ private:
         img.sig_mask = task_.sig_mask;
         img.altstack = task_.alt_stack;
         img.rlimits = proc_.rlimits;
-        img.pte_lo = proc_.pte_lo;
-        img.pte_hi = proc_.pte_hi;
         img.environ = proc_.environ();
         img.auxv = proc_.auxv();
         img.cmdline = proc_.cmdline();
@@ -2694,6 +2693,14 @@ private:
         // closing a shared backing's fd. No duplicates: on macOS closing
         // any fd of a file drops the process's POSIX locks on it.
         const auto mm_lock = proc_.mmap_lock();
+        // The memory the child gets: the address space as of NOW, under the
+        // lock, so no sibling's mmap/munmap lands between choosing the
+        // extents and the snapshot the forker takes of them.
+        img.extents = fork_extents();
+        if (std::getenv("LINUXITY_PROFILE_FORK"))
+            std::fprintf(stderr, "[do_fork] extents %zu, %lld us since start\n", img.extents.size(),
+                         static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - fstart).count()));
         std::vector<std::shared_ptr<HostFd>> keep_files;
         {
             auto ex = proc_.with_fds([&](FdTable& t) { return t.export_table(); });
@@ -2764,7 +2771,7 @@ public:
         std::string range_names;        // "begin end name\n"..., for maps
         struct Backed { std::uint64_t at, len; std::int64_t off; std::int32_t group; };
         std::vector<Backed> backings;   // shared host pages; `group` indexes fd_hosts
-        std::uint64_t pte_lo{~std::uint64_t{0}}, pte_hi{0};   // narrowed page permissions
+        std::vector<HvfMachine::Extent> extents;   // the memory snapshots, in message order
     };
     using SpawnFork = std::function<pid_t(ForkImage&)>;
     void set_fork_spawner(SpawnFork f) { spawn_ = std::move(f); }
@@ -2838,8 +2845,6 @@ public:
             if (static_cast<std::size_t>(b.group) < host_fds.size()) ::close(host_fds[static_cast<std::size_t>(b.group)]);
         proc_.rlimits = img.rlimits;
         proc_.with_fds([&](FdTable& t) { t.set_limit(static_cast<std::size_t>(proc_.rlimits[7].cur)); return 0; });
-        proc_.pte_lo = img.pte_lo;              // the tables came in the snapshot
-        proc_.pte_hi = img.pte_hi;
         proc_.set_environ(img.environ);
         proc_.set_auxv(img.auxv);
         proc_.set_cmdline(img.cmdline);
@@ -3208,40 +3213,16 @@ private:
                 static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - e0).count()));
         };
-        std::uint64_t zeroed = 0, nvma = 0;
-        // Shared objects leave the address space FIRST: zeroing a range still
-        // backed by one would wipe it for every other process mapping it.
+        // Shared objects leave the address space FIRST, so their pages are
+        // written back and released, not discarded with the window.
         drop_backings(0, ~std::uint64_t{0} >> 1);
-        if (proc_.pte_hi > proc_.pte_lo) {
-            // the old image's page permissions go with it
-            machine_.protect(proc_.pte_lo, proc_.pte_hi - proc_.pte_lo, true, true, true);
-            proc_.pte_lo = ~std::uint64_t{0};
-            proc_.pte_hi = 0;
-            cpu_.flush_tlb_on_entry();
-        }
-        for (const Vma& v : proc_.with_space([&](AddressSpace& t) { return t.vmas(); })) {
-            // Read-only, file-backed mappings (library text, rodata, the
-            // program image) were never written by the guest; their bytes
-            // are file contents, not secrets, and the loader overwrites
-            // whatever it reuses. Zeroing them is pure cost -- 1 ms of
-            // every exec, mostly copying COW pages of libc's text just to
-            // clear them. Writable or anonymous ranges are still cleared.
-            if (!v.anonymous && !has(v.prot, GuestProt::write)) continue;
-            const auto z0 = std::chrono::steady_clock::now();
-            machine_.zero(v.begin, v.size());
-            zeroed += v.size(); ++nvma;
-            if (eprof) {
-                const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - z0).count();
-                if (us > 50) std::fprintf(stderr, "[exec %d]   vma %#llx +%llu KiB prot=%d: %lld us\n", task_.tid,
-                    static_cast<unsigned long long>(v.begin),
-                    static_cast<unsigned long long>(v.size() >> 10), static_cast<int>(v.prot),
-                    static_cast<long long>(us));
-            }
-        }
-        if (eprof) std::fprintf(stderr, "[exec %d] zeroed %llu KiB in %llu vmas\n", task_.tid,
-                                static_cast<unsigned long long>(zeroed >> 10),
-                                static_cast<unsigned long long>(nvma));
+        // Then the whole old image goes at once: every range it could have
+        // touched becomes fresh memory (one Mach entry each, microseconds
+        // whatever it held) and no chunk stays in the VM. On a fork child
+        // that also drops its COW snapshot without copying a page.
+        // argv/envp were copied out before this point.
+        machine_.reset_space(fork_extents());
+        cpu_.flush_tlb_on_entry();
         emark("zero");
         auto ex = hvf_exec(machine_, resolve, guest_path, argv, envp);
         emark("load");
@@ -4573,6 +4554,10 @@ public:
     }
 
     [[noreturn]] void end_process(int status) {
+        if (fault_prof())
+            std::fprintf(stderr, "[faults %d] %llu repaired, %llu us, %zu chunks\n", tgid_,
+                         static_cast<unsigned long long>(g_fault_n.load()),
+                         static_cast<unsigned long long>(g_fault_ns.load() / 1000), machine_.populated());
         if (std::getenv("LINUXITY_DEBUG") && (status & 0xff))
             std::fprintf(stderr, "linuxity: guest pid %d exits %d\n", tgid_, status & 0xff);
         pids_.reparent_children_of(tgid_);
@@ -4651,21 +4636,179 @@ private:
         }
     }
 
-    // -- Page protection in the guest's own page tables ----------------------
-    // The stage-1 tables start RWX everywhere guest-visible; mmap/mprotect
-    // narrow ranges (HvfMachine::protect) and munmap puts them back. The
-    // touched window rides through fork (the tables are in the snapshot)
-    // and is reset at exec, so a new image starts from the default.
-    void set_pte_prot(std::uint64_t at, std::uint64_t len, GuestProt p) {
+    // -- Page protection: the guest's page tables are a cache ----------------
+    // What a guest page may do is decided by ONE thing, fill_prot below: the
+    // VMA map, the brk heap, and the end of a mapped file. The stage-1
+    // entries are computed from it when a chunk enters the VM
+    // (HvfMachine::populate) and recomputed here whenever it changes; a
+    // fault re-asks it (repair_fault), so an entry that is stale or missing
+    // costs a refault, never a wrong answer.
+    void fill_prot(std::uint64_t lo, std::uint64_t hi, std::uint8_t* out) {
+        constexpr std::uint64_t P = AddressSpace::kPageSize;
+        const std::uint64_t n = (hi - lo) / P;
+        std::memset(out, 0, n);
+        auto paint = [&](std::uint64_t b, std::uint64_t e, std::uint8_t p) {
+            b = std::max(b, lo);
+            e = std::min(e, hi);
+            for (std::uint64_t a = b; a < e; a += P) out[(a - lo) / P] = p;
+        };
+        proc_.with_space([&](AddressSpace& t) {
+            const auto& v = t.vmas();
+            auto it = std::upper_bound(v.begin(), v.end(), lo,
+                                       [](std::uint64_t a, const Vma& m) { return a < m.end; });
+            for (; it != v.end() && it->begin < hi; ++it)
+                paint(it->begin, it->end, static_cast<std::uint8_t>(it->prot));
+            // the brk heap is not a VMA: [base, break) is read/write
+            const std::uint64_t base = t.arena().brk_base, top = AddressSpace::page_up(t.brk());
+            if (top > base)
+                paint(base, top, static_cast<std::uint8_t>(GuestProt::read | GuestProt::write));
+            return 0;
+        });
+        // A file mapping's pages at or past the file's end have nothing
+        // behind them: SIGBUS on Linux (report_fault, past_file_end). The
+        // host maps whole 16 KiB pages and would show zeros there instead.
+        proc_.with_backings([&](auto& bs) {
+            for (const auto& b : bs) {
+                if (b.at >= hi || b.at + b.len <= lo) continue;
+                struct ::stat st{};
+                if (::fstat(b.fd, &st) != 0) continue;
+                const auto size = static_cast<std::uint64_t>(st.st_size);
+                const auto off = static_cast<std::uint64_t>(b.off);
+                const std::uint64_t live = size <= off ? 0 : AddressSpace::page_up(size - off);
+                if (live < b.len) paint(b.at + live, b.at + b.len, 0);
+            }
+            return 0;
+        });
+    }
+    [[nodiscard]] std::uint8_t prot_at(std::uint64_t va) {
+        std::uint8_t p = 0;
+        const std::uint64_t pg = AddressSpace::page_down(va);
+        fill_prot(pg, pg + AddressSpace::kPageSize, &p);
+        return p;
+    }
+    // The truth changed over [at, at+len): recompute the entries that are in
+    // the VM. Other threads may hold old translations: the stub's tlbi is
+    // broadcast (inner-shareable), so this vCPU running it before the
+    // syscall returns drops them for every vCPU of the VM.
+    void sync_pte(std::uint64_t at, std::uint64_t len) {
         if (!len) return;
-        machine_.protect(at, len, has(p, GuestProt::read) || has(p, GuestProt::write),
-                         has(p, GuestProt::write), has(p, GuestProt::exec));
-        proc_.pte_lo = std::min(proc_.pte_lo, at);
-        proc_.pte_hi = std::max(proc_.pte_hi, at + len);
-        // Other threads may hold old translations: the stub's tlbi is
-        // broadcast (inner-shareable), so this vCPU running it before the
-        // syscall returns drops them for every vCPU of the VM.
-        cpu_.flush_tlb_on_entry();
+        if (machine_.refresh(at, len, [this](std::uint64_t lo, std::uint64_t hi, std::uint8_t* o) {
+                fill_prot(lo, hi, o);
+            }))
+            cpu_.flush_tlb_on_entry();
+    }
+    // (The protection is already in the VMA map by the time these run; the
+    // argument documents the call site's intent.)
+    void set_pte_prot(std::uint64_t at, std::uint64_t len, GuestProt) { sync_pte(at, len); }
+    void reset_pte_prot(std::uint64_t at, std::uint64_t len) { sync_pte(at, len); }
+
+    // A guest abort the truth does not explain: a chunk not in the VM yet,
+    // an entry older than the map, a slot evicted under a stale TLB entry,
+    // a chunk mid-swap in back_shared. Fix it and retry the instruction;
+    // false means it is a real fault (a signal). A fault that keeps coming
+    // back at the same pc and address after "repairs" is treated as real
+    // rather than looping forever.
+    [[nodiscard]] bool repair_fault() {
+        if (!fault_prof()) return repair_fault_();
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool r = repair_fault_();
+        if (r) {
+            g_fault_n.fetch_add(1);
+            g_fault_ns.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t0).count()));
+        }
+        return r;
+    }
+    static bool fault_prof() {
+        static const bool on = std::getenv("LINUXITY_PROFILE_FAULTS") != nullptr;
+        return on;
+    }
+    static inline std::atomic<std::uint64_t> g_fault_n{0}, g_fault_ns{0};
+    [[nodiscard]] bool repair_fault_() {
+        const std::uint64_t ec = regs_.ec();
+        if (ec != 0x24 && ec != 0x20) return false;
+        const std::uint64_t va = cpu_.fault_address() & 0x00ff'ffff'ffff'ffffull;   // TBI0
+        if (va >= machine_.mem_size() || va < HvfLayout::floor) return false;
+        if (va == last_fault_va_ && regs_.elr == last_fault_pc_) {
+            // The same fault again right after a repair. Rarely legitimate
+            // more than a few times (an eviction racing the retry), so after
+            // many it is a fault the tables can't fix -- report it rather
+            // than loop forever.
+            if (++fault_repeats_ > 64) {
+                fault_repeats_ = 0;
+                if (std::getenv("LINUXITY_DEBUG"))
+                    std::fprintf(stderr, "linuxity: fault at %#llx keeps recurring after repair (prot %d, esr %#llx, s2 %d)\n",
+                                 static_cast<unsigned long long>(va), prot_at(va),
+                                 static_cast<unsigned long long>(regs_.esr), cpu_.stage2_ipa().has_value());
+                return false;
+            }
+        } else {
+            last_fault_va_ = va;
+            last_fault_pc_ = regs_.elr;
+            fault_repeats_ = 0;
+        }
+        const std::uint64_t iss = regs_.esr & 0x1ffffff;
+        const bool write = ec == 0x24 && (iss >> 6 & 1) && !(iss >> 8 & 1);   // WnR, not a CM op
+        const std::uint8_t need = ec == 0x20 ? 4 : write ? 2 : 1;
+        const std::uint8_t have = prot_at(va);
+        if (!(have & need) && !(need == 1 && (have & 2))) return false;
+        if (cpu_.stage2_ipa()) {
+            if (past_file_end(va)) return false;
+            machine_.settle();                    // a swap in progress: wait it out
+            cpu_.flush_tlb_on_entry();            // a stale VA->slot entry
+            return true;
+        }
+        auto perms = [this](std::uint64_t lo, std::uint64_t hi, std::uint8_t* o) { fill_prot(lo, hi, o); };
+        switch (machine_.populate(va, perms)) {
+            case HvfMachine::Populate::mapped: return true;
+            case HvfMachine::Populate::busy: cpu_.flush_tlb_on_entry(); return true;
+            case HvfMachine::Populate::present:
+                (void)machine_.refresh(va, AddressSpace::kPageSize, perms);
+                cpu_.flush_tlb_on_entry();
+                return true;
+            case HvfMachine::Populate::failed: break;
+        }
+        if (std::getenv("LINUXITY_DEBUG"))
+            std::fprintf(stderr, "linuxity: cannot bring guest memory %#llx into the VM (%zu/%zu chunks)\n",
+                         static_cast<unsigned long long>(va), machine_.populated(), machine_.slots());
+        return false;
+    }
+
+    // What a fork must carry: every mapping and the brk heap, on host pages,
+    // with near neighbours merged (each extent is one Mach memory entry).
+    // Everything else in the window is unmapped and reads as zero anyway.
+    [[nodiscard]] std::vector<HvfMachine::Extent> fork_extents() {
+        const std::uint64_t hp = HvfMachine::host_page();
+        std::vector<HvfMachine::Extent> r;
+        proc_.with_space([&](AddressSpace& t) {
+            r.reserve(t.vmas().size() + 1);
+            for (const Vma& v : t.vmas()) r.push_back({v.begin, v.end});
+            const std::uint64_t base = t.arena().brk_base, top = AddressSpace::page_up(t.brk());
+            if (top > base) r.push_back({base, top});
+            return 0;
+        });
+        for (auto& e : r) { e.lo &= ~(hp - 1); e.hi = (e.hi + hp - 1) & ~(hp - 1); }
+        std::sort(r.begin(), r.end(), [](const auto& a, const auto& b) { return a.lo < b.lo; });
+        std::vector<HvfMachine::Extent> out;
+        constexpr std::uint64_t kMergeGap = 1ull << 20;
+        for (const auto& e : r) {
+            if (e.hi <= e.lo) continue;
+            if (!out.empty() && e.lo <= out.back().hi + kMergeGap) out.back().hi = std::max(out.back().hi, e.hi);
+            else out.push_back(e);
+        }
+        // only what may hold data: a COW snapshot costs per byte covered
+        return machine_.touched_extents(out);
+    }
+
+    // munmap'd memory goes back to the host, unless a shared object still
+    // backs part of the range (its pages are the object's, not ours).
+    void release_pages(std::uint64_t at, std::uint64_t len) {
+        const bool shared = proc_.with_backings([&](auto& bs) {
+            for (const auto& b : bs)
+                if (b.at < at + len && b.at + b.len > at) return true;
+            return false;
+        });
+        if (!shared) machine_.discard(at, len);
     }
     // A file this process maps shared changed size (truncate/ftruncate).
     // The host maps whole 16 KiB pages, so a page of the file that is now
@@ -4693,15 +4836,7 @@ private:
             return 0;
         });
         for (const auto& [at, n] : dead) set_pte_prot(at, n, GuestProt::none);
-        for (const auto& [at, n] : live) {
-            const Vma* v = proc_.with_space([&](AddressSpace& t) { return t.find(at); });
-            if (v) set_pte_prot(at, n, v->prot);
-        }
-    }
-    void reset_pte_prot(std::uint64_t at, std::uint64_t len) {
-        if (!len || proc_.pte_hi <= proc_.pte_lo) return;      // nothing narrowed yet
-        machine_.protect(at, len, true, true, true);
-        cpu_.flush_tlb_on_entry();
+        for (const auto& [at, n] : live) set_pte_prot(at, n, GuestProt::none);
     }
     // -- memfd seals ---------------------------------------------------------
     // A write a seal forbids is EPERM. Only memfds carry seals, and checking
@@ -4878,8 +5013,10 @@ private:
                 // (a shared map's host-page tail is part of its VMA: what
                 // lies past the object's end faults there, as past EOF)
                 proc_.unname(at, at + len);
-                auto win = machine_.ram().at(at, len);
-                if (win.empty()) return -12;
+                // Bounds only: the backing slabs are mapped when something
+                // touches them, not for a reservation that may never be used.
+                if (at < HvfLayout::floor || at >= machine_.mem_size() || len > machine_.mem_size() - at)
+                    return -12;
 
                 if (anon) {
                     if (host_shared) {
@@ -4957,8 +5094,11 @@ private:
                         return static_cast<std::int64_t>(at);
                     }
                 }
+                auto win = machine_.ram().at(at, len);
+                if (win.size() < a1) return -12;
                 auto n = ::pread(ffd, win.data(), a1, foff);
                 if (n < 0) return darwin::fail();
+                machine_.note_touched(at, static_cast<std::uint64_t>(n));
                 const auto got = static_cast<std::uint64_t>(n);
                 if (got < a1) {
                     auto tail = machine_.ram().at(at + got, a1 - got);
@@ -4998,9 +5138,9 @@ private:
                 proc_.with_space([&](AddressSpace& t) { return t.unmap(a0, len); });
                 proc_.unname(a0, a0 + len);
                 // Gone means gone: a later touch faults (SIGSEGV), as on
-                // Linux. The pages stay fenced until something maps them
-                // again (mmap, brk and mremap all set their own protection).
+                // Linux, and the memory goes back to the host.
                 set_pte_prot(a0, len, GuestProt::none);
+                release_pages(a0, len);
                 return 0;
             }
             case S::mprotect: {
@@ -5095,14 +5235,19 @@ private:
                 const bool anon = v->anonymous;
                 std::uint64_t to = proc_.with_space([&](AddressSpace& t) { return t.map(0, new_len, prot, false, anon); });
                 if (to == AddressSpace::kFail) return -12;
-                auto src = machine_.ram().at(a0, old_len);
-                auto dst = machine_.ram().at(to, new_len);
-                if (src.empty() || dst.empty()) return -14;
-                std::memmove(dst.data(), src.data(), old_len);
-                machine_.zero(to + old_len, new_len - old_len);
+                // Copy only what may hold data: untouched pages of the old
+                // range read as zero, and so does the fresh new range.
+                machine_.zero(to, new_len);
+                for (const auto& e : machine_.touched_extents({{a0, a0 + old_len}})) {
+                    auto src = machine_.ram().at(e.lo, e.hi - e.lo);
+                    auto dst = machine_.ram().at(to + (e.lo - a0), e.hi - e.lo);
+                    if (src.empty() || dst.size() < src.size()) return -14;
+                    std::memmove(dst.data(), src.data(), src.size());
+                }
                 proc_.with_space([&](AddressSpace& t) { return t.unmap(a0, old_len); });
                 set_pte_prot(a0, old_len, GuestProt::none);
                 set_pte_prot(to, new_len, prot);
+                release_pages(a0, old_len);
                 return static_cast<std::int64_t>(to);
             }
             default:
@@ -7458,12 +7603,21 @@ private:
     }
     // The guest's resident set: its own mappings' pages the host has in core
     // (the host task's RSS also counts linuxity's binary, heap and threads).
+    // Only chunks that were ever touched can be resident, so only those are
+    // asked: mincore over a process's whole map walked Firefox's 176 GiB of
+    // PROT_NONE reservations -- 26 s per read of /proc/self/statm, which
+    // Python reads on every fork.
     [[nodiscard]] static std::uint64_t guest_resident(HvfMachine& m, ProcessState& pr) {
-        std::vector<std::span<std::byte>> ranges;
+        std::vector<HvfMachine::Extent> live;
         pr.with_space([&](AddressSpace& s) {
-            for (const Vma& v : s.vmas())
-                if (auto w = m.ram().at(v.begin, v.end - v.begin); !w.empty()) ranges.push_back(w);
+            for (const Vma& v : s.vmas()) live.push_back({v.begin, v.end});
+            const std::uint64_t base = s.arena().brk_base, top = AddressSpace::page_up(s.brk());
+            if (top > base) live.push_back({base, top});
         });
+        std::sort(live.begin(), live.end(), [](const auto& a, const auto& b) { return a.lo < b.lo; });
+        std::vector<std::span<std::byte>> ranges;
+        for (const auto& e : m.touched_extents(live))
+            if (auto w = m.ram().at(e.lo, e.hi - e.lo); !w.empty()) ranges.push_back(w);
         return memsvc::resident_bytes(ranges);
     }
 public:
@@ -7752,6 +7906,9 @@ private:
         return fd;
     }
     GuestRegs regs_{};
+    // repair_fault's loop guard: the last repaired fault and its repeats.
+    std::uint64_t last_fault_va_{0}, last_fault_pc_{0};
+    unsigned fault_repeats_{0};
     bool exited_{false};
     int code_{0};
 };

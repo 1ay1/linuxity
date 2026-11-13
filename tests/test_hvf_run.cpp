@@ -73,7 +73,7 @@ struct RunResult {
                                   const std::string& guest_path,
                                   const std::vector<std::string>& argv) {
     runtime::HvfMachine vm;
-    if (auto st = vm.init(512ull << 20); !st) return {};
+    if (auto st = vm.init(); !st) return {};
 
     host::PosixHost hw;
     kernel::Kernel<host::PosixHost> k{hw};
@@ -115,7 +115,7 @@ struct RunResult {
     task.tid = 1;
     runtime::HvfTrap trap{vm, cpu, proc, task, pids};
     runtime::HvfMem mem{vm, &trap};
-    trap.set_arena(img->image_end, vm.mem_size() - (8ull << 20));
+    trap.set_arena(img->image_end, runtime::ExecArena::mmap_top(vm.mem_size()));
     // Hand the loader's own mappings to the VMA map, or the guest's mprotect
     // on them (glibc applies RELRO right before transferring control) fails
     // ENOMEM and the program dies with "cannot apply additional memory
@@ -127,8 +127,7 @@ struct RunResult {
         if (sg.flags & 1) prot = prot | runtime::GuestProt::exec;
         trap.adopt(sg.begin, sg.end, prot);
     }
-    trap.adopt(*sp & ~std::uint64_t{0xfff}, vm.mem_size() - 0x10000,
-               runtime::GuestProt::read | runtime::GuestProt::write);
+    trap.adopt_stack(*sp, vm.mem_size());
 
     cpu.set_entry(img->entry, *sp);
     runtime::Cpu loop{trap, k, mem, abi::Arch::aarch64};
@@ -152,7 +151,7 @@ int main() {
     {
         // Probe the entitlement once so the skip message is accurate.
         runtime::HvfMachine probe;
-        if (auto st = probe.init(2ull << 20); !st) {
+        if (auto st = probe.init(); !st) {
             std::puts("hvf_run: skipped (no hypervisor entitlement)");
             return 0;
         }

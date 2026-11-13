@@ -45,121 +45,105 @@
 
 namespace lx::runtime {
 
-// -- Guest physical memory layout -----------------------------------------
-// One contiguous IPA region. The bottom is hypervisor-private (exception
-// vectors + page tables), mapped EL1-only so guest code can neither read nor
-// write it. Everything from priv_end up belongs to the guest.
+// -- The guest address space ---------------------------------------------
 //
-//   0x0000_0000  vectors        (VBAR_EL1, 2 KiB used)
-//   0x0000_1000  L1 table       (one page: covers 512 GiB, i.e. all of it)
-//   0x0000_2000  L2 tables      (one page per GiB of guest RAM)
-//   ...          L3 tables      (one page per 2 MiB of guest RAM)
-//   priv_end     first guest page
+// Linux gives a process a 47/48-bit address space and memory on first
+// touch, and programs lean on both: Firefox reserves eleven 16 GiB PROT_NONE
+// regions at startup (SpiderMonkey's and WebAssembly's guard regions) and
+// commits pieces of them later. When guest VA was an identity map of RAM
+// (VA == GPA, 2-4 GiB), every one of those reservations was ENOMEM and the
+// browser came up as a blank 122x38 window. Three address spaces meet here:
 //
-// The table area is SIZED from the RAM size rather than fixed: at 4 KiB
-// granule, mapping N bytes needs N/2MiB L3 pages plus N/1GiB L2 pages. A
-// fixed layout silently breaks at 1 GiB -- the L2 index wraps and the top
-// gigabyte (where the stack lives) aliases the bottom, while the L3 tables
-// grow over the vectors -- and the guest's first svc then jumps into garbage
-// and spins forever. Computing it makes that impossible.
+//   guest VA -- what the program sees: [0, 2^46).
+//   host VA  -- `window_`: a sparse 2^46-byte MAP_SHARED reservation, the
+//               backing store of the guest's address space. Guest address
+//               A is host address window_+A, always, so the kernel side
+//               reads and writes guest memory with no translation, and
+//               untouched memory costs nothing anywhere.
+//   IPA      -- guest-"physical": what Hypervisor.framework can map, 36
+//               bits on an M1 (hv_vm_config_get_max_ipa_size). Too small to
+//               map the window, so it is a CACHE of it: 2 MiB slots, each
+//               showing one 2 MiB chunk of the window, filled when the guest
+//               first touches the chunk and evicted (oldest first) when the
+//               slots run out. A guest can use far more memory than the IPA
+//               space; it only pays a refault for chunks it stops touching.
+//
+// The stage-1 page tables are a cache as well -- of the VMA map, which is
+// the one truth about what may be accessed (see HvfTrap::fill_prot). A
+// chunk's 512 entries are computed when it is populated, rewritten when
+// mmap/mprotect/munmap change the map, and simply dropped at exec. Every
+// fault is checked against the truth: a stale or missing entry is repaired
+// and the instruction retried; only a fault the VMA map agrees with becomes
+// a signal.
+//
+// IPA layout:
+//   0x0000_0000  vectors + TLB-flush stub (VBAR_EL1)
+//   0x0000_1000  in-guest syscall answers (darwin/inguest.hpp)
+//   0x0000_3000  L0 table
+//   2 MiB        one L3 table page per slot, then the L1/L2 table pool
+//   slots_ipa_   the slots, 2 MiB each, up to the top of the IPA space
+// Guest VA [0, 2 MiB) is an EL1-only block over the first IPA chunk, so the
+// vectors run with the MMU on and EL0 sees no page there (the NULL guard).
 struct HvfLayout {
-    static constexpr std::uint64_t page       = 0x1000;
-    static constexpr std::uint64_t vectors    = 0x0000;   // VBAR_EL1 (2 KiB-aligned)
-    // The TLB-flush stub, right after the 16 vectors in the same page.
-    static constexpr std::uint64_t tlb_flush_stub = 0x0800;
-    // 512 syscall numbers x {value, live} -- see darwin/inguest.hpp.
-    static constexpr std::uint64_t answers_bytes = 512 * 16;
-    // The in-guest syscall table (darwin/inguest.hpp). It sits right after the
-    // L2 tables, inside the EL1-only private area, so a guest can neither
-    // read it nor forge an entry.
-    [[nodiscard]] static constexpr std::uint64_t answers(std::uint64_t ram) noexcept {
-        return l2_tables + n_l2(ram) * page;
-    }
-    static constexpr std::uint64_t l1_table   = 0x1000;
-    static constexpr std::uint64_t l2_tables  = 0x2000;
-    static constexpr std::uint64_t gib        = 1ull << 30;
-    static constexpr std::uint64_t block      = 1ull << 21;   // 2 MiB per L3 table
-
-    [[nodiscard]] static constexpr std::uint64_t n_l2(std::uint64_t ram) noexcept {
-        return (ram + gib - 1) / gib;
-    }
-    // The classic NON-PIE (ET_EXEC) load addresses. An ET_EXEC program's
-    // p_vaddr is absolute -- it cannot be relocated. GNU ld's aarch64
-    // default is 0x400000 and lld's is 0x200000 (Firefox, Chromium, every
-    // LLVM-linked -no-pie binary), so the window starts at 2 MiB: the first
-    // 2 MiB block stays EL1-only (vectors, tables, and the null-page guard).
-    // Starting at 4 MiB made `firefox` fail exec with ENOMEM.
-    static constexpr std::uint64_t nonpie_base = 0x20'0000;      // 2 MiB
-    // Room for a large fixed-address image (text+data+bss) above that, up
-    // to 128 MiB: big toolchain binaries are non-PIE too (cc1plus is a
-    // 42 MiB fixed image at 0x400000), and 28 MiB was not enough.
-    static constexpr std::uint64_t nonpie_size = 0x7e0'0000;      // 126 MiB
-    // vectors + L1 + L2 (one page per GiB, 64 GiB at most) + answers
-    static_assert(l2_tables + 64 * page + answers_bytes <= nonpie_base,
-                  "the private tables must fit below the non-PIE window");
-
-    // The L3 array (one page per 2 MiB of RAM) starts ABOVE the reserved
-    // non-PIE window rather than immediately after the L2 pages. Putting it
-    // low made priv_end ~0x600000 at 2 GiB, which covered 0x400000: loading
-    // gcc then failed ENOMEM (ram().at() refuses the private span) -- the
-    // package installed fine and every `gcc` exec died with errno 12.
-    //
-    // It must stay a single ascending run, because build_page_tables()
-    // assigns these pages sequentially as it walks RAM from 0 upward.
-    //
-    // The floor only applies when RAM can afford it. A tiny VM (the 2 MiB
-    // capability probe) has no room to reserve 32 MiB, and forcing it there
-    // put priv_end past the end of RAM -- the program base then pointed
-    // outside memory and the loader walked off the mapping.
-    [[nodiscard]] static constexpr std::uint64_t l3_tables(std::uint64_t ram) noexcept {
-        const std::uint64_t after_l2 = l2_tables + n_l2(ram) * page
-                                     + answers_bytes;
-        const std::uint64_t floor    = nonpie_base + nonpie_size;
-        // Need the window itself plus the table array plus a block to spare.
-        // Below 1 GiB keep the compact layout (tests, probes): reserving a
-        // 128 MiB hole there would squeeze the PIE/interp/mmap arena.
-        if (ram < gib || ram < floor + (ram / block) * page + block) return after_l2;
-        return after_l2 > floor ? after_l2 : floor;
-    }
-    // First guest-owned address: past the tables, rounded to a 2 MiB block so
-    // the private area is whole L3 tables (no shared page between EL1-only
-    // and EL0 mappings).
-    [[nodiscard]] static constexpr std::uint64_t priv_end(std::uint64_t ram) noexcept {
-        const std::uint64_t end = l3_tables(ram) + (ram / block) * page;
-        return (end + block - 1) & ~(block - 1);
-    }
-
-    // The guest-owned hole below the table array that a fixed-address
-    // ET_EXEC image loads into. Empty unless the floor actually applied
-    // (see l3_tables): on a tiny VM there is no reserved window.
-    [[nodiscard]] static constexpr bool has_nonpie_window(std::uint64_t ram) noexcept {
-        return l3_tables(ram) >= nonpie_base + nonpie_size;
-    }
-    // The EL1-only table range that sits ABOVE the window, i.e. inside what
-    // a non-PIE program's brk/mmap arena would otherwise cover. Callers
-    // reserve it in the VMA map so the heap can never grow into it.
-    [[nodiscard]] static constexpr std::uint64_t tables_lo(std::uint64_t ram) noexcept {
-        return has_nonpie_window(ram) ? nonpie_base + nonpie_size : priv_end(ram);
-    }
-    [[nodiscard]] static constexpr bool is_nonpie_window(std::uint64_t a) noexcept {
-        return a >= nonpie_base && a < nonpie_base + nonpie_size;
-    }
-
-    // The stack sits at the TOP of guest RAM (VA == GPA, so there is no
-    // translation above mem_size); a guest only ever reads sp, so it can't
-    // tell this from Linux's 0x7fff_ffff_f000.
-    static constexpr std::uint64_t stack_guard = 0x10000;
+    static constexpr std::uint64_t page           = 0x1000;
+    static constexpr std::uint64_t chunk          = 1ull << 21;   // one slot / one L3 table
+    static constexpr std::uint64_t vectors        = 0x0000;       // VBAR_EL1 (2 KiB-aligned)
+    static constexpr std::uint64_t tlb_flush_stub = 0x0800;       // right after the 16 vectors
+    static constexpr std::uint64_t answers        = 0x1000;       // 512 syscalls x {value, live}
+    static constexpr std::uint64_t answers_bytes  = 512 * 16;
+    static constexpr std::uint64_t l0_table       = answers + answers_bytes;
+    static constexpr std::uint64_t tables         = chunk;
+    // The first guest-owned address. ET_EXEC programs load at their fixed
+    // p_vaddr: lld's default is 0x200000, GNU ld's 0x400000.
+    static constexpr std::uint64_t floor          = chunk;
+    // Where a PIE program goes. Above every fixed-address image we know of
+    // (cc1plus: 42 MiB at 0x400000), below everything else.
+    static constexpr std::uint64_t program_base   = 0x800'0000;
+    // Unmapped room above the stack, as Linux keeps above 0x7fff_ffff_f000.
+    static constexpr std::uint64_t stack_guard    = 0x10000;
 };
+static_assert(HvfLayout::l0_table + HvfLayout::page <= HvfLayout::chunk,
+              "the private page set must fit the EL1-only block at VA 0");
 
-// The guest address-space plan above the private area: the stack at the top
-// of RAM with room to grow (Linux's default RLIMIT_STACK, which is what
-// prlimit64 reports), and the mmap arena everything below that.
+// The address-space plan: the stack at the top of guest VA (an 8 MiB VMA,
+// Linux's default RLIMIT_STACK), 1 GiB of unmapped room below it that the
+// mmap arena never hands out, the vDSO just under that, and the arena
+// everything below.
 struct ExecArena {
-    static constexpr std::uint64_t stack_reserve = 8ull << 20;
-    [[nodiscard]] static constexpr std::uint64_t mmap_top(std::uint64_t mem_size) noexcept {
-        return mem_size - HvfLayout::stack_guard - stack_reserve - (1ull << 20);
+    static constexpr std::uint64_t stack_reserve = 8ull << 20;    // the initial stack VMA
+    static constexpr std::uint64_t stack_room    = 1ull << 30;    // what it may grow into
+    [[nodiscard]] static constexpr std::uint64_t mmap_top(std::uint64_t va_top) noexcept {
+        return va_top - HvfLayout::stack_guard - stack_room - (1ull << 20);
     }
 };
+
+// Stage-1 descriptors, 4 KiB granule.
+namespace pte {
+inline constexpr std::uint64_t kTable = 3, kPage = 3, kBlock = 1;
+inline constexpr std::uint64_t kAf = 1ull << 10, kSh = 3ull << 8;
+inline constexpr std::uint64_t kPxn = 1ull << 53, kUxn = 1ull << 54;
+inline constexpr std::uint64_t kAddr = 0x0000'ffff'ffff'f000ull;
+// A guest page with Linux protection bits (1 read, 2 write, 4 exec). AP[2:1]
+// 01 is read/write, 11 read-only, 00 no EL0 data access (exec-only); a page
+// with no access at all is no entry, so touching it is a translation fault.
+// Write implies read: arm64 has no write-only pages, nor does Linux on it.
+[[nodiscard]] constexpr std::uint64_t page(std::uint64_t ipa, std::uint8_t prot) noexcept {
+    if (!(prot & 7)) return 0;
+    const bool r = prot & 1, w = prot & 2, x = prot & 4;
+    const std::uint64_t ap = !r && !w ? 0 : (w ? 1 : 3);
+    return ipa | kAf | kSh | (ap << 6) | kPxn | (x ? 0 : kUxn) | kPage;
+}
+} // namespace pte
+
+// Set once by HvfMachine (before any vCPU exists) and read by HvfCpu::create.
+inline std::atomic<unsigned> g_va_bits{46}, g_ipa_bits{36};
+
+// TLB-flush accounting, for reusing an evicted slot (HvfMachine::take_slot).
+// A flush is numbered when a vCPU enters the flush stub and recorded as done
+// when the stub has run; the stub's `tlbi vmalle1is` is broadcast, so ONE
+// completed flush that began after an eviction clears every vCPU's view of
+// the evicted chunk.
+inline std::atomic<std::uint64_t> g_flush_begun{0}, g_flush_done{0};
 
 // The EL1 exception vector stub. ARM requires 16 entries of 0x80 bytes each;
 // every one does the same thing: `hvc #<index>` so the hypervisor (us) sees
@@ -169,15 +153,15 @@ struct ExecArena {
 // Vector 8 (lower EL, AArch64, synchronous -- i.e. every guest syscall) is
 // the exception: it gets the in-guest handler, which answers the pure
 // syscalls in-guest and falls through to the same `hvc #8` for the rest.
-inline void write_vector_stub(std::byte* mem, std::uint64_t ram) {
+inline void write_vector_stub(std::byte* mem) {
     for (int v = 0; v < 16; ++v) {
         const std::uint32_t hvc = 0xD4000002u | (static_cast<std::uint32_t>(v) << 5);
         std::memcpy(mem + HvfLayout::vectors + static_cast<std::size_t>(v) * 0x80,
                     &hvc, 4);
     }
     auto* v8 = reinterpret_cast<std::uint32_t*>(mem + HvfLayout::vectors + 8 * 0x80);
-    (void)inguest::emit_handler(v8, HvfLayout::answers(ram), 8);
-    std::memset(mem + HvfLayout::answers(ram), 0, HvfLayout::answers_bytes);
+    (void)inguest::emit_handler(v8, HvfLayout::answers, 8);
+    std::memset(mem + HvfLayout::answers, 0, HvfLayout::answers_bytes);
     // Past the 16 vectors (0x800), the TLB-flush stub: after the host edits
     // the guest's page tables (mprotect), the vCPU enters here at EL1 and
     // drops every cached translation -- broadcast, so every vCPU of the VM
@@ -191,50 +175,21 @@ inline void write_vector_stub(std::byte* mem, std::uint64_t ram) {
     std::memcpy(mem + HvfLayout::tlb_flush_stub, flush, sizeof flush);
 }
 
-// Build a 3-level, 4 KiB-granule identity map of [0, ram). The private area
-// below priv_end is EL1-only (AP=0b00); the rest is EL0 read/write/execute
-// (AP=0b01). Not setting UXN per region is deliberate: mprotect is tracked
-// in the VMA map, and a JIT in the guest needs to make pages executable.
-inline void build_page_tables(std::byte* mem, std::uint64_t ram) {
-    auto put64 = [mem](std::uint64_t at, std::uint64_t v) {
-        std::memcpy(mem + at, &v, 8);
-    };
-    constexpr std::uint64_t kTable = 3, kPage = 3;
-    constexpr std::uint64_t kAf = 1ull << 10, kSh = 3ull << 8;
-    const std::uint64_t priv = HvfLayout::priv_end(ram);
-    const bool nonpie_win    = HvfLayout::has_nonpie_window(ram);
-
-    // L1: one entry per GiB -> that GiB's L2 table.
-    for (std::uint64_t g = 0; g < HvfLayout::n_l2(ram); ++g)
-        put64(HvfLayout::l1_table + g * 8,
-              (HvfLayout::l2_tables + g * HvfLayout::page) | kTable);
-
-    // L2 -> L3 -> pages.
-    std::uint64_t l3 = HvfLayout::l3_tables(ram);
-    for (std::uint64_t base = 0; base < ram; base += HvfLayout::block) {
-        const std::uint64_t g   = base / HvfLayout::gib;
-        const std::uint64_t l2i = (base >> 21) & 0x1ff;
-        put64(HvfLayout::l2_tables + g * HvfLayout::page + l2i * 8, l3 | kTable);
-        for (std::uint64_t off = 0; off < HvfLayout::block; off += HvfLayout::page) {
-            const std::uint64_t pa = base + off;
-            // EL1-only below priv_end, EXCEPT the non-PIE window: that hole
-            // sits below the table array but belongs to the guest, so a
-            // fixed-address ET_EXEC image can both load and execute there.
-            const std::uint64_t ap =
-                (pa < priv && !(nonpie_win && HvfLayout::is_nonpie_window(pa)))
-                    ? 0ull : 1ull;
-            put64(l3 + (off >> 12) * 8, pa | kAf | kSh | (ap << 6) | kPage);
-        }
-        l3 += HvfLayout::page;
-    }
-}
-
-// -- The machine: guest RAM shared by every vCPU ---------------------------
+// -- The machine: the guest address space shared by every vCPU -------------
 //
 // Non-copyable and non-movable: hv_vm is a process-global resource and vCPUs
 // hold a reference to this object, so its address is part of its identity.
 class HvfMachine {
 public:
+    // A run of guest VA a fork must carry to the child (HvfTrap::fork_extents).
+    struct Extent { std::uint64_t lo, hi; };
+    enum class Populate {
+        mapped,     // the chunk is now in the VM; the guest may retry
+        present,    // it already was: the fault was a stale entry, or a race
+        busy,       // no slot until a TLB flush completes: flush, then retry
+        failed,     // not guest memory, or the hypervisor refused
+    };
+
     HvfMachine() = default;
     HvfMachine(const HvfMachine&) = delete;
     HvfMachine& operator=(const HvfMachine&) = delete;
@@ -242,92 +197,118 @@ public:
     HvfMachine& operator=(HvfMachine&&) = delete;
     ~HvfMachine() {
         if (vm_live_) ::hv_vm_destroy();
-        if (owns_ram_ && base_) ::munmap(base_, size_);
+        for (std::size_t s = 0; s < slabs_.size(); ++s)
+            if (slabs_[s])
+                (void)::mach_vm_deallocate(::mach_task_self(),
+                                           reinterpret_cast<mach_vm_address_t>(window_) + (s << kSlabBits), kSlab);
+        if (priv_) ::munmap(priv_, priv_bytes_);
     }
 
-    [[nodiscard]] Status init(std::uint64_t mem_size) {
-        constexpr std::uint64_t kBlock = HvfLayout::block;
-        size_ = (mem_size + kBlock - 1) & ~(kBlock - 1);
-        if (size_ > (1ull << 36)) return err(Errno::einval);   // 36-bit IPA
-        // Guest RAM lives in an anonymous SHARED mapping, not MAP_PRIVATE.
-        // Two things need that:
-        //   * futex. os_sync_wait_on_address's SHARED flags require memory
-        //     that is genuinely shared, which is what a Linux process-shared
-        //     futex (a pthread mutex in shared memory, and every futex in a
-        //     multi-process guest) means.
-        //   * threads. A guest thread is a host thread in THIS process, so
-        //     it already shares the mapping -- but keeping one representation
-        //     for both cases means fork and threads can't disagree.
-        // A forked child still gets copy-on-write semantics: the Mach memory
-        // entry it receives is a COW snapshot (see hvf_fork.hpp), so sharing
-        // here does not leak writes across a guest fork.
-        int fd = -1;
-        char tmpl[] = "/tmp/linuxity-ram-XXXXXX";
-        fd = ::mkstemp(tmpl);
-        if (fd < 0) return err(Errno::enomem);
-        ::unlink(tmpl);
-        if (::ftruncate(fd, static_cast<off_t>(size_)) != 0) { ::close(fd); return err(Errno::enomem); }
-        void* p = ::mmap(nullptr, size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        ::close(fd);
-        if (p == MAP_FAILED) return err(Errno::enomem);
-        base_ = static_cast<std::byte*>(p);
-        owns_ram_ = true;
-        return attach();
-    }
-
-    // Fork child: adopt the parent's copy-on-write RAM snapshot (already
-    // mapped, see hvf_fork.hpp) as this machine's guest memory, in a FRESH
-    // process whose Hypervisor.framework has never run.
-    // Create the VM with NO memory yet. A zygote does this while parked, so
-    // the hv_vm_create (and the vCPU it then makes) are off the fork's
-    // critical path; init_from() later just maps the snapshot in.
+    // Create the VM with an empty address space. A zygote does this while
+    // parked, so the hv_vm_create, the window and the vCPU it then makes are
+    // all off the fork's critical path. Idempotent.
     [[nodiscard]] Status prewarm() {
         if (vm_live_) return ok();
-        if (::hv_vm_create(nullptr) != HV_SUCCESS) return err(Errno::enodev);
+        std::uint32_t ipa = 36;
+        if (::hv_vm_config_get_max_ipa_size(&ipa) != HV_SUCCESS || ipa < 36) ipa = 36;
+        ipa = std::min<std::uint32_t>(ipa, 48);
+        hv_vm_config_t cfg = ::hv_vm_config_create();
+        if (cfg) (void)::hv_vm_config_set_ipa_size(cfg, ipa);
+        const hv_return_t created = ::hv_vm_create(cfg);
+        if (cfg) ::os_release(cfg);
+        if (created != HV_SUCCESS) return err(Errno::enodev);
         vm_live_ = true;
-        return ok();
+        ipa_bits_ = ipa;
+        g_ipa_bits.store(ipa);
+        if (auto st = reserve_window(); !st) return st;
+        return build_private();
     }
 
-    [[nodiscard]] Status init_from(void* ram, std::uint64_t size) {
-        base_ = static_cast<std::byte*>(ram);
-        size_ = size;
-        owns_ram_ = false;          // the Mach entry mapping owns it
-        // The snapshot is the PARENT's RAM, page tables and vectors included:
-        // the same layout (same size) builds byte-identical tables. Rewriting
-        // them here touched every L3 page (4 MiB for 2 GiB), forcing a COW
-        // copy of each -- 0.8 ms of every fork for no change. Skip it.
-        return attach(/*build_tables=*/false);
+    // A fresh process: the empty space is all it needs.
+    [[nodiscard]] Status init() { return prewarm(); }
+
+    // Fork, parent side: copy-on-write snapshots of `ext`, one send right
+    // each (mach_make_memory_entry_64 + MAP_MEM_VM_COPY: no page is copied
+    // until one side writes it). Empty on failure.
+    [[nodiscard]] std::vector<mach_port_t> snapshot(const std::vector<Extent>& ext) const {
+        std::vector<mach_port_t> out;
+        out.reserve(ext.size());
+        for (const Extent& e : ext) {
+            memory_object_size_t n = e.hi - e.lo;
+            mach_port_t p = MACH_PORT_NULL;
+            if (!ensure(e.lo, e.hi - e.lo) ||
+                ::mach_make_memory_entry_64(::mach_task_self(), &n,
+                    reinterpret_cast<memory_object_offset_t>(window_ + e.lo),
+                    VM_PROT_READ | VM_PROT_WRITE | MAP_MEM_VM_COPY, &p, MACH_PORT_NULL)
+                    != KERN_SUCCESS) {
+                for (mach_port_t q : out) ::mach_port_deallocate(::mach_task_self(), q);
+                return {};
+            }
+            out.push_back(p);
+        }
+        return out;
+    }
+
+    // Fork, child side: the parent's snapshots, each at its own guest VA. The
+    // page tables are NOT carried: they are a cache, and this process's are
+    // rebuilt as the guest touches its memory.
+    [[nodiscard]] Status init_child(const std::vector<Extent>& ext,
+                                    const std::vector<mach_port_t>& ports) {
+        if (auto st = prewarm(); !st) return st;
+        if (ext.size() != ports.size()) return err(Errno::einval);
+        for (const Extent& e : ext) note_touched(e.lo, e.hi - e.lo);
+        Status st = ok();
+        for (std::size_t i = 0; i < ext.size(); ++i) {
+            // the slab first (it is mapped OVER anything there), then the
+            // snapshot over its part of the slab
+            if (!ensure(ext[i].lo, ext[i].hi - ext[i].lo)) st = err(Errno::enomem);
+            auto at = reinterpret_cast<mach_vm_address_t>(window_ + ext[i].lo);
+            if (st && ::mach_vm_map(::mach_task_self(), &at, ext[i].hi - ext[i].lo, 0,
+                                    VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, ports[i], 0,
+                                    /*copy=*/FALSE, VM_PROT_READ | VM_PROT_WRITE,
+                                    VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE) != KERN_SUCCESS)
+                st = err(Errno::enomem);
+            ::mach_port_deallocate(::mach_task_self(), ports[i]);
+        }
+        return st;
     }
 
     // -- Memory -----------------------------------------------------------
     [[nodiscard]] GuestRam ram() const noexcept {
-        const bool win = HvfLayout::has_nonpie_window(size_);
-        return GuestRam{base_, size_, HvfLayout::priv_end(size_),
-                        win ? HvfLayout::nonpie_base : 0,
-                        win ? HvfLayout::nonpie_base + HvfLayout::nonpie_size : 0};
+        return GuestRam{window_, va_top_, HvfLayout::floor, this, &HvfMachine::ensure_cb};
     }
     // Let a syscall be answered IN-GUEST with a constant (see
     // darwin/inguest.hpp): no VM exit, ~32 ns instead of ~930.
     void set_guest_answer(int nr, std::uint64_t value) noexcept {
-        if (nr < 0 || static_cast<std::size_t>(nr) >= inguest::kMaxNr || !base_) return;
-        auto* t = reinterpret_cast<inguest::Entry*>(base_ + HvfLayout::answers(size_));
+        if (nr < 0 || static_cast<std::size_t>(nr) >= inguest::kMaxNr || !priv_) return;
+        auto* t = reinterpret_cast<inguest::Entry*>(priv_ + HvfLayout::answers);
         t[nr].value = value;
         std::atomic_thread_fence(std::memory_order_release);
         t[nr].live = 1;
     }
     void clear_guest_answer(int nr) noexcept {
-        if (nr < 0 || static_cast<std::size_t>(nr) >= inguest::kMaxNr || !base_) return;
-        reinterpret_cast<inguest::Entry*>(base_ + HvfLayout::answers(size_))[nr].live = 0;
+        if (nr < 0 || static_cast<std::size_t>(nr) >= inguest::kMaxNr || !priv_) return;
+        reinterpret_cast<inguest::Entry*>(priv_ + HvfLayout::answers)[nr].live = 0;
     }
     void clear_all_guest_answers() noexcept {
-        if (base_) std::memset(base_ + HvfLayout::answers(size_), 0, HvfLayout::answers_bytes);
+        if (priv_) std::memset(priv_ + HvfLayout::answers, 0, HvfLayout::answers_bytes);
     }
 
-    [[nodiscard]] std::uint64_t mem_size() const noexcept { return size_; }
-    [[nodiscard]] std::byte* raw_base() const noexcept { return base_; }
+    // The top of guest VA (2^46 unless the host refused a window that big).
+    [[nodiscard]] std::uint64_t mem_size() const noexcept { return va_top_; }
+    // Chunks currently in the VM, and how many it can hold at once.
+    [[nodiscard]] std::size_t populated() const {
+        std::lock_guard l{mu_};
+        return slot_of_.size();
+    }
+    [[nodiscard]] std::size_t slots() const noexcept { return nslots_; }
+    // Wait out a back_shared/evict in progress: they hold mu_ while a chunk
+    // is out of the VM, and a vCPU that touched it meanwhile took a stage-2
+    // fault that only needs retrying once they are done.
+    void settle() const { std::lock_guard l{mu_}; }
 
     // Zero one host-page-aligned run: MADV_ZERO where allowed (plain anon
-    // RAM), mach_vm_write from a zero region on a COW snapshot (where
+    // memory), mach_vm_write from a zero region on a COW snapshot (where
     // MADV_ZERO is ENOTSUP), memset as a last resort.
     static void zero_run(std::uintptr_t at, std::size_t n) noexcept {
 #if defined(MADV_ZERO)
@@ -350,183 +331,549 @@ public:
         std::memset(reinterpret_cast<void*>(at), 0, n);
     }
 
-    // Clear a guest range, touching NO byte outside [gpa, gpa+n).
+    // Clear a guest range, touching NO byte outside [va, va+n).
     //
-    // Two hardware facts make this subtle on Apple Silicon:
+    // madvise(MADV_ZERO) works at HOST page granularity -- 16 KiB on Apple
+    // Silicon -- while the guest uses 4 KiB pages. A 4 KiB MADV_ZERO
+    // silently zeroes the surrounding 16 KiB host page, destroying up to 12
+    // KiB of neighbouring guest memory (that once corrupted libc's data a
+    // moment before relocation). So: zero only the host-page-aligned
+    // interior that way, and memset the unaligned head and tail.
     //
-    //  * mmap(MAP_FIXED) over guest RAM is forbidden: it replaces the host
-    //    pages while the guest's IPA translation still points at the OLD
-    //    ones, so the guest keeps reading stale data (verified, macOS 27).
-    //  * madvise(MADV_ZERO) works at HOST page granularity -- 16 KiB on
-    //    Apple Silicon -- while the guest uses 4 KiB pages. A 4 KiB
-    //    MADV_ZERO silently zeroes the surrounding 16 KiB host page
-    //    (verified: zeroing [0x6000,0x7000) also wiped 0x4000..0x8000),
-    //    destroying up to 12 KiB of neighbouring guest memory on every
-    //    anonymous mmap and .bss clear. That corrupted libc's data a moment
-    //    before relocation, so RELR produced libc_base instead of
-    //    libc_base+offset and the guest loaded its own ELF header as a
-    //    pointer ("\x7fELF" faults).
-    //
-    // So: MADV_ZERO only the host-page-aligned interior (cheap, no page
-    // touched), and memset the unaligned head and tail.
-    void zero(std::uint64_t gpa, std::size_t n) noexcept {
-        static constexpr std::size_t kZeroSrc = 16u << 20;   // one zero region, reused
-        auto win = ram().at(gpa, n);
-        if (win.empty()) return;
-        static const std::uintptr_t host_page =
-            static_cast<std::uintptr_t>(::getpagesize());
-        const auto base = reinterpret_cast<std::uintptr_t>(win.data());
-        const std::uintptr_t lo = (base + host_page - 1) & ~(host_page - 1);
-        const std::uintptr_t hi = (base + win.size()) & ~(host_page - 1);
-        // Skip pages that were never touched. Most of an exec'ing process's
-        // VMAs are mostly untouched (an 8 MiB stack with a few dirty pages,
-        // library .bss), and a page with no physical backing already reads
-        // as zero. mincore (~0.02 us/page) finds the ones that exist; only
-        // those runs are zeroed. On a fork child's COW snapshot this avoids
-        // copying the untouched pages just to clear them: 2.5 ms of every
-        // exec, measured. A failing mincore falls through to the old path.
-        if (hi > lo) {
-            const std::size_t npages = (hi - lo) / host_page;
-            std::vector<char> vec(npages);
-            if (::mincore(reinterpret_cast<void*>(lo), hi - lo, vec.data()) == 0) {
-                constexpr char kHas = MINCORE_INCORE | MINCORE_PAGED_OUT;
-                for (std::size_t i = 0; i < npages;) {
-                    if (!(vec[i] & kHas)) { ++i; continue; }
-                    std::size_t j = i;
-                    while (j < npages && (vec[j] & kHas)) ++j;
-                    zero_run(lo + i * host_page, (j - i) * host_page);
-                    i = j;
-                }
-                if (lo > base) std::memset(win.data(), 0, lo - base);
-                if (base + win.size() > hi)
-                    std::memset(reinterpret_cast<void*>(hi), 0, base + win.size() - hi);
-                return;
-            }
+    // Pages that were never touched are skipped: they already read as zero,
+    // and on a fork child's COW snapshot writing them would copy each one.
+    void zero(std::uint64_t va, std::size_t n) noexcept {
+        if (!n || va >= va_top_) return;
+        n = std::min<std::uint64_t>(n, va_top_ - va);
+        // Slab by slab: a slab never mapped holds nothing to clear, and
+        // mapping it just to look would cost a slab per reservation.
+        for (std::uint64_t at = va, end = va + n; at < end;) {
+            const std::uint64_t s = at >> kSlabBits;
+            const std::uint64_t stop = std::min(end, (s + 1) << kSlabBits);
+            if (__atomic_load_n(&slabs_[s], __ATOMIC_ACQUIRE)) zero_mapped(at, stop - at);
+            at = stop;
         }
-#if defined(MADV_ZERO)
-        if (hi > lo &&
-            ::madvise(reinterpret_cast<void*>(lo), hi - lo, MADV_ZERO) == 0) {
-            std::memset(win.data(), 0, lo - base);
-            std::memset(reinterpret_cast<void*>(hi), 0, base + win.size() - hi);
+    }
+    // Small ranges: clear the touched host pages in place (mincore finds
+    // them; a fork child's COW pages it never touched are not copied).
+    // Large ones: swap in fresh memory, one map entry whatever the size --
+    // a 16 GiB MAP_FIXED over a live mapping costs microseconds, not a
+    // mincore walk of four million pages.
+    static constexpr std::uint64_t kZeroInPlace = 64ull << 20;
+    void zero_mapped(std::uint64_t va, std::size_t n) noexcept {
+        std::byte* const data = window_ + va;
+        const std::uintptr_t hp = host_page();
+        const auto base = reinterpret_cast<std::uintptr_t>(data);
+        const std::uintptr_t lo = (base + hp - 1) & ~(hp - 1);
+        const std::uintptr_t hi = (base + n) & ~(hp - 1);
+        if (hi <= lo) { std::memset(data, 0, n); return; }
+        std::memset(data, 0, lo - base);
+        std::memset(reinterpret_cast<void*>(hi), 0, base + n - hi);
+        if (hi - lo > kZeroInPlace) {
+            (void)fresh(va + (lo - base), hi - lo);
             return;
         }
-        if (hi > lo) {
-            // MADV_ZERO is refused (ENOTSUP) on a fork child's RAM: that is
-            // a mach_vm_map of a COW memory entry, not plain anonymous
-            // memory. memset there COPIES every page out of the snapshot
-            // first (13 MB at each exec = 2.2 ms). mach_vm_write from a
-            // zero region lets the VM system do it a page at a time: 0.35 ms
-            // for the same range, and verified (tools/.. zr5) to be seen by
-            // the GUEST through its existing IPA mapping, unlike the
-            // MAP_FIXED remap noted above. Same 16 KiB host-page rule.
-            static void* const zero_src = [] {
-                void* z = ::mmap(nullptr, kZeroSrc, PROT_READ, MAP_ANON | MAP_PRIVATE, -1, 0);
-                return z == MAP_FAILED ? nullptr : z;
-            }();
-            bool ok = zero_src != nullptr;
-            for (std::uintptr_t at = lo; ok && at < hi; at += kZeroSrc) {
-                const std::size_t chunk = std::min<std::size_t>(kZeroSrc, hi - at);
-                ok = ::mach_vm_write(::mach_task_self(), at,
-                                     reinterpret_cast<vm_offset_t>(zero_src),
-                                     static_cast<mach_msg_type_number_t>(chunk)) == KERN_SUCCESS;
-            }
-            if (ok) {
-                std::memset(win.data(), 0, lo - base);
-                std::memset(reinterpret_cast<void*>(hi), 0, base + win.size() - hi);
-                return;
-            }
+        const std::size_t npages = (hi - lo) / hp;
+        std::vector<char> vec(npages);
+        if (::mincore(reinterpret_cast<void*>(lo), hi - lo, vec.data()) != 0) {
+            zero_run(lo, hi - lo);
+            return;
         }
-#endif
-        std::memset(win.data(), 0, win.size());
+        constexpr char kHas = MINCORE_INCORE | MINCORE_PAGED_OUT;
+        for (std::size_t i = 0; i < npages;) {
+            if (!(vec[i] & kHas)) { ++i; continue; }
+            std::size_t j = i;
+            while (j < npages && (vec[j] & kHas)) ++j;
+            zero_run(lo + i * hp, (j - i) * hp);
+            i = j;
+        }
+    }
+
+    // Give the host back the memory behind [va, va+n), which the guest no
+    // longer maps (munmap). Only whole host pages inside the range go, so no
+    // neighbouring mapping loses a byte; they come back as zero pages. This
+    // is what makes a guest's munmap lower its footprint, as on Linux.
+    void discard(std::uint64_t va, std::uint64_t n) noexcept {
+        const std::uint64_t hp = host_page();
+        const std::uint64_t lo = (va + hp - 1) & ~(hp - 1), hi = std::min(va_top_, (va + n) & ~(hp - 1));
+        // only where a slab exists: elsewhere nothing was ever allocated
+        for (std::uint64_t at = lo; at < hi;) {
+            const std::uint64_t s = at >> kSlabBits;
+            const std::uint64_t stop = std::min(hi, (s + 1) << kSlabBits);
+            if (__atomic_load_n(&slabs_[s], __ATOMIC_ACQUIRE)) (void)fresh(at, stop - at);
+            at = stop;
+        }
+    }
+    // Replace [va, va+n) (host-page aligned, inside mapped slabs) with fresh
+    // zero memory: one Mach named entry, so one map entry however large --
+    // MAP_ANON would split it into 128 MiB pieces. Slots showing the range
+    // leave the VM for the swap, as in back_shared.
+    bool fresh(std::uint64_t va, std::uint64_t n) noexcept {
+        std::lock_guard l{mu_};
+        const auto hit = populated_in(va, va + n);
+        for (const auto& [c, s] : hit) (void)::hv_vm_unmap(slot_ipa(s), HvfLayout::chunk);
+        const bool ok = fresh_unlocked(va, n);
+        bool evicted = false;
+        for (const auto& [c, s] : hit)
+            if (::hv_vm_map(window_ + (c << 21), slot_ipa(s), HvfLayout::chunk, kRwx) != HV_SUCCESS) {
+                evict(s);
+                evicted = true;
+            }
+        if (evicted) seal_evictions();
+        return ok;
     }
 
     // Publish freshly written guest code: the host wrote it through a data
     // mapping, the guest will FETCH it, and on arm64 those are separate
     // caches with no coherency guarantee.
-    void publish_code(std::uint64_t gpa, std::size_t n) const noexcept {
-        auto win = ram().at(gpa, n);
+    void publish_code(std::uint64_t va, std::size_t n) const noexcept {
+        auto win = ram().at(va, n);
         if (!win.empty()) ::sys_icache_invalidate(win.data(), win.size());
     }
 
-    // -- Page protection ---------------------------------------------------
-    // Rewrite the EL0 permissions of [gpa, gpa+n) in the guest's own stage-1
-    // tables (VA == GPA, so the L3 entry for a page is found by arithmetic):
-    // AP[2:1] = 01 read/write, 11 read-only, 00 EL1-only (PROT_NONE), and
-    // UXN for anything not executable. The caller must then flush the
-    // guest's TLB (HvfCpu::flush_tlb_on_entry) before the guest runs again.
-    // The private area is never touched.
-    void protect(std::uint64_t gpa, std::uint64_t n, bool r, bool w, bool x) noexcept {
-        const std::uint64_t lo = gpa & ~(HvfLayout::page - 1);
-        const std::uint64_t hi = (gpa + n + HvfLayout::page - 1) & ~(HvfLayout::page - 1);
-        const std::uint64_t priv = HvfLayout::priv_end(size_);
-        const bool win = HvfLayout::has_nonpie_window(size_);
-        constexpr std::uint64_t kApMask = 3ull << 6, kUxn = 1ull << 54;
-        const std::uint64_t ap = !r && !w ? 0ull : (w ? 1ull : 3ull);
-        for (std::uint64_t pa = lo; pa < hi && pa < size_; pa += HvfLayout::page) {
-            if (pa < priv && !(win && HvfLayout::is_nonpie_window(pa))) continue;
-            const std::uint64_t at = HvfLayout::l3_tables(size_) + (pa >> 12) * 8;
-            std::uint64_t e;
-            std::memcpy(&e, base_ + at, 8);
-            e = (e & ~(kApMask | kUxn)) | (ap << 6) | (x ? 0 : kUxn);
-            std::memcpy(base_ + at, &e, 8);
-        }
-    }
-
     // -- Shared pages -------------------------------------------------------
-    // Back [gpa, gpa+n) with `fd` at `off`, MAP_SHARED: the guest then reads
+    // Back [va, va+n) with `fd` at `off`, MAP_SHARED: the guest then reads
     // and writes the object's own pages, so every process that maps it
     // (another guest process, a fork child, read()/write() on the file)
-    // sees the same bytes at once -- MAP_SHARED, for real.
+    // sees the same bytes at once -- MAP_SHARED, for real. fd < 0 puts fresh
+    // zero memory there instead.
     //
-    // The host mapping can't simply be replaced under a live VM (the IPA
-    // keeps translating to the OLD pages, see zero()), so the range leaves
-    // the VM, is remapped, and comes back. gpa, n and off must be host-page
-    // aligned (16 KiB on Apple Silicon). fd < 0 restores private anonymous
-    // (zero) memory there.
+    // A host mapping replaced under a live VM keeps the guest translating to
+    // the OLD pages (hv_vm_map captures the objects), so every slot showing
+    // the range leaves the VM for the swap and comes back: a guest thread
+    // touching it meanwhile takes a stage-2 fault, which waits on mu_ and
+    // retries. va, n and off must be host-page aligned (16 KiB).
     [[nodiscard]] static std::uintptr_t host_page() noexcept {
         static const std::uintptr_t p = static_cast<std::uintptr_t>(::getpagesize());
         return p;
     }
-    [[nodiscard]] bool back_shared(std::uint64_t gpa, std::uint64_t n, int fd, std::int64_t off) noexcept {
+    [[nodiscard]] bool back_shared(std::uint64_t va, std::uint64_t n, int fd, std::int64_t off) noexcept {
         const std::uintptr_t hp = host_page();
-        if ((gpa | n) & (hp - 1) || (off & static_cast<std::int64_t>(hp - 1)) || !n) return false;
-        auto win = ram().at(gpa, n);
+        if ((va | n) & (hp - 1) || (off & static_cast<std::int64_t>(hp - 1)) || !n) return false;
+        auto win = ram().at(va, n);
         if (win.empty()) return false;
-        const auto flags = static_cast<hv_memory_flags_t>(HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
-        if (vm_live_ && ::hv_vm_unmap(gpa, n) != HV_SUCCESS) return false;
+        std::lock_guard l{mu_};
+        const auto hit = populated_in(va, va + n);
+        for (const auto& [c, s] : hit) (void)::hv_vm_unmap(slot_ipa(s), HvfLayout::chunk);
+        constexpr int kRw = PROT_READ | PROT_WRITE;
         void* got = fd >= 0
-            ? ::mmap(win.data(), n, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, off)
-            : ::mmap(win.data(), n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+            ? ::mmap(win.data(), n, kRw, MAP_SHARED | MAP_FIXED, fd, off)
+            : ::mmap(win.data(), n, kRw, MAP_SHARED | MAP_ANON | MAP_FIXED, -1, 0);
         const bool ok = got == win.data();
-        if (!ok)        // keep the range usable: plain private memory
-            (void)::mmap(win.data(), n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
-        if (vm_live_ && ::hv_vm_map(win.data(), gpa, n, flags) != HV_SUCCESS) return false;
+        if (!ok)        // keep the range usable: plain zero memory
+            (void)::mmap(win.data(), n, kRw, MAP_SHARED | MAP_ANON | MAP_FIXED, -1, 0);
+        bool back = true;
+        bool evicted = false;
+        for (const auto& [c, s] : hit)
+            if (::hv_vm_map(window_ + (c << 21), slot_ipa(s), HvfLayout::chunk, kRwx) != HV_SUCCESS) {
+                evict(s);                              // refaults later
+                back = false;
+                evicted = true;
+            }
+        if (evicted) seal_evictions();
+        return ok && back;
+    }
+
+    // -- Page tables ----------------------------------------------------------
+    // `perms(lo, hi, out)` fills out[i] with the Linux protection of the
+    // guest page lo + i*4096, for [lo, hi) inside one chunk: the caller's
+    // view of the truth (HvfTrap::fill_prot), consulted under mu_.
+
+    // Bring the chunk holding `va` into the VM. The caller retries the
+    // faulting instruction on mapped/present, and on busy after a flush.
+    template <class Perms>
+    [[nodiscard]] Populate populate(std::uint64_t va, Perms&& perms) {
+        const std::uint64_t c = va >> 21;
+        if (!c || va >= va_top_ || !priv_) return Populate::failed;
+        if (!ensure(c << 21, HvfLayout::chunk)) return Populate::failed;
+        std::lock_guard l{mu_};
+        if (slot_of_.count(c)) return Populate::present;
+        const std::uint32_t s = take_slot();
+        if (s == kNoSlot) return Populate::busy;
+        const std::uint64_t ipa = slot_ipa(s);
+        const std::uint64_t l2 = l2_for(c << 21, /*create=*/true);
+        if (!l2 || ::hv_vm_map(window_ + (c << 21), ipa, HvfLayout::chunk, kRwx) != HV_SUCCESS) {
+            free_slots_.push_back(s);
+            return Populate::failed;
+        }
+        std::uint8_t prot[512];
+        perms(c << 21, (c + 1) << 21, prot);
+        auto* l3 = table(l3_ipa(s));
+        for (std::uint64_t i = 0; i < 512; ++i) l3[i] = pte::page(ipa + i * HvfLayout::page, prot[i]);
+        // the entries before the link: a walk that sees the link sees them
+        put(table(l2) + (c & 0x1ff), l3_ipa(s) | pte::kTable);
+        slot_of_.emplace(c, s);
+        chunk_of_[s] = c;
+        fifo_.push_back({s, c});
+        touched_insert(c);
+        return Populate::mapped;
+    }
+
+    // Recompute the entries of [va, va+n) wherever its chunks are in the VM
+    // (elsewhere there is nothing to update: they are computed when
+    // populated). True if any entry was rewritten -- the caller must then
+    // flush the guest's TLB (HvfCpu::flush_tlb_on_entry) before it runs.
+    template <class Perms>
+    bool refresh(std::uint64_t va, std::uint64_t n, Perms&& perms) {
+        const std::uint64_t lo = va & ~(HvfLayout::page - 1);
+        const std::uint64_t hi = std::min(va_top_, (va + n + HvfLayout::page - 1) & ~(HvfLayout::page - 1));
+        if (hi <= lo || !priv_) return false;
+        std::lock_guard l{mu_};
+        bool any = false;
+        std::uint8_t prot[512];
+        for (const auto& [c, s] : populated_in(lo, hi)) {
+            const std::uint64_t plo = std::max(lo, c << 21), phi = std::min(hi, (c + 1) << 21);
+            perms(plo, phi, prot);
+            auto* l3 = table(l3_ipa(s));
+            const std::uint64_t ipa = slot_ipa(s);
+            for (std::uint64_t p = plo; p < phi; p += HvfLayout::page) {
+                const std::uint64_t i = (p >> 12) & 0x1ff;
+                put(l3 + i, pte::page(ipa + i * HvfLayout::page, prot[(p - plo) >> 12]));
+            }
+            any = true;
+        }
+        return any;
+    }
+
+    // A fork's extents: `want` (the address space's live ranges, host-page
+    // aligned) cut down to the chunks that may hold data, merged into runs.
+    [[nodiscard]] std::vector<Extent> touched_extents(const std::vector<Extent>& want) const {
+        std::vector<std::uint64_t> cs;
+        {
+            std::lock_guard l{touched_mu_};
+            cs.assign(touched_.begin(), touched_.end());
+        }
+        std::sort(cs.begin(), cs.end());
+        std::vector<Extent> out;
+        std::size_t k = 0;
+        for (const Extent& e : want) {
+            const std::uint64_t c0 = e.lo >> 21, c1 = (e.hi - 1) >> 21;
+            k = static_cast<std::size_t>(std::lower_bound(cs.begin(), cs.end(), c0) - cs.begin());
+            for (; k < cs.size() && cs[k] <= c1; ++k) {
+                const std::uint64_t lo = std::max(e.lo, cs[k] << 21);
+                const std::uint64_t hi = std::min(e.hi, (cs[k] + 1) << 21);
+                if (!out.empty() && out.back().hi == lo) out.back().hi = hi;
+                else out.push_back({lo, hi});
+            }
+        }
+        return out;
+    }
+    // The host is about to write guest memory directly (a loader, read(2)
+    // into a buffer, a signal frame): what it writes must survive a fork.
+    void note_touched(std::uint64_t va, std::uint64_t n) const {
+        if (!n || va >= va_top_) return;
+        const std::uint64_t c0 = va >> 21, c1 = (std::min(va + n, va_top_) - 1) >> 21;
+        std::lock_guard l{touched_mu_};
+        for (std::uint64_t c = c0; c <= c1; ++c) touched_.insert(c);
+    }
+    void touched_insert(std::uint64_t c) const {
+        std::lock_guard l{touched_mu_};
+        touched_.insert(c);
+    }
+
+    // execve: the old image's memory and translations go, all of them. The
+    // caller flushes the TLB before the guest runs again, and exec is single
+    // threaded, so no vCPU can use a stale translation before that flush --
+    // which is why the slots and table pages are reusable at once. `old` is
+    // every range the old image could have touched (HvfTrap::fork_extents):
+    // replacing just those with fresh memory costs microseconds, where
+    // replacing the whole 64 TiB window walks all of it (11 ms and up).
+    void reset_space(const std::vector<Extent>& old) noexcept {
+        std::lock_guard l{mu_};
+        for (const auto& [c, s] : slot_of_) {
+            (void)::hv_vm_unmap(slot_ipa(s), HvfLayout::chunk);
+            chunk_of_[s] = kNoChunk;
+        }
+        slot_of_.clear();
+        fifo_.clear();
+        quarantine_.clear();
+        unsealed_.clear();
+        {
+            std::lock_guard tl{touched_mu_};
+            touched_.clear();
+        }
+        free_slots_.clear();
+        for (std::uint32_t s = nslots_; s-- > 0;) free_slots_.push_back(s);
+        std::memset(priv_ + HvfLayout::l0_table, 0, HvfLayout::page);
+        pool_next_ = pool_base_;
+        (void)map_private_block();
+        for (const Extent& e : old)
+            for (std::uint64_t at = e.lo, end = std::min(e.hi, va_top_); at < end;) {
+                const std::uint64_t s = at >> kSlabBits;
+                const std::uint64_t stop = std::min(end, (s + 1) << kSlabBits);
+                if (slabs_[s]) (void)fresh_unlocked(at, stop - at);
+                at = stop;
+            }
+    }
+    // [va, va+n) -> fresh zero memory, nothing populated over it (callers:
+    // reset_space, under mu_ with every slot already out of the VM).
+    bool fresh_unlocked(std::uint64_t va, std::uint64_t n) noexcept {
+        memory_object_size_t sz = n;
+        mach_port_t e = MACH_PORT_NULL;
+        if (::mach_make_memory_entry_64(::mach_task_self(), &sz, 0,
+                MAP_MEM_NAMED_CREATE | VM_PROT_READ | VM_PROT_WRITE, &e, MACH_PORT_NULL) != KERN_SUCCESS)
+            return false;
+        mach_vm_address_t at = reinterpret_cast<mach_vm_address_t>(window_ + va);
+        const bool ok = ::mach_vm_map(::mach_task_self(), &at, n, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, e, 0,
+                                      FALSE, VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE,
+                                      VM_INHERIT_NONE) == KERN_SUCCESS;
+        ::mach_port_deallocate(::mach_task_self(), e);
         return ok;
     }
 
 private:
-    [[nodiscard]] Status attach(bool build_tables = true) {
-        if (build_tables) {
-            build_page_tables(base_, size_);
-            write_vector_stub(base_, size_);
-            ::sys_icache_invalidate(base_ + HvfLayout::vectors, 16 * 0x80);
-        }
+    static constexpr std::uint32_t kNoSlot = ~std::uint32_t{0};
+    static constexpr std::uint64_t kNoChunk = ~std::uint64_t{0};
+    static constexpr auto kRwx = static_cast<hv_memory_flags_t>(HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
 
-        if (!vm_live_) {
-            if (::hv_vm_create(nullptr) != HV_SUCCESS) return err(Errno::enodev);
-            vm_live_ = true;
+    // The biggest window the host grants, from 2^46 down. One per process:
+    // two 64 TiB reservations do not fit the host's 47-bit user space, but a
+    // fork child is a fresh process with its own.
+    //
+    // Reserving 64 TiB costs what its map entries cost, and XNU makes many:
+    // plain anonymous memory is split into 128 MiB entries (ANON_CHUNK_SIZE),
+    // half a million of them -- 65 ms to create, as much to tear down at
+    // exit, on every guest process. A single named entry tops out at 2^45,
+    // and two of them still cost 5 ms per process exit. So the window is
+    // NOT reserved: it is a fixed host range (host processes map nothing
+    // that high: libraries and heaps live below 1 TiB) populated in 8 GiB
+    // SLABS, each one Mach named entry created on first use -- a typical
+    // process touches four or five (image, heap, libraries, stack), for
+    // ~30 us. Every host-side access goes through GuestRam, whose ensure
+    // hook maps a slab before handing out a pointer into it.
+    static constexpr unsigned kSlabBits = 33;
+    static constexpr std::uint64_t kSlab = 1ull << kSlabBits;
+    [[nodiscard]] Status reserve_window() {
+        constexpr std::uint64_t kBase = 1ull << 44;          // 16 TiB
+        for (unsigned bits = 46; bits >= 39; --bits) {
+            mach_vm_address_t probe = kBase;
+            // the range must be free: claim nothing, just look
+            mach_vm_size_t sz = 0;
+            vm_region_basic_info_data_64_t info{};
+            mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+            mach_port_t obj = MACH_PORT_NULL;
+            const bool clear = ::mach_vm_region(::mach_task_self(), &probe, &sz, VM_REGION_BASIC_INFO_64,
+                                                reinterpret_cast<vm_region_info_t>(&info), &cnt, &obj) != KERN_SUCCESS
+                               || probe >= kBase + (1ull << bits);
+            if (!clear) continue;
+            window_ = reinterpret_cast<std::byte*>(kBase);
+            va_top_ = 1ull << bits;
+            va_bits_ = bits;
+            g_va_bits.store(bits);
+            slabs_.assign(static_cast<std::size_t>(va_top_ >> kSlabBits), 0);
+            return ok();
         }
-        const auto flags = static_cast<hv_memory_flags_t>(
-            HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
-        if (::hv_vm_map(base_, 0, size_, flags) != HV_SUCCESS)
-            return err(Errno::enomem);
+        return err(Errno::enomem);
+    }
+    // Map the slabs under [va, va+n). Lock-free on the hot path (slab
+    // already there); creation serializes on slab_mu_.
+    [[nodiscard]] bool ensure(std::uint64_t va, std::uint64_t n) const noexcept {
+        if (!n || va >= va_top_) return n == 0;
+        const std::uint64_t last = std::min(va + n, va_top_) - 1;
+        for (std::uint64_t s = va >> kSlabBits; s <= last >> kSlabBits; ++s)
+            if (!__atomic_load_n(&slabs_[s], __ATOMIC_ACQUIRE) && !make_slab(s)) return false;
+        return true;
+    }
+    // GuestRam's hook: a host pointer into guest memory is about to be used
+    // (read or written -- it can't tell), so the chunks may hold data a fork
+    // must carry. Huge spans (a bounds probe over a reservation) are not
+    // recorded chunk by chunk: those are never written whole.
+    static bool ensure_cb(const void* self, std::uint64_t va, std::uint64_t n) {
+        const auto* m = static_cast<const HvfMachine*>(self);
+        if (!m->ensure(va, n)) return false;
+        if (n <= kNoteMax) m->note_touched(va, n);
+        return true;
+    }
+    static constexpr std::uint64_t kNoteMax = 256ull << 20;
+    [[nodiscard]] bool make_slab(std::uint64_t s) const noexcept {
+        std::lock_guard l{slab_mu_};
+        if (slabs_[s]) return true;
+        memory_object_size_t n = kSlab;
+        mach_port_t e = MACH_PORT_NULL;
+        if (::mach_make_memory_entry_64(::mach_task_self(), &n, 0,
+                MAP_MEM_NAMED_CREATE | VM_PROT_READ | VM_PROT_WRITE, &e, MACH_PORT_NULL) != KERN_SUCCESS)
+            return false;
+        mach_vm_address_t at = reinterpret_cast<mach_vm_address_t>(window_) + (s << kSlabBits);
+        // OVERWRITE: a fork child's snapshot extents may already sit here;
+        // they are re-laid over the fresh slab by the caller (init_child).
+        const kern_return_t kr = ::mach_vm_map(::mach_task_self(), &at, kSlab, 0,
+                                               VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, e, 0, FALSE,
+                                               VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE,
+                                               VM_INHERIT_NONE);
+        ::mach_port_deallocate(::mach_task_self(), e);
+        if (kr != KERN_SUCCESS) return false;
+        __atomic_store_n(&slabs_[s], std::uint8_t{1}, __ATOMIC_RELEASE);
+        return true;
+    }
+
+    // Size the IPA plan, then build the private pages and map them.
+    [[nodiscard]] Status build_private() {
+        const std::uint64_t ipa_top = 1ull << ipa_bits_;
+        // Every L1 and L2 table the VA space could ever need: tables are
+        // never freed (bounded, and a freed table could be reached through a
+        // stale walk cache), so the pool must hold them all.
+        const std::uint64_t pool_pages = (1ull << (va_bits_ - 30)) + (1ull << (va_bits_ - 39)) + 1;
+        auto end_of = [&](std::uint64_t n) {
+            const std::uint64_t pool_end = HvfLayout::tables + (n + pool_pages) * HvfLayout::page;
+            const std::uint64_t slots = (pool_end + HvfLayout::chunk - 1) & ~(HvfLayout::chunk - 1);
+            return slots + n * HvfLayout::chunk;
+        };
+        std::uint64_t n = std::min<std::uint64_t>((ipa_top - HvfLayout::tables) / (HvfLayout::chunk + HvfLayout::page),
+                                                  1u << 20);
+        while (n && end_of(n) > ipa_top) --n;
+        if (const char* e = std::getenv("LINUXITY_VM_SLOTS"))     // tests: force eviction
+            n = std::clamp<std::uint64_t>(std::strtoull(e, nullptr, 10), 4, n);
+        if (n < 4) return err(Errno::enomem);
+        nslots_ = static_cast<std::uint32_t>(n);
+        pool_base_ = pool_next_ = HvfLayout::tables + n * HvfLayout::page;
+        pool_end_ = pool_base_ + pool_pages * HvfLayout::page;
+        priv_bytes_ = (pool_end_ + HvfLayout::chunk - 1) & ~(HvfLayout::chunk - 1);
+        slots_ipa_ = priv_bytes_;
+        void* p = ::mmap(nullptr, priv_bytes_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (p == MAP_FAILED) return err(Errno::enomem);
+        priv_ = static_cast<std::byte*>(p);
+        write_vector_stub(priv_);
+        ::sys_icache_invalidate(priv_ + HvfLayout::vectors, 16 * 0x80 + 16);
+        if (!map_private_block()) return err(Errno::enomem);
+        if (::hv_vm_map(priv_, 0, priv_bytes_, kRwx) != HV_SUCCESS) return err(Errno::enomem);
+        chunk_of_.assign(nslots_, kNoChunk);
+        free_slots_.clear();
+        for (std::uint32_t s = nslots_; s-- > 0;) free_slots_.push_back(s);
         return ok();
     }
 
-    std::byte* base_{nullptr};
-    std::uint64_t size_{0};
+    // VA [0, 2 MiB) -> IPA [0, 2 MiB): EL1-only (AP=00), executable at EL1
+    // only (UXN), as one block entry.
+    [[nodiscard]] bool map_private_block() {
+        const std::uint64_t l2 = l2_for(0, /*create=*/true);
+        if (!l2) return false;
+        put(table(l2), 0 | pte::kAf | pte::kSh | pte::kUxn | pte::kBlock);
+        return true;
+    }
+
+    [[nodiscard]] std::uint64_t* table(std::uint64_t ipa) const noexcept {
+        return reinterpret_cast<std::uint64_t*>(priv_ + ipa);
+    }
+    static void put(std::uint64_t* e, std::uint64_t v) noexcept {
+        __atomic_store_n(e, v, __ATOMIC_RELEASE);
+    }
+    [[nodiscard]] std::uint64_t slot_ipa(std::uint32_t s) const noexcept {
+        return slots_ipa_ + static_cast<std::uint64_t>(s) * HvfLayout::chunk;
+    }
+    [[nodiscard]] static std::uint64_t l3_ipa(std::uint32_t s) noexcept {
+        return HvfLayout::tables + static_cast<std::uint64_t>(s) * HvfLayout::page;
+    }
+    // The L2 table whose entries cover `va`'s GiB, creating the L1 and L2
+    // tables on the way if asked; 0 if absent (or the pool is exhausted).
+    [[nodiscard]] std::uint64_t l2_for(std::uint64_t va, bool create) {
+        std::uint64_t at = HvfLayout::l0_table;
+        for (const unsigned shift : {39u, 30u}) {
+            std::uint64_t* e = table(at) + ((va >> shift) & 0x1ff);
+            if (!(*e & 1)) {
+                if (!create || pool_next_ >= pool_end_) return 0;
+                const std::uint64_t t = pool_next_;
+                pool_next_ += HvfLayout::page;
+                std::memset(priv_ + t, 0, HvfLayout::page);
+                put(e, t | pte::kTable);
+            }
+            at = *e & pte::kAddr;
+        }
+        return at;
+    }
+    // The populated chunks overlapping [lo, hi), as (chunk, slot).
+    [[nodiscard]] std::vector<std::pair<std::uint64_t, std::uint32_t>>
+    populated_in(std::uint64_t lo, std::uint64_t hi) const {
+        std::vector<std::pair<std::uint64_t, std::uint32_t>> out;
+        if (hi <= lo) return out;
+        const std::uint64_t c0 = lo >> 21, c1 = (hi - 1) >> 21;
+        if (c1 - c0 + 1 > slot_of_.size()) {          // a huge range: walk the slots instead
+            for (const auto& [c, s] : slot_of_)
+                if (c >= c0 && c <= c1) out.emplace_back(c, s);
+        } else {
+            for (std::uint64_t c = c0; c <= c1; ++c)
+                if (auto it = slot_of_.find(c); it != slot_of_.end()) out.emplace_back(c, it->second);
+        }
+        return out;
+    }
+
+    // A free slot, evicting the oldest chunks if there is none. Evicted
+    // slots wait in quarantine until a TLB flush that began after their
+    // eviction has completed: until then some vCPU may still hold a
+    // translation to them, and reusing one would show it ANOTHER chunk.
+    [[nodiscard]] std::uint32_t take_slot() {
+        if (free_slots_.empty()) release_quarantine();
+        if (free_slots_.empty() && quarantine_.size() < nslots_ / 32 + 1) {
+            for (std::size_t n = nslots_ / 16 + 1; n && !fifo_.empty();) {
+                const auto [s, c] = fifo_.front();
+                fifo_.pop_front();
+                if (chunk_of_[s] != c) continue;       // evicted earlier
+                evict(s);
+                --n;
+            }
+            seal_evictions();
+            release_quarantine();
+        }
+        if (free_slots_.empty()) return kNoSlot;
+        const std::uint32_t s = free_slots_.back();
+        free_slots_.pop_back();
+        return s;
+    }
+    void release_quarantine() {
+        const std::uint64_t done = g_flush_done.load(std::memory_order_acquire);
+        std::erase_if(quarantine_, [&](const std::pair<std::uint32_t, std::uint64_t>& q) {
+            if (q.second > done) return false;
+            free_slots_.push_back(q.first);
+            return true;
+        });
+    }
+    // Unlink the chunk FIRST, then take it out of the VM: no new walk can
+    // reach the slot, and the unmap drops what the TLB held of it.
+    void evict(std::uint32_t s) {
+        const std::uint64_t c = chunk_of_[s];
+        if (c == kNoChunk) return;
+        if (const std::uint64_t l2 = l2_for(c << 21, /*create=*/false))
+            put(table(l2) + (c & 0x1ff), 0);
+        (void)::hv_vm_unmap(slot_ipa(s), HvfLayout::chunk);
+        chunk_of_[s] = kNoChunk;
+        slot_of_.erase(c);
+        unsealed_.push_back(s);
+    }
+    // Ticket the slots just evicted: the next flush to BEGIN from now on
+    // starts after their entries were gone, so its completion frees them.
+    // (Taken after the unlinks -- a ticket taken before could match a
+    // flush that ran while a walk could still cache the old entry.)
+    void seal_evictions() {
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        const std::uint64_t ticket = g_flush_begun.load(std::memory_order_acquire) + 1;
+        for (std::uint32_t s : unsealed_) quarantine_.emplace_back(s, ticket);
+        unsealed_.clear();
+    }
+
+    std::byte* window_{nullptr};        // guest VA backing store
+    std::uint64_t va_top_{0};
+    mutable std::vector<std::uint8_t> slabs_;     // which 8 GiB slabs are mapped
+    mutable std::mutex slab_mu_;
+    unsigned va_bits_{0}, ipa_bits_{36};
+    std::byte* priv_{nullptr};          // IPA [0, priv_bytes_)
+    std::uint64_t priv_bytes_{0};
+    std::uint64_t pool_base_{0}, pool_next_{0}, pool_end_{0};
+    std::uint64_t slots_ipa_{0};
+    std::uint32_t nslots_{0};
     bool vm_live_{false};
-    bool owns_ram_{false};
+
+    mutable std::mutex mu_;
+    std::unordered_map<std::uint64_t, std::uint32_t> slot_of_;    // chunk -> slot
+    std::vector<std::uint64_t> chunk_of_;                         // slot -> chunk
+    std::vector<std::uint32_t> free_slots_;
+    std::deque<std::pair<std::uint32_t, std::uint64_t>> fifo_;    // (slot, chunk), oldest first
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> quarantine_;   // (slot, flush ticket)
+    std::vector<std::uint32_t> unsealed_;                         // evicted, not yet ticketed
+    // Every chunk that may hold data: populated in the VM since the last
+    // exec, written by the host (ensure_touched), or received from a fork
+    // parent. A fork snapshots only these -- a Mach COW snapshot costs ~9 ms
+    // per GiB COVERED, touched or not, and Firefox reserves 176 GiB.
+    mutable std::unordered_set<std::uint64_t> touched_;
+    mutable std::mutex touched_mu_;     // a leaf lock: taken under mu_ too
 };
 
 // -- The vCPU budget ---------------------------------------------------------
@@ -637,13 +984,16 @@ public:
         };
         sr(HV_SYS_REG_VBAR_EL1, HvfLayout::vectors);
         sr(HV_SYS_REG_MAIR_EL1, 0xff);               // Attr0 = Normal WB
-        // TCR_EL1: T0SZ=25 (39-bit VA) | EPD1 | 4 KiB granule | inner
-        // shareable | Normal-WB walks | TBI0 (libc pointer tagging) |
-        // IPS=36-bit.
-        sr(HV_SYS_REG_TCR_EL1, 25ull | (1ull << 8) | (1ull << 10)
+        // TCR_EL1: T0SZ = 64 - VA bits (a 4-level walk from L0) | Normal-WB
+        // walks | inner shareable | 4 KiB granule | EPD1 | TBI0 (libc
+        // pointer tagging) | IPS = the VM's IPA size.
+        const unsigned va = g_va_bits.load(), ipa = g_ipa_bits.load();
+        const std::uint64_t ips = ipa <= 32 ? 0 : ipa <= 36 ? 1 : ipa <= 40 ? 2
+                                : ipa <= 42 ? 3 : ipa <= 44 ? 4 : 5;
+        sr(HV_SYS_REG_TCR_EL1, (64ull - va) | (1ull << 8) | (1ull << 10)
                                      | (3ull << 12) | (1ull << 23)
-                                     | (1ull << 32));
-        sr(HV_SYS_REG_TTBR0_EL1, HvfLayout::l1_table);
+                                     | (1ull << 37) | (ips << 32));
+        sr(HV_SYS_REG_TTBR0_EL1, HvfLayout::l0_table);
         sr(HV_SYS_REG_CPACR_EL1, 3ull << 20);        // FP/SIMD usable at EL0
         // SCTLR_EL1: M | C | I (MMU + caches) | SA/SA0 | nTWI/nTWE | SPAN,
         // plus the RES1 bits. Caches ON matters: libc issues DC/IC
@@ -689,7 +1039,9 @@ public:
     // events, so they surface as EINTR for the caller to retry.
     [[nodiscard]] Result<GuestRegs> run() {
         const bool detour = flush_pending_;
+        std::uint64_t ticket = 0;
         if (flush_pending_) {
+            ticket = g_flush_begun.fetch_add(1, std::memory_order_acq_rel) + 1;
             // Enter at EL1 on the flush stub, which erets to the guest's
             // real PC/PSTATE (parked in ELR_EL1/SPSR_EL1): its translations
             // are rebuilt from the edited tables before it runs one insn.
@@ -705,8 +1057,10 @@ public:
         if (::hv_vcpu_run(cpu_) != HV_SUCCESS) return err<GuestRegs>(Errno::eio);
         if (exit_->reason != HV_EXIT_REASON_EXCEPTION) {
             unwind_el1(detour);
+            if (ticket && !flush_pending_) flush_done(ticket);
             return err<GuestRegs>(Errno::eintr);
         }
+        if (ticket) flush_done(ticket);    // any exception exit: the stub has run
         // Most exits arrive through the guest's EL1 vectors, which `hvc` out
         // with ESR_EL1/ELR_EL1 describing the EL0 event. A STAGE-2 abort does
         // not: the host refused the page behind guest RAM (a shared file
@@ -721,6 +1075,7 @@ public:
             ::hv_vcpu_get_reg(cpu_, HV_REG_CPSR, &r.spsr);
             r.esr = exit_->exception.syndrome;
             stage2_far_ = exit_->exception.virtual_address;
+            stage2_ipa_ = exit_->exception.physical_address;
             return ok(r);
         }
         stage2_far_.reset();
@@ -730,12 +1085,25 @@ public:
     void set_result(const GuestRegs& r, std::int64_t ret) noexcept {
         write_return(cpu_, r, ret);
     }
+    // Resume at the faulting instruction itself (a fault that was repaired:
+    // a chunk populated, a stale entry rewritten). r.elr/r.spsr are the
+    // EL0 context for both kinds of abort.
+    void retry(const GuestRegs& r) noexcept {
+        ::hv_vcpu_set_reg(cpu_, HV_REG_PC, r.elr);
+        ::hv_vcpu_set_reg(cpu_, HV_REG_CPSR, r.spsr);
+    }
 
     // FAR_EL1, fetched only when a caller actually needs it -- see the note
     // on read_regs(). Valid only for an abort.
     [[nodiscard]] std::uint64_t fault_address() const noexcept {
         if (stage2_far_) return *stage2_far_;
         return ::lx::runtime::fault_address(cpu_);
+    }
+    // The last fault was the HOST refusing guest-physical memory (stage 2),
+    // not the guest's own tables: the IPA it touched.
+    [[nodiscard]] std::optional<std::uint64_t> stage2_ipa() const noexcept {
+        if (!stage2_far_) return std::nullopt;
+        return stage2_ipa_;
     }
 
     // -- Full user-visible state ------------------------------------------
@@ -823,6 +1191,11 @@ public:
     }
 
 private:
+    static void flush_done(std::uint64_t ticket) noexcept {
+        std::uint64_t cur = g_flush_done.load(std::memory_order_relaxed);
+        while (cur < ticket &&
+               !g_flush_done.compare_exchange_weak(cur, ticket, std::memory_order_acq_rel)) {}
+    }
     void destroy() noexcept {
         if (!live_) return;
         {
@@ -853,13 +1226,18 @@ private:
         if (pc >= HvfLayout::tlb_flush_stub) {
             flush_pending_ = detour || flush_pending_;   // may not have run
         } else if (pc >= HvfLayout::vectors + 8 * 0x80 &&
-                   pc < HvfLayout::vectors + 9 * 0x80 &&
-                   (sys(HV_SYS_REG_ESR_EL1) >> 26) == 0x15) {
-            // An svc in the in-guest handler. Past `mov x0, x16` (0x34:
-            // the eret) the answer is in x0 -- finish it; before, x0 is
-            // untouched and the svc simply runs again (x16/x17 are
-            // scratch by the ABI).
-            if (pc != HvfLayout::vectors + 8 * 0x80 + 0x34) elr -= 4;
+                   pc < HvfLayout::vectors + 9 * 0x80) {
+            const std::uint64_t entry = HvfLayout::vectors + 8 * 0x80;
+            if ((sys(HV_SYS_REG_ESR_EL1) >> 26) == 0x15) {
+                // An svc in the in-guest handler. At the eret the answer is
+                // in x0 -- finish it; before, x0 is untouched and the svc
+                // simply runs again (x16/x17 are scratch by the ABI).
+                if (pc != entry + inguest::kEretOffset) elr -= 4;
+            } else if (pc > entry) {
+                // A fault on its way out: the handler parked the guest's x16
+                // in TPIDR_EL1 and may have overwritten it since.
+                ::hv_vcpu_set_reg(cpu_, HV_REG_X16, sys(HV_SYS_REG_TPIDR_EL1));
+            }
         }
         // Any other vector: ELR is the faulting/next instruction already.
         ::hv_vcpu_set_reg(cpu_, HV_REG_PC, elr);
@@ -881,6 +1259,7 @@ private:
     bool flush_pending_{false};
     // FAR of the last stage-2 abort (run()); FAR_EL1 is stale for those.
     std::optional<std::uint64_t> stage2_far_;
+    std::uint64_t stage2_ipa_{0};
 };
 
 } // namespace lx::runtime

@@ -63,9 +63,16 @@ namespace {
 
 using cli::Options;
 
-// The guest's RAM: --memory, else 2 GiB. A VM needs a size up front.
+// What the guest is told it has (MemTotal, sysinfo): --memory, else the
+// host's physical RAM. Nothing is reserved up front -- guest memory is
+// allocated on first touch and returned on munmap/exit -- so this is a
+// report, as a container's limit reads, not a size the VM must commit.
 [[nodiscard]] std::uint64_t vm_bytes(const Options& o) {
-    return o.res.mem_max.value_or(std::uint64_t{2048} << 20);
+    if (o.res.mem_max) return *o.res.mem_max;
+    std::uint64_t ram = 0;
+    std::size_t n = sizeof ram;
+    if (::sysctlbyname("hw.memsize", &ram, &n, nullptr, 0) == 0 && ram) return ram;
+    return std::uint64_t{8} << 30;
 }
 
 [[nodiscard]] bool is_dir(const std::string& p) {
@@ -362,10 +369,9 @@ public:
                 std::vector<int> fds{0, 1, 2};
                 fds.insert(fds.end(), img.fd_hosts.begin(), img.fd_hosts.end());
                 fds.push_back(pids_.fd());
-                const mach_port_t mem = runtime::fork_ipc::snapshot(machine_.raw_base(),
-                                                                    machine_.mem_size());
-                const bool sent = runtime::fork_ipc::send_with_fds(
-                    z.reply, mem, machine_.mem_size(), runtime::wire::encode(img), fds);
+                const auto mem = machine_.snapshot(img.extents);
+                const bool sent = !mem.empty() && runtime::fork_ipc::send_with_fds(
+                    z.reply, mem, runtime::wire::encode(img), fds);
                 ::mach_port_deallocate(::mach_task_self(), z.reply);
                 mark("zygote-sent");
                 if (sent) { spawn_zygote_async(); return z.pid; }
@@ -505,10 +511,10 @@ public:
             return -1;
         }
         mark("hello");
-        const mach_port_t mem = runtime::fork_ipc::snapshot(machine_.raw_base(), machine_.mem_size());
+        const auto mem = machine_.snapshot(img.extents);
         mark("snapshot");
-        const bool sent = runtime::fork_ipc::send(hello.h.msgh_remote_port, mem,
-                                                  machine_.mem_size(), runtime::wire::encode(img));
+        const bool sent = !mem.empty() &&
+            runtime::fork_ipc::send(hello.h.msgh_remote_port, mem, runtime::wire::encode(img));
         mark("sent");
         ::mach_port_mod_refs(::mach_task_self(), svc, MACH_PORT_RIGHT_RECEIVE, -1);
         if (!sent) fork_failed("sending the guest to the child", 0);
@@ -720,15 +726,18 @@ struct ChildArgs {
     rmark("hello-sent");
     if (!runtime::fork_ipc::receive(reply, in, parent)) ::_exit(127);   // parent gave up: so do we
     rmark("received");
-    void* ram = runtime::fork_ipc::map_snapshot(in.memory, in.mem_size);
-    if (!ram) { std::fputs("linuxity: fork: cannot map the parent's memory\n", stderr); return false; }
-    if (auto st = vm.init_from(ram, in.mem_size); !st) {
-        std::fprintf(stderr, "linuxity: fork: %s\n", st.error() == Errno::enodev
-            ? "the hypervisor refused another VM (too many guest processes at once?)"
-            : "cannot map guest memory into the VM");
+    if (!runtime::wire::decode(in.blob, img)) {
+        runtime::fork_ipc::drop_ports(in.memory);
+        std::fputs("linuxity: fork: a malformed handoff\n", stderr);
         return false;
     }
-    return runtime::wire::decode(in.blob, img);
+    if (auto st = vm.init_child(img.extents, in.memory); !st) {
+        std::fprintf(stderr, "linuxity: fork: %s\n", st.error() == Errno::enodev
+            ? "the hypervisor refused another VM (too many guest processes at once?)"
+            : "cannot map the parent's memory");
+        return false;
+    }
+    return true;
 }
 
 // -- Running one guest THREAD ------------------------------------------------
@@ -1127,13 +1136,14 @@ int cli::host_internal(const Options& o, int argc, char** argv, int i) {
         }
         const int pid_fd = in.fds.back();
         std::vector<int> groups(in.fds.begin() + 3, in.fds.end() - 1);
-        void* ram = runtime::fork_ipc::map_snapshot(in.memory, in.mem_size);
-        zmark("mapped");
         runtime::HvfTrap::ForkImage img;
-        if (!ram || !machine.init_from(ram, in.mem_size) || !runtime::wire::decode(in.blob, img)) {
+        const bool decoded = runtime::wire::decode(in.blob, img);
+        if (!decoded) runtime::fork_ipc::drop_ports(in.memory);
+        if (!decoded || !machine.init_child(img.extents, in.memory)) {
             std::fputs("linuxity: zygote handoff failed\n", stderr);
             return 127;
         }
+        zmark("mapped");
         zmark("vm");
         m.k.import_fork(img.namespace_state);
         runtime::g_pending.reset_for_fork_child();
@@ -1198,7 +1208,7 @@ int cli::host_run(Options& o, int, char**) {
     }
 
     runtime::HvfMachine machine;
-    if (auto st = machine.init(vm_bytes(o)); !st) {
+    if (auto st = machine.init(); !st) {
         std::fprintf(stderr,
             "linuxity: cannot create a hypervisor VM. This binary must be signed\n"
             "with the com.apple.security.hypervisor entitlement:\n"
