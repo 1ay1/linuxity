@@ -22,6 +22,8 @@
 #define LX_KERNEL_RESOLVER_HPP
 
 #include <array>
+#include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -95,10 +97,23 @@ using Nameservers = std::vector<std::string>;
 
 // --- the policy ------------------------------------------------------------
 
+// The resolver address a guest is given when linuxity proxies the host's own
+// (127.0.0.53:53, systemd-resolved's stub address), and the loopback port the
+// proxy really listens on. 0 = no proxy running.
+inline constexpr std::string_view kDnsGuestAddrText = "127.0.0.53";
+inline constexpr std::array<std::uint8_t, 4> kDnsGuestAddr{127, 0, 0, 53};
+inline std::atomic<std::uint16_t>& dns_proxy_port_ref() noexcept {
+    static std::atomic<std::uint16_t> p{0};
+    return p;
+}
+[[nodiscard]] inline std::uint16_t dns_proxy_port() noexcept {
+    return dns_proxy_port_ref().load(std::memory_order_relaxed);
+}
+
 // Where a resolver list came from, so the caller can tell the user. The guest
 // never sees this; it exists because "DNS silently did nothing" is the bug
 // this module was written to kill.
-enum class ResolverOrigin { none, env, host_file, guest_file, fallback };
+enum class ResolverOrigin { none, env, host_file, guest_file, host_proxy, fallback };
 
 struct ResolverChoice {
     Nameservers     servers{};
@@ -113,6 +128,7 @@ struct ResolverChoice {
         case ResolverOrigin::env:        return "LINUXITY_DNS";
         case ResolverOrigin::host_file:  return "host /etc/resolv.conf";
         case ResolverOrigin::guest_file: return "rootfs /etc/resolv.conf";
+        case ResolverOrigin::host_proxy: return "the host's resolver";
         case ResolverOrigin::fallback:   return "public resolvers";
     }
     return "?";
@@ -138,6 +154,11 @@ struct ResolverChoice {
     if (host_resolv && *host_resolv)
         if (auto v = nameservers_from_file(host_resolv); !v.empty())
             return {std::move(v), ResolverOrigin::host_file};
+
+    // A host whose resolver isn't a file (Android's netd): linuxity proxies
+    // it at kDnsGuestAddr, which the trap redirects (runtime/linux/dns_proxy.hpp).
+    if (dns_proxy_port() != 0)
+        return {{std::string{kDnsGuestAddrText}}, ResolverOrigin::host_proxy};
 
     return {nameservers_public(), ResolverOrigin::fallback};
 }

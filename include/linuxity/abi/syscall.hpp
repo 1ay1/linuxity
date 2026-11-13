@@ -17,6 +17,7 @@
 #include "linuxity/kernel/file_namespace.hpp"
 #include "linuxity/kernel/machine.hpp"
 #include "linuxity/kernel/nl80211.hpp"
+#include "linuxity/kernel/resolver.hpp"
 #include "linuxity/kernel/process_table.hpp"
 #include "linuxity/kernel/subsystem.hpp"
 #include "linuxity/abi/identity.hpp"
@@ -1066,6 +1067,7 @@ private:
             case Sysno::bind:
                 return do_sockaddr_un(r, /*for_bind=*/true);
             case Sysno::connect:
+                if (dns_redirect(r.arg[1], r.arg[2])) return fwd();
                 return do_sockaddr_un(r, /*for_bind=*/false);
 
             // -- prctl(PR_SET_DUMPABLE, 0): a security-conscious guest
@@ -1144,6 +1146,7 @@ private:
                 if (auto o = nl_answer(static_cast<int>(r.arg[0]), uaddr(r.arg[1]),
                                        static_cast<std::size_t>(r.arg[2])))
                     return std::move(*o);
+                dns_redirect(r.arg[4], r.arg[5]);
                 return fwd();
             case Sysno::sendmsg:
                 if (!nl_socks_.empty()) {
@@ -1167,6 +1170,12 @@ private:
                 return fwd();
 
             case Sysno::prlimit64: return do_prlimit(r);
+            // recvfrom with an address (trapped only while the DNS forwarder
+            // runs): forwarded; the trap makes an answer from the forwarder
+            // read back as port 53 at the call's exit (it may block, so it
+            // must not be stepped synchronously)
+            case Sysno::recvfrom:
+                return fwd();
             // seccomp(SECCOMP_SET_MODE_STRICT=0, 0, NULL): like the prctl
             case Sysno::seccomp:
                 if (r.arg[0] == 0 && r.arg[1] == 0) {
@@ -1317,6 +1326,24 @@ private:
     static Outcome sig(std::int32_t pid, std::int32_t signum) {
         return Outcome::raise_at(pid, signum);
     }
+    // A guest UDP/TCP address of 127.0.0.53:53 is the host-resolver forwarder
+    // (dns_proxy.hpp), which listens on another port: point this call at it,
+    // and put the guest's bytes back afterwards. True if it rewrote.
+    bool dns_redirect(std::uint64_t addr, std::uint64_t len) {
+        const std::uint16_t port = kernel::dns_proxy_port();
+        if (!port || !addr || len < 8) return false;
+        std::array<std::byte, 16> b{};
+        if (!mem_.copy_in(uaddr(addr), {b.data(), 8})) return false;
+        const auto u8 = [&](std::size_t i) { return std::to_integer<std::uint8_t>(b[i]); };
+        if (u8(0) != AF_INET || u8(1) != 0 || u8(2) != 0 || u8(3) != 53) return false;
+        for (std::size_t i = 0; i < 4; ++i)
+            if (u8(4 + i) != kernel::kDnsGuestAddr[i]) return false;
+        (void)mem_.copy_in(uaddr(addr), b);
+        restore_after_ = {addr, b};
+        const std::array<std::byte, 2> p{static_cast<std::byte>(port >> 8), static_cast<std::byte>(port & 0xff)};
+        return mem_.copy_out(uaddr(addr + 2), p).has_value();
+    }
+
     // prlimit64(pid, res, new, old). The host enforces limits, but linuxity's
     // host user can't raise a hard limit, which a guest root (CAP_SYS_RESOURCE)
     // may. So a raise past the host's hard limit is recorded per process and

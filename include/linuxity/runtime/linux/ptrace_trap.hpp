@@ -1106,7 +1106,8 @@ public:
     // `ls -lR /usr/include`.
     [[nodiscard]] static bool owes_exit_stop(unsigned long long nr) {
         const auto s = abi::decode(kTraceeArch, nr);
-        return returns_pid(nr) || s == abi::Sysno::waitid || s == abi::Sysno::rt_sigtimedwait;
+        return returns_pid(nr) || s == abi::Sysno::waitid || s == abi::Sysno::rt_sigtimedwait ||
+               (s == abi::Sysno::recvfrom && kernel::dns_proxy_port() != 0);
     }
 
     // fcntl(F_GETLK) fills struct flock's l_pid with the HOST pid of the
@@ -1275,6 +1276,14 @@ public:
         auto uw = static_cast<std::uint64_t>(word);
         uw = (uw & ~0xffffffffull) | static_cast<std::uint32_t>(known_gpid_of(host));
         ::ptrace(PTRACE_POKEDATA, w, reinterpret_cast<void*>(at), reinterpret_cast<void*>(uw));
+    }
+
+    // Forward, and run `then` at the call's exit stop. Unlike forward_sync
+    // the tracer keeps serving other tasks while the call runs, so it suits
+    // calls that may block (a socket waiting for its peer).
+    [[nodiscard]] Result<std::int64_t> forward_then(std::function<void(std::int64_t)> then) {
+        tasks_[cur_].on_exit = std::move(then);
+        return forward();
     }
 
     [[nodiscard]] Result<std::int64_t> forward() {
@@ -2772,6 +2781,27 @@ private:
                             auto uw = static_cast<std::uint64_t>(word);
                             uw = (uw & ~0xffffffffull) | static_cast<std::uint32_t>(g);
                             ::ptrace(PTRACE_POKEDATA, w, reinterpret_cast<void*>(infop + 16), reinterpret_cast<void*>(uw));
+                        }
+                    }
+                }
+            } else if (abi::decode(kTraceeArch, r.nr()) == abi::Sysno::recvfrom) {
+                // an answer from the DNS forwarder reads back as from port 53
+                const std::uint16_t port = kernel::dns_proxy_port();
+                const std::uint64_t sa = r.arg(4);
+                if (port && sa && static_cast<long long>(r.ret()) >= 0) {
+                    errno = 0;
+                    const long word = ::ptrace(PTRACE_PEEKDATA, w, reinterpret_cast<void*>(sa), 0);
+                    if (errno == 0) {
+                        const auto u = static_cast<std::uint64_t>(word);
+                        const std::uint16_t fam = static_cast<std::uint16_t>(u & 0xffff);
+                        const std::uint16_t p_be = static_cast<std::uint16_t>((u >> 16) & 0xffff);
+                        const std::uint16_t p = static_cast<std::uint16_t>((p_be >> 8) | (p_be << 8));
+                        const std::uint32_t a = static_cast<std::uint32_t>(u >> 32);
+                        std::uint32_t want = 0;
+                        std::memcpy(&want, kernel::kDnsGuestAddr.data(), 4);
+                        if (fam == AF_INET && p == port && a == want) {
+                            const std::uint64_t nw = (u & ~0xffff0000ull) | (std::uint64_t{0x3500} << 16);
+                            ::ptrace(PTRACE_POKEDATA, w, reinterpret_cast<void*>(sa), reinterpret_cast<void*>(nw));
                         }
                     }
                 }

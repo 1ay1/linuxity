@@ -485,9 +485,18 @@ public:
                         }
                     }
                     // A forward that borrowed the guest's buffer (prlimit's
-                    // clamped limit) puts it back once the call has run.
-                    if constexpr (runtime::ForwardsSynchronously<T>) {
-                        if (auto rb = locked([&] { return sys.take_restore(); })) {
+                    // clamped limit, a DNS address) puts it back once the call
+                    // has run -- at its exit stop, so a blocking call (a
+                    // connect, a send to a full socket) doesn't stall others.
+                    if (auto rb = locked([&] { return sys.take_restore(); })) {
+                        if constexpr (requires { trap_.forward_then([](std::int64_t) {}); }) {
+                            const auto put = *rb;
+                            auto fr = trap_.forward_then([&locked, &sys, put](std::int64_t) {
+                                locked([&] { sys.put_back(put); });
+                            });
+                            if (!fr) return recover(fr.error());
+                            return Step::next;
+                        } else if constexpr (runtime::ForwardsSynchronously<T>) {
                             auto fr = trap_.forward_sync([&](std::int64_t) {
                                 locked([&] { sys.put_back(*rb); });
                             });

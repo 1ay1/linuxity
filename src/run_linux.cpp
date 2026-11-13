@@ -14,6 +14,7 @@
 #include "linuxity/kernel/resolver.hpp"
 #include "linuxity/kernel/resources.hpp"
 #include "linuxity/loader/interp.hpp"
+#include "linuxity/runtime/linux/dns_proxy.hpp"
 #include "linuxity/runtime/linux/ptrace_trap.hpp"
 #include "linuxity/runtime/resource_governor.hpp"
 #include "linuxity/runtime/trap.hpp"
@@ -506,6 +507,10 @@ int lx::cli::host_run(lx::cli::Options& o, int argc, char** argv) {
     // DNS, /etc/hostname and /etc/hosts, served as virtual files
     // (src/guest_files.hpp, shared by every host). The resolv.conf body is
     // shared so `linuxity reload` can change it live.
+#if defined(__ANDROID__)
+    // Android has no resolv.conf: forward to netd (runtime/linux/dns_proxy.hpp)
+    if (o.manage_dns && o.dns.empty() && !std::getenv("LINUXITY_DNS")) (void)runtime::DnsProxy::start();
+#endif
     auto resolv = cli::mount_guest_files(k, o);
 
     // Which AF_UNIX namespace this host actually permits. Probed, not
