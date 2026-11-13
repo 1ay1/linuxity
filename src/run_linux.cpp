@@ -654,8 +654,9 @@ int lx::cli::host_run(lx::cli::Options& o, int argc, char** argv) {
             else for (char c : a) if (c == 'S' || c == 'U') is_txn = true;
         }
         if (base == "pacman" && is_txn) {
-            child_argv.push_back("--overwrite");
-            child_argv.push_back("*");
+            // before the guest's arguments, which may end in "--"
+            const std::size_t at = child_argv.size() - (gargv.empty() ? 0 : gargv.size() - 1);
+            child_argv.insert(child_argv.begin() + static_cast<std::ptrdiff_t>(at), {"--overwrite", "*"});
         }
     }
     out.exec_path = std::move(exec_path);

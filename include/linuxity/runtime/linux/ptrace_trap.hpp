@@ -1829,9 +1829,11 @@ public:
         ptrs.push_back(p_interp);          // argv[0] = interpreter
         for (auto p : p_prefix) ptrs.push_back(p);  // shebang arg / sh host path
         ptrs.push_back(p_prog);            // the program (guest path)
+        // --overwrite "*" goes before the guest's own arguments: yay ends its
+        // with "--", and anything after that is a package name to pacman
+        for (auto p : p_extra) ptrs.push_back(p);
         for (std::size_t i = 1; i < orig.size(); ++i)
             ptrs.push_back(orig[i]);       // original argv[1..]
-        for (auto p : p_extra) ptrs.push_back(p);  // appended --overwrite "*"
         ptrs.push_back(0);                 // NULL terminator
         std::vector<std::byte> arrbytes(ptrs.size() * 8);
         std::memcpy(arrbytes.data(), ptrs.data(), arrbytes.size());
