@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstdio>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 
@@ -482,6 +483,7 @@ void Seat::send_modifiers(Client* only) {
     Client& c = only ? *only : s->client();
     Modifiers m = mods_;
     if (comp_->options().command_is_control) { m.control = m.control || m.super; m.super = false; }
+    if (term_shift_) m.shift = true;
     const std::uint32_t depressed = (m.shift ? kShift : 0) | (m.control ? kControl : 0) |
                                     (m.alt ? kMod1 : 0) | (m.super ? kMod4 : 0);
     const std::uint32_t locked = (m.caps_lock ? kLock : 0) | (m.num_lock ? kMod2 : 0);
@@ -529,7 +531,24 @@ void Seat::refocus() {
     keyboard_enter(target);
 }
 
+namespace {
+// Terminals use Ctrl-C/V/T/N for the program inside; their own copy,
+// paste, new tab and new window are Ctrl+Shift+those. So with Command as
+// Control, Cmd-C in a terminal must mean Ctrl+Shift+C -- copy, as on a Mac
+// -- not an interrupt.
+[[nodiscard]] bool is_terminal(std::string_view app_id) {
+    std::string id{app_id};
+    for (auto& c : id) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    for (const char* t : {"foot", "terminal", "kitty", "alacritty", "konsole", "xterm", "wezterm", "ghostty",
+                          "tilix", "terminator", "urxvt", "termite", "rio", "contour", "blackbox", "ptyxis"})
+        if (id.find(t) != std::string::npos) return true;
+    return false;
+}
+constexpr std::uint32_t KEY_T = 20, KEY_C = 46, KEY_V = 47, KEY_N = 49;
+}  // namespace
+
 void Seat::key(std::uint32_t code, bool pressed, std::uint32_t t) {
+    const bool command = comp_->options().command_is_control && mods_.super;
     if (comp_->options().command_is_control) {
         if (code == KEY_LEFTMETA) code = KEY_LEFTCTRL;
         else if (code == KEY_RIGHTMETA) code = KEY_RIGHTCTRL;
@@ -545,11 +564,23 @@ void Seat::key(std::uint32_t code, bool pressed, std::uint32_t t) {
     }
     auto s = kb_focus_.lock();
     if (!s || !s->alive()) return;
+    const bool term_key = (code == KEY_C || code == KEY_V || code == KEY_T || code == KEY_N);
+    if (pressed && command && term_key) {
+        auto w = focused_window_.lock();
+        if (w && w->toplevel() && is_terminal(w->toplevel()->app_id())) {
+            term_shift_ = code;
+            send_modifiers();
+        }
+    }
     const std::uint32_t serial = comp_->server().next_serial();
     if (pressed) key_serial_ = serial;
     each_keyboard(s->client(), [&](Keyboard& k) {
         k.send(WlKeyboard::Ev::key, serial, t, code, pressed ? WlKeyboard::KeyState::pressed : WlKeyboard::KeyState::released);
     });
+    if (!pressed && term_shift_ == code) {
+        term_shift_ = 0;
+        send_modifiers();
+    }
 }
 
 void Seat::modifiers(Modifiers m) {
@@ -572,6 +603,7 @@ void Seat::release_all() {
         }
     }
     keys_down_.clear();
+    term_shift_ = 0;
     modifiers(Modifiers{.caps_lock = mods_.caps_lock, .num_lock = mods_.num_lock});
 }
 

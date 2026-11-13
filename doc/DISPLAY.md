@@ -112,13 +112,30 @@ The core never sees an `NSWindow`, an `HWND`, or a `Surface` from
 
 ### macOS (hosts/cocoa)
 
-- One `NSWindow` per toplevel. Popups (menus, tooltips, combo lists) are
-  borderless child windows at popup level, so they track their parent.
+- Every toplevel is a real titled `NSWindow`: system shadow and corner
+  shape, edge resizing with the resize cursors, Sequoia tiling, Mission
+  Control, minimize, native full screen. Apps that draw their own title bar
+  (GTK's headerbar) get the same window with a transparent title bar and
+  hidden buttons; the core shows only their window geometry and tells them
+  their edges are tiled, so they draw no shadow or resize margins of their
+  own (`Host::native_frames`). Apps that want a native title bar get one.
+- Resizing is synchronized: while you drag an edge, each step configures
+  the app and waits up to a frame for its new buffer before AppKit shows
+  the frame, so content and frame move together.
+- Popups (menus, tooltips, combo lists) are borderless child windows at
+  popup level, so they track their parent.
+- Mac shortcuts behave as on a Mac: Cmd-Q quits the app in front (closes
+  its windows, which may ask to save), Cmd-W closes the window, Cmd-M
+  minimizes, Cmd-H / Opt-Cmd-H hide, Ctrl-Cmd-F is full screen, Cmd-` and
+  the Window menu cycle windows. Other Command shortcuts go to the app as
+  Control (Cmd-C copies); in terminals (foot, GNOME Terminal, kitty, ...)
+  Cmd-C/V/T/N become Ctrl+Shift+C/V/T/N, their copy/paste/new-tab/window,
+  so Cmd-C copies instead of interrupting. `--command-is-super` keeps
+  Command as Super instead.
 - Every surface of a window's tree is a `CALayer`; Core Animation
   composites on the GPU. Unchanged surfaces keep their layer contents.
-- Server-side decorations are the native title bar; GTK's headerbar
-  (client-side) gets a borderless resizable window, and the app's
-  `xdg_toplevel.move/resize` drive a native drag / an event-driven resize.
+- An app's own title bar drags and resizes through `xdg_toplevel.move/resize`
+  (a native window drag, an event-driven edge resize).
 - Keys are sent as evdev codes from the hardware keycode, so the guest's XKB
   layout interprets them exactly as on Linux; the keymap's layout is chosen
   from the Mac's input source. **Command acts as Control** by default
@@ -219,8 +236,29 @@ composites IOSurfaces directly on the GPU. A blinking cursor in a terminal
 moves a few hundred bytes per frame end to end; an unchanged surface moves
 none.
 
+## GPU
+
+Compositing is on the GPU: every surface is an IOSurface-backed Core
+Animation layer, updated only where it changed, composited by the window
+server. What still runs on the CPU is the apps' own drawing: the guest has
+no GPU device, so GL apps render with Mesa's llvmpipe and GTK4 with it or
+cairo.
+
+Giving guests the Mac's GPU is a project of its own, and the known-good
+shape of it is Venus: Mesa's Vulkan driver in the guest speaks the
+virtio-gpu protocol, linuxity would provide a `/dev/dri/renderD128` that
+accepts the virtgpu ioctls (context, blob resources, execbuffer, fences)
+and hands the command stream to virglrenderer's Venus renderer on the host,
+which runs it on MoltenVK/Metal; OpenGL apps get it through Zink on top.
+The hard parts are mapping host GPU memory (blobs) into the guest's address
+space and fence/poll semantics. Results would come back as dmabufs, which
+is when `linux-dmabuf` joins the protocol list.
+
 ## Known issues
 
+- The Mac menu bar names the app "linuxity-display" and one Dock icon
+  stands for every Linux app; per-app icons and Cmd-Tab entries need a
+  process per app (planned: thin per-app presenter processes fed IOSurfaces).
 - Mesa's llvmpipe is capped at two raster threads (`LP_NUM_THREADS=2`):
   with more, GTK4 apps intermittently crash at renderer start-up on macOS.
   A multi-vCPU memory race in the runtime is suspected; the mmap race found

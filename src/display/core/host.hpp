@@ -22,6 +22,7 @@
 #include "geometry.hpp"
 #include "loop.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -124,7 +125,18 @@ public:
     virtual ~WindowSink() = default;
     // The user (or the platform) wants this size and state; 0x0 = client picks.
     virtual void host_configure(Size size, WindowStates states) = 0;
+    // The same, during an interactive resize: configure, then give the
+    // client up to `budget` to draw the new size, and present it before
+    // returning -- so the frame the platform shows next already has the
+    // new content (no wobble, no stretched or clipped frames). A slow
+    // client simply misses the budget and catches up a frame later.
+    virtual void host_configure_and_wait(Size size, WindowStates states, std::chrono::milliseconds budget) {
+        (void)budget;
+        host_configure(size, states);
+    }
     virtual void host_close() = 0;
+    // "Quit" for the app this window belongs to (Cmd-Q): close all of it.
+    virtual void host_close_app() { host_close(); }
     virtual void host_focus(bool focused) = 0;
     // Pointer, in view coordinates.
     virtual void host_pointer_motion(double x, double y, std::uint32_t time_ms) = 0;
@@ -250,6 +262,13 @@ class Host {
 public:
     virtual ~Host() = default;
     [[nodiscard]] virtual EventLoop& loop() = 0;
+    // The host gives every toplevel a real platform frame -- shadow, corner
+    // shape, edge resizing, tiling -- even when the app draws its own title
+    // bar. Then the core shows only the window geometry (no client-drawn
+    // shadow margins) and tells clients their edges are tiled, so they stop
+    // drawing shadows and resize borders nobody will see. macOS, and an
+    // Android/Windows desktop host, say yes; headless says no.
+    [[nodiscard]] virtual bool native_frames() const { return false; }
     virtual void attach(HostSink& sink) = 0;
     [[nodiscard]] virtual std::vector<OutputInfo> outputs() = 0;
     [[nodiscard]] virtual KeyboardInfo keyboard() = 0;

@@ -219,6 +219,8 @@ void ShellSurface::request(std::uint16_t op, wire::Args& a) {
             if (it == sent_serials_.end()) break;   // stale or unknown: harmless
             sent_serials_.erase(sent_serials_.begin(), std::next(it));
             acked_any_ = true;
+            last_acked_ = serial;
+            commits_at_ack_ = commits_;
             break;
         }
         default: break;
@@ -228,6 +230,7 @@ void ShellSurface::request(std::uint16_t op, wire::Args& a) {
 void ShellSurface::role_commit() {
     Surface* s = surface();
     if (!s) return;
+    if (s->mapped_content()) ++commits_;
     if (pending_geometry_) geometry_ = std::exchange(pending_geometry_, std::nullopt);
     if (!toplevel_ && !popup_) return;
     if (!initial_commit_seen_) {
@@ -287,7 +290,11 @@ void ShellSurface::build_scene(Scene& out, std::vector<std::weak_ptr<Surface>>& 
         if (r > l && b > t) g = {l, t, r - l, b - t};
     }
     out.geometry = g;
-    out.view = decorations() == Decorations::server ? g : extent;
+    // What the platform window shows: just the window geometry when the
+    // platform draws the frame (its title bar, or its shadow and edges
+    // around an app-drawn title bar); the whole tree otherwise.
+    const bool native = decorations() == Decorations::server || (toplevel_ && comp_->host().native_frames());
+    out.view = native ? g : extent;
 }
 
 void ShellSurface::schedule_present() {
@@ -389,8 +396,36 @@ std::optional<Point> ShellSurface::origin_of(const Surface* s) const {
 void ShellSurface::host_configure(Size size, WindowStates states) {
     if (toplevel_) toplevel_->host_wants(size, states);
 }
+
+void ShellSurface::host_configure_and_wait(Size size, WindowStates states, std::chrono::milliseconds budget) {
+    if (!toplevel_) return;
+    const std::size_t had = sent_serials_.size();
+    const std::uint32_t before = sent_serials_.empty() ? last_acked_ : sent_serials_.back();
+    toplevel_->host_wants(size, states);
+    if (sent_serials_.size() == had && (sent_serials_.empty() || sent_serials_.back() == before)) return;   // nothing new
+    const std::uint32_t want = sent_serials_.back();
+    // A client waiting on its last frame callback won't draw until it fires.
+    comp_->fire_frames_now();
+    std::weak_ptr<Resource> weak = weak_from_this();
+    client().pump_until([&] {
+        auto r = weak.lock();
+        if (!r || !r->alive()) return true;
+        // acked this configure (or a newer one), and drew after acking
+        return static_cast<std::int32_t>(last_acked_ - want) >= 0 && acked_any_ && commits_ > commits_at_ack_;
+    }, budget);
+    auto r = weak.lock();
+    if (r && r->alive() && window_) present_now();
+}
+
 void ShellSurface::host_close() {
     if (toplevel_) toplevel_->send(XdgToplevel::Ev::close);
+}
+
+void ShellSurface::host_close_app() {
+    // every toplevel of this client, as a Linux desktop's "Quit" closes the
+    // app's windows and lets it decide (unsaved work prompts stay possible)
+    for (auto& w : comp_->windows())
+        if (&w->client() == &client() && w->toplevel()) w->toplevel()->send(XdgToplevel::Ev::close);
 }
 void ShellSurface::host_focus(bool focused) {
     if (toplevel_) {
@@ -489,8 +524,10 @@ void Toplevel::configure() {
     if (states_.fullscreen) st.push_back(static_cast<std::uint32_t>(XdgToplevel::State::fullscreen));
     if (states_.resizing) st.push_back(static_cast<std::uint32_t>(XdgToplevel::State::resizing));
     if (states_.activated) st.push_back(static_cast<std::uint32_t>(XdgToplevel::State::activated));
-    // a native title bar: tell the client its edges are the platform's
-    if (decorations_ == Decorations::server && version() >= 2)
+    // the platform frames the window (title bar, or shadow and resize
+    // edges): tell the client its edges are tiled, so it draws no shadow
+    // margins or rounded-corner cut-outs of its own
+    if ((decorations_ == Decorations::server || xs->comp().host().native_frames()) && version() >= 2)
         for (auto s : {XdgToplevel::State::tiled_left, XdgToplevel::State::tiled_right,
                        XdgToplevel::State::tiled_top, XdgToplevel::State::tiled_bottom})
             st.push_back(static_cast<std::uint32_t>(s));

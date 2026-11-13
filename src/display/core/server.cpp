@@ -9,6 +9,7 @@
 #include <ctime>
 
 #include <sys/file.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -246,6 +247,20 @@ void Client::flush() {
         return;
     }
     if (closing_) disconnect("protocol error");
+}
+
+bool Client::pump_until(const std::function<bool()>& done, std::chrono::milliseconds budget) {
+    const auto until = std::chrono::steady_clock::now() + budget;
+    flush();
+    while (!dead_ && !closing_ && !done()) {
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(until - std::chrono::steady_clock::now());
+        if (left.count() <= 0) break;
+        ::pollfd p{chan_.fd(), POLLIN, 0};
+        if (::poll(&p, 1, static_cast<int>(left.count())) <= 0) continue;
+        readable();
+        flush();
+    }
+    return !dead_ && done();
 }
 
 // -- Server -------------------------------------------------------------------

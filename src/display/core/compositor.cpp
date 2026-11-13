@@ -17,8 +17,8 @@ void bind_extra_globals(Compositor& comp);
 
 class OutputResource final : public Object<WlOutput> {
 public:
-    OutputResource(Client& c, std::uint32_t v, ObjectId id, Compositor& comp, std::size_t index)
-        : Object(c, v, id), comp_(&comp), index_(index) {}
+    OutputResource(Client& c, std::uint32_t v, ObjectId id, std::size_t index)
+        : Object(c, v, id), index_(index) {}
     void describe(const OutputInfo& o) {
         send(WlOutput::Ev::geometry, o.logical.x, o.logical.y, o.physical_mm.w, o.physical_mm.h,
              WlOutput::Subpixel::unknown, o.make, o.model, WlOutput::Transform::normal);
@@ -32,7 +32,6 @@ public:
 protected:
     void request(std::uint16_t, wire::Args&) override {}
 private:
-    Compositor* comp_;
     std::size_t index_;
 };
 
@@ -75,7 +74,7 @@ void Compositor::sync_outputs() {
     for (std::size_t k = 0; k < outputs_.size(); ++k) {
         output_globals_.push_back(server_->add_global<WlOutput>(4, [this, k](Client& c, std::uint32_t v, ObjectId id) {
             if (k >= outputs_.size()) return;
-            auto r = c.create<OutputResource>(id, v, *this, k);
+            auto r = c.create<OutputResource>(id, v, k);
             if (!r) return;
             r->describe(outputs_[k]);
             std::erase_if(bound_outputs_, [](const BoundOutput& b) { return b.r.expired(); });

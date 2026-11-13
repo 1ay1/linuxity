@@ -109,6 +109,7 @@ class HeadlessHost final : public Host {
 public:
     HeadlessHost(std::string dump, HeadlessLog* log) : loop_(make_poll_loop()), dump_(std::move(dump)), log_(log) {}
     EventLoop& loop() override { return *loop_; }
+    [[nodiscard]] bool native_frames() const override { return log_ && log_->native_frames; }
     void attach(HostSink& s) override { sink_ = &s; if (log_) log_->sink = &s; }
     std::vector<OutputInfo> outputs() override {
         OutputInfo o;

@@ -14,6 +14,7 @@ namespace lx::display {
 // What a headless host was asked to do, for tests to assert on.
 struct HeadlessLog {
     double scale{0};                       // the output's scale (0: 1)
+    bool native_frames{false};             // act like a desktop host that frames windows
     HostSink* sink{nullptr};               // to inject keys and IME text
     struct Present { std::uint64_t id; Rect damage; std::uint64_t generation; SourceRect source; Rect rect; };
     std::vector<Present> presents;

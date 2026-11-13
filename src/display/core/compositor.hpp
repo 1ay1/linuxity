@@ -273,7 +273,9 @@ public:
 
     // WindowSink
     void host_configure(Size size, WindowStates states) override;
+    void host_configure_and_wait(Size size, WindowStates states, std::chrono::milliseconds budget) override;
     void host_close() override;
+    void host_close_app() override;
     void host_focus(bool focused) override;
     void host_pointer_motion(double x, double y, std::uint32_t t) override;
     void host_pointer_leave() override;
@@ -297,6 +299,8 @@ private:
     Popup* popup_{nullptr};
     std::optional<Rect> geometry_, pending_geometry_;
     std::vector<std::uint32_t> sent_serials_;
+    std::uint32_t last_acked_{0};
+    std::uint64_t commits_{0}, commits_at_ack_{0};   // buffer commits, and how many when the last ack came
     bool acked_any_{false};
     bool initial_commit_seen_{false};
     std::unique_ptr<HostWindow> window_;
@@ -339,7 +343,7 @@ private:
     WindowStates states_;
     Decorations decorations_{Decorations::client};
     Decoration* decoration_{nullptr};
-    bool want_maximized_{false}, want_fullscreen_{false}, want_minimized_{false};
+    bool want_maximized_{false}, want_fullscreen_{false};
 };
 
 class Popup final : public Object<proto::XdgPopup> {
@@ -473,6 +477,7 @@ private:
     std::weak_ptr<ShellSurface> focused_window_;
     std::weak_ptr<Surface> kb_focus_;
     std::vector<std::uint32_t> keys_down_;
+    std::uint32_t term_shift_{0};   // a Cmd key a terminal gets as Ctrl+Shift (seat.cpp)
     Modifiers mods_;
     std::vector<std::weak_ptr<ShellSurface>> popups_;
 
@@ -510,6 +515,8 @@ public:
 
     // frame callbacks fire on the next refresh
     void queue_frame(std::shared_ptr<Callback> cb);
+    // ... or now: a client blocked on its frame callback may draw at once
+    void fire_frames_now() { tick(); }
 
     // outputs
     [[nodiscard]] const std::vector<OutputInfo>& outputs() const noexcept { return outputs_; }

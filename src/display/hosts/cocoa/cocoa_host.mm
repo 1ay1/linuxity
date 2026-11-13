@@ -312,6 +312,7 @@ public:
     void did_change_screen();
     void did_focus(bool f) { if (sink_) sink_->host_focus(f); }
     void wants_close() { if (sink_) sink_->host_close(); }
+    void quit_app() { if (sink_) sink_->host_close_app(); }
     void fullscreen_changed(bool on) { fullscreen_ = on; send_configure(); }
     void mouse(NSEvent* e, bool down_or_up, bool pressed);
     [[nodiscard]] bool resize_drag(NSEvent* e);     // true: consumed by a client-side resize
@@ -396,6 +397,7 @@ public:
     std::unique_ptr<HostWindow> create_window(const WindowSpec& spec, WindowSink& sink) override {
         return std::make_unique<CocoaWindow>(*this, spec, sink);
     }
+    [[nodiscard]] bool native_frames() const override { return true; }
     void set_cursor(const CursorImage& c) override;
     void set_cursor_shape(CursorShape s) override;
     void bell() override;
@@ -442,6 +444,7 @@ CocoaWindow::CocoaWindow(CocoaHost& host, const WindowSpec& spec, WindowSink& si
     view_.wantsLayer = YES;
     view_.layer = [CALayer layer];
     view_.layer.geometryFlipped = YES;          // y down, as Wayland
+    view_.layer.masksToBounds = YES;            // nothing outside the window geometry
     view_.layerContentsRedrawPolicy = NSViewLayerContentsRedrawNever;
     win_.contentView = view_;
     delegate_ = [LXWindowDelegate new];
@@ -478,17 +481,32 @@ CocoaWindow::~CocoaWindow() {
 
 void CocoaWindow::apply_style() {
     if (kind_ == WindowSpec::Kind::popup) return;
-    NSWindowStyleMask m = NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable;
-    if (decorations_ == Decorations::server) m |= NSWindowStyleMaskTitled | NSWindowStyleMaskClosable;
-    else m |= NSWindowStyleMaskBorderless;
+    // Every toplevel is a real titled window: the window server then gives
+    // it the system shadow, corner shape, edge resizing (with the resize
+    // cursors), Sequoia tiling, Mission Control and minimize. An app that
+    // draws its own title bar (GTK's headerbar) gets the same window with
+    // the title bar made transparent and its buttons hidden -- its content
+    // runs to the top edge and its own buttons do the job. The core shows
+    // only the window geometry and says the edges are tiled, so the app
+    // draws no shadow or resize margins of its own (host.hpp native_frames).
+    const bool csd = decorations_ == Decorations::client;
+    NSWindowStyleMask m = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable |
+                          NSWindowStyleMaskMiniaturizable;
+    if (csd) m |= NSWindowStyleMaskFullSizeContentView;
     if (fullscreen_) m |= NSWindowStyleMaskFullScreen;
-    const NSRect content = [win_ contentRectForFrameRect:win_.frame];
+    const NSRect content = shown_ ? [win_ contentRectForFrameRect:win_.frame] : NSZeroRect;
     win_.styleMask = m;
+    win_.titlebarAppearsTransparent = csd;
+    win_.titleVisibility = csd ? NSWindowTitleHidden : NSWindowTitleVisible;
+    for (NSWindowButton b : {NSWindowCloseButton, NSWindowMiniaturizeButton, NSWindowZoomButton})
+        [win_ standardWindowButton:b].hidden = csd;
+    win_.hasShadow = YES;
     // keep the content where it was across the change of frame
-    [win_ setFrame:[win_ frameRectForContentRect:content] display:NO];
-    // A client-decorated window (GTK's headerbar) draws its own shadow
-    // into its surface; a native one under it would double it.
-    win_.hasShadow = decorations_ == Decorations::server;
+    if (shown_) {
+        programmatic_resize_ = true;
+        [win_ setFrame:[win_ frameRectForContentRect:content] display:NO];
+        programmatic_resize_ = false;
+    }
 }
 
 void CocoaWindow::set_decorations(Decorations d) {
@@ -650,7 +668,7 @@ ld::Rect CocoaWindow::work_area() const {
 }
 
 void CocoaWindow::send_configure() {
-    if (!sink_ || kind_ != WindowSpec::Kind::toplevel) return;
+    if (!sink_ || kind_ != WindowSpec::Kind::toplevel || !shown_) return;
     const NSRect c = [win_ contentRectForFrameRect:win_.frame];
     WindowStates st;
     st.activated = win_.keyWindow;
@@ -663,13 +681,20 @@ void CocoaWindow::send_configure() {
     want.w -= v.w - g.w;
     want.h -= v.h - g.h;
     last_configured_ = want;
-    sink_->host_configure(want, st);
+    // Dragging an edge: let the app draw the new size before AppKit shows
+    // the frame (a frame's budget), so content and frame move together.
+    if (live_resize_ || resize_edges_) sink_->host_configure_and_wait(want, st, std::chrono::milliseconds(24));
+    else sink_->host_configure(want, st);
 }
 
 void CocoaWindow::did_resize() {
-    if (programmatic_resize_) return;
+    // Before the first frame the window has no size of its own: the style
+    // change in the constructor resizes it (320x240 default) and AppKit
+    // says so -- passing that on told apps to shrink to it.
+    if (programmatic_resize_ || !shown_) return;
     live_resize_ = view_.inLiveResize;
     send_configure();
+    [win_ invalidateShadow];
 }
 
 void CocoaWindow::did_change_screen() {
@@ -732,9 +757,11 @@ bool CocoaWindow::resize_drag(NSEvent* e) {
     return true;
 }
 
+// LXView is flipped (isFlipped), so its own coordinates are already y-down
+// from the top-left, as Wayland's are. Flipping again here put every click
+// at the mirror-image height.
 NSPoint CocoaWindow::view_point(NSEvent* e) const {
-    NSPoint p = [view_ convertPoint:e.locationInWindow fromView:nil];
-    return NSMakePoint(p.x, view_.bounds.size.height - p.y);   // y down
+    return [view_ convertPoint:e.locationInWindow fromView:nil];
 }
 
 void CocoaWindow::mouse(NSEvent* e, bool is_button, bool pressed) {
@@ -911,16 +938,38 @@ void CocoaWindow::flags(NSEvent* e) {
 CocoaHost::CocoaHost() {
     [NSApplication sharedApplication];
     NSApp.activationPolicy = NSApplicationActivationPolicyAccessory;
-    // A minimal menu so Cmd-Q and the app menu behave.
+    // The menus every Mac app has, wired to the Linux app in front:
+    //   Cmd-Q quits that app (closes its windows; it may ask to save),
+    //   Cmd-W closes the window, Cmd-M minimizes, Cmd-H hides, Ctrl-Cmd-F
+    //   is full screen; the Window menu lists every window and gives Cmd-`.
+    // Everything else with Command goes to the app (as Control, see seat).
     NSMenu* bar = [NSMenu new];
-    NSMenuItem* app = [NSMenuItem new];
-    [bar addItem:app];
-    NSMenu* am = [NSMenu new];
-    [am addItemWithTitle:@"Hide Linux Windows" action:@selector(hide:) keyEquivalent:@"h"];
+    auto submenu = [&](NSString* title) {
+        NSMenuItem* item = [NSMenuItem new];
+        NSMenu* m = [[NSMenu alloc] initWithTitle:title];
+        item.submenu = m;
+        [bar addItem:item];
+        return m;
+    };
+    NSMenu* am = submenu(@"Linux");
+    [am addItemWithTitle:@"Hide Linux Apps" action:@selector(hide:) keyEquivalent:@"h"];
+    NSMenuItem* others = [am addItemWithTitle:@"Hide Others" action:@selector(hideOtherApplications:) keyEquivalent:@"h"];
+    others.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagOption;
+    [am addItemWithTitle:@"Show All" action:@selector(unhideAllApplications:) keyEquivalent:@""];
     [am addItem:[NSMenuItem separatorItem]];
-    [am addItemWithTitle:@"Close Linux Windows and Quit" action:@selector(terminate:) keyEquivalent:@""];
-    app.submenu = am;
+    [am addItemWithTitle:@"Quit App" action:@selector(lxQuitApp:) keyEquivalent:@"q"];
+    [am addItemWithTitle:@"Close All Linux Windows" action:@selector(terminate:) keyEquivalent:@""];
+    NSMenu* fm = submenu(@"File");
+    [fm addItemWithTitle:@"Close Window" action:@selector(performClose:) keyEquivalent:@"w"];
+    NSMenu* wm = submenu(@"Window");
+    [wm addItemWithTitle:@"Minimize" action:@selector(performMiniaturize:) keyEquivalent:@"m"];
+    [wm addItemWithTitle:@"Zoom" action:@selector(performZoom:) keyEquivalent:@""];
+    NSMenuItem* fs = [wm addItemWithTitle:@"Enter Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"];
+    fs.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagControl;
+    [wm addItem:[NSMenuItem separatorItem]];
+    [wm addItemWithTitle:@"Bring All to Front" action:@selector(arrangeInFront:) keyEquivalent:@""];
     NSApp.mainMenu = bar;
+    NSApp.windowsMenu = wm;   // AppKit fills in the window list and Cmd-`
     [NSApp finishLaunching];
 }
 
@@ -1102,20 +1151,30 @@ void CocoaHost::set_has_windows(bool any) {
 - (NSRect)firstRectForCharacterRange:(NSRange)r actualRange:(NSRangePointer)a {
     return self.owner ? self.owner->ime_rect() : NSZeroRect;
 }
-// Cmd-key combos come here first: they're the app's, not AppKit's menus
+// Cmd-key combos come here first. The Mac's own window shortcuts go to the
+// menus (Cmd-Q/W/M/H, Opt-Cmd-H, Ctrl-Cmd-F, Cmd-`); everything else is the
+// app's (with Command as Control).
 - (BOOL)performKeyEquivalent:(NSEvent*)e {
     if (!self.owner || self.window.firstResponder != self) return NO;
     if (e.type == NSEventTypeKeyDown) {
-        // Cmd-H stays the Mac's; everything else is the app's (with
-        // Command as Control, Cmd-Q is Ctrl-Q: the app's own Quit)
-        NSString* c = e.charactersIgnoringModifiers;
-        const NSEventModifierFlags m = e.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
-        if (m == NSEventModifierFlagCommand && [c isEqualToString:@"h"]) return NO;
+        NSString* c = e.charactersIgnoringModifiers.lowercaseString;
+        const NSEventModifierFlags m = e.modifierFlags & (NSEventModifierFlagCommand | NSEventModifierFlagControl |
+                                                          NSEventModifierFlagOption | NSEventModifierFlagShift);
+        const NSEventModifierFlags cmd = NSEventModifierFlagCommand;
+        if (m == cmd && ([c isEqualToString:@"q"] || [c isEqualToString:@"w"] || [c isEqualToString:@"m"] ||
+                         [c isEqualToString:@"h"] || [c isEqualToString:@"`"]))
+            return NO;
+        if (m == (cmd | NSEventModifierFlagOption) && [c isEqualToString:@"h"]) return NO;
+        if (m == (cmd | NSEventModifierFlagControl) && [c isEqualToString:@"f"]) return NO;
         self.owner->key(e, true);
         return YES;
     }
     return NO;
 }
+// The transparent title bar of an app-drawn window: its clicks are the
+// app's (its headerbar is there), not AppKit's window drag.
+- (BOOL)mouseDownCanMoveWindow { return NO; }
+- (void)lxQuitApp:(id)sender { if (self.owner) self.owner->quit_app(); }
 @end
 
 @implementation LXWindowDelegate

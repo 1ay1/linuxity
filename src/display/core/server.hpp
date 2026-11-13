@@ -134,6 +134,11 @@ public:
     void fatal(ObjectId id, std::uint32_t code, const std::string& message);
     void disconnect(const char* why = "closed");   // drop the client now
     [[nodiscard]] bool dead() const noexcept { return dead_; }
+    // Flush our events, then read and dispatch this client's requests
+    // right here (not via the loop) until `done()` or `budget` runs out.
+    // For the few places a platform callback must see the client's answer
+    // before it returns (interactive resize). Returns done().
+    bool pump_until(const std::function<bool()>& done, std::chrono::milliseconds budget);
 
 private:
     friend class Resource;

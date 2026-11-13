@@ -32,6 +32,14 @@ if(APPLE)
     target_compile_definitions(linuxity-display PRIVATE LX_DISPLAY_COCOA=1)
     target_link_libraries(linuxity-display PRIVATE
         "-framework AppKit" "-framework QuartzCore" "-framework Carbon" "-framework CoreVideo" "-framework IOSurface")
+
+    # The macOS host against real AppKit windows (needs a GUI session).
+    add_executable(test_cocoa ${CMAKE_SOURCE_DIR}/tests/display/test_cocoa.mm hosts/cocoa/cocoa_host.mm)
+    set_source_files_properties(${CMAKE_SOURCE_DIR}/tests/display/test_cocoa.mm PROPERTIES
+        COMPILE_OPTIONS "-fobjc-arc;-Wno-old-style-cast;-Wno-sign-conversion;-Wno-shorten-64-to-32;-UNDEBUG")
+    target_link_libraries(test_cocoa PRIVATE linuxity_display_core
+        "-framework AppKit" "-framework QuartzCore" "-framework Carbon" "-framework CoreVideo" "-framework IOSurface")
+    add_test(NAME display_cocoa COMMAND test_cocoa)
 endif()
 
 install(TARGETS linuxity-display RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

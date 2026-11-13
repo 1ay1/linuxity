@@ -8,8 +8,11 @@
 #include "core/compositor.hpp"
 #include "hosts/headless.hpp"
 
+#include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <chrono>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -198,13 +201,14 @@ struct Fixture {
     std::map<std::string, std::uint32_t> globals;   // interface -> name
     wire::ObjectId registry{0}, compositor{0}, shm{0}, wm{0}, sub{0};
 
-    explicit Fixture(double scale = 0) {
+    explicit Fixture(double scale = 0, bool native_frames = false, CompositorOptions opts = {}) {
         log.scale = scale;
+        log.native_frames = native_frames;
         char tmpl[] = "/tmp/lxd-dump-XXXXXX";
         dump = ::mkdtemp(tmpl);
         host = make_headless_host(dump, &log);
         server = std::make_unique<Server>(host->loop());
-        comp = std::make_unique<Compositor>(*server, *host);
+        comp = std::make_unique<Compositor>(*server, *host, opts);
         int sv[2];
         assert(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
         (void)server->adopt(wire::Fd{sv[0]});
@@ -539,6 +543,7 @@ void test_cursor_shape_activation_bell() {
     ShmBuffer b(50, 50, 0);
     const auto buf = f.buffer(b, 50, 50);
     auto [s, xs, tl] = f.toplevel(buf, "cur");
+    (void)xs; (void)tl;
     const auto dev = f.c->make(WpCursorShapeDeviceV1::iface);
     f.c->req(csm, WpCursorShapeManagerV1::Req::get_pointer, wire::NewId{dev}, wire::Object{ptr});
     auto windows = f.comp->windows();
@@ -591,7 +596,7 @@ void test_text_input() {
     f.c->req(tim, ZwpTextInputManagerV3::Req::get_text_input, wire::NewId{ti}, wire::Object{seat});
     ShmBuffer b(80, 40, 0);
     const auto buf = f.buffer(b, 80, 40);
-    auto [s, xs, tl] = f.toplevel(buf, "ime");
+    (void)f.toplevel(buf, "ime");
     check(f.c->has("zwp_text_input_v3", "enter", ti), "text_input enters with the keyboard focus");
     f.c->req(ti, ZwpTextInputV3::Req::enable);
     f.c->req(ti, ZwpTextInputV3::Req::set_cursor_rectangle, 12, 8, 2, 16);
@@ -622,6 +627,7 @@ void test_primary_selection() {
     ShmBuffer b(20, 20, 0);
     const auto buf = f.buffer(b, 20, 20);
     auto [s, xs, tl] = f.toplevel(buf, "psel");
+    (void)xs; (void)tl;
     const auto dev = f.c->make(ZwpPrimarySelectionDeviceV1::iface);
     f.c->req(psm, ZwpPrimarySelectionDeviceManagerV1::Req::get_device, wire::NewId{dev}, wire::Object{seat});
     const auto src = f.c->make(ZwpPrimarySelectionSourceV1::iface);
@@ -634,6 +640,113 @@ void test_primary_selection() {
     check(sel && sel->v[0] != 0, "the selection is offered back to the focused client");
     const auto offer = f.c->take("zwp_primary_selection_offer_v1", "offer");
     check(offer && offer->s[0] == "text/plain;charset=utf-8", "with its types");
+}
+
+// A GTK-style window: shadow margins around a geometry, title bar drawn by
+// the app. On a host that frames windows itself, only the geometry shows
+// and the app is told its edges are tiled (so it stops drawing shadows).
+void test_native_frames() {
+    Fixture f(0, true);
+    ShmBuffer b(140, 120, 0x00000000);   // 20px transparent margins
+    b.fill(20, 20, 100, 80, 0x00336699);
+    const auto buf = f.buffer(b, 140, 120);
+    const auto s = f.surface();
+    const auto xs = f.c->make(proto::XdgSurface::iface);
+    f.c->req(f.wm, XdgWmBase::Req::get_xdg_surface, wire::NewId{xs}, wire::Object{s});
+    const auto tl = f.c->make(XdgToplevel::iface);
+    f.c->req(xs, proto::XdgSurface::Req::get_toplevel, wire::NewId{tl});
+    f.c->req(tl, XdgToplevel::Req::set_title, "csd");
+    f.c->req(xs, proto::XdgSurface::Req::set_window_geometry, 20, 20, 100, 80);
+    f.c->req(s, WlSurface::Req::commit);
+    pump(f.host->loop(), *f.c, [&] { return f.c->has("xdg_surface", "configure", xs); });
+    const auto cfg = f.c->take("xdg_toplevel", "configure", tl);
+    // states array: tiled_left..bottom are 5..8
+    bool tiled = false;
+    if (cfg && cfg->a[0].size() >= 16) {
+        std::vector<std::uint32_t> st(cfg->a[0].size() / 4);
+        std::memcpy(st.data(), cfg->a[0].data(), cfg->a[0].size());
+        tiled = std::count_if(st.begin(), st.end(), [](std::uint32_t v) { return v >= 5 && v <= 8; }) == 4;
+    }
+    check(tiled, "an app-drawn window is told all four edges are tiled");
+    f.c->req(xs, proto::XdgSurface::Req::ack_configure, static_cast<std::uint32_t>(f.c->take("xdg_surface", "configure", xs)->v[0]));
+    f.c->req(s, WlSurface::Req::attach, wire::Object{buf}, 0, 0);
+    f.c->req(s, WlSurface::Req::commit);
+    f.sync();
+    int w = 0, h = 0;
+    const auto px = ppm_pixel(f.dump_of(1, "csd"), 0, 0, &w, &h);
+    check(w == 100 && h == 80, "the platform window shows just the geometry");
+    check(px && px->b == 0x99, "starting at the geometry's corner, not the shadow margin");
+}
+
+// Dragging an edge: the host configures and waits; the client's new frame
+// is presented before host_configure_and_wait returns.
+void test_synchronized_resize() {
+    Fixture f;
+    ShmBuffer small(100, 80, 0x00ff0000), big(300, 200, 0x0000ff00);
+    const auto b1 = f.buffer(small, 100, 80);
+    const auto b2 = f.buffer(big, 300, 200);
+    auto [s, xs, tl] = f.toplevel(b1, "rs");
+    f.c->events.clear();
+    std::atomic<bool> stop{false};
+    std::thread app([&] {
+        // the app: on a 300x200 configure, ack it and draw that size
+        while (!stop) {
+            f.c->poll();
+            if (auto c = f.c->take("xdg_toplevel", "configure", tl); c && c->v[0] == 300) {
+                auto x = f.c->take("xdg_surface", "configure", xs);
+                while (!x) { f.c->poll(); x = f.c->take("xdg_surface", "configure", xs); }
+                f.c->req(xs, proto::XdgSurface::Req::ack_configure, static_cast<std::uint32_t>(x->v[0]));
+                f.c->req(s, WlSurface::Req::attach, wire::Object{b2}, 0, 0);
+                f.c->req(s, WlSurface::Req::commit);
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
+    auto windows = f.comp->windows();
+    WindowStates st;
+    st.resizing = true;
+    const std::size_t before = f.log.presents.size();
+    windows[0]->host_configure_and_wait({300, 200}, st, std::chrono::milliseconds(2000));
+    stop = true;
+    app.join();
+    check(f.log.presents.size() > before && f.log.presents.back().rect == Rect{0, 0, 300, 200},
+          "the new size is on screen when the resize step returns");
+}
+
+// With Command as Control, Cmd-C in a terminal is its copy (Ctrl+Shift+C),
+// not an interrupt; elsewhere it stays Ctrl+C.
+void test_terminal_shortcuts() {
+    CompositorOptions o;
+    o.command_is_control = true;
+    Fixture f(0, false, o);
+    const auto seat = f.bind(WlSeat::iface, 8);
+    const auto kb = f.c->make(WlKeyboard::iface);
+    f.c->req(seat, WlSeat::Req::get_keyboard, wire::NewId{kb});
+    ShmBuffer b(40, 40, 0);
+    const auto buf = f.buffer(b, 40, 40);
+    auto [s, xs, tl] = f.toplevel(buf, "foot");
+    auto mods_for_cmd_c = [&](const char* app_id) {
+        f.c->req(tl, XdgToplevel::Req::set_app_id, app_id);
+        f.sync();
+        f.c->events.clear();
+        Modifiers m;
+        m.super = true;
+        f.comp->host_modifiers(m);
+        f.comp->host_key(46, true, 1);
+        f.comp->host_key(46, false, 2);
+        f.comp->host_modifiers({});
+        f.sync();
+        // the modifiers in force when the key went down
+        std::int64_t depressed = -1;
+        for (const auto& e : f.c->events) {
+            if (e.iface == "wl_keyboard" && e.name == "modifiers") depressed = e.v[1];
+            if (e.iface == "wl_keyboard" && e.name == "key") break;
+        }
+        return depressed;
+    };
+    check(mods_for_cmd_c("foot") == 5, "Cmd-C in foot arrives as Ctrl+Shift+C");
+    check(mods_for_cmd_c("org.gnome.TextEditor") == 4, "Cmd-C in an editor arrives as Ctrl+C");
 }
 
 void test_keyboard_keymap() {
@@ -665,6 +778,9 @@ int main() {
     test_cursor_shape_activation_bell();
     test_text_input();
     test_primary_selection();
+    test_native_frames();
+    test_synchronized_resize();
+    test_terminal_shortcuts();
     std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "PASSED", g_failures, g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;
 }

@@ -56,7 +56,7 @@ void usage() {
 int main(int argc, char** argv) {
     using namespace lx::display;
     std::string socket, dump;
-    bool headless = false;
+    bool headless = false, native_frames = false;
     int idle_exit = 0, ready_fd = -1;
     CompositorOptions opts;
 #if defined(__APPLE__)
@@ -78,13 +78,16 @@ int main(int argc, char** argv) {
         else if (a == "--command-is-control") opts.command_is_control = true;
         else if (a == "--ready-fd") ready_fd = std::atoi(next());
         else if (a == "-v" || a == "--verbose") opts.verbose = true;
+        else if (a == "--native-frames") native_frames = true;
         else if (a == "-h" || a == "--help") { usage(); return 0; }
         else { usage(); return 2; }
     }
     if (socket.empty()) socket = default_socket();
     ::signal(SIGPIPE, SIG_IGN);
 
-    std::unique_ptr<Host> host = dump.empty() ? make_host(headless) : make_headless_host(dump);
+    static HeadlessLog dump_log;   // --native-frames: frame windows like a desktop host
+    dump_log.native_frames = native_frames;
+    std::unique_ptr<Host> host = dump.empty() ? make_host(headless) : make_headless_host(dump, &dump_log);
     Server server{host->loop()};
     server.verbose = opts.verbose;
     std::string why;
