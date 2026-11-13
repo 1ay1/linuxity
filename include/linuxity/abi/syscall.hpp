@@ -3193,6 +3193,7 @@ private:
                 if (std::string e = mem_.exe_of_pid(pid); !e.empty()) return e;
             }
             if (const auto* pi = k_.procs().find(pid)) {
+                if (!pi->exe.empty()) return pi->exe;   // recorded at exec
                 // cmdline is NUL-joined argv (ProcInfo::cmdline's documented
                 // format, and the /proc wire format), so argv[0] ends at the
                 // first NUL -- not the first space. Splitting on a space here
@@ -3208,7 +3209,7 @@ private:
                 // Only an ABSOLUTE argv[0] is a valid exe link target; a bare
                 // name ("linuxity", "bash") or the spawn placeholder is not,
                 // so we leave the link to the host-backed /proc (redirect).
-                if (!a0.empty() && a0[0] == '/' && a0 != "(spawning)") return a0;
+                if (!a0.empty() && a0[0] == '/' && a0 != "(spawning)") return k_.files().canonical(a0);
             }
             return {};
         };
@@ -3351,6 +3352,28 @@ private:
 
     // execve/execveat: rewrite the program-path argument to the translated
     // host path (host-backed) and forward. Virtual exec targets are refused.
+    // The image the kernel ends up running for guest path `g`: a #! script
+    // runs its interpreter (nested up to 4 times, like the kernel).
+    [[nodiscard]] std::string exec_image(std::string g, int depth = 0) {
+        const auto pc = k_.files().classify(g);
+        if (depth >= 4 || pc.realm != kernel::Realm2::host_backed || pc.host_path.empty()) return g;
+        const int fd = ::open(pc.host_path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return g;
+        char b[256];
+        const ::ssize_t n = ::read(fd, b, sizeof b - 1);
+        ::close(fd);
+        if (n < 3 || b[0] != '#' || b[1] != '!') return g;
+        std::string_view l(b + 2, static_cast<std::size_t>(n - 2));
+        l = l.substr(0, l.find('\n'));
+        const auto s = l.find_first_not_of(" \t");
+        if (s == std::string_view::npos) return g;
+        l.remove_prefix(s);
+        std::string interp{l.substr(0, l.find_first_of(" \t"))};
+        if (interp.empty()) return g;
+        interp = k_.files().absolutize(interp, k_.files().cwd());
+        return exec_image(k_.files().canonical(interp), depth + 1);
+    }
+
     [[nodiscard]] Outcome path_exec(const Regs& r, int path_arg) {
         if (empty_path_arg(r, path_arg)) return eno(Errno::enoent);
         std::string abs = resolve_arg(r, path_arg, path_arg == 1);
@@ -3382,6 +3405,9 @@ private:
             // some x bit on a file (guest_may handles both).
             if (guest_search_denied(abs)) return eno(Errno::eacces);
             if (!guest_may(k_.files().resolve_links(abs), 1)) return eno(Errno::eacces);
+            // /proc/<pid>/exe will be the file the kernel runs: symlinks
+            // resolved, and a #! script's interpreter. Taken at the exec event.
+            me().exe_next = exec_image(k_.files().canonical(abs));
             // A set-user/group-ID program raises the caller's effective id, and
             // the guest's ids are ours to keep, so note the owner here for
             // creds::on_exec to apply once the image is in. Without this a

@@ -109,6 +109,7 @@ struct ProcInfo : Creds {
     std::uint32_t uid{0};
     std::uint32_t gid{0};
     std::string  exe{};              // guest path of the image (/proc/<pid>/exe)
+    std::string  exe_next{};         // set by execve, becomes exe at the exec event
     std::vector<std::int32_t> threads{}; // guest tids besides the main thread
     // names of non-main threads that set one; comm is the main thread's
     std::vector<std::pair<std::int32_t, std::string>> thread_comms{};

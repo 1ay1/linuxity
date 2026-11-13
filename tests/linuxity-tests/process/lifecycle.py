@@ -87,6 +87,20 @@ def strict_seccomp_kills():
 
 
 @test
+def exe_link_is_the_real_file():
+    """/proc/self/exe names the file the kernel ran: symlinks resolved."""
+    import subprocess, tempfile
+    d = tempfile.mkdtemp()
+    real = os.path.realpath("/bin/sh")
+    os.symlink("/bin/sh", os.path.join(d, "link"))
+    out = subprocess.run([os.path.join(d, "link"), "-c", "readlink /proc/$$/exe; true"],
+                         capture_output=True, text=True).stdout.strip()
+    eq(out, real, "exe after exec through a symlink")
+    eq(os.readlink("/proc/self/exe"), os.path.realpath(os.readlink("/proc/self/exe")), "ours is canonical")
+    return real
+
+
+@test
 def hard_limit_raise():
     """Only root may raise a hard rlimit once it's lowered."""
     def body():

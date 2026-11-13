@@ -812,6 +812,7 @@ private:
                         if (const auto* pp = kernel_.procs().find(pi.ppid)) {
                             pi.comm = pp->comm;
                             pi.cmdline = pp->cmdline;
+                            pi.exe = pp->exe;
                             pi.vsize_bytes = pp->vsize_bytes;
                             pi.rss_pages = pp->rss_pages;
                             pi.creds() = pp->creds();       // fork: one value, every field
@@ -873,6 +874,9 @@ private:
                             }
                             np.state = 'R';
                             np.creds_given = false;      // exec keeps them (upsert)
+                            if (!np.exe_next.empty()) np.exe = std::move(np.exe_next);
+                            else np.exe.clear();   // started by us: argv[0] decides
+                            np.exe_next.clear();
                             kernel_.procs().upsert(np);
                             // execve's credential transform (set-ID bits
                             // path_exec resolved) and SysV detach, shared

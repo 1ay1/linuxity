@@ -463,6 +463,29 @@ public:
         return t.empty() ? abs : t;
     }
 
+    // `abs` with a symlink in ANY component resolved (realpath(3)), the
+    // name the kernel gives a file it opened: /bin/dash -> /usr/bin/dash.
+    [[nodiscard]] std::string canonical(const std::string& abs, int depth = 0) const {
+        if (depth > 40) return abs;
+        std::string cur;
+        std::size_t i = 0;
+        while (i < abs.size()) {
+            while (i < abs.size() && abs[i] == '/') ++i;
+            if (i >= abs.size()) break;
+            std::size_t j = abs.find('/', i);
+            if (j == std::string::npos) j = abs.size();
+            const std::string_view c{abs.data() + i, j - i};
+            i = j;
+            if (c == ".") continue;
+            if (c == "..") { if (!cur.empty()) cur.resize(cur.rfind('/')); continue; }
+            cur += '/';
+            cur += c;
+            if (const std::string t = physical_if_symlink(cur, depth); !t.empty())
+                cur = t == "/" ? std::string{} : canonical(t, depth + 1);
+        }
+        return cur.empty() ? std::string{"/"} : cur;
+    }
+
     // If guest path `abs` is a symlink, the guest path it finally resolves
     // to; otherwise "". Targets are guest paths (an absolute rootfs link
     // means the guest's root), so this is walked here, not by the host.
