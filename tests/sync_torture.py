@@ -398,6 +398,32 @@ def a_handler_without_sa_restorer_returns_on_any_thread():
 
 
 @check
+def a_unix_socket_under_a_long_path():
+    # sun_path is 108 bytes on Linux, but the PATH that names a socket can be
+    # anything a bind() through a relative name reaches. And a short guest
+    # path may be long on the host: linuxity's macOS overlay lives under
+    # $TMPDIR, so Firefox's $XDG_RUNTIME_DIR/wayland-proxy-N failed with
+    # "bind() error: File name too long".
+    import socket
+    import tempfile
+    d = tempfile.mkdtemp()
+    deep = os.path.join(d, *["a-fairly-long-directory"] * 3)
+    os.makedirs(deep)
+    p = os.path.join(deep, "s")
+    ok(len(p) < 108, f"guest path fits sun_path ({len(p)} bytes)")
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(p)
+    srv.listen(1)
+    c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    c.connect(p)
+    a, _ = srv.accept()
+    c.sendall(b"hi")
+    eq(a.recv(2), b"hi", "bound, connected and talking")
+    for s in (a, c, srv):
+        s.close()
+
+
+@check
 def epoll_over_every_kind_of_fd():
     import socket
     ep = select.epoll()

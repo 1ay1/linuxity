@@ -683,15 +683,7 @@ public:
         const auto sc = abi::decode(abi::Arch::aarch64, regs_.nr());
         const int h = host_fd(static_cast<int>(regs_.arg(0)));
         if (h < 0) return complete(-9);
-        ::sockaddr_un sun{};
-        if (host_path.size() >= sizeof sun.sun_path) return complete(-36);   // ENAMETOOLONG
-        sun.sun_family = AF_UNIX;
-        std::memcpy(sun.sun_path, host_path.c_str(), host_path.size() + 1);
-        sun.sun_len = static_cast<std::uint8_t>(offsetof(::sockaddr_un, sun_path)
-                                                + host_path.size() + 1);
-        const int rc = sc == abi::Sysno::bind
-            ? ::bind(h, reinterpret_cast<::sockaddr*>(&sun), sun.sun_len)
-            : ::connect(h, reinterpret_cast<::sockaddr*>(&sun), sun.sun_len);
+        const int rc = net::unix_path_call(h, host_path, sc == abi::Sysno::bind);
         if (rc < 0) {
             // Darwin says ENOTSOCK for connecting to a path that is not a
             // socket (about the ADDRESS -- the fd is one); Linux, ECONNREFUSED.
@@ -1653,6 +1645,9 @@ private:
                         std::memcpy(&gfdx, ctl.data() + off + kLHdr + i * 4, 4);
                         const int hx = host_fd(gfdx);
                         if (hx < 0) return -9;
+                        // the receiver may map it at once: our unflushed
+                        // copy-fallback stores to that file go first
+                        sync_shared_of_file(hx);
                         fds_out.push_back(hx);
                     }
                 }
@@ -4492,6 +4487,23 @@ public:
     }
 private:
 
+    // Write back every copy-fallback shared map of the file `fd` names
+    // (same device and inode), keeping them mapped.
+    void sync_shared_of_file(int fd) {
+        struct ::stat want{};
+        if (::fstat(fd, &want) != 0) return;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+        proc_.with_shared_maps([&](auto& v) {
+            for (const auto& m : v) {
+                struct ::stat st{};
+                if (::fstat(m.fd, &st) == 0 && st.st_dev == want.st_dev && st.st_ino == want.st_ino)
+                    ranges.emplace_back(m.at, m.len);
+            }
+            return 0;
+        });
+        for (const auto& [at, len] : ranges) sync_shared(at, len, /*drop=*/false);
+    }
+
     // Write the shared file mappings overlapping [at, at+len) back to their
     // files; with `drop`, the range is going away, so forget the covered
     // mappings (a partial unmap keeps the rest registered). The ONE place a
@@ -4838,6 +4850,12 @@ private:
                         return static_cast<std::int64_t>(at);
                     }
                 }
+                // Another copy-fallback MAP_SHARED view of this same file in
+                // this process holds stores the file hasn't seen yet: write
+                // them back first, or this view reads stale bytes. (Firefox
+                // fills a shared-memory block through one mapping and reads
+                // it through another: MOZ_RELEASE_ASSERT(mMagic == ...).)
+                sync_shared_of_file(ffd);
                 auto n = ::pread(ffd, win.data(), a1, foff);
                 if (n < 0) return darwin::fail();
                 const auto got = static_cast<std::uint64_t>(n);
@@ -5823,6 +5841,8 @@ private:
 
         switch (cmd) {
             case 1033: {                         // F_ADD_SEALS
+                // sealing freezes the contents others will map: flush ours
+                sync_shared_of_file(h);
                 const auto s = memfd_seals(h);
                 if (!s) return -22;              // EINVAL: not a memfd
                 if (*s & kSealSeal) return -1;   // EPERM: sealing is sealed
@@ -6980,16 +7000,10 @@ private:
                     // one is vanishingly rare and needs no device number.
                     const int s = ::socket(AF_UNIX, SOCK_STREAM, 0);
                     if (s < 0) return darwin::fail();
-                    ::sockaddr_un sun{};
-                    if (path->size() >= sizeof sun.sun_path) { ::close(s); return -36; }
-                    sun.sun_family = AF_UNIX;
-                    std::memcpy(sun.sun_path, path->c_str(), path->size() + 1);
-                    const int rc = ::bind(s, reinterpret_cast<::sockaddr*>(&sun),
-                                          static_cast<socklen_t>(
-                                              offsetof(::sockaddr_un, sun_path)
-                                              + path->size() + 1));
+                    const int rc = net::unix_path_call(s, *path, true);
+                    const std::int64_t e = rc < 0 ? darwin::fail() : 0;
                     ::close(s);
-                    return rc < 0 ? darwin::fail() : 0;
+                    return e;
                 }
                 return -1;                                       // EPERM: device node
             }
@@ -7148,13 +7162,10 @@ private:
                 ::sockaddr_storage ss{};
                 socklen_t slen = 0;
                 if (path) {
-                    auto* sun = reinterpret_cast<::sockaddr_un*>(&ss);
-                    if (path->size() >= sizeof sun->sun_path) return -36;  // ENAMETOOLONG
-                    sun->sun_family = AF_UNIX;
-                    std::memcpy(sun->sun_path, path->c_str(), path->size() + 1);
-                    sun->sun_len = static_cast<std::uint8_t>(
-                        offsetof(::sockaddr_un, sun_path) + path->size() + 1);
-                    slen = sun->sun_len;
+                    // a filesystem socket, of any length (net::unix_path_call)
+                    if (net::unix_path_call(h, *path, sc == S::bind) == 0) return 0;
+                    if (errno == ENOTSOCK && sc == S::connect) return -111;
+                    return darwin::fail();
                 } else {
                     auto addr = ram.at(regs_.arg(1), regs_.arg(2));
                     if (addr.empty()) return -14;
@@ -7581,6 +7592,10 @@ class HvfMem {
 public:
     explicit HvfMem(const HvfMachine& machine, const HvfTrap* trap = nullptr) noexcept
         : machine_{machine}, trap_{trap} {}
+
+    // AF_UNIX bind/connect paths of any host length: HvfTrap reaches long
+    // ones relative to their directory (net::unix_path_call).
+    static constexpr bool unix_paths_any_length() noexcept { return true; }
 
     // The identity bridge abi::Syscalls probes for (`requires { mem_.current_ids(); }`),
     // so the portable core's getpid/getppid and /proc/self see this

@@ -5243,11 +5243,14 @@ private:
             return fwd();
         std::string host_path = std::move(pc.host_path);
 
-        // The translated host path must fit in sun_path (108 bytes incl. NUL).
-        // The overlay prefix (/tmp/linuxity-upper-<pid>) is short so real
-        // socket paths fit; a pathological overflow falls back to a raw
-        // forward rather than truncating (truncation is worse).
-        if (host_path.size() + 1 > 108) return fwd();
+        // The translated host path must fit in sun_path (108 bytes incl. NUL)
+        // -- unless the backend builds the host sockaddr itself and can reach
+        // a longer path relative to its directory (macOS: the overlay lives
+        // under the long $TMPDIR, and Firefox's $XDG_RUNTIME_DIR/wayland-
+        // proxy-N came out at 110 bytes). Otherwise a pathological overflow
+        // falls back to a raw forward rather than truncating.
+        constexpr bool any_length = requires { mem_.unix_paths_any_length(); };
+        if (!any_length && host_path.size() + 1 > 108) return fwd();
 
         // Emit a socket-path rewrite: the trap pokes host_path into the
         // guest's sun_path and sets the socklen register, then forwards the

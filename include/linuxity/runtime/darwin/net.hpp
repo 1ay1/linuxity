@@ -29,6 +29,9 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <fcntl.h>
+#include <cerrno>
+#include <cstddef>
 #include <libproc.h>
 #include <sys/proc_info.h>
 #include <unistd.h>
@@ -349,6 +352,43 @@ inline constexpr std::uint64_t kMsgNosignal = 0x4000;
     if (lf & 0x80)   df |= MSG_EOR;
     // MSG_NOSIGNAL has no Darwin flag: the socket gets SO_NOSIGPIPE instead.
     return df;
+}
+
+// bind(2) or connect(2) an AF_UNIX socket to a filesystem `path` of any
+// length. Darwin's sun_path holds 104 bytes and the overlay puts guest
+// sockets deep under $TMPDIR (/var/folders/../T/...), so a short guest path
+// -- Firefox's /run/user/1000/wayland-proxy-7 -- became ENAMETOOLONG. A path
+// that doesn't fit is reached relative to its directory, opened and made
+// THIS thread's working directory for the one call (pthread_fchdir_np:
+// per-thread, so no other thread's relative paths move). Returns the call's
+// result; errno as the call left it.
+extern "C" int pthread_fchdir_np(int fd);
+[[nodiscard]] inline int unix_path_call(int s, const std::string& path, bool bind) {
+    ::sockaddr_un sun{};
+    sun.sun_family = AF_UNIX;
+    auto call = [&](const std::string& p) {
+        std::memcpy(sun.sun_path, p.c_str(), p.size() + 1);
+        sun.sun_len = static_cast<std::uint8_t>(offsetof(::sockaddr_un, sun_path) + p.size() + 1);
+        auto* a = reinterpret_cast<::sockaddr*>(&sun);
+        return bind ? ::bind(s, a, sun.sun_len) : ::connect(s, a, sun.sun_len);
+    };
+    if (path.size() < sizeof sun.sun_path) return call(path);
+    const auto slash = path.rfind('/');
+    const std::string dir = slash == 0 ? "/" : path.substr(0, slash);
+    const std::string leaf = path.substr(slash + 1);
+    if (slash == std::string::npos || leaf.empty() || leaf.size() >= sizeof sun.sun_path) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    const int d = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (d < 0) return -1;
+    if (pthread_fchdir_np(d) != 0) { const int e = errno; ::close(d); errno = e; return -1; }
+    const int rc = call(leaf);
+    const int e = errno;
+    (void)pthread_fchdir_np(-1);   // back to the process's directory
+    ::close(d);
+    errno = e;
+    return rc;
 }
 
 } // namespace lx::runtime::net

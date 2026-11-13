@@ -128,6 +128,22 @@ def threads_mapping_and_unmapping_at_once():
 
 
 @check
+def a_second_shared_view_sees_the_first():
+    # Fill a memfd through one MAP_SHARED mapping, then map it again:
+    # the new view must see the bytes -- Firefox's shared string maps do
+    # exactly this (odd sizes, not host-page aligned).
+    fd = os.memfd_create("lx-view")
+    size = 5 * PAGE + 123
+    os.ftruncate(fd, size)
+    a = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+    a[0:8] = b"MAGIC123"
+    a[size - 4:size] = b"TAIL"
+    b = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ)
+    eq((b[0:8], b[size - 4:size]), (b"MAGIC123", b"TAIL"), "the second view sees the first's stores")
+    a.close(); b.close(); os.close(fd)
+
+
+@check
 def protections_are_enforced():
     a = anon(4 * PAGE)
     poke(a, b"data")
