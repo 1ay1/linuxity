@@ -142,6 +142,13 @@ public:
         std::lock_guard g{mu_};
         return fn(space_);
     }
+    // Linux's mmap_lock: a memory-map syscall (brk, mmap, munmap, mprotect,
+    // mremap) runs whole under it, so choosing an address range and setting
+    // that range's page tables are one step. Without it a thread's munmap
+    // could fence (PTE none) the range another thread's mmap had just been
+    // handed, and the new owner's first store faulted. Recursive: the
+    // syscalls nest (mmap -> zero/backing helpers that remap).
+    [[nodiscard]] std::unique_lock<std::recursive_mutex> mmap_lock() { return std::unique_lock{mmap_mu_}; }
     template <class Fn>
     decltype(auto) with_signals(Fn&& fn) {
         std::lock_guard g{mu_};
@@ -335,6 +342,7 @@ public:
 
 private:
     mutable std::mutex mu_;
+    std::recursive_mutex mmap_mu_;
     FdTable fds_;
     AddressSpace space_;
     SignalDispositions signals_;

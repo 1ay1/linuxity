@@ -4627,6 +4627,16 @@ private:
 
     [[nodiscard]] Maybe do_memory(abi::Sysno sc) {
         using S = abi::Sysno;
+        switch (sc) {
+            case S::brk: case S::mmap: case S::munmap: case S::mprotect: case S::mremap: break;
+            default: return do_memory_locked(sc);
+        }
+        const auto lock = proc_.mmap_lock();   // see ProcessState::mmap_lock
+        return do_memory_locked(sc);
+    }
+
+    [[nodiscard]] Maybe do_memory_locked(abi::Sysno sc) {
+        using S = abi::Sysno;
         const std::uint64_t a0 = regs_.arg(0), a1 = regs_.arg(1),
                             a2 = regs_.arg(2), a3 = regs_.arg(3);
         switch (sc) {

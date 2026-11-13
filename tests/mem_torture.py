@@ -11,9 +11,10 @@ import os
 import resource
 import signal
 import struct
+import tempfile
 
 from torture import *  # noqa: F401,F403
-from torture import check, ok, eq, expect_errno, child, status, run_in_child, Skip, main, libc, ARCH
+from torture import check, ok, eq, expect_errno, child, status, run_in_child, Skip, main, libc, ARCH, sh, have
 
 PROT_NONE, PROT_READ, PROT_WRITE, PROT_EXEC = 0, 1, 2, 4
 MAP_SHARED, MAP_PRIVATE, MAP_FIXED, MAP_ANON = 1, 2, 0x10, 0x20
@@ -81,6 +82,49 @@ def anonymous_memory_is_zeroed_and_unmapped_is_gone():
     eq(peek(a, 1) + peek(a + 6 * PAGE, 1), b"\0\0", "both sides of the hole survive")
     eq(libc.munmap(a + 1, PAGE), -1, "munmap of an unaligned address")
     eq(ctypes.get_errno(), errno.EINVAL, "is EINVAL")
+
+
+_MMAP_RACE_C = r"""
+#include <pthread.h>
+#include <stdio.h>
+#include <sys/mman.h>
+static void* run(void* a) {
+    (void)a;
+    for (int r = 0; r < 3000; r++) {
+        volatile int* p = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        p[0] = r;
+        munmap((void*)p, 4096);
+    }
+    return 0;
+}
+int main(void) {
+    pthread_t t[4];
+    for (int i = 0; i < 4; i++) pthread_create(&t[i], 0, run, 0);
+    for (int i = 0; i < 4; i++) pthread_join(t[i], 0);
+    puts("ok");
+    return 0;
+}
+"""
+
+
+@check(timeout=120)
+def threads_mapping_and_unmapping_at_once():
+    # mmap_lock: picking an address and setting its page tables is one step.
+    # Without it a thread's munmap could fence the range another thread had
+    # just been handed, and that thread's first store faulted -- every JIT
+    # and threaded allocator (llvmpipe, so every OpenGL app) hit it. Native
+    # threads: Python's take turns and never overlap in the syscalls.
+    cc = next((c for c in ("cc", "gcc", "clang") if have(c)), None)
+    if not cc:
+        raise Skip("no C compiler")
+    d = tempfile.mkdtemp()
+    src, exe = os.path.join(d, "race.c"), os.path.join(d, "race")
+    with open(src, "w") as f:
+        f.write(_MMAP_RACE_C)
+    eq(sh(f"{cc} -O2 -pthread -o {exe} {src}")[0], 0, "compiles")
+    for _ in range(3):
+        rc, out, _err = sh(exe)
+        eq((rc, out.strip()), (0, "ok"), "four threads mapping, storing and unmapping")
 
 
 @check
