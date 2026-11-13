@@ -108,6 +108,40 @@ def lock_and_wait_timeouts():
 
 
 @check
+def a_signal_for_nobody_does_not_end_a_timeout():
+    # SIGCHLD at its default disposition is discarded, and a signal another
+    # thread takes wakes nobody here: neither may end select/poll early.
+    # linuxity's signal wake made them return 0 (a timeout) at once, so
+    # asyncio's pidfd watcher, waiting 5 s for a quick child, gave up in
+    # 3 ms while other threads' children exited around it.
+    errors = []
+
+    def spawner(k):
+        for i in range(8):
+            pid = os.posix_spawn("/bin/sh", ["sh", "-c", "exit 3"], os.environ)
+            time.sleep(((i + k) % 4) * 0.003)
+            fd = os.pidfd_open(pid)
+            t0 = time.monotonic()
+            if select.select([fd], [], [], 5)[0] != [fd]:
+                errors.append(f"{k}/{i}: select gave up after {time.monotonic() - t0:.3f}s")
+            os.close(fd)
+            os.waitpid(pid, 0)
+    ts = [threading.Thread(target=spawner, args=(k,)) for k in range(6)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    eq(errors, [], "every wait lasted until the child exited")
+    r, _ = os.pipe()
+    p = select.poll()
+    p.register(r, select.POLLIN)
+    t0 = time.monotonic()
+    os.kill(os.getpid(), signal.SIGCHLD)
+    eq(p.poll(300), [], "poll times out with nothing ready")
+    ok(time.monotonic() - t0 >= 0.25, "despite a SIGCHLD to the process")
+
+
+@check
 def signals_reach_the_main_thread_while_others_run():
     got = []
     signal.signal(signal.SIGUSR1, lambda s, f: got.append(threading.get_native_id()))

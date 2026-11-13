@@ -6475,8 +6475,32 @@ private:
             if (any && fits) return fifo_aware_poll(p, timeout, fifo, wfd, deliverable);
         }
         if (wfd >= 0) p.push_back({wfd, POLLIN, 0});
-        const int rc = ::poll(p.data(), static_cast<nfds_t>(p.size()), timeout);
-        const bool woke = wfd >= 0 && (p.back().revents & POLLIN);
+        // The wake pipe fires for any signal to the process -- a SIGCHLD
+        // that is ignored, one another thread takes. That wake delivers
+        // nothing to THIS thread, and returning its 0 made select/poll
+        // report a timeout after a few ms of a 5 s wait (asyncio's pidfd
+        // watcher saw a child "never" exit). Linux sleeps on: so do we,
+        // until the caller's deadline.
+        using Clock = std::chrono::steady_clock;
+        const auto deadline = timeout >= 0 ? Clock::now() + std::chrono::milliseconds(timeout)
+                                           : Clock::time_point::max();
+        int rc = 0;
+        bool woke = false;
+        for (int left = timeout;;) {
+            for (auto& e : p) e.revents = 0;
+            rc = ::poll(p.data(), static_cast<nfds_t>(p.size()), left);
+            woke = wfd >= 0 && (p.back().revents & POLLIN);
+            if (rc < 0 || rc != (woke ? 1 : 0) || !woke || deliverable()) break;
+            g_pending.drain_wake();
+            drain_mail();
+            if (deliverable()) break;
+            if (timeout >= 0) {
+                const auto now = Clock::now();
+                if (now >= deadline) { rc = 0; woke = false; break; }
+                left = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            deadline - now).count()) + 1;
+            }
+        }
         if (wfd >= 0) p.pop_back();
         if (rc < 0) return errno == EINTR ? -4 : static_cast<int>(darwin::fail());
         const int n = rc - (woke ? 1 : 0);
