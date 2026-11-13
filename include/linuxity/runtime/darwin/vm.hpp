@@ -1184,10 +1184,19 @@ public:
     // cross-thread operation the framework permits, and the basis of both
     // signal delivery and thread-group exit.
     void kick() noexcept {
-        std::lock_guard l{kick_mu_};   // not mid-park: a destroyed handle may be reused
-        if (!live_) return;
-        hv_vcpu_t v = cpu_;
-        ::hv_vcpus_exit(&v, 1);
+        // signals blocked: a host signal's handler kicks too (kick_all), and
+        // hv_vcpus_exit re-entered on one thread aborts the process
+        ::sigset_t all, old;
+        sigfillset(&all);
+        ::pthread_sigmask(SIG_BLOCK, &all, &old);
+        {
+            std::lock_guard l{kick_mu_};   // not mid-park: a destroyed handle may be reused
+            if (live_) {
+                hv_vcpu_t v = cpu_;
+                ::hv_vcpus_exit(&v, 1);
+            }
+        }
+        ::pthread_sigmask(SIG_SETMASK, &old, nullptr);
     }
 
 private:

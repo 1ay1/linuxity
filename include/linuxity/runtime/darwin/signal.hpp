@@ -258,12 +258,24 @@ struct PendingSignals {
     // always: a raiser can't know which state each thread is in.
     void kick_all() noexcept {
         poke();
+        // hv_vcpus_exit takes a lock inside Hypervisor.framework and is not
+        // async-signal-safe: a host signal arriving while this thread is
+        // already in it (a kick of our own, or another signal's handler)
+        // re-entered it and XNU aborted the whole process -- "BUG IN
+        // CLIENT OF LIBPLATFORM: Trying to recursively lock an
+        // os_unfair_lock". So every signal stays blocked across the kick
+        // (pthread_sigmask is async-signal-safe); one that comes in the
+        // meantime runs right after, and its own kick is then harmless.
+        ::sigset_t all, old;
+        sigfillset(&all);
+        ::pthread_sigmask(SIG_BLOCK, &all, &old);
         const int n = cpu_count.load(std::memory_order_acquire);
         for (int i = 0; i < n; ++i)
             if (const std::uint64_t s = cpus[i].load(std::memory_order_relaxed)) {
                 hv_vcpu_t v = static_cast<hv_vcpu_t>(s - 1);
                 ::hv_vcpus_exit(&v, 1);
             }
+        ::pthread_sigmask(SIG_SETMASK, &old, nullptr);
     }
 
     // Block until one of `interesting` is pending, then return. Used by
