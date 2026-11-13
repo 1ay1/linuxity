@@ -423,6 +423,86 @@ def a_unix_socket_under_a_long_path():
         s.close()
 
 
+_THREADS_FORKS_C = r"""
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+static volatile int stop;
+static void* sleeper(void* a) { (void)a; sleep(2); return 0; }
+static void* churn(void* a) { (void)a; while (!stop) { int f = open("/dev/null", O_RDONLY); close(f); } return 0; }
+static int fork_fail;
+static void* forker(void* a) {
+    (void)a;
+    for (int i = 0; i < 8; i++) {
+        pid_t p = fork();
+        if (p == 0) _exit(3);
+        if (p < 0) { __atomic_fetch_add(&fork_fail, 1, 0); continue; }
+        int st; waitpid(p, &st, 0);
+        if (!WIFEXITED(st) || WEXITSTATUS(st) != 3) __atomic_fetch_add(&fork_fail, 1, 0);
+    }
+    return 0;
+}
+int main(int argc, char** argv) {
+    if (argc > 1 && !strcmp(argv[1], "threads")) {
+        pthread_t t[300]; int n = 0;
+        for (int i = 0; i < 300; i++) if (pthread_create(&t[i], 0, sleeper, 0) == 0) n++;
+        for (int i = 0; i < n; i++) pthread_join(t[i], 0);
+        printf("%d\n", n);
+    } else {
+        pthread_t c[3], f[4];
+        for (int i = 0; i < 3; i++) pthread_create(&c[i], 0, churn, 0);
+        for (int i = 0; i < 4; i++) pthread_create(&f[i], 0, forker, 0);
+        for (int i = 0; i < 4; i++) pthread_join(f[i], 0);
+        stop = 1;
+        for (int i = 0; i < 3; i++) pthread_join(c[i], 0);
+        printf("%d\n", fork_fail);
+    }
+    fflush(stdout);
+    return 0;
+}
+"""
+
+
+def _build_threads_forks():
+    from torture import sh, have
+    cc = next((c for c in ("cc", "gcc", "clang") if have(c)), None)
+    if not cc:
+        raise Skip("no C compiler")
+    import tempfile
+    d = tempfile.mkdtemp()
+    src, exe = os.path.join(d, "tf.c"), os.path.join(d, "tf")
+    with open(src, "w") as f:
+        f.write(_THREADS_FORKS_C)
+    eq(sh(f"{cc} -O1 -pthread -o {exe} {src}")[0], 0, "compiles")
+    return exe
+
+
+@check(timeout=120)
+def hundreds_of_live_threads():
+    # Linux runs thousands of threads; programs (Firefox's thread pools, Go,
+    # the JVM) assume hundreds. Most sleep in a syscall at any moment. A
+    # runtime that gives each thread a hypervisor vCPU must not stop at the
+    # vCPU limit (64 on macOS): it hung at 63, then failed EAGAIN, and
+    # Firefox died in "nsThreadPool::PutEvent() - Failed to create a new
+    # thread when pool is empty".
+    from torture import sh
+    rc, out, _ = sh(_build_threads_forks() + " threads", timeout=100)
+    eq((rc, out.strip()), (0, "300"), "300 threads alive at once")
+
+
+@check(timeout=120)
+def forks_from_many_threads_at_once():
+    # Four threads forking while three others open and close fds: fork must
+    # not trip on an fd another thread just closed (EBADF -> EAGAIN) or on
+    # two forks drawing the same rendezvous name.
+    from torture import sh
+    rc, out, _ = sh(_build_threads_forks() + " forks", timeout=100)
+    eq((rc, out.strip()), (0, "0"), "no fork failed")
+
+
 @check
 def epoll_over_every_kind_of_fd():
     import socket

@@ -234,6 +234,11 @@ public:
     struct Export {
         std::vector<Exported> entries;
         std::vector<int> host_fds;      // host fd for each group, in the PARENT
+        // The open files themselves: held for as long as the fork needs
+        // host_fds, so a sibling thread's close() can't free a number under
+        // it. (Not dup'd: on macOS closing ANY fd of a file drops the
+        // process's POSIX record locks on it.)
+        std::vector<std::shared_ptr<HostFd>> keep;
     };
     [[nodiscard]] Export export_table() const {
         Export out;
@@ -244,6 +249,7 @@ public:
             if (it != seen.end()) return static_cast<int>(it - seen.begin());
             seen.push_back(f.get());
             out.host_fds.push_back(f->get());
+            out.keep.push_back(f);
             return static_cast<int>(seen.size() - 1);
         };
         for (std::size_t g = 0; g < slots_.size(); ++g) {

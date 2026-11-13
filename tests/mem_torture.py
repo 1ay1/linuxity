@@ -6,6 +6,7 @@ import sys
 sys.dont_write_bytecode = True
 import ctypes
 import errno
+import fcntl
 import mmap
 import os
 import resource
@@ -141,6 +142,43 @@ def a_second_shared_view_sees_the_first():
     b = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ)
     eq((b[0:8], b[size - 4:size]), (b"MAGIC123", b"TAIL"), "the second view sees the first's stores")
     a.close(); b.close(); os.close(fd)
+    # Firefox's shape: a /dev/shm file opened twice, written through the
+    # read-write fd's mapping, mapped again through the read-only fd.
+    path = "/dev/shm/lx-view-%d" % os.getpid()
+    rw = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    ro = os.open(path, os.O_RDONLY)
+    os.unlink(path)
+    os.ftruncate(rw, size)
+    w = mmap.mmap(rw, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+    w[0:8] = b"SHMMAGIC"
+    r = mmap.mmap(ro, size, mmap.MAP_SHARED, mmap.PROT_READ)
+    eq(r[0:8], b"SHMMAGIC", "a read-only fd's mapping sees the read-write mapping's stores")
+    w.close(); r.close(); os.close(rw); os.close(ro)
+    # ...and Firefox's real one: fill a sealed memfd, fork, the child maps it
+    fd = os.memfd_create("lx-fork-view", os.MFD_ALLOW_SEALING)
+    os.ftruncate(fd, size)
+    w = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+    w[0:8] = b"FORKSEEN"
+    fcntl.fcntl(fd, 1033, 0x10 | 0x4 | 0x2)   # F_ADD_SEALS: FUTURE_WRITE|GROW|SHRINK
+    def child_reads():
+        m = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ)
+        return 0 if m[0:8] == b"FORKSEEN" else 7
+    eq(run_in_child(child_reads), 0, "a fork child's mapping sees the parent's stores")
+    w.close(); os.close(fd)
+    # Firefox's actual handle: write a memfd, reopen it read-only through
+    # /proc/self/fd/N, map that
+    fd = os.memfd_create("lx-reopen", os.MFD_ALLOW_SEALING)
+    os.ftruncate(fd, size)
+    w = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+    w[0:8] = b"REOPENED"
+    w.close()
+    ro = os.open("/proc/self/fd/%d" % fd, os.O_RDONLY)
+    r = mmap.mmap(ro, size, mmap.MAP_SHARED, mmap.PROT_READ)
+    eq(r[0:8], b"REOPENED", "a /proc/self/fd reopen of a memfd is the same file")
+    w = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+    w[0:8] = b"LATERONE"
+    eq(r[0:8], b"LATERONE", "and sees later stores")
+    r.close(); w.close(); os.close(ro); os.close(fd)
 
 
 @check

@@ -36,6 +36,7 @@
 #include <servers/bootstrap.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -88,7 +89,12 @@ struct HandoffRecv {
 // (rather than inheriting a port) works with posix_spawn, which doesn't pass
 // arbitrary rights.
 [[nodiscard]] inline std::string unique_service_name() {
+    // pid, a per-process counter, and the clock: two threads forking in the
+    // same 41 ns tick drew the same name, the second bootstrap_register
+    // failed, and the guest's fork() was EAGAIN.
+    static std::atomic<std::uint64_t> seq{0};
     return "org.linuxity.fork." + std::to_string(::getpid()) + "." +
+           std::to_string(seq.fetch_add(1, std::memory_order_relaxed)) + "-" +
            std::to_string(::mach_absolute_time());
 }
 

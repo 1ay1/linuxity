@@ -102,6 +102,7 @@
 #include <span>
 #include <string>
 #include <type_traits>
+#include <future>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -1054,6 +1055,69 @@ private:
     [[nodiscard]] std::int64_t service(const std::string* path,
                                        const std::string* path2) {
         const auto sc = abi::decode(abi::Arch::aarch64, regs_.nr());
+        // A call that may block, while vCPUs are scarce: give ours back for
+        // the duration (VcpuBudget). Taken again before the result is
+        // written, so nothing past this function ever sees it parked.
+        ParkScope park{cpu_, may_block(sc) && park_allowed(sc) && g_vcpus.scarce()};
+        return service_inner(sc, path, path2);
+    }
+
+    // LINUXITY_PARK=0 turns parking off; =N limits it to syscall N (debug).
+    [[nodiscard]] static bool park_allowed(abi::Sysno sc) {
+        static const int mode = [] {
+            const char* p = std::getenv("LINUXITY_PARK");
+            return p ? std::atoi(p) : -1;
+        }();
+        return mode < 0 || (mode > 0 && static_cast<int>(sc) == mode);
+    }
+
+    // Syscalls that can sleep in the host for a long time.
+    [[nodiscard]] bool may_block(abi::Sysno sc) const {
+        using S = abi::Sysno;
+        switch (sc) {
+            case S::futex: {
+                const auto cmd = static_cast<std::uint32_t>(regs_.arg(1)) & kFutexCmdMask;
+                return cmd == static_cast<std::uint32_t>(FutexOp::wait) ||
+                       cmd == static_cast<std::uint32_t>(FutexOp::wait_bitset);
+            }
+            case S::clone:
+                // a new thread waits for its vCPU; we must not hold one while
+                // it does (at the limit, two threads would wait on each other)
+                return CloneRequest{regs_.arg(0), 0, 0, 0, 0}.is_thread();
+            case S::ppoll: case S::pselect6: case S::epoll_pwait: case S::epoll_pwait2:
+            case S::nanosleep: case S::clock_nanosleep: case S::read: case S::readv:
+            case S::recvfrom: case S::recvmsg: case S::accept: case S::accept4:
+            case S::wait4: case S::waitid: case S::rt_sigsuspend: case S::rt_sigtimedwait:
+            case S::msgrcv: case S::semtimedop:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    struct ParkScope {
+        HvfCpu& cpu;
+        bool parked{false};
+        ParkScope(HvfCpu& c, bool want) : cpu(c) {
+            if (!want || !cpu.live()) return;
+            g_pending.unregister_cpu(cpu.handle());
+            cpu.park();
+            parked = true;
+        }
+        ~ParkScope() {
+            if (!parked) return;
+            if (!cpu.unpark()) {
+                std::fputs("linuxity: the hypervisor refused a vCPU for a waking thread\n", stderr);
+                ::_exit(70);
+            }
+            g_pending.register_cpu(cpu.handle());
+        }
+        ParkScope(const ParkScope&) = delete;
+        ParkScope& operator=(const ParkScope&) = delete;
+    };
+
+    [[nodiscard]] std::int64_t service_inner(abi::Sysno sc, const std::string* path,
+                                             const std::string* path2) {
         if (auto r = do_signal(sc))         return *r;
         if (auto r = do_ipc(sc))            return *r;
         if (auto r = do_lifecycle(sc))      return *r;
@@ -2551,8 +2615,17 @@ private:
             (void)machine_.ram().put(req.child_tid_addr, std::int32_t{tid});
         if (req.flags & clone_flag::parent_settid)
             (void)machine_.ram().put(req.parent_tid_addr, std::int32_t{tid});
-
-        if (!spawn_thread_(std::move(start))) return -11;   // EAGAIN
+        // The new thread reports its vCPU before running a single guest
+        // instruction; no vCPU, no thread: EAGAIN.
+        auto started = start.started->get_future();
+        bool ok = spawn_thread_(std::move(start));
+        if (ok) {
+            try { ok = started.get(); } catch (const std::future_error&) { ok = false; }
+        }
+        if (!ok) {
+            pids_.release(tid);
+            return -11;                                   // EAGAIN
+        }
         return tid;
     }
 
@@ -2565,6 +2638,12 @@ private:
     //      which starts a fresh linuxity that resumes the guest with x0 = 0.
     [[nodiscard]] std::int64_t do_fork(const CloneRequest& req) {
         if (!pids_.valid() || !spawn_) return -38;
+        // The child is another process: anything it maps from a file must
+        // see our MAP_SHARED stores, so the copy-fallback ones go to their
+        // files now (kept mapped). Firefox fills a sealed memfd, forks its
+        // helpers and hands them the fd; they read zeros otherwise and die
+        // in MOZ_RELEASE_ASSERT(GetHeader().mMagic == kSharedStringMapMagic).
+        sync_shared(0, ~std::uint64_t{0} >> 1, /*drop=*/false);
         const auto fstart = std::chrono::steady_clock::now();
         const std::int32_t child = pids_.allocate(0);   // placeholder host pid
         if (child < 0) return -11;                       // EAGAIN
@@ -2603,10 +2682,19 @@ private:
             img.brk = sp.brk();
             img.arena = sp.arena();
         });
+        // What the child inherits must stay what it is until spawn_ is done:
+        // the open files are held (keep_files) so a sibling thread's close()
+        // can't free a host fd number under posix_spawn (it failed EBADF and
+        // Firefox's fork() saw EAGAIN), and the mmap lock keeps munmap from
+        // closing a shared backing's fd. No duplicates: on macOS closing
+        // any fd of a file drops the process's POSIX locks on it.
+        const auto mm_lock = proc_.mmap_lock();
+        std::vector<std::shared_ptr<HostFd>> keep_files;
         {
             auto ex = proc_.with_fds([&](FdTable& t) { return t.export_table(); });
             img.fds = std::move(ex.entries);
             img.fd_hosts = std::move(ex.host_fds);
+            keep_files = std::move(ex.keep);
         }
         // Shared backings ride as extra fd groups after the table's own: the
         // child maps the SAME objects, so writes on either side are seen by
@@ -2685,6 +2773,10 @@ public:
         std::int32_t tgid{};            // the process this thread belongs to
         std::uint64_t sig_mask{};
         std::uint64_t clear_child_tid{};
+        // The new thread says whether it got a vCPU (HVF allows 64 per VM)
+        // before clone returns: a thread that can never run must be clone's
+        // EAGAIN, as on Linux -- otherwise the guest waits forever on it.
+        std::shared_ptr<std::promise<bool>> started{std::make_shared<std::promise<bool>>()};
     };
     using SpawnThread = std::function<bool(ThreadStart)>;
     void set_thread_spawner(SpawnThread f) { spawn_thread_ = std::move(f); }
@@ -4821,6 +4913,14 @@ private:
                 // covers, so rounding up here would wipe a neighbour.
                 const int ffd = proc_.with_fds([&](FdTable& t) { return t.host(static_cast<int>(regs_.arg(4))); }).value_or(-1);
                 if (ffd < 0) return -9;                              // EBADF
+                // Another copy-fallback MAP_SHARED view of this same file in
+                // this process holds stores the file hasn't seen yet: write
+                // them back before this mapping reads it -- by either path
+                // below, the real host mapping or the copy. Firefox writes a
+                // /dev/shm block through one fd's mapping and maps it again
+                // through a second, read-only fd (MOZ_RELEASE_ASSERT(
+                // GetHeader().mMagic == kSharedStringMapMagic)).
+                sync_shared_of_file(ffd);
                 const auto foff = static_cast<off_t>(regs_.arg(5));
                 if (shared) {
                     // A shared WRITABLE map needs a writable file (EACCES),
@@ -4850,12 +4950,6 @@ private:
                         return static_cast<std::int64_t>(at);
                     }
                 }
-                // Another copy-fallback MAP_SHARED view of this same file in
-                // this process holds stores the file hasn't seen yet: write
-                // them back first, or this view reads stale bytes. (Firefox
-                // fills a shared-memory block through one mapping and reads
-                // it through another: MOZ_RELEASE_ASSERT(mMagic == ...).)
-                sync_shared_of_file(ffd);
                 auto n = ::pread(ffd, win.data(), a1, foff);
                 if (n < 0) return darwin::fail();
                 const auto got = static_cast<std::uint64_t>(n);
@@ -6813,6 +6907,15 @@ private:
                     const bool reg = ::fstat(*h, &st) == 0 && S_ISREG(st.st_mode);
                     if (reg && st.st_nlink > 0 && ::fcntl(*h, F_GETPATH, p) == 0) {
                         fd_path_storage_ = p;
+                    } else if (reg && (sc == S::openat || sc == S::open) &&
+                               ::fgetxattr(*h, kMemfdNameXattr, nullptr, 0, 0, 0) >= 0) {
+                        // A memfd: shared memory by definition. The reopen
+                        // must BE that file -- Firefox writes a memfd, then
+                        // reopens /proc/self/fd/N read-only and hands that
+                        // out as the shared view; a snapshot read zeros
+                        // (MOZ_RELEASE_ASSERT(mMagic == kSharedStringMapMagic)).
+                        // /dev/fd/K reaches it (sharing the offset, which
+                        // mapping users never notice).
                     } else if (reg && (sc == S::openat || sc == S::open)) {
                         // Unlinked: no name to reopen. A READ-ONLY reopen
                         // (the common one: read what a deleted temp held)

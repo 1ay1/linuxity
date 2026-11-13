@@ -33,7 +33,9 @@
 
 #include <atomic>
 #include <cerrno>
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <cstdio>
 #include <cstdlib>
@@ -527,6 +529,61 @@ private:
     bool owns_ram_{false};
 };
 
+// -- The vCPU budget ---------------------------------------------------------
+//
+// Hypervisor.framework allows a VM 64 vCPUs (hv_vm_get_max_vcpu_count), and
+// every guest thread runs on one -- but Linux programs run hundreds of
+// threads: Firefox's thread pools, Go, the JVM. Most of them, most of the
+// time, sit blocked in a syscall, where a thread needs no vCPU at all.
+//
+// So the vCPUs are a budget. HvfCpu::create() takes a slot (waiting for one
+// if none is free), the destructor gives it back, and a thread about to
+// block in a syscall while slots are scarce parks: its full CPU state is
+// saved, the vCPU destroyed and the slot handed to whoever waits; it takes a
+// slot again (waiting if it must) and rebuilds the vCPU when the syscall
+// returns. With slots to spare nothing parks, so ordinary programs pay
+// nothing; a 500-thread program runs with at most `capacity` on CPUs at a
+// time -- which is what any machine with fewer cores than threads does.
+struct VcpuBudget {
+    std::mutex mu;
+    std::condition_variable cv;
+    int capacity{0};
+    int in_use{0};
+    int waiting{0};
+
+    void init_locked() {
+        if (capacity) return;
+        std::uint32_t max = 0;
+        if (::hv_vm_get_max_vcpu_count(&max) != HV_SUCCESS || max < 4) max = 64;
+        capacity = static_cast<int>(max) - 2;   // headroom for the framework's own
+    }
+    void acquire() {
+        std::unique_lock l{mu};
+        init_locked();
+        ++waiting;
+        cv.wait(l, [this] { return in_use < capacity; });
+        --waiting;
+        ++in_use;
+    }
+    void release() {
+        {
+            std::lock_guard l{mu};
+            if (in_use > 0) --in_use;
+        }
+        cv.notify_one();
+    }
+    // Worth parking for: past half the budget, or anyone waiting. Half, not
+    // "nearly full": a thread that blocked before parking began keeps its
+    // vCPU until it wakes, so at most half can ever be pinned that way and
+    // the other half always circulates.
+    [[nodiscard]] bool scarce() {
+        std::lock_guard l{mu};
+        init_locked();
+        return waiting > 0 || in_use * 2 >= capacity;
+    }
+};
+inline VcpuBudget g_vcpus;
+
 // -- One vCPU --------------------------------------------------------------
 //
 // MUST be created on, and only ever used from, the host thread that will run
@@ -538,14 +595,43 @@ public:
     HvfCpu() = default;
     HvfCpu(const HvfCpu&) = delete;
     HvfCpu& operator=(const HvfCpu&) = delete;
-    ~HvfCpu() { if (live_) ::hv_vcpu_destroy(cpu_); }
+    ~HvfCpu() { destroy(); }
+
+    // Give the vCPU back while this thread blocks (see VcpuBudget): its
+    // state is kept here and restored by unpark(), which may wait for a
+    // slot. Only from the owning thread, outside hv_vcpu_run.
+    void park() {
+        if (!live_) return;
+        parked_state_ = save();
+        destroy();
+    }
+    // False only if the framework refuses a vCPU even with a slot held.
+    [[nodiscard]] bool unpark() {
+        if (live_ || !parked_state_) return live_;
+        if (!create()) return false;
+        // out of parked_state_ FIRST: while it is set, load() only edits the
+        // kept copy (that is what makes load() safe on a parked thread)
+        const CpuState s = std::move(*parked_state_);
+        parked_state_.reset();
+        restore_el1_ = true;     // the SAME thread coming back: all of it
+        load(s);
+        restore_el1_ = false;
+        return true;
+    }
+    [[nodiscard]] bool parked() const noexcept { return parked_state_.has_value(); }
 
     // Bring this vCPU up in "Linux userspace" state: MMU on, EL0
     // unprivileged, our vector stub installed.
     [[nodiscard]] Status create() {
-        if (::hv_vcpu_create(&cpu_, &exit_, nullptr) != HV_SUCCESS)
+        g_vcpus.acquire();
+        if (::hv_vcpu_create(&cpu_, &exit_, nullptr) != HV_SUCCESS) {
+            g_vcpus.release();
             return err(Errno::enodev);
-        live_ = true;
+        }
+        {
+            std::lock_guard l{kick_mu_};
+            live_ = true;
+        }
         auto sr = [this](hv_sys_reg_t r, std::uint64_t v) {
             ::hv_vcpu_set_sys_reg(cpu_, r, v);
         };
@@ -661,9 +747,16 @@ public:
         std::uint64_t pc{}, cpsr{}, sp_el0{}, tpidr_el0{}, tpidrro_el0{};
         std::uint64_t fpcr{}, fpsr{};
         hv_simd_fp_uchar16_t q[32]{};
+        // EL1 context: a vCPU stopped inside one of our EL1 paths (the
+        // in-guest syscall handler, a vector stub) resumes into it, and
+        // that code relies on these. A rebuilt vCPU (VcpuBudget parking)
+        // would otherwise wake with them zeroed.
+        std::uint64_t sp_el1{}, elr_el1{}, spsr_el1{}, tpidr_el1{}, esr_el1{}, far_el1{};
+        bool el1{false};   // carried (save() from a live vCPU); thread starts leave them
     };
 
     [[nodiscard]] CpuState save() const noexcept {
+        if (parked_state_) return *parked_state_;   // parked: the kept state is the CPU
         CpuState s;
         for (unsigned i = 0; i < 31; ++i)
             ::hv_vcpu_get_reg(cpu_, static_cast<hv_reg_t>(HV_REG_X0 + i), &s.x[i]);
@@ -677,10 +770,18 @@ public:
         for (unsigned i = 0; i < 32; ++i)
             ::hv_vcpu_get_simd_fp_reg(
                 cpu_, static_cast<hv_simd_fp_reg_t>(HV_SIMD_FP_REG_Q0 + i), &s.q[i]);
+        ::hv_vcpu_get_sys_reg(cpu_, HV_SYS_REG_SP_EL1, &s.sp_el1);
+        ::hv_vcpu_get_sys_reg(cpu_, HV_SYS_REG_ELR_EL1, &s.elr_el1);
+        ::hv_vcpu_get_sys_reg(cpu_, HV_SYS_REG_SPSR_EL1, &s.spsr_el1);
+        ::hv_vcpu_get_sys_reg(cpu_, HV_SYS_REG_TPIDR_EL1, &s.tpidr_el1);
+        ::hv_vcpu_get_sys_reg(cpu_, HV_SYS_REG_ESR_EL1, &s.esr_el1);
+        ::hv_vcpu_get_sys_reg(cpu_, HV_SYS_REG_FAR_EL1, &s.far_el1);
+        s.el1 = true;
         return s;
     }
 
     void load(const CpuState& s) noexcept {
+        if (parked_state_) { *parked_state_ = s; return; }
         for (unsigned i = 0; i < 31; ++i)
             ::hv_vcpu_set_reg(cpu_, static_cast<hv_reg_t>(HV_REG_X0 + i), s.x[i]);
         ::hv_vcpu_set_reg(cpu_, HV_REG_PC, s.pc);
@@ -693,6 +794,14 @@ public:
         for (unsigned i = 0; i < 32; ++i)
             ::hv_vcpu_set_simd_fp_reg(
                 cpu_, static_cast<hv_simd_fp_reg_t>(HV_SIMD_FP_REG_Q0 + i), s.q[i]);
+        if (s.el1 && restore_el1_) {
+            ::hv_vcpu_set_sys_reg(cpu_, HV_SYS_REG_SP_EL1, s.sp_el1);
+            ::hv_vcpu_set_sys_reg(cpu_, HV_SYS_REG_ELR_EL1, s.elr_el1);
+            ::hv_vcpu_set_sys_reg(cpu_, HV_SYS_REG_SPSR_EL1, s.spsr_el1);
+            ::hv_vcpu_set_sys_reg(cpu_, HV_SYS_REG_TPIDR_EL1, s.tpidr_el1);
+            ::hv_vcpu_set_sys_reg(cpu_, HV_SYS_REG_ESR_EL1, s.esr_el1);
+            ::hv_vcpu_set_sys_reg(cpu_, HV_SYS_REG_FAR_EL1, s.far_el1);
+        }
     }
 
     [[nodiscard]] std::uint64_t sp() const noexcept { return sys(HV_SYS_REG_SP_EL0); }
@@ -707,12 +816,22 @@ public:
     // cross-thread operation the framework permits, and the basis of both
     // signal delivery and thread-group exit.
     void kick() noexcept {
+        std::lock_guard l{kick_mu_};   // not mid-park: a destroyed handle may be reused
         if (!live_) return;
         hv_vcpu_t v = cpu_;
         ::hv_vcpus_exit(&v, 1);
     }
 
 private:
+    void destroy() noexcept {
+        if (!live_) return;
+        {
+            std::lock_guard l{kick_mu_};
+            live_ = false;
+        }
+        ::hv_vcpu_destroy(cpu_);
+        g_vcpus.release();
+    }
     // A kick (hv_vcpus_exit) can cancel the run while the vCPU is inside
     // one of OUR EL1 detours on the vectors page: the TLB-flush stub, the
     // in-guest syscall handler at VBAR+0x400, or a vector's `hvc` not yet
@@ -756,6 +875,9 @@ private:
     hv_vcpu_t cpu_{};
     hv_vcpu_exit_t* exit_{nullptr};
     bool live_{false};
+    std::mutex kick_mu_;
+    std::optional<CpuState> parked_state_;
+    bool restore_el1_{false};
     bool flush_pending_{false};
     // FAR of the last stage-2 abort (run()); FAR_EL1 is stale for those.
     std::optional<std::uint64_t> stage2_far_;
