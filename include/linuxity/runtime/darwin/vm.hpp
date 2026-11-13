@@ -557,7 +557,12 @@ public:
         // SCTLR_EL1: M | C | I (MMU + caches) | SA/SA0 | nTWI/nTWE | SPAN,
         // plus the RES1 bits. Caches ON matters: libc issues DC/IC
         // maintenance and relies on normal memory ordering.
-        sr(HV_SYS_REG_SCTLR_EL1, 0x30d0199dull);
+        // UCT (15) and UCI (26), as Linux sets them: EL0 may read CTR_EL0
+        // and clean/invalidate by VA (DC CVAU/CIVAC, IC IVAU). That is the
+        // whole of __clear_cache, which every JIT runs after writing code
+        // (Mesa's llvmpipe, V8, LuaJIT); without them `mrs x, ctr_el0`
+        // trapped and the program died with SIGSEGV at the read.
+        sr(HV_SYS_REG_SCTLR_EL1, 0x30d0199dull | (1ull << 15) | (1ull << 26));
         // CNTKCTL_EL1: EL0VCTEN | EL0PCTEN -- let EL0 read CNTVCT_EL0/CNTFRQ
         // directly, as Linux does. This is what makes the vDSO's
         // clock_gettime a few instructions instead of a VM exit (~1 us), and
