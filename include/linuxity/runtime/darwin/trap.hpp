@@ -5834,8 +5834,16 @@ private:
             // a master is what ptsname answers for (Darwin's isatty() says
             // yes for a master too, yet refuses most requests on it)
             char name[128];
-            if (::ptsname_r(hfd, name, sizeof name) == 0)
+            if (::ptsname_r(hfd, name, sizeof name) == 0) {
                 slave.fd = ::open(name, O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
+                // Still locked: Linux sizes a master's terminal before
+                // unlockpt (foot sets TIOCSWINSZ in the parent while its
+                // child unlocks), Darwin can't reach the slave until then.
+                // Unlock it now -- the guest's own unlockpt follows anyway
+                // and is then a no-op, as it is on Linux once unlocked.
+                if (slave.fd < 0 && ::grantpt(hfd) == 0 && ::unlockpt(hfd) == 0)
+                    slave.fd = ::open(name, O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
+            }
             if (slave.fd >= 0) hfd = slave.fd;
         }
         using namespace tty;
