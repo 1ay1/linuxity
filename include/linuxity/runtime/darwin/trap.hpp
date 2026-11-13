@@ -346,7 +346,7 @@ public:
     // exec_happened): set-ID credentials, SysV detach. Forks and exits
     // need no event here -- each is its own linuxity with its own table.
     struct ProcEvent {
-        enum Kind { spawn, exec, reap, thread, stop, cont, reparent } kind;
+        enum Kind { spawn, exec, reap, thread, stop, cont, reparent, zombie } kind;   // zombie: never emitted here
         std::int32_t pid;
         std::int32_t ppid;
         std::string comm;

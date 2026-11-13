@@ -1356,6 +1356,9 @@ private:
         const auto res = static_cast<std::uint32_t>(r.arg[1]);
         const std::uint64_t nu = r.arg[2], old = r.arg[3];
         if (res >= 16 || (r.arg[0] != 0 && static_cast<std::int32_t>(r.arg[0]) != ids().pid)) return fwd();
+#if !defined(__linux__)
+        return fwd();   // rlimit64 / SYS_prlimit64 are Linux-only
+#else
         if constexpr (!requires { mem_.host_tid(); }) {
             return fwd();
         } else {
@@ -1363,7 +1366,7 @@ private:
             if (!p.hard_over[res] && (!nu || !creds::capable(p, creds::kCapSysResource)))
                 return fwd();   // nothing of ours involved: the host answers
             const ::pid_t task = static_cast<::pid_t>(mem_.host_tid());
-            struct ::rlimit64 host{};
+            struct ::rlimit host{};   // = the kernel's rlimit64 on every 64-bit Linux (musl has no rlimit64)
             if (::syscall(SYS_prlimit64, task, static_cast<int>(res), nullptr, &host) != 0) {
                 // can't look: the task holds what we last gave it, which began
                 // as linuxity's own (inherited across the guest's start)
@@ -1400,7 +1403,7 @@ private:
             p.hard_over[res] = nmax > hmax ? nmax + 1 : 0;
             p.host_cur[res] = hcur + 1;
             p.host_max[res] = hmax + 1;
-            struct ::rlimit64 apply{hcur, hmax};
+            struct ::rlimit apply{hcur, hmax};
             if (::syscall(SYS_prlimit64, task, static_cast<int>(res), &apply, nullptr) == 0) return val(0);
             // clamp the guest's own buffer, let its call apply it, put it back
             std::array<std::byte, 16> clamped{};
@@ -1410,6 +1413,7 @@ private:
             restore_after_ = {nu, want};
             return fwd();
         }
+#endif
     }
 
     // kill(2) to one process, with the kernel's permission rule in the
