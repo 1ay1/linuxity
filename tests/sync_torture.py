@@ -293,6 +293,64 @@ def signalfd_reads_signals():
 
 
 @check
+def a_reused_fd_number_forgets_its_timerfd():
+    # Fd numbers come back at once (lowest free). A runtime that keyed
+    # timerfd state by number and kept it past close made the next eventfd
+    # with that number refuse writes (foot: "failed to send terminal
+    # shutdown event: Invalid argument", then a window that never closed).
+    libc.timerfd_create.argtypes = [ctypes.c_int, ctypes.c_int]
+    t = libc.timerfd_create(CLOCK_MONOTONIC, os.O_NONBLOCK | os.O_CLOEXEC)
+    ok(t >= 0, "timerfd_create")
+    os.close(t)
+    e = os.eventfd(0, os.EFD_NONBLOCK)
+    eq(e, t, "the eventfd takes the timerfd's number")
+    os.eventfd_write(e, 5)
+    eq(os.eventfd_read(e), 5, "and works as an eventfd")
+    t2 = libc.timerfd_create(CLOCK_MONOTONIC, os.O_NONBLOCK)
+    os.dup2(e, t2)
+    os.eventfd_write(t2, 2)
+    eq(os.eventfd_read(e), 2, "dup2 over a timerfd makes an eventfd of it too")
+    os.close(t2)
+    os.close(e)
+
+
+@check
+def epoll_pwait_opens_its_sigmask_for_the_wait():
+    # The p-variants exist for this: keep SIGCHLD blocked, open it only
+    # inside the wait. foot's event loop does exactly this; ignoring the
+    # mask meant it never heard its shell exit.
+    def run():
+        libc.epoll_pwait.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+        got = []
+        signal.signal(signal.SIGCHLD, lambda *a: got.append(1))
+        old = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGCHLD})
+        ep = select.epoll()
+        r, _w = os.pipe()
+        ep.register(r, select.EPOLLIN)
+        orig = (ctypes.c_uint64 * 16)()
+        for s in old:
+            orig[0] |= 1 << (s - 1)
+        pid = os.fork()
+        if pid == 0:
+            time.sleep(0.2)
+            os._exit(4)
+        events = (ctypes.c_uint8 * 64)()
+        t = time.monotonic()
+        n = libc.epoll_pwait(ep.fileno(), events, 4, 5000, orig)
+        e = ctypes.get_errno()
+        waited = time.monotonic() - t
+        eq((n, e), (-1, errno.EINTR), "SIGCHLD interrupts the wait")
+        ok(waited < 3, f"promptly ({waited:.2f}s)")
+        eq(got, [1], "its handler ran")
+        blocked = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        ok(signal.SIGCHLD in blocked, "the caller's mask is back afterwards")
+        _, st = os.waitpid(pid, 0)
+        eq(os.waitstatus_to_exitcode(st), 4, "the child is reaped")
+        return 0
+    eq(run_in_child(run), 0, "in a child")
+
+
+@check
 def epoll_over_every_kind_of_fd():
     import socket
     ep = select.epoll()

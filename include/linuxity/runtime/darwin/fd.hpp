@@ -202,6 +202,14 @@ public:
     void on_exec() {
         for (auto& s : slots_) if (s.cloexec) s = {};
     }
+    // The guest fds on_exec() is about to drop.
+    [[nodiscard]] std::vector<int> cloexec_fds() const {
+        std::vector<int> v;
+        for (std::size_t g = 0; g < slots_.size(); ++g)
+            if (slots_[g].file && slots_[g].cloexec) v.push_back(static_cast<int>(g));
+        return v;
+    }
+    [[nodiscard]] bool open(int g) const noexcept { return host(g).has_value(); }
 
     // -- Fork handoff -------------------------------------------------------
     // A spawn-based fork (runtime/darwin/fork.hpp) gives the child a fresh fd

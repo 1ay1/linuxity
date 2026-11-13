@@ -3161,6 +3161,7 @@ private:
             adopt(sg.begin, sg.end, prot_from_elf(sg.flags));
         note_image(*ex);                          // before the stack names itself
         adopt_stack(ex->sp, machine_.mem_size());
+        for (int g : proc_.with_fds([&](FdTable& t) { return t.cloexec_fds(); })) fd_gone(g);
         proc_.with_fds([&](FdTable& t) { return t.on_exec(); });
         dirs_.clear();
         // execve(2): caught signals revert to SIG_DFL (the handler code is
@@ -3690,7 +3691,9 @@ private:
                     timeout_ms = static_cast<int>(ts.sec * 1000 + ts.nsec / 1'000'000);
                 }
                 std::vector<LinuxEpollEvent> ready;
-                const auto n = epoll_wait_guest(*it->second, ready, static_cast<int>(a2), timeout_ms);
+                const auto n = with_wait_mask(regs_.arg(4), regs_.arg(5), [&]() -> std::int64_t {
+                    return epoll_wait_guest(*it->second, ready, static_cast<int>(a2), timeout_ms);
+                });
                 if (n < 0) return n;
                 for (std::size_t i = 0; i < ready.size(); ++i)
                     if (!ram.put(a1 + i * sizeof(LinuxEpollEvent), ready[i])) return -14;
@@ -5000,9 +5003,8 @@ private:
         // fd-table operations first: they don't need a resolved host fd.
         switch (sc) {
             case S::close: {
-                dirs_.erase(gfd);                  // drop any directory stream
-                epolls_.erase(gfd);                // and any epoll set
                 const int rc = proc_.with_fds([&](FdTable& t) { return t.close(gfd); });
+                if (rc == 0) fd_gone(gfd);
                 // A pumped listener whose last guest fd just went: stop the
                 // pump, refusing what it still holds (as Linux would).
                 if (proc_.has_pumps())
@@ -5017,6 +5019,9 @@ private:
             case S::dup:   return proc_.with_fds([&](FdTable& t) { return t.dup(gfd, std::nullopt, false); });
             case S::dup3: {
                 if (static_cast<int>(a1) == gfd) return -22;          // EINVAL
+                // dup3 onto an open fd closes it first: forget what it was
+                if (proc_.with_fds([&](FdTable& t) { return t.open(static_cast<int>(a1)) && t.open(gfd); }))
+                    fd_gone(static_cast<int>(a1));
                 return proc_.with_fds([&](FdTable& t) { return t.dup(gfd, static_cast<int>(a1), (a2 & abi::wire::kOCloexec) != 0); });
             }
             case S::fcntl: return do_fcntl(gfd, a1, a2);
@@ -5025,8 +5030,15 @@ private:
                 if (!h) return -9;
                 return do_ioctl(*h, a1, a2);
             }
-            case S::ppoll:    return do_ppoll(regs_.arg(0), a1, a2);
-            case S::pselect6: return do_pselect(regs_.arg(0), a1, a2, a3, regs_.arg(4));
+            case S::ppoll:
+                return with_wait_mask(regs_.arg(3), regs_.arg(4), [&] { return do_ppoll(regs_.arg(0), a1, a2); });
+            case S::pselect6: {
+                // the 6th argument is {const sigset_t* ss; size_t ss_len}
+                struct { std::uint64_t ss, len; } sig{};
+                if (regs_.arg(5) && !machine_.ram().get(regs_.arg(5), sig)) return -14;
+                return with_wait_mask(sig.ss, sig.len,
+                                      [&] { return do_pselect(regs_.arg(0), a1, a2, a3, regs_.arg(4)); });
+            }
 
             // eventfd2(initval, flags): a counter you can poll. curl, glib
             // and every event loop uses one as a wakeup channel, and curl
@@ -5541,8 +5553,10 @@ private:
                 auto it = epolls_.find(gfd);
                 if (it == epolls_.end()) return -22;
                 std::vector<LinuxEpollEvent> ready;
-                const auto n = epoll_wait_guest(*it->second, ready, static_cast<int>(a2),
-                                                static_cast<int>(static_cast<std::int32_t>(a3)));
+                const auto n = with_wait_mask(regs_.arg(4), regs_.arg(5), [&]() -> std::int64_t {
+                    return epoll_wait_guest(*it->second, ready, static_cast<int>(a2),
+                                            static_cast<int>(static_cast<std::int32_t>(a3)));
+                });
                 if (n < 0) return n;
                 for (std::size_t i = 0; i < ready.size(); ++i)
                     if (!ram.put(a1 + i * sizeof(LinuxEpollEvent), ready[i])) return -14;
@@ -5605,7 +5619,8 @@ private:
                 const auto lo = static_cast<int>(a0);
                 const auto hi = static_cast<int>(std::min<std::uint64_t>(a1, FdTable::kMaxFds - 1));
                 proc_.with_fds([&](FdTable& t) {
-                    for (int fd = lo; fd <= hi; ++fd) (void)t.close(fd);
+                    for (int fd = lo; fd <= hi; ++fd)
+                        if (t.close(fd) == 0) fd_gone(fd);
                 });
                 return 0;
             }
@@ -6371,12 +6386,56 @@ private:
         return ready;
     }
 
+    // ppoll / pselect6 / epoll_pwait(2): wait with the guest's temporary
+    // signal mask in force, as one atomic step -- the whole point of the
+    // p-variants. Programs keep SIGCHLD (or SIGWINCH, SIGINT...) blocked and
+    // open it only inside the wait, so the signal can't land between a
+    // check and the sleep. Ignoring the mask left those signals blocked for
+    // good: foot never heard its shell exit and its window hung forever.
+    // Linux's rule: on EINTR the temporary mask stays until the handler has
+    // run (sigsuspend's suspend_restore does exactly that), otherwise the
+    // old mask is back at once.
+    template <class Wait>
+    [[nodiscard]] std::int64_t with_wait_mask(std::uint64_t mask_at, std::uint64_t size, Wait&& wait) {
+        if (!mask_at) return wait();
+        if (size != sizeof(std::uint64_t)) return -22;
+        std::uint64_t tmp = 0;
+        if (!machine_.ram().get(mask_at, tmp)) return -14;
+        const std::uint64_t saved = task_.sig_mask;
+        task_.sig_mask = tmp & ~(sigbit(9) | sigbit(19));
+        const std::int64_t rc = wait();
+        if (rc == -4) task_.suspend_restore = saved;
+        else task_.sig_mask = saved;
+        return rc;
+    }
+
     // Install a host fd into the guest table, closing it if the table is
     // full so the descriptor never leaks.
     [[nodiscard]] std::int64_t install_or_close(int h, bool cloexec) {
         const int g = proc_.with_fds([&](FdTable& t) { return t.install(h, cloexec); });
         if (g < 0) { ::close(h); return -24; }               // EMFILE
         return g;
+    }
+
+    // Guest fd `g` is gone (close, close_range, dup3 over it, exec of a
+    // close-on-exec fd): forget everything this process keyed by its
+    // number. Fd numbers are reused at once -- the lowest free one -- so
+    // stale state is not a leak but a wrong answer: a timerfd's entry left
+    // behind made the NEXT fd with that number refuse writes with EINVAL
+    // (foot's shutdown eventfd: "failed to send terminal shutdown event",
+    // then a window that never closes), and its timer kept firing into a
+    // pipe nobody owned.
+    void fd_gone(int g) {
+        dirs_.erase(g);
+        epolls_.erase(g);
+        if (const auto it = timerfds_.find(g); it != timerfds_.end()) {
+            (void)timers_.erase(it->second);
+            timerfds_.erase(it);
+        }
+        signalfds_.erase(g);
+        inotifies_.erase(g);
+        pidfds_.erase(g);
+        mem_fds_.erase(g);
     }
 
     // readv/writev: one Darwin call per entry. Building a host iovec array
