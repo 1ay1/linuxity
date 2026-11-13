@@ -7,6 +7,7 @@
 #include "headless.hpp"
 
 #include <cctype>
+#include <cstdlib>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
@@ -38,7 +39,12 @@ public:
         WindowStates st;
         st.activated = true;
         st.maximized = on;
-        sink_->host_configure(on ? screen_.size() : Size{}, st);
+        // As Cocoa does mid live-resize: wait (pumping this client) for the
+        // app to draw the new size, from inside the request's handler.
+        if (log_ && log_->wait_on_configure)
+            sink_->host_configure_and_wait(on ? screen_.size() : Size{}, st, std::chrono::milliseconds(200));
+        else
+            sink_->host_configure(on ? screen_.size() : Size{}, st);
     }
     void set_fullscreen(bool on) override {
         WindowStates st;
@@ -118,6 +124,10 @@ public:
         o.model = "headless";
         o.logical = {0, 0, 1920, 1080};
         o.fractional_scale = log_ ? log_->scale : 0;
+        // LINUXITY_DISPLAY_SCALE=2: present a HiDPI output, as a Retina
+        // screen does -- clients then draw (and share) 4x larger buffers.
+        if (o.fractional_scale <= 0)
+            if (const char* s = std::getenv("LINUXITY_DISPLAY_SCALE")) o.fractional_scale = std::atof(s);
         o.scale = o.fractional_scale > 0 ? static_cast<std::int32_t>(std::ceil(o.fractional_scale)) : 1;
         o.pixels = {1920 * o.scale, 1080 * o.scale};
         o.physical_mm = {520, 290};

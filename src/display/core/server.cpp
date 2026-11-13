@@ -2,6 +2,7 @@
 #include "server.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -174,22 +175,49 @@ void Client::readable() {
     errno = 0;
     const auto io = chan_.read_some(in_);
     if (io == wire::Channel::Io::closed) { disconnect(errno ? std::strerror(errno) : "peer closed"); return; }
-    std::size_t at = 0;
-    while (!dead_ && !closing_ && in_.size() - at >= 8) {
+    dispatch_buffered();
+}
+
+bool Client::has_buffered_message() const noexcept {
+    if (in_.size() - in_pos_ < 8) return false;
+    std::uint32_t w = 0;
+    std::memcpy(&w, in_.data() + in_pos_ + 4, 4);
+    return in_.size() - in_pos_ >= std::max<std::size_t>(8, w >> 16);
+}
+
+void Client::dispatch_buffered() {
+    // Reentrancy: a request handler can pump this client again -- a window
+    // being mapped makes AppKit resize it synchronously, and a live resize
+    // waits for the client to redraw (ShellSurface::host_configure_and_wait
+    // -> pump_until -> readable). The nested call appends to in_ (which may
+    // move it) and dispatches the NEXT requests. So the read position is the
+    // member in_pos_, shared by every level and advanced BEFORE a dispatch;
+    // a body is copied out of in_ before its handler runs; and only the
+    // outermost call compacts the buffer. (A local cursor over in_, erased
+    // at the end of each level, corrupted the heap -- the compositor died
+    // with "memory corruption of free block" -- and dispatched requests
+    // twice: "invalid new id".)
+    ++depth_;
+    while (!dead_ && !closing_ && in_.size() - in_pos_ >= 8) {
         std::uint32_t id = 0, w = 0;
-        std::memcpy(&id, in_.data() + at, 4);
-        std::memcpy(&w, in_.data() + at + 4, 4);
+        std::memcpy(&id, in_.data() + in_pos_, 4);
+        std::memcpy(&w, in_.data() + in_pos_ + 4, 4);
         const std::size_t size = w >> 16;
         const auto op = static_cast<std::uint16_t>(w & 0xffff);
         if (size < 8 || size % 4 || size > wire::kMaxMessage) {
             fatal(1, static_cast<std::uint32_t>(WlDisplay::Error::invalid_method), "bad message size");
             break;
         }
-        if (in_.size() - at < size) break;
-        dispatch_one(id, op, {in_.data() + at + 8, size - 8});
-        at += size;
+        if (in_.size() - in_pos_ < size) break;
+        std::array<std::byte, wire::kMaxMessage> body;
+        std::memcpy(body.data(), in_.data() + in_pos_ + 8, size - 8);
+        in_pos_ += size;
+        dispatch_one(id, op, {body.data(), size - 8});
     }
-    if (!dead_) in_.erase(in_.begin(), in_.begin() + static_cast<std::ptrdiff_t>(at));
+    if (--depth_ == 0 && !dead_) {
+        in_.erase(in_.begin(), in_.begin() + static_cast<std::ptrdiff_t>(in_pos_));
+        in_pos_ = 0;
+    }
 }
 
 void Client::dispatch_one(ObjectId id, std::uint16_t op, std::span<const std::byte> body) {
@@ -253,6 +281,9 @@ bool Client::pump_until(const std::function<bool()>& done, std::chrono::millisec
     const auto until = std::chrono::steady_clock::now() + budget;
     flush();
     while (!dead_ && !closing_ && !done()) {
+        // requests already read (by an outer readable() that is waiting on
+        // us) come first: they may be exactly what `done` waits for
+        if (has_buffered_message()) { dispatch_buffered(); flush(); continue; }
         const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(until - std::chrono::steady_clock::now());
         if (left.count() <= 0) break;
         ::pollfd p{chan_.fd(), POLLIN, 0};

@@ -145,6 +145,8 @@ private:
     friend class Server;
     [[nodiscard]] bool id_ok(ObjectId id);
     void readable();
+    void dispatch_buffered();
+    [[nodiscard]] bool has_buffered_message() const noexcept;
     void dispatch_one(ObjectId id, std::uint16_t op, std::span<const std::byte> body);
     void flush();
     void remove(Resource& r);
@@ -154,6 +156,8 @@ private:
     pid_t pid_{-1};
     wire::Channel chan_;
     std::vector<std::byte> in_, out_;
+    std::size_t in_pos_{0};     // next unread byte of in_ (shared by nested readable())
+    int depth_{0};              // readable() nesting
     std::vector<int> out_fds_;
     std::map<ObjectId, std::shared_ptr<Resource>> objects_;
     std::map<ObjectId, const wire::Interface*> zombies_;   // server-destroyed, client may not know yet

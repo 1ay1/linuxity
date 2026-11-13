@@ -714,6 +714,70 @@ void test_synchronized_resize() {
           "the new size is on screen when the resize step returns");
 }
 
+// A request whose handler waits for the client (Cocoa's live resize:
+// host_configure_and_wait pumps the client from inside the dispatch) while
+// the client's next requests are ALREADY read into the same buffer. The
+// compositor used to walk that buffer with a local cursor and erase it
+// afterwards at every nesting level: the requests the inner pump ran were
+// dispatched again by the outer one ("invalid new id"), and the erase hit
+// freed memory once the buffer had grown -- the compositor died with
+// "memory corruption of free block" as Firefox mapped its window.
+void test_requests_dispatched_from_a_handler() {
+    Fixture f;
+    f.log.wait_on_configure = true;
+    ShmBuffer small(100, 80, 0x00ff0000), big(1920, 1080, 0x0000ff00);
+    const auto b1 = f.buffer(small, 100, 80);
+    const auto b2 = f.buffer(big, 1920, 1080);
+    auto [s, xs, tl] = f.toplevel(b1, "nest");
+    f.c->events.clear();
+    // The app answers the maximize configure from its own thread while the
+    // compositor is still inside set_maximized's handler, waiting.
+    std::atomic<bool> stop{false}, answered{false};
+    std::thread app([&] {
+        while (!stop) {
+            f.c->poll();
+            if (auto c = f.c->take("xdg_toplevel", "configure", tl); c && c->v[0] == 1920) {
+                auto x = f.c->take("xdg_surface", "configure", xs);
+                while (!x) { f.c->poll(); x = f.c->take("xdg_surface", "configure", xs); }
+                f.c->req(xs, proto::XdgSurface::Req::ack_configure, static_cast<std::uint32_t>(x->v[0]));
+                f.c->req(s, WlSurface::Req::attach, wire::Object{b2}, 0, 0);
+                f.c->req(s, WlSurface::Req::commit);
+                answered = true;
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
+    // One batch, already in the compositor's buffer when maximize waits:
+    // maximize, then many requests after it -- enough bytes that the buffer
+    // must grow when the inner pump appends the app's answer.
+    std::vector<wire::ObjectId> cbs;
+    f.c->req(tl, XdgToplevel::Req::set_maximized);
+    for (int i = 0; i < 300; ++i) {
+        cbs.push_back(f.c->make(WlCallback::iface));
+        f.c->req(1, WlDisplay::Req::sync, wire::NewId{cbs.back()});
+    }
+    // the compositor runs; the client is the app thread's until it answered
+    bool ok = false;
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    auto t = f.host->loop().every(std::chrono::milliseconds(1), [&] {
+        if (answered) {
+            f.c->poll();
+            if (f.c->has("wl_callback", "done", cbs.back())) { ok = true; f.host->loop().stop(); }
+        }
+        if (std::chrono::steady_clock::now() > until) f.host->loop().stop();
+    });
+    f.host->loop().run();
+    t.reset();
+    stop = true;
+    app.join();
+    check(ok, "the compositor got through the batch");
+    check(!f.c->has("wl_display", "error"), "no protocol error (nothing dispatched twice)");
+    int done = 0;
+    for (auto id : cbs) done += f.c->has("wl_callback", "done", id) ? 1 : 0;
+    check(done == 300, "every request after the waiting one ran exactly once");
+}
+
 // With Command as Control, Cmd-C in a terminal is its copy (Ctrl+Shift+C),
 // not an interrupt; elsewhere it stays Ctrl+C.
 void test_terminal_shortcuts() {
@@ -780,6 +844,7 @@ int main() {
     test_primary_selection();
     test_native_frames();
     test_synchronized_resize();
+    test_requests_dispatched_from_a_handler();
     test_terminal_shortcuts();
     std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "PASSED", g_failures, g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;
