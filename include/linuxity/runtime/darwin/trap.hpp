@@ -63,6 +63,7 @@
 #include "linuxity/runtime/darwin/exec.hpp"
 #include "linuxity/runtime/darwin/fd.hpp"
 #include "linuxity/runtime/darwin/fdobj.hpp"
+#include "linuxity/runtime/darwin/inflight.hpp"
 #include "linuxity/runtime/darwin/futex.hpp"
 #include "linuxity/runtime/darwin/ipc.hpp"
 #include "linuxity/runtime/darwin/proc.hpp"
@@ -1741,6 +1742,7 @@ private:
             ? ::sendmsg(h, &hm, net::msg_flags_to_darwin(flags))
             : ::recvmsg(h, &hm, net::msg_flags_to_darwin(flags));
         if (n < 0) return darwin::fail();
+        if (sending && !fds_out.empty()) inflight::Holder::get().sent(fds_out);
         if (!sending) {
             if (m.name && !write_sockaddr(ss, m.name, msg_at + offsetof(LinuxMsghdr, namelen)))
                 return -14;
@@ -1757,6 +1759,7 @@ private:
                         int hx = -1;
                         std::memcpy(&hx, CMSG_DATA(hc) + i * sizeof(int), sizeof(int));
                         ::fcntl(hx, F_SETFD, FD_CLOEXEC);      // host side is always private
+                        inflight::Holder::received(hx);
                         const int gx = proc_.with_fds([&](FdTable& t) { return t.install(hx, cloexec); });
                         if (gx < 0) { ::close(hx); g[i] = -1; } else g[i] = gx;
                     }

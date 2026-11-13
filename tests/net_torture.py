@@ -398,6 +398,38 @@ def unix_passes_fds_and_credentials():
 
 
 @check
+def a_passed_socket_keeps_its_data_in_flight():
+    # Firefox's fork server gets each new content process's channel this
+    # way: the browser sends one end of a fresh socketpair, closes its copy,
+    # writes the launch info into the other end and closes that too -- all
+    # before the fork server reads the message. Linux keeps the end and its
+    # data alive inside the queued message. XNU's unix-socket garbage
+    # collector, which any closing socket with fds in it sets off, flushed
+    # it: the receiver read EOF, and every content process MOZ_CRASHed.
+    conn_a, conn_b = socket.socketpair()
+
+    def receiver():
+        conn_a.close()
+        time.sleep(0.3)                    # let the sender finish first
+        _, fds, _, _ = socket.recv_fds(conn_b, 10, 2)
+        got = b""
+        while chunk := os.read(fds[0], 4096):
+            got += chunk
+        return 0 if got == b"E" * 724 else 3
+    pid = child(receiver)
+    conn_b.close()
+    e0, e1 = socket.socketpair()
+    socket.send_fds(conn_a, [b"x"], [e1.fileno()])
+    e1.close()
+    e0.send(b"E" * 724)
+    x0, x1 = socket.socketpair()           # any closing socket with fds in flight
+    socket.send_fds(x0, [b"y"], [x1.fileno()])
+    for s in (x1, x0, e0):
+        s.close()
+    eq(status(pid), 0, "the receiver reads all 724 bytes, then EOF")
+
+
+@check
 def broken_connections_sigpipe_and_epipe():
     a, b = socket.socketpair()
     b.close()
