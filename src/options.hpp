@@ -64,6 +64,9 @@ struct Options {
     int ready_fd{-1};               // a daemon tells its launcher it is up
 
     std::vector<std::string> argv;  // the program; empty in instance mode
+    // --pass-fd N: host fd N becomes the guest's fd N (socket activation:
+    // a listening socket handed to a daemon, as systemd's LISTEN_FDS does)
+    std::vector<int> pass_fds;
 
     // Report each syscall the backend cannot serve yet (--verbose).
     bool verbose{false};

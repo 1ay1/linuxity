@@ -186,7 +186,7 @@ inline void serve(std::string path, RamFn ram, ResidentFn resident = {}, FactFn 
     if (leaf.empty() || leaf.size() > 64) return std::nullopt;
     const int c = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (c < 0) return std::nullopt;
-    const ::timeval tv{2, 0};
+    const ::timeval tv{10, 0};               // under load the peer may be slow to answer
     (void)::setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     (void)::setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
     ::sockaddr_un a{};

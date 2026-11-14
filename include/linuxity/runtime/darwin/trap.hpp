@@ -696,7 +696,20 @@ public:
     // directory" -- the host has no /etc/pacman.d -- and `pacman -S` then
     // died with "keyring is not writable".
     [[nodiscard]] Result<std::int64_t> rewrite_sockaddr(UAddr path_addr, const std::string& host_path,
-                                                        int, unsigned long long) {
+                                                        int a, unsigned long long b) {
+        return rewrite_sockaddr(path_addr, host_path, a, b, nullptr);
+    }
+    // ...with `done(rc)` once the call has its result: the dispatcher then
+    // records the bound node's owner and mode (a bind is a create) and the
+    // name getsockname reports.
+    [[nodiscard]] Result<std::int64_t> rewrite_sockaddr(UAddr path_addr, const std::string& host_path,
+                                                        int, unsigned long long,
+                                                        std::function<void(std::int64_t)> done) {
+        const auto r = rewrite_sockaddr_(path_addr, host_path);
+        if (done && r) done(*r == 0 ? 0 : -1);
+        return r;
+    }
+    [[nodiscard]] Result<std::int64_t> rewrite_sockaddr_(UAddr path_addr, const std::string& host_path) {
         const auto sc = abi::decode(abi::Arch::aarch64, regs_.nr());
         const int h = host_fd(static_cast<int>(regs_.arg(0)));
         if (h < 0) return complete(-9);
@@ -1435,6 +1448,33 @@ private:
             case S::getsockopt: {
                 const int h = host_fd(gfd);
                 if (h < 0) return -9;
+                // SO_ACCEPTCONN (30): Darwin answers ENOPROTOOPT for AF_UNIX
+                // sockets. Whether it listens is what a socket-activated
+                // daemon checks on the fd it was handed (sd_is_socket;
+                // dbus-daemon refused its session bus socket over this).
+                // The listening flag is in the socket's state (SO_OPTIONS'
+                // SO_ACCEPTCONN bit for every family Darwin supports).
+                if (a1 == 1 && a2 == 30) {
+                    int v = 0;
+                    socklen_t vl = sizeof v;
+                    if (::getsockopt(h, SOL_SOCKET, SO_ACCEPTCONN, &v, &vl) < 0) {
+                        if (errno != ENOPROTOOPT) return darwin::fail();
+                        // the kernel's own record of the socket: its options
+                        // word carries SO_ACCEPTCONN once listen() succeeded
+                        ::socket_fdinfo si{};
+                        if (::proc_pidfdinfo(::getpid(), h, PROC_PIDFDSOCKETINFO, &si, sizeof si) != sizeof si)
+                            return -92;
+                        v = (si.psi.soi_options & SO_ACCEPTCONN) != 0;
+                    }
+                    const std::int32_t out = v ? 1 : 0;
+                    if (!ram.put(a3, out)) return -14;
+                    const std::uint32_t four = 4;
+                    return (a4 == 0 || ram.put(a4, four)) ? 0 : -14;
+                }
+                if (a1 == 1 && a2 == 59) {                 // SO_PEERGROUPS: none (Linux's for no supplementary)
+                    const std::uint32_t zero = 0;
+                    return (a4 == 0 || ram.put(a4, zero)) ? 0 : -14;
+                }
                 // SO_TYPE of an emulated SEQPACKET pair, and SO_PASSCRED.
                 // SO_PROTOCOL (38) and SO_DOMAIN (39): Darwin has no such
                 // option. The family comes from the socket's own address; the

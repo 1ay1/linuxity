@@ -14,6 +14,7 @@
 // and that is host_run() in src/run_<host>.cpp (see host_run.hpp).
 #include "host_run.hpp"
 #include "options.hpp"
+#include "session_bus.hpp"
 #include "verbs.hpp"
 
 #include "linuxity/kernel/resolver.hpp"
@@ -218,6 +219,7 @@ int parse_flags(int argc, char** argv, int i, Options& o) {
         else if (f == "--locale") { o.locale = need("--locale"); }
         else if (f == "--status-fd") { o.status_fd = std::atoi(need("--status-fd")); }
         else if (f == "--quiet" || f == "-q") { o.quiet = true; }
+        else if (f == "--pass-fd") { o.pass_fds.push_back(std::atoi(need("--pass-fd"))); }
         else if (f == "--verbose") { o.verbose = true; }
         else if (f == "--foreground") { /* handled by `up` */ }
         else if (f == "-h" || f == "--help") { usage(argv[0]); std::exit(0); }
@@ -422,6 +424,7 @@ int main(int argc, char** argv) {
     // our own re-runs: an instance, a one-off run
     if (sub == "__up") return cmd_up(argc, argv);
     if (sub == "__run") return cmd_run(argc, argv);
+    if (sub == "__bus") return lx::cli::session_bus::watcher_main(argc, argv);
     // `linuxity lx ...` works where there's no lx symlink
     if (sub == "lx") {
         std::vector<std::string> a(argv + 1, argv + argc);

@@ -6775,6 +6775,15 @@ public:
     // `host_tid` is the task the fd belongs to: this runs from a deferred
     // exit hook, after the trap may have moved on to another task.
     void note_socket_name(int host_tid, int fd, const std::string& name, bool binds) {
+        // A bound path is a new name, like any create: owned by the binder,
+        // mode 0777 & ~umask (unix(7)). Without this a socket uid 1000
+        // bound read as root's, and its own chmod was EPERM -- dbus-daemon
+        // gave up making its session bus socket world-connectable.
+        if (binds && !name.empty()) {
+            const std::string abs = k_.files().absolutize(name);
+            k_.files().meta().set_mode(abs, 0777u & ~guest_umask());
+            note_created(abs, false);
+        }
         const std::uint64_t ino = socket_inode_of(host_tid, fd);
         if (ino == 0) return;
         (binds ? sock_names_ : sock_peers_)[ino] = name;

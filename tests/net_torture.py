@@ -502,6 +502,29 @@ def netlink_answers_a_written_request_from_any_thread():
 
 
 @check
+def a_bound_unix_socket_is_its_binders():
+    # bind creates a filesystem node owned by the binder, mode 0777 & ~umask,
+    # which the binder may chmod -- dbus-daemon does, on its bus socket.
+    # Here the node read as root's and the chmod was EPERM. And whether a
+    # socket listens (SO_ACCEPTCONN) is what a socket-activated daemon checks
+    # on the fd it is handed; Darwin had no answer for AF_UNIX.
+    old = os.umask(0o022)
+    try:
+        s = socket.socket(socket.AF_UNIX)
+        s.bind("s")
+        st = os.stat("s")
+        eq((st.st_uid, st.st_gid), (os.getuid(), os.getgid()), "owned by the binder")
+        eq(st.st_mode & 0o777, 0o755, "mode 0777 & ~umask")
+        os.chmod("s", 0o666)
+        eq(os.stat("s").st_mode & 0o777, 0o666, "and the binder may chmod it")
+        eq(s.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN), 0, "not listening yet")
+        s.listen(4)
+        eq(s.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN), 1, "SO_ACCEPTCONN after listen")
+    finally:
+        os.umask(old)
+
+
+@check
 def broken_connections_sigpipe_and_epipe():
     a, b = socket.socketpair()
     b.close()

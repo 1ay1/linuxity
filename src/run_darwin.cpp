@@ -52,6 +52,7 @@
 #include "linuxity/host/self_exe.hpp"
 
 #include "display_attach.hpp"
+#include "session_bus.hpp"
 #include "guest_env.hpp"
 #include "guest_files.hpp"
 #include "host_run.hpp"
@@ -1253,8 +1254,20 @@ int cli::host_run(Options& o, int, char**) {
         cli::display::setup(o, env, ge.login.uid, why);
         if (!why.empty() && !o.quiet) std::fprintf(stderr, "linuxity: no display: %s\n", why.c_str());
     }
+    // ...and a D-Bus session bus at $XDG_RUNTIME_DIR/bus (src/session_bus.hpp)
+    cli::session_bus::setup(o, env, ge.login.name);
 
     Machine m{o};
+    // /run/user/<uid> belongs to its user, mode 0700, as pam_systemd makes
+    // it (dbus-daemon and others check). Only for the session's own fresh
+    // dir (display::setup), never a user-supplied XDG_RUNTIME_DIR.
+    for (const auto& kv : env)
+        if (kv.starts_with("XDG_RUNTIME_DIR=/run/user/") && ge.login.uid != 0) {
+            const std::string rt = kv.substr(16);
+            m.k.files().meta().set_owner(rt, ge.login.uid, ge.login.gid);
+            m.k.files().meta().set_mode(rt, 0700);
+            m.k.files().meta().set_owner(rt + "/bus", ge.login.uid, ge.login.gid);
+        }
     // the host's terminfo for this terminal, mounted by Machine
     if (m.has_terminfo_bridge)
         env.push_back(std::string{"TERMINFO_DIRS="} + kGuestTerminfo + ":/usr/share/terminfo");
@@ -1307,6 +1320,14 @@ int cli::host_run(Options& o, int, char**) {
     // Only the ROOT process reserves the low fds: a fork child inherits its
     // parent's whole table (reservations included) through the handoff.
     proc.with_fds([](runtime::FdTable& t) { t.reserve_low_fds(); });
+    // --pass-fd: a host fd handed to the guest at the same number (a bus
+    // socket for a socket-activated daemon, see session_bus.hpp)
+    for (const int fd : o.pass_fds) {
+        const int h = ::fcntl(fd, F_DUPFD_CLOEXEC, 64);
+        if (h < 0) continue;
+        ::close(fd);
+        proc.with_fds([&](runtime::FdTable& t) { t.adopt_at(fd, h); return 0; });
+    }
     trap.set_arena(ex->brk_base, runtime::ExecArena::mmap_top(machine.mem_size()));
     for (const auto& sg : ex->segments)
         trap.adopt(sg.begin, sg.end, runtime::prot_from_elf(sg.flags));

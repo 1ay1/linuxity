@@ -205,5 +205,28 @@ def parallel_build_like_make():
         eq(len([f for f in os.listdir(".") if f.endswith(".out")]), 64, "make -j8")
 
 
+@check(timeout=60)
+def a_session_dbus_bus_is_there():
+    # A Linux login session has a D-Bus session bus at $XDG_RUNTIME_DIR/bus
+    # (systemd's dbus.socket). GTK's accessibility bridge, Firefox, portals
+    # and notifications all reach for it; without one every GTK app warned
+    # "Failed to create DBus proxy for org.a11y.Bus". linuxity starts the
+    # guest's own dbus-daemon on first use, socket-activated.
+    if not have("dbus-send"):
+        raise Skip("no dbus-send in this image")
+    addr = os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")
+    if not addr:
+        raise Skip("no session bus in this session (no XDG_RUNTIME_DIR or dbus-daemon)")
+    rt = os.environ.get("XDG_RUNTIME_DIR", "")
+    ok(addr == f"unix:path={rt}/bus", f"the bus is at $XDG_RUNTIME_DIR/bus ({addr})")
+    st = os.stat(rt)
+    eq((st.st_uid, st.st_mode & 0o777), (os.getuid(), 0o700), "XDG_RUNTIME_DIR is ours, 0700")
+    rc, out, err = sh("dbus-send --session --print-reply --dest=org.freedesktop.DBus / org.freedesktop.DBus.GetId", timeout=20)
+    eq(rc, 0, f"the bus answers: {err.strip()}")
+    if os.path.exists("/usr/share/dbus-1/services/org.a11y.Bus.service"):
+        rc, out, err = sh("dbus-send --session --print-reply --dest=org.a11y.Bus /org/a11y/bus org.a11y.Bus.GetAddress", timeout=20)
+        eq(rc, 0, f"D-Bus activation works (org.a11y.Bus): {err.strip()}")
+
+
 if __name__ == "__main__":
     sys.exit(main("real programs"))

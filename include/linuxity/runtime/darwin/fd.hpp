@@ -92,6 +92,14 @@ public:
         }
     }
 
+    // Host fd `host_fd` (adopted, ours to close) as guest fd `g`, replacing
+    // whatever was there: socket activation's fd 3 (--pass-fd).
+    void adopt_at(int g, int host_fd) {
+        if (g < 0 || host_fd < 0) return;
+        ::fcntl(host_fd, F_SETFD, FD_CLOEXEC);       // the host side stays private
+        install_at(g, std::make_shared<HostFd>(host_fd), false);
+    }
+
     // Host fd backing guest fd `g`, or nullopt (EBADF).
     [[nodiscard]] std::optional<int> host(int g) const noexcept {
         if (g < 0 || static_cast<std::size_t>(g) >= slots_.size()) return std::nullopt;
