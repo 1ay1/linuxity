@@ -15,7 +15,7 @@
 //
 // The event loop is the main dispatch queue: AppKit must own the main
 // thread, and GCD sources there give us fd readiness and timers.
-#include "../../core/host.hpp"
+#include "core/host_registry.hpp"
 
 #import <AppKit/AppKit.h>
 #import <Carbon/Carbon.h>
@@ -1260,3 +1260,22 @@ std::unique_ptr<Host> make_cocoa_host() {
 }
 
 }  // namespace lx::display
+
+// The registry entry (core/host_registry.hpp): the Mac's windows, whenever
+// there is a window server session to put them on.
+const lx::display::HostBackend& lx_display_host_cocoa() {
+    static const lx::display::HostBackend b{
+        .name = "cocoa",
+        .summary = "macOS: an NSWindow per toplevel, native frames, Retina, IME",
+        .priority = 100,
+        // a login session with a window server (not ssh, not a daemon)
+        .available = [] () noexcept {
+            CFDictionaryRef s = CGSessionCopyCurrentDictionary();
+            if (!s) return false;
+            CFRelease(s);
+            return true;
+        },
+        .create = [](const lx::display::HostConfig&) { return lx::display::make_cocoa_host(); },
+    };
+    return b;
+}

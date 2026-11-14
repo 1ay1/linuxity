@@ -1,7 +1,10 @@
-// src/display/hosts/headless.hpp -- the screenless host (headless.cpp).
+// src/display/hosts/headless/headless.hpp -- the screenless host.
+//
+// Also the reference backend: the smallest complete Host, and what the
+// host conformance tests (tests/display/host_conformance.hpp) run against.
 #pragma once
 
-#include "../core/host.hpp"
+#include "core/host_registry.hpp"
 
 #include <cstdint>
 #include <memory>

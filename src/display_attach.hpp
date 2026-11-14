@@ -62,14 +62,16 @@ namespace lx::cli::display {
 
 inline constexpr const char* kGuestDisplay = "/run/linuxity/display";
 
-// Hosts where linuxity-display has a native window backend (core/host.hpp).
-// Elsewhere it would be a compositor with nowhere to show windows: apps
-// would start and draw into nothing. There a guest gets the host's own
-// compositor or no display at all, and says so ("cannot open display").
-#if defined(__APPLE__)
+// Whether linuxity-display has a native window backend in this build (any
+// host besides headless, see src/display/CMakeLists.txt). Elsewhere it would
+// be a compositor with nowhere to show windows: apps would start and draw
+// into nothing. There a guest gets the host's own compositor or no display
+// at all, and says so ("cannot open display"). Adding a backend turns this
+// on by itself.
+#if defined(LX_DISPLAY_NATIVE_HOST)
 inline constexpr bool kOwnCompositor = true;
 #else
-inline constexpr bool kOwnCompositor = false;   // Android, Windows: next
+inline constexpr bool kOwnCompositor = false;
 #endif
 
 struct Attachment {

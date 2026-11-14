@@ -211,6 +211,13 @@ if(LX_DISPLAY AND NOT WIN32)
     add_subdirectory(src/display)
     if(TARGET linuxity)
         add_dependencies(linuxity linuxity-display)
+        # whether our compositor can show windows here: any backend besides
+        # headless (src/display_attach.hpp), straight from the backend list
+        set(_native ${LX_DISPLAY_HOSTS})
+        list(REMOVE_ITEM _native headless)
+        if(_native)
+            target_compile_definitions(linuxity PRIVATE LX_DISPLAY_NATIVE_HOST=1)
+        endif()
     endif()
 endif()
 

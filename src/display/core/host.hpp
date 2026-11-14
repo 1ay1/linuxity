@@ -15,6 +15,17 @@
 // An Android host maps HostWindow onto an activity's SurfaceView, a Windows
 // one onto an HWND; neither needs a line of core code to change.
 //
+// Adding one (doc/DISPLAY.md, "Adding a host"):
+//   1. hosts/<name>/: subclass Host and HostWindow. Only loop, attach,
+//      outputs, create_window, present and work_area are required; every
+//      other virtual has the default of a platform without that feature.
+//      Reuse what is portable: make_poll_loop() for a POSIX loop,
+//      soft_compose() (soft_compose.hpp) to turn a Scene into an image, and
+//      keymap.hpp for scancode -> evdev tables.
+//   2. Define `const HostBackend& lx_display_host_<name>()` (host_registry).
+//   3. CMake: lx_display_host(<name> SOURCES ... LIBRARIES ... [CONDITION]).
+//   4. Run tests/display/host_conformance.hpp against it.
+//
 // Coordinates are logical pixels (macOS points), y down. A window shows a
 // "view" rectangle of its root surface's coordinate space (see Scene).
 #pragma once
@@ -159,17 +170,25 @@ struct WindowSpec {
 class HostWindow {
 public:
     virtual ~HostWindow() = default;
+    // -- required: a window that shows pixels ------------------------------
     virtual void present(const Scene& s) = 0;     // first present maps it
-    virtual void set_title(std::string_view title) = 0;
-    virtual void set_decorations(Decorations d) = 0;
-    virtual void set_size_limits(Size min, Size max) = 0;
-    virtual void set_maximized(bool on) = 0;
-    virtual void set_fullscreen(bool on) = 0;
-    virtual void minimize() = 0;
-    virtual void begin_move() = 0;                // the pointer button is down
-    virtual void begin_resize(std::uint32_t edges) = 0;
-    virtual void move_popup(Point at) = 0;
-    virtual void activate() = 0;
+    // The usable screen area, relative to this window's view origin.
+    [[nodiscard]] virtual Rect work_area() const = 0;
+
+    // -- optional: each default is what a host without the feature does ---
+    virtual void set_title(std::string_view title) { (void)title; }
+    virtual void set_decorations(Decorations d) { (void)d; }
+    virtual void set_size_limits(Size min, Size max) { (void)min; (void)max; }
+    // A host that can't maximize or go fullscreen says so by never sending
+    // the state back; the core keeps its request pending, as a desktop with
+    // no such action would.
+    virtual void set_maximized(bool on) { (void)on; }
+    virtual void set_fullscreen(bool on) { (void)on; }
+    virtual void minimize() {}
+    virtual void begin_move() {}                  // the pointer button is down
+    virtual void begin_resize(std::uint32_t edges) { (void)edges; }
+    virtual void move_popup(Point at) { (void)at; }
+    virtual void activate() {}
     // Ask for the user's attention without taking focus (the Dock icon
     // bounces, the taskbar entry flashes): a terminal's urgent bell, an
     // app that wanted focus it wasn't entitled to.
@@ -179,8 +198,6 @@ public:
     // press-and-hold accents) and put their candidate window by `cursor`
     // (view coordinates). nullopt: plain keys again.
     virtual void set_text_input(std::optional<Rect> cursor) { (void)cursor; }
-    // The usable screen area, relative to this window's view origin.
-    [[nodiscard]] virtual Rect work_area() const = 0;
 };
 
 // -- The rest of the platform ------------------------------------------------
@@ -261,7 +278,13 @@ public:
 class Host {
 public:
     virtual ~Host() = default;
+    // -- required: a loop, a screen, windows --------------------------------
     [[nodiscard]] virtual EventLoop& loop() = 0;
+    virtual void attach(HostSink& sink) = 0;
+    [[nodiscard]] virtual std::vector<OutputInfo> outputs() = 0;
+    [[nodiscard]] virtual std::unique_ptr<HostWindow> create_window(const WindowSpec& spec, WindowSink& sink) = 0;
+
+    // -- optional -------------------------------------------------------------
     // The host gives every toplevel a real platform frame -- shadow, corner
     // shape, edge resizing, tiling -- even when the app draws its own title
     // bar. Then the core shows only the window geometry (no client-drawn
@@ -269,20 +292,18 @@ public:
     // drawing shadows and resize borders nobody will see. macOS, and an
     // Android/Windows desktop host, say yes; headless says no.
     [[nodiscard]] virtual bool native_frames() const { return false; }
-    virtual void attach(HostSink& sink) = 0;
-    [[nodiscard]] virtual std::vector<OutputInfo> outputs() = 0;
-    [[nodiscard]] virtual KeyboardInfo keyboard() = 0;
-    [[nodiscard]] virtual std::unique_ptr<HostWindow> create_window(const WindowSpec& spec, WindowSink& sink) = 0;
-    virtual void set_cursor(const CursorImage& c) = 0;
+    // The keyboard layout clients should compile (US by default).
+    [[nodiscard]] virtual KeyboardInfo keyboard() { return {}; }
+    virtual void set_cursor(const CursorImage& c) { (void)c; }
     virtual void set_cursor_shape(CursorShape s) { (void)s; reset_cursor(); }
-    virtual void reset_cursor() = 0;               // the platform's default arrow
+    virtual void reset_cursor() {}                 // the platform's default arrow
     virtual void bell() {}                         // the system alert sound
     [[nodiscard]] virtual HostClipboard* clipboard() { return nullptr; }
     // Windows exist (show us in the Dock / task switcher) or not.
     virtual void set_has_windows(bool any) { (void)any; }
 };
 
-// The host this build provides (cocoa on macOS, headless elsewhere for now).
-[[nodiscard]] std::unique_ptr<Host> make_host(bool headless);
+// Which host to run, and its construction, live in host_registry.hpp: a
+// backend registers itself there, nowhere else.
 
 }  // namespace lx::display

@@ -8,7 +8,8 @@
 // instance serves every environment of the user, the way one compositor
 // serves a desktop session.
 #include "core/compositor.hpp"
-#include "hosts/headless.hpp"
+#include "core/host_registry.hpp"
+#include "hosts/headless/headless.hpp"
 
 #include <csignal>
 #include <cstdio>
@@ -21,20 +22,6 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <unistd.h>
-
-namespace lx::display {
-#if defined(LX_DISPLAY_COCOA)
-std::unique_ptr<Host> make_cocoa_host();
-#endif
-
-std::unique_ptr<Host> make_host(bool headless) {
-#if defined(LX_DISPLAY_COCOA)
-    if (!headless) return make_cocoa_host();
-#endif
-    (void)headless;
-    return make_headless_host({});
-}
-}  // namespace lx::display
 
 namespace {
 
@@ -82,16 +69,28 @@ void relink_sessions(const std::string& socket) {
 }
 
 void usage() {
-    std::fputs("usage: linuxity-display [--socket PATH] [--headless [--dump DIR]] [--idle-exit SECS]\n"
-               "                        [--command-is-super] [--ready-fd N]\n", stderr);
+    std::fputs("usage: linuxity-display [--socket PATH] [--host NAME] [--host-opt KEY=VALUE]...\n"
+               "                        [--headless [--dump DIR]] [--idle-exit SECS]\n"
+               "                        [--command-is-super] [--ready-fd N] [--list-hosts]\n", stderr);
+}
+
+void list_hosts() {
+    using namespace lx::display;
+    const HostBackend* best = best_host();
+    for (const HostBackend* b : host_backends()) {
+        const bool up = !b->available || b->available();
+        std::printf("%c %-10s %s%s\n", b == best ? '*' : ' ', std::string{b->name}.c_str(),
+                    std::string{b->summary}.c_str(), up ? "" : "  (not available here)");
+    }
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
     using namespace lx::display;
-    std::string socket, dump;
-    bool headless = false, native_frames = false;
+    std::string socket, dump, host_name;
+    HostConfig host_cfg;
+    bool native_frames = false;
     int idle_exit = 0, ready_fd = -1;
     CompositorOptions opts;
 #if defined(__APPLE__)
@@ -106,8 +105,16 @@ int main(int argc, char** argv) {
             return argv[++i];
         };
         if (a == "--socket") socket = next();
-        else if (a == "--headless") headless = true;
-        else if (a == "--dump") { dump = next(); headless = true; }
+        else if (a == "--host") host_name = next();
+        else if (a == "--host-opt") {
+            const std::string_view kv = next();
+            const auto eq = kv.find('=');
+            host_cfg.params.insert_or_assign(std::string{kv.substr(0, eq)},
+                                             eq == std::string_view::npos ? std::string{"1"} : std::string{kv.substr(eq + 1)});
+        }
+        else if (a == "--list-hosts") { list_hosts(); return 0; }
+        else if (a == "--headless") host_name = "headless";
+        else if (a == "--dump") { dump = next(); host_name = "headless"; }
         else if (a == "--idle-exit") idle_exit = std::atoi(next());
         else if (a == "--command-is-super") opts.command_is_control = false;
         else if (a == "--command-is-control") opts.command_is_control = true;
@@ -120,9 +127,28 @@ int main(int argc, char** argv) {
     if (socket.empty()) socket = default_socket();
     ::signal(SIGPIPE, SIG_IGN);
 
-    static HeadlessLog dump_log;   // --native-frames: frame windows like a desktop host
+    // --native-frames: a headless host that frames windows like a desktop
+    // one (development); everything else goes through the registry
+    static HeadlessLog dump_log;
     dump_log.native_frames = native_frames;
-    std::unique_ptr<Host> host = dump.empty() ? make_host(headless) : make_headless_host(dump, &dump_log);
+    host_cfg.dump_dir = dump;
+    std::unique_ptr<Host> host;
+    if (native_frames) {
+        host = make_headless_host(dump, &dump_log);
+    } else {
+        const HostBackend* b = host_name.empty() ? best_host() : find_host(host_name);
+        if (!b) {
+            std::fprintf(stderr, "linuxity-display: no host named '%s' in this build (--list-hosts)\n", host_name.c_str());
+            return 2;
+        }
+        if (b->available && !b->available())
+            std::fprintf(stderr, "linuxity-display: host '%s' may not work here; trying anyway\n", std::string{b->name}.c_str());
+        host = b->create(host_cfg);
+        if (!host) {
+            std::fprintf(stderr, "linuxity-display: host '%s' failed to start\n", std::string{b->name}.c_str());
+            return 1;
+        }
+    }
     Server server{host->loop()};
     server.verbose = opts.verbose;
     std::string why;

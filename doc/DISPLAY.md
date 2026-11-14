@@ -71,29 +71,41 @@ each saw the other's writes).
 | `src/display/core/seat.cpp` | pointer, keyboard, `wl_data_device` (clipboard) |
 | `src/display/core/compositor.*` | globals, `wl_output`, frame pacing, host events |
 | `src/display/core/host.hpp` | **the platform seam** |
+| `src/display/core/host_registry.hpp` | the backends in this build, how one is chosen |
+| `src/display/core/soft_compose.*` | a `Scene` as one image (any bitmap-backed host) |
 | `src/display/hosts/cocoa/` | macOS |
-| `src/display/hosts/headless.cpp` | no screen; software-composites into PPM files |
+| `src/display/hosts/headless/` | no screen; software-composites into PPM files (also the reference backend) |
 | `src/display_attach.hpp` | linuxity's side: find or start a compositor, give the guest a socket |
-| `tests/display/` | a scripted Wayland client against the headless host |
+| `tests/display/test_display.cpp` | a scripted Wayland client against the headless host |
+| `tests/display/test_hosts.cpp` | every backend in the build against the Host contract |
 
 ## The Host seam
 
-`core/host.hpp` is the only thing a new platform implements:
+`core/host.hpp` is the only thing a new platform implements. Six members
+are required; every other one has the default of a platform without that
+feature, so a first backend can be small and grow:
 
 ```cpp
 class Host {
+    // required
     EventLoop& loop();                                  // the platform's run loop
+    void attach(HostSink&);                             // where host-wide input goes
     std::vector<OutputInfo> outputs();                  // screens, scale, refresh
-    KeyboardInfo keyboard();                            // XKB layout + repeat
     std::unique_ptr<HostWindow> create_window(const WindowSpec&, WindowSink&);
-    void set_cursor(const CursorImage&); void reset_cursor();
-    HostClipboard* clipboard();
+    // optional (defaults: no native frames, US keymap, default cursor, no
+    // clipboard, no bell, ...)
+    bool native_frames() const; KeyboardInfo keyboard();
+    void set_cursor(const CursorImage&); void set_cursor_shape(CursorShape);
+    HostClipboard* clipboard(); void bell(); void set_has_windows(bool);
 };
 class HostWindow {
+    // required
     void present(const Scene&);                         // layers of pixels
+    Rect work_area() const;                             // for popup placement
+    // optional (defaults: the request is ignored, as by a platform that
+    // can't do it -- the core keeps the client's state consistent)
     void set_title(...); set_decorations(...); set_maximized(...); ...
     void begin_move(); void begin_resize(edges);        // client-side frames
-    Rect work_area() const;                             // for popup placement
 };
 ```
 
@@ -109,6 +121,59 @@ Data flows one way each:
 
 The core never sees an `NSWindow`, an `HWND`, or a `Surface` from
 `android.view`; the hosts never see a Wayland object.
+
+## Adding a host
+
+A backend is a directory and one CMake call; nothing else in the tree
+names a platform.
+
+1. **`src/display/hosts/<name>/`**: subclass `Host` and `HostWindow`.
+   Reuse what is portable before writing anything:
+   - `make_poll_loop()` (`core/loop.hpp`) is a complete `EventLoop` for any
+     POSIX host without a UI run loop of its own;
+   - `soft_compose(scene, scale)` (`core/soft_compose.hpp`) turns a `Scene`
+     into one premultiplied BGRA image -- all a bitmap-backed window needs
+     (Android `ANativeWindow_lock`, a Win32 DIB, a framebuffer). Hand layers
+     to a platform compositor instead (as Cocoa does with `CALayer`s) only
+     when that pays;
+   - keys go to the core as Linux **evdev** codes; translate the platform's
+     scancodes once in a table, as `hosts/cocoa` does.
+2. **Register it**: define, in one of its sources,
+   ```cpp
+   const lx::display::HostBackend& lx_display_host_<name>() {
+       static const lx::display::HostBackend b{
+           .name = "<name>", .summary = "...", .priority = 100,
+           .available = [] () noexcept { return /* a GUI session is here */ true; },
+           .create = [](const lx::display::HostConfig& c) { return make_<name>_host(c); },
+       };
+       return b;
+   }
+   ```
+   `available()` must be cheap and side-effect free (no window, no app
+   registration): `linuxity-display` asks every backend, then starts the
+   highest-priority one that can run (`--host NAME` picks one; `--list-hosts`
+   shows the choice). Platform knobs come in `HostConfig::params`
+   (`--host-opt key=value`), so no command-line plumbing is needed.
+3. **Build it**: in `src/display/CMakeLists.txt`,
+   ```cmake
+   lx_display_host(<name> SOURCES hosts/<name>/<name>_host.cpp
+                          LIBRARIES <platform libs>
+                          CONDITION ${ANDROID})
+   ```
+   The backend becomes its own static library and a line of the generated
+   `host_list.inc`. linuxity itself learns that it now has a compositor
+   that can show windows (`kOwnCompositor` in `src/display_attach.hpp`).
+4. **Test it**: `test_display_hosts` runs the Host contract against every
+   backend in the build that is available where it runs -- outputs, window
+   creation, presenting, every optional request, the loop. The protocol
+   tests (`test_display`) run on headless and need nothing from a new host.
+   Add a platform test like `test_cocoa.mm` for what only the platform
+   half can get wrong: coordinate flips, scale, IME.
+
+Why a generated list and not self-registering static objects: registrars in
+a static library are dropped by the linker when nothing references their
+object file, and their order is unspecified. The list is explicit, ordered
+by priority, and a missing backend is a link error, not a silent absence.
 
 ### macOS (hosts/cocoa)
 

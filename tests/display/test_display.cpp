@@ -6,7 +6,7 @@
 // headless host composites every presented window into a PPM, so the tests
 // assert on the pixels a user would see, not just on protocol traffic.
 #include "core/compositor.hpp"
-#include "hosts/headless.hpp"
+#include "hosts/headless/headless.hpp"
 
 #include <algorithm>
 #include <atomic>

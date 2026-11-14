@@ -1,10 +1,12 @@
-// src/display/hosts/headless.cpp -- a Host with no screen.
+// src/display/hosts/headless/headless.cpp -- a Host with no screen.
 //
 // Windows are bookkeeping only; with a dump directory every present is
 // composited in software and written as <dir>/<n>-<title>.ppm, so tests can
 // check the pixels a client drew without a display. Also the fallback on
 // hosts that have no native backend yet.
 #include "headless.hpp"
+
+#include "core/soft_compose.hpp"
 
 #include <cctype>
 #include <cstdlib>
@@ -64,43 +66,11 @@ public:
 
 private:
     void write(const Scene& s) {
-        const Rect v = s.view;
-        if (v.empty()) return;
-        std::vector<float> rgb(static_cast<std::size_t>(v.w) * static_cast<std::size_t>(v.h) * 3, 0.f);
-        for (const auto& l : s.layers) {
-            if (!l.pixels) continue;
-            const Pixels& p = *l.pixels;
-            for (int y = 0; y < l.rect.h; ++y)
-                for (int x = 0; x < l.rect.w; ++x) {
-                    const int dx = l.rect.x + x - v.x, dy = l.rect.y + y - v.y;
-                    if (dx < 0 || dy < 0 || dx >= v.w || dy >= v.h) continue;
-                    // the layer shows `source` of the buffer stretched over its rect
-                    const SourceRect src = l.source.whole()
-                        ? SourceRect{0, 0, static_cast<double>(p.width), static_cast<double>(p.height)} : l.source;
-                    const int sx = static_cast<int>(src.x + (x + 0.5) * src.w / l.rect.w);
-                    const int sy = static_cast<int>(src.y + (y + 0.5) * src.h / l.rect.h);
-                    if (sx < 0 || sy < 0 || sx >= p.width || sy >= p.height) continue;
-                    const auto* px = reinterpret_cast<const unsigned char*>(p.data.data()) +
-                                     static_cast<std::size_t>(sy) * static_cast<std::size_t>(p.stride) + static_cast<std::size_t>(sx) * 4;
-                    float r, g, b, a;
-                    switch (p.format) {
-                        case PixelFormat::argb8888: b = px[0]; g = px[1]; r = px[2]; a = px[3]; break;
-                        case PixelFormat::xrgb8888: b = px[0]; g = px[1]; r = px[2]; a = 255; break;
-                        case PixelFormat::abgr8888: r = px[0]; g = px[1]; b = px[2]; a = px[3]; break;
-                        default: r = px[0]; g = px[1]; b = px[2]; a = 255; break;
-                    }
-                    float* d = &rgb[(static_cast<std::size_t>(dy) * static_cast<std::size_t>(v.w) + static_cast<std::size_t>(dx)) * 3];
-                    const float k = 1.f - a / 255.f;   // premultiplied over
-                    d[0] = r + d[0] * k;
-                    d[1] = g + d[1] * k;
-                    d[2] = b + d[2] * k;
-                }
-        }
+        const ComposedImage img = soft_compose(s);
+        if (img.width == 0) return;
         std::string safe;
         for (char c : title_) safe += (std::isalnum(static_cast<unsigned char>(c)) ? c : '_');
-        std::ofstream f(dump_ + "/" + std::to_string(n_) + "-" + safe + ".ppm", std::ios::binary);
-        f << "P6\n" << v.w << " " << v.h << "\n255\n";
-        for (float c : rgb) f.put(static_cast<char>(static_cast<unsigned char>(std::min(255.f, c))));
+        (void)write_ppm(img, (dump_ + "/" + std::to_string(n_) + "-" + safe + ".ppm").c_str());
     }
 
     WindowSink* sink_;
@@ -133,13 +103,11 @@ public:
         o.physical_mm = {520, 290};
         return {o};
     }
-    KeyboardInfo keyboard() override { return {}; }
     std::unique_ptr<HostWindow> create_window(const WindowSpec& spec, WindowSink& sink) override {
         return std::make_unique<HeadlessWindow>(sink, spec, dump_, ++n_, Rect{0, 0, 1920, 1080}, log_);
     }
     void set_cursor(const CursorImage&) override { if (log_) log_->cursor_shape = 0; }
     void set_cursor_shape(CursorShape s) override { if (log_) log_->cursor_shape = static_cast<std::uint32_t>(s); }
-    void reset_cursor() override {}
     void bell() override { if (log_) ++log_->bells; }
 
 private:
@@ -157,3 +125,16 @@ std::unique_ptr<Host> make_headless_host(std::string dump_dir, HeadlessLog* log)
 }
 
 }  // namespace lx::display
+
+// The registry entry (core/host_registry.hpp). Lowest priority: what runs
+// when nothing better can, and what tests and CI ask for by name.
+const lx::display::HostBackend& lx_display_host_headless() {
+    static const lx::display::HostBackend b{
+        .name = "headless",
+        .summary = "no screen; --dump DIR writes every frame as a PPM",
+        .priority = 0,
+        .available = [] () noexcept { return true; },
+        .create = [](const lx::display::HostConfig& c) { return lx::display::make_headless_host(c.dump_dir); },
+    };
+    return b;
+}

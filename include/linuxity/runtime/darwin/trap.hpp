@@ -1220,7 +1220,7 @@ private:
                         (void)::setsockopt(e, SOL_SOCKET, SO_RCVBUF, &sz, sizeof sz);
                     }
                     net::mark_netlink(p[0]);
-                    const int g = install_socket(p[0], (a1 & net::kSockCloexec) != 0);
+                    const auto g = install_socket(p[0], (a1 & net::kSockCloexec) != 0);
                     if (g < 0) { ::close(p[1]); return g; }
                     // requests written any way (write, writev, send...) are
                     // answered by the responder; sendto/sendmsg are still

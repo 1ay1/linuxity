@@ -126,7 +126,7 @@ private:
         auto last_sweep = std::chrono::steady_clock::now();
         std::unique_lock l{mu_};
         for (;;) {
-            cv_.wait_for(l, kPoll, [this] { return false; });
+            cv_.wait_for(l, kPoll);
             if (held_.empty()) { cv_.wait(l, [this] { return !held_.empty(); }); continue; }
             const auto now = std::chrono::steady_clock::now();
             if (now - last_sweep > std::chrono::seconds(10)) { sweep_dead(); last_sweep = now; }
