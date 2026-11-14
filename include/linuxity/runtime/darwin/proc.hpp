@@ -156,6 +156,14 @@ public:
         return true;
     }
     // -- Guest ptrace slots (see Shared::tracer) ---------------------------
+    // Yama's exception (prctl PR_SET_PTRACER): the guest pid allowed to
+    // trace g even though it is not g's descendant; -1 = anyone; 0 = none.
+    void set_ptracer(std::int32_t g, std::int32_t who) noexcept {
+        if (g > 0 && g < kMax && shared_) shared_->ptracer[g].store(who, std::memory_order_release);
+    }
+    [[nodiscard]] std::int32_t ptracer_of(std::int32_t g) const noexcept {
+        return (g > 0 && g < kMax && shared_) ? shared_->ptracer[g].load(std::memory_order_acquire) : 0;
+    }
     [[nodiscard]] std::int32_t tracer_of(std::int32_t g) const noexcept {
         return (g > 0 && g < kMax && shared_) ? shared_->tracer[g].load(std::memory_order_acquire) : 0;
     }
@@ -188,14 +196,37 @@ public:
         // the tracer is a parent sleeping in wait: wake it
         const std::int32_t t = shared_->tracer[g].load();
         if (const auto th = host_of(t)) ::kill(*th, SIGCHLD);
-        while (shared_->resume[g].load(std::memory_order_acquire) == gen) {
-            if (!still_traced()) return {7, 0, false};
+        for (int n = 0; shared_->resume[g].load(std::memory_order_acquire) == gen; ++n) {
+            if (!still_traced()) { shared_->stop_status[g].store(0, std::memory_order_release); return {7, 0, false}; }
+            // a tracer that exits without detaching detaches its tracees
+            // (Linux's exit_ptrace): Breakpad's dump child does exactly that
+            if (n % 64 == 63 && !tracer_alive(g)) {
+                shared_->tracer[g].store(0, std::memory_order_release);
+                shared_->stop_status[g].store(0, std::memory_order_release);
+                return {7, 0, false};
+            }
             ::usleep(200);
         }
         shared_->stop_status[g].store(0, std::memory_order_release);
         const bool changed = shared_->regs_dirty[g].exchange(false);
         if (changed) std::memcpy(back, shared_->regs[g], sizeof back);
         return {shared_->resume_cmd[g].load(), shared_->resume_sig[g].load(), changed};
+    }
+    // Is g's tracer still a live process? (no tracer: false)
+    [[nodiscard]] bool tracer_alive(std::int32_t g) const noexcept {
+        const std::int32_t t = (g > 0 && g < kMax && shared_) ? shared_->tracer[g].load() : 0;
+        if (t <= 0) return false;
+        const auto h = host_of(t);
+        return h && *h > 0 && (::kill(*h, 0) == 0 || errno == EPERM);
+    }
+    // A tracer's exit: every process it traces is let go, running.
+    void detach_all_of(std::int32_t tracer) noexcept {
+        if (!shared_ || tracer <= 0) return;
+        for (int g = 1; g < kMax; ++g)
+            if (shared_->tracer[g].load(std::memory_order_relaxed) == tracer) {
+                shared_->tracer[g].store(0, std::memory_order_release);
+                trace_resume(g, 7, 0);
+            }
     }
     // Tracer: the stop g sits in (0 = running), and whether wait took it.
     [[nodiscard]] std::int32_t stop_of(std::int32_t g) const noexcept {
@@ -216,11 +247,48 @@ public:
         shared_->resume_sig[g].store(sig);
         shared_->resume[g].fetch_add(1, std::memory_order_acq_rel);
     }
+    // -- Per-thread registers at a trace stop --------------------------------
+    // A stop holds the whole process (one host process), and a debugger or
+    // crash reporter reads EVERY thread's registers. The stopping thread
+    // publishes through trace_stop; each sibling, kicked out of the guest,
+    // publishes its own here (slot = its tid) and waits for the resume.
+    void publish_thread_regs(std::int32_t tid, const std::uint64_t (&r)[34], std::uint32_t gen) noexcept {
+        if (tid > 0 && tid < kMax && shared_) {
+            std::memcpy(shared_->tregs[tid], r, sizeof r);
+            shared_->thread_gen[tid].store(gen + 1, std::memory_order_release);
+        }
+    }
+    // Has tid published its registers for the stop at resume generation gen?
+    [[nodiscard]] bool thread_published(std::int32_t tid, std::uint32_t gen) const noexcept {
+        return tid > 0 && tid < kMax && shared_ && shared_->thread_gen[tid].load(std::memory_order_acquire) == gen + 1;
+    }
+    [[nodiscard]] std::uint64_t* thread_regs(std::int32_t tid) noexcept {
+        return (tid > 0 && tid < kMax && shared_) ? shared_->tregs[tid] : nullptr;
+    }
+    // The generation of g's resumes: a parked sibling waits for it to move.
+    [[nodiscard]] std::uint32_t resume_gen(std::int32_t g) const noexcept {
+        return (g > 0 && g < kMax && shared_) ? shared_->resume[g].load(std::memory_order_acquire) : 0;
+    }
+    // The tid whose stop the process is in (its registers are trace_regs).
+    void set_stop_tid(std::int32_t g, std::int32_t tid) noexcept {
+        if (g > 0 && g < kMax && shared_) shared_->stop_tid[g].store(tid, std::memory_order_release);
+    }
+    [[nodiscard]] std::int32_t stop_tid(std::int32_t g) const noexcept {
+        return (g > 0 && g < kMax && shared_) ? shared_->stop_tid[g].load(std::memory_order_acquire) : 0;
+    }
     [[nodiscard]] std::uint64_t* trace_regs(std::int32_t g) noexcept {
         return (g > 0 && g < kMax && shared_) ? shared_->regs[g] : nullptr;
     }
     void mark_regs_dirty(std::int32_t g) noexcept {
         if (g > 0 && g < kMax && shared_) shared_->regs_dirty[g].store(true);
+    }
+    // The FP/SIMD registers a stopped tracee published (read-only to the
+    // tracer: NT_FPREGSET for crash reporters and debuggers' `info float`).
+    void publish_fpregs(std::int32_t g, const std::uint64_t (&fp)[66]) noexcept {
+        if (g > 0 && g < kMax && shared_) std::memcpy(shared_->fpregs[g], fp, sizeof fp);
+    }
+    [[nodiscard]] const std::uint64_t* fpregs(std::int32_t g) const noexcept {
+        return (g > 0 && g < kMax && shared_) ? shared_->fpregs[g] : nullptr;
     }
 
     // Every live member of a group, for kill(-pgid) and kill(0).
@@ -253,6 +321,18 @@ public:
     }
     [[nodiscard]] std::uint32_t threads_of(std::int32_t g) const noexcept {
         return g > 0 && g < kMax && shared_ ? shared_->nthreads[g].load(std::memory_order_relaxed) : 0;
+    }
+    // The guest process (thread group leader) of tid t. Processes record an
+    // image (exe) and threads don't (see is_process); a thread shares its
+    // leader's host pid. t itself if it leads; 0 if unknown.
+    [[nodiscard]] std::int32_t group_of(std::int32_t t) const noexcept {
+        if (t <= 0 || t >= kMax || !shared_ || !host_of(t)) return 0;
+        if (const std::int32_t g = shared_->tgid[t].load(std::memory_order_acquire)) return g;
+        return t;                                         // a process: its own group
+    }
+    // A thread's tid: its group leader, for group_of (and /proc/<tid>).
+    void set_group(std::int32_t t, std::int32_t leader) noexcept {
+        if (t > 0 && t < kMax && shared_) shared_->tgid[t].store(leader == t ? 0 : leader, std::memory_order_release);
     }
     // Guest process g's threads, leader first: every slot bound to g's host
     // process (a thread allocates its tid here with its process's host pid).
@@ -329,6 +409,8 @@ public:
             shared_->exe[g][0] = '\0';
             shared_->comm[g][0] = '\0';
             shared_->tracer[g].store(0, std::memory_order_relaxed);
+            shared_->tgid[g].store(0, std::memory_order_relaxed);
+            shared_->ptracer[g].store(0, std::memory_order_relaxed);
             shared_->stop_status[g].store(0, std::memory_order_relaxed);
             shared_->exited[g].store(false, std::memory_order_relaxed);
             shared_->exit_final[g].store(false, std::memory_order_relaxed);
@@ -612,13 +694,20 @@ private:
         // The tracee publishes its registers at each stop (regs, x0..x30, sp,
         // pc, pstate) for PTRACE_GETREGSET; SETREGSET writes them back.
         std::atomic<std::int32_t> tracer[kMax]{};
+        std::atomic<std::int32_t> tgid[kMax]{};        // a thread's leader (0: it leads)
+        std::atomic<std::int32_t> ptracer[kMax]{};     // PR_SET_PTRACER
         std::atomic<std::int32_t> trace_opts[kMax]{};
         std::atomic<std::int32_t> stop_status[kMax]{};
         std::atomic<bool> stop_reported[kMax]{};
         std::atomic<std::uint32_t> resume[kMax]{};
         std::atomic<std::int32_t> resume_cmd[kMax]{}, resume_sig[kMax]{};
         std::atomic<bool> regs_dirty[kMax]{};
+        std::atomic<std::uint32_t> thread_gen[kMax]{};  // 1 + the stop generation tid's tregs belong to
+        std::atomic<std::int32_t> stop_tid[kMax]{};    // the thread that took g's stop
         std::uint64_t regs[kMax][34]{};
+        std::uint64_t tregs[kMax][34]{};               // parked siblings' own registers
+        // Linux's user_fpsimd_state at each stop: v0..v31, fpsr, fpcr, pad.
+        std::uint64_t fpregs[kMax][66]{};
         std::atomic<std::int8_t> policy[kMax]{};
         std::atomic<std::uint64_t> affinity[kMax]{};
         // See post_signal. Allocated lazily: kMax x 1024 records is 64 MiB

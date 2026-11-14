@@ -848,6 +848,8 @@ void run_guest_thread(ThreadContext& ctx, runtime::HvfTrap::ThreadStart start) {
     m.k.procs().set_tracer_resolver([&pids](std::int32_t g) {
         return std::pair<std::int32_t, bool>{pids.tracer_of(g), pids.stop_of(g) != 0};
     });
+    // another process's thread -> its process (/proc/<tid> resolves)
+    m.k.procs().set_group_resolver([&pids](std::int32_t t) { return pids.group_of(t); });
     // /proc's per-task facts: macOS has no host /proc, so this process
     // answers for itself (and its threads), Darwin for the others.
     m.k.procs().set_host_facts([&proc, &pids, &trap](std::int32_t g, std::string_view leaf)
@@ -864,6 +866,9 @@ void run_guest_thread(ThreadContext& ctx, runtime::HvfTrap::ThreadStart start) {
             for (const auto t : pids.tids_of(g)) s += std::to_string(t) + "\n";
             return s;
         }
+        // its address space and image: only its own linuxity knows them
+        if (*h != ::getpid() && runtime::procinfo::is_own_fact(leaf))
+            return trap.fact_of(pids.guest_of(*h), leaf);
         // RSS is the GUEST's pages in core; the host task's also counts ours
         runtime::procinfo::Peer peer{pids.threads_of(g), pids.vsize_of(g),
                                      [&trap, g] { return trap.resident_of(g); }};
@@ -875,6 +880,11 @@ void run_guest_thread(ThreadContext& ctx, runtime::HvfTrap::ThreadStart start) {
     });
 
     proc.add_thread(task.tid, &cpu, &task);
+    trap.set_own_facts([&proc, &pids](std::string_view leaf) -> std::optional<std::string> {
+        if (!runtime::procinfo::is_own_fact(leaf)) return std::nullopt;
+        const runtime::procinfo::Self self{proc, pids.guest_of(::getpid())};
+        return runtime::procinfo::fact(leaf, ::getpid(), &self);
+    });
     pids.set_threads(task.tid, static_cast<std::uint32_t>(proc.thread_count()));
     pids.set_vsize(task.tid, runtime::procinfo::guest_vsize(proc));
     runtime::g_pending.register_cpu(cpu.handle());

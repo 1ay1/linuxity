@@ -96,6 +96,10 @@ struct TaskState {
     // Pending signals targeted at this thread specifically (tgkill), as
     // opposed to the process-wide set.
     std::atomic<std::uint64_t> pending{0};
+    // In a syscall that may sleep in the host: the guest registers at the
+    // svc (x0..x30, sp, pc, pstate), for a sibling's ptrace stop to report.
+    std::atomic<bool> blocked{false};
+    std::uint64_t blocked_regs[34]{};
 };
 
 // -- Process-wide state ----------------------------------------------------
@@ -177,6 +181,11 @@ public:
     void add_thread(std::int32_t tid, HvfCpu* cpu, TaskState* task) {
         std::lock_guard g{mu_};
         threads_.push_back({tid, cpu, task});
+    }
+    template <class Fn>
+    void for_each_thread(Fn&& fn) {
+        std::lock_guard g{mu_};
+        for (const Thread& t : threads_) fn(t.tid, static_cast<const TaskState*>(t.task));
     }
     // tkill/tgkill to a sibling thread: pend `sig` on THAT thread and knock
     // it out of the guest (or of a blocking wait) so it takes it at once.

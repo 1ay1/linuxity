@@ -6340,7 +6340,10 @@ private:
     [[nodiscard]] Outcome do_ptrace(const Regs& r) {
         if constexpr (requires { mem_.guest_ptrace(0, 0, 0, 0); }) {
             const auto req = static_cast<std::int64_t>(r.arg[0]);
-            const auto pid = static_cast<std::int32_t>(r.arg[1]);
+            auto pid = static_cast<std::int32_t>(r.arg[1]);
+            // a thread's tid: permissions are its process's
+            if constexpr (requires { mem_.group_of(0); })
+                if (pid > 0) if (const auto g = mem_.group_of(pid); g > 0) pid = g;
             if (req == 16 /*ATTACH*/ || req == 0x4206 /*SEIZE*/) {
                 // ptrace_may_access: CAP_SYS_PTRACE, or the same uids; then
                 // Yama (scope 1: only descendants without the capability)
@@ -6366,11 +6369,14 @@ private:
                             if (pi->ppid == ids().pid) { below = true; break; }
                             p = pi->ppid;
                         }
+                        // ...or the target named us (PR_SET_PTRACER)
+                        if constexpr (requires { mem_.ptracer_allows(0); })
+                            if (!below) below = mem_.ptracer_allows(pid);
                         if (!below) return eno(Errno::eperm);
                     }
                 }
             }
-            const std::int64_t ret = mem_.guest_ptrace(req, pid, r.arg[2], r.arg[3]);
+            const std::int64_t ret = mem_.guest_ptrace(req, static_cast<std::int32_t>(r.arg[1]), r.arg[2], r.arg[3]);
             return val(ret);
         } else {
             return eno(Errno::eperm);

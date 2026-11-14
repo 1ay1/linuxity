@@ -463,6 +463,7 @@ public:
             (void)deliver_pending();
             if (task_.tid == tgid_) proc_.leader_sigmask.store(task_.sig_mask, std::memory_order_relaxed);
             if (exited_) return ok(false);
+            park_for_trace_stop();          // another thread holds a ptrace stop
             auto regs = cpu_.run();
             if (!regs) {
                 if (regs.error() == Errno::eintr) continue;   // kicked: deliver
@@ -548,6 +549,15 @@ public:
         // twin goes through the target's mailbox, and a kick wakes it.
         auto send_to = [&](std::int32_t g, pid_t h) -> bool {
             if (sig == 0) return ::kill(h, 0) == 0;
+            // A traced process stops for its TRACER, inside linuxity (a
+            // signal-delivery stop the tracer's wait reports): the host's
+            // SIGSTOP would freeze the whole host process instead, where no
+            // guest wait can see it -- PTRACE_ATTACH then waited forever.
+            if (sig == 19 && pids_.tracer_of(g) != 0) {
+                if (!pids_.post_signal(g, {19, tgid_, 0 /*SI_USER*/, 0})) { errno = EAGAIN; return false; }
+                (void)::kill(h, kKickSignal);
+                return true;
+            }
             if (hs > 0 && sig < 32) {
                 // the host delivers it; the record says who sent it (si_pid)
                 (void)pids_.post_signal(g, {sig, tgid_, 0 /*SI_USER*/, 0});
@@ -629,7 +639,11 @@ public:
         for (int n = 0; n < PidSpace::kSigRing; ++n) {
             const auto r = pids_.take_signal(tgid_);
             if (!r.signo) break;
-            if (r.signo < 32 && signal_from_linux(r.signo) > 0) {
+            if (r.signo == 19 && traced()) {
+                // no host SIGSTOP accompanies it (deliver_signal): the
+                // record IS the signal, a stop for the tracer
+                g_pending.enqueue({r.signo, r.sender, r.code, r.value});
+            } else if (r.signo < 32 && signal_from_linux(r.signo) > 0) {
                 // the host signal may not have landed yet: record the sender
                 // without making it pending on its own
                 g_pending.note_sender({r.signo, r.sender, r.code, r.value});
@@ -1060,7 +1074,30 @@ private:
         // A call that may block, while vCPUs are scarce: give ours back for
         // the duration (VcpuBudget). Taken again before the result is
         // written, so nothing past this function ever sees it parked.
-        ParkScope park{cpu_, may_block(sc) && park_allowed(sc) && g_vcpus.scarce()};
+        const bool blocks = may_block(sc);
+        // While we sleep in the host, a sibling's ptrace stop must still
+        // report OUR registers (a debugger's every-thread backtrace, a crash
+        // reporter's minidump): leave them where the process can read them.
+        if (blocks) {
+            for (int i = 0; i < 31; ++i) task_.blocked_regs[i] = regs_.x[static_cast<std::size_t>(i)];
+            task_.blocked_regs[31] = cpu_.sp_el0();
+            task_.blocked_regs[32] = regs_.elr;
+            task_.blocked_regs[33] = regs_.spsr;
+            task_.blocked.store(true, std::memory_order_release);
+            // a stop that began just before we got here: its scan of blocked
+            // threads may have missed us
+            publish_blocked_regs();
+        }
+        struct Unblock { HvfTrap& self; bool on;
+            ~Unblock() {
+                if (!on) return;
+                // still mid-syscall in the guest's eyes: report THESE regs if
+                // a sibling's stop is waiting for us, then mark us running
+                self.publish_blocked_regs();
+                self.task_.blocked.store(false, std::memory_order_release);
+            } }
+            unblock{*this, blocks};
+        ParkScope park{cpu_, blocks && park_allowed(sc) && g_vcpus.scarce()};
         return service_inner(sc, path, path2);
     }
 
@@ -2251,10 +2288,11 @@ private:
         if (s != 9 && traced() && !injecting_) {
             const std::int32_t wst = 0x7f | (s << 8);
             auto c = cpu_.save();
+            publish_fp(c);
             std::uint64_t pub[34]{}, back[34]{};
             for (int i = 0; i < 31; ++i) pub[i] = c.x[i];
             pub[31] = c.sp_el0; pub[32] = c.pc; pub[33] = c.cpsr;
-            const auto r = pids_.trace_stop(tgid_, wst, pub, back, [this] { return traced() && !exited_; });
+            const auto r = group_trace_stop(wst, pub, back);
             syscall_stops_ = r.cmd == 24;
             if (r.cmd == 8) kill_with(9);
             if (r.regs_changed) {
@@ -2612,6 +2650,7 @@ private:
         // `pacman -Sy` was killed by a SIGTERM no guest had sent.
         const std::int32_t tid = pids_.allocate(::getpid());
         if (tid < 0) return -11;                         // EAGAIN: namespace full
+        pids_.set_group(tid, tgid_);
         inherit_sched(task_.tid, tid);
 
         // The child resumes at the same PC as the parent (right after the
@@ -2929,6 +2968,16 @@ private:
                 if (!tracees_.count(c.guest) && pids_.tracer_of(c.guest) == tgid_) tracees_.insert(c.guest);
         };
         discover();
+        // waitpid(tid) on a thread we attached to (another thread of a
+        // tracee): it is stopped along with its process; report that stop.
+        if (gpid > 0 && attached_threads_.count(gpid)) {
+            const std::int32_t g = pids_.group_of(gpid);
+            if (g && pids_.tracer_of(g) == tgid_ && pids_.stop_of(g)) {
+                if (status) (void)machine_.ram().put(status, pids_.stop_of(g));
+                return gpid;
+            }
+            return -10;                                       // ECHILD: it went
+        }
         // A child whose exit is final in the table though its host process
         // lingers (a session leader the host holds until its tty drains:
         // release_parent_from_tty_drain) is reaped from the table.
@@ -2966,7 +3015,21 @@ private:
                     if (const auto r = reap_final(gpid)) return r;
                     if (auto h = pids_.host_of(gpid)) got2 = ::waitpid(*h, &s2, WNOHANG | (hopts & (WUNTRACED | WCONTINUED)));
                     if (got2 > 0) { st = s2; got = got2; break; }
-                    if (got2 < 0 && errno == ECHILD) return -10;
+                    if (got2 < 0 && errno == ECHILD) {
+                        // A tracee that is not our child (attached to, not
+                        // forked -- Breakpad's dump child attaches to the
+                        // process it was cloned from): its stops come through
+                        // the table; its end is the end of the tracing.
+                        if (!tracees_.count(gpid)) return -10;
+                        const auto h = pids_.host_of(gpid);
+                        if (!h || (::kill(*h, 0) != 0 && errno == ESRCH)) {
+                            tracees_.erase(gpid);
+                            return -10;
+                        }
+                        if (hopts & WNOHANG) return 0;
+                        if (signal_aware_poll_ms(5) == -4) return poll_interrupted();   // EINTR or restart
+                        continue;
+                    }
                 } else {
                     break;                          // the general path polls on a tick below
                 }
@@ -2996,16 +3059,19 @@ private:
                     if (reg == 0 && !pids_.take_stop_report_peek(gpid))
                         (void)::kevent(kq, nullptr, 0, &out, 1, &tick);
                     ::close(kq);
+                    // signals that come by mail (real-time ones, a tracer's
+                    // SIGSTOP) only become pending once collected
+                    g_pending.drain_wake();
+                    drain_mail();
                     if (const std::uint64_t ready = (g_pending.bits.load(std::memory_order_relaxed) |
                                                      task_.pending.load(std::memory_order_relaxed)) & ~task_.sig_mask;
                         ready & ~sigbit(17))
-                        return -4;                  // a signal other than our own SIGCHLD kick
-                    g_pending.drain_wake();
+                        return poll_interrupted();  // a signal other than our own SIGCHLD kick
                     continue;
                 }
                 // untraced and not yet TRACEME'd: a cheap poll, a few ms
                 std::vector<struct ::pollfd> none;
-                if (signal_aware_poll(none, 2) == -4) return -4;
+                if (signal_aware_poll(none, 2) == -4) return poll_interrupted();
             }
         }
         if (got > 0) {
@@ -3088,11 +3154,12 @@ private:
                 ::close(kq);
                 if (n < 0 && e == EINTR) return -4;             // EINTR, as Linux
                 if (n > 0 && wk >= 0 && out.filter == EVFILT_READ && out.ident == static_cast<uintptr_t>(wk)) {
+                    g_pending.drain_wake();
+                    drain_mail();
                     if (const std::uint64_t ready = (g_pending.bits.load(std::memory_order_relaxed) |
                                                      task_.pending.load(std::memory_order_relaxed)) & ~task_.sig_mask;
                         ready & ~sigbit(17))
-                        return -4;                              // a real signal for the guest
-                    g_pending.drain_wake();
+                        return poll_interrupted();              // a real signal for the guest
                 }
                 // n > 0: an exit (or an EV_ERROR for a pid already gone --
                 // either way the WNOHANG sweep above now finds it).
@@ -4349,6 +4416,17 @@ private:
                         return no_new_privs_ ? 1 : 0;
                     case kSetDumpable: case kGetDumpable:
                         return a0 == kGetDumpable ? 1 : 0;
+                    case 0x59616d61: {      // PR_SET_PTRACER (Yama)
+                        // who may trace us though not our ancestor: Breakpad
+                        // lets its dump child (a CLONE of the crashing
+                        // process, so not an ancestor) attach this way
+                        const auto who = static_cast<std::int64_t>(a1);
+                        if (who == -1) { pids_.set_ptracer(tgid_, -1); return 0; }   // PR_SET_PTRACER_ANY
+                        if (who == 0) { pids_.set_ptracer(tgid_, 0); return 0; }
+                        if (who < 0 || !pids_.host_of(static_cast<std::int32_t>(who))) return -22;
+                        pids_.set_ptracer(tgid_, static_cast<std::int32_t>(who));
+                        return 0;
+                    }
                     case kSetPdeathsig: {
                         // The signal to send this process when its parent
                         // dies. The parent is another host process (each
@@ -4545,6 +4623,17 @@ public:
     // flushes, and _exit. Never returns.
     using ExitHook = std::function<void()>;
     void on_exit(ExitHook h) { exit_hooks_.push_back(std::move(h)); }
+    // What this process answers, through its memory service, about its own
+    // /proc entries that only it knows (maps, auxv, environ...): another
+    // guest process reading /proc/<us>/maps -- a debugger, a crash reporter
+    // -- has no host /proc to ask.
+    void set_own_facts(memsvc::FactFn f) { own_facts_ = std::move(f); }
+    // ...and asking another process for one of its own.
+    [[nodiscard]] std::optional<std::string> fact_of(std::int32_t g, std::string_view leaf) {
+        const std::string p = memsvc_path(g);
+        if (p.empty() || g == tgid_) return std::nullopt;
+        return memsvc::fact(p, leaf);
+    }
     // XNU's exit makes a SESSION LEADER wait, with no timeout, until its
     // controlling tty's output has drained (proc_exit -> ttywait), and a
     // leader can't drop the tty first (TIOCNOTTY is EINVAL). Linux exits at
@@ -4573,6 +4662,7 @@ public:
                          static_cast<unsigned long long>(g_fault_ns.load() / 1000), machine_.populated());
         if (std::getenv("LINUXITY_DEBUG") && (status & 0xff))
             std::fprintf(stderr, "linuxity: guest pid %d exits %d\n", tgid_, status & 0xff);
+        if (!tracees_.empty()) pids_.detach_all_of(tgid_);   // Linux's exit_ptrace
         pids_.reparent_children_of(tgid_);
         pids_.post_exit(tgid_, (status & 0xff) << 8);
         proc_.request_group_exit(status);
@@ -6663,6 +6753,11 @@ private:
         }
     }
 
+    // Sleep up to `ms`, cut short by a deliverable signal (-4).
+    [[nodiscard]] int signal_aware_poll_ms(int ms) {
+        std::vector<struct ::pollfd> none;
+        return signal_aware_poll(none, ms);
+    }
     // A socket with TCP urgent (out-of-band) data waiting: what POLLPRI means.
     [[nodiscard]] static bool urgent_waiting(int fd) {
         struct ::stat st{};
@@ -6674,6 +6769,9 @@ private:
     [[nodiscard]] int signal_aware_poll_raw(std::vector<struct ::pollfd>& p, int timeout) {
         g_pending.drain_wake();
         drain_mail();
+        // A sibling's trace stop pokes us; the poke may be what drain_wake
+        // just ate (waits come in short ticks), so answer it here too.
+        publish_for_trace_stop();
         auto deliverable = [&] {
             return ((g_pending.bits.load(std::memory_order_relaxed)
                      | task_.pending.load(std::memory_order_relaxed)) & ~task_.sig_mask) != 0;
@@ -6709,6 +6807,7 @@ private:
             if (rc < 0 || rc != (woke ? 1 : 0) || !woke || deliverable()) break;
             g_pending.drain_wake();
             drain_mail();
+            publish_for_trace_stop();
             if (deliverable()) break;
             if (timeout >= 0) {
                 const auto now = Clock::now();
@@ -7631,6 +7730,7 @@ private:
     // The thread-group id: this process's pid, i.e. its MAIN thread's tid.
     // A cloned thread keeps it while task_.tid becomes its own.
     std::int32_t tgid_{1};
+    memsvc::FactFn own_facts_;
     bool threaded_{false};        // a clone(CLONE_THREAD) has happened
     struct Child { std::int32_t guest; pid_t host; };
     std::vector<Child> children_;
@@ -7670,7 +7770,7 @@ private:
         ProcessState* pr = &proc_;
         memsvc::serve(p, [m](std::uint64_t addr, std::uint64_t len) -> std::span<std::byte> {
             return m->ram().at(addr, len);
-        }, [m, pr] { return guest_resident(*m, *pr); });
+        }, [m, pr] { return guest_resident(*m, *pr); }, own_facts_);
     }
     // The guest's resident set: its own mappings' pages the host has in core
     // (the host task's RSS also counts linuxity's binary, heap and threads).
@@ -7778,23 +7878,109 @@ private:
     // we're traced, and which syscall boundary the tracer wants us to stop
     // at next (PTRACE_SYSCALL).
     std::unordered_set<std::int32_t> tracees_;
+    // non-leader threads of tracees we attached to: waitpid(tid) reports
+    // their process's stop (see do_guest_ptrace)
+    std::unordered_set<std::int32_t> attached_threads_;
     bool syscall_stops_{false};        // PTRACE_SYSCALL in force
     bool injecting_{false};            // delivering a signal the tracer passed on
     std::vector<std::uint64_t> ll_chain_;   // our landlock domain chain (ig_after_dispatch)
     std::function<void(std::int64_t)> before_resume_;   // see run_in_guest
     bool in_syscall_stop_{false};      // between the entry stop and the exit stop
     [[nodiscard]] bool traced() const noexcept { return pids_.tracer_of(tgid_) != 0; }
+    // A trace stop holds the WHOLE process, as on Linux where every thread
+    // of a tracee stops: this thread posts the stop, and every sibling is
+    // kicked out of the guest to park (park_for_trace_stop) with its own
+    // registers published -- what a debugger's `thread apply all bt` or a
+    // crash reporter's minidump reads, one thread at a time.
+    PidSpace::Resume group_trace_stop(std::int32_t wst, const std::uint64_t (&pub)[34], std::uint64_t (&back)[34]) {
+        pids_.set_stop_tid(tgid_, task_.tid);
+        // siblings asleep in the host: their registers are where they left
+        // them (service); the rest are kicked out of the guest and publish
+        // themselves on the way back in (park_for_trace_stop)
+        const std::uint32_t gen = pids_.resume_gen(tgid_);
+        proc_.for_each_thread([&](std::int32_t tid, const TaskState* t) {
+            if (tid == task_.tid || !t || !t->blocked.load(std::memory_order_acquire)) return;
+            std::uint64_t r[34];
+            std::memcpy(r, t->blocked_regs, sizeof r);
+            pids_.publish_thread_regs(tid, r, gen);
+        });
+        proc_.kick_others(task_.tid);
+        g_pending.poke();               // siblings blocked in a host wait publish from there
+        const auto r = pids_.trace_stop(tgid_, wst, pub, back, [this] { return traced() && !exited_; });
+        pids_.set_stop_tid(tgid_, 0);
+        return r;
+    }
+    // Registers of `tid` in process g's stop: the stopping thread's are the
+    // stop's own (writable); a sibling's are the snapshot it published for
+    // THIS stop -- it was kicked, so give it a moment to arrive.
+    [[nodiscard]] std::uint64_t* regs_of_thread(std::int32_t g, std::int32_t tid) {
+        const std::int32_t holder = pids_.stop_tid(g);
+        if (tid == holder || holder == 0) return pids_.trace_regs(g);
+        const std::uint32_t gen = pids_.resume_gen(g);
+        for (int i = 0; i < 5000 && !pids_.thread_published(tid, gen) && pids_.stop_tid(g); ++i) ::usleep(200);
+        if (!pids_.thread_published(tid, gen) && std::getenv("LINUXITY_DEBUG"))
+            std::fprintf(stderr, "linuxity: ptrace: thread %d of %d (stop held by %d) never published its registers\n",
+                         tid, g, holder);
+        return pids_.thread_regs(tid);           // its own, if possibly from an earlier stop
+    }
+    void publish_blocked_regs() {
+        const std::int32_t holder = pids_.stop_tid(tgid_);
+        if (!holder || holder == task_.tid) return;
+        const std::uint32_t gen = pids_.resume_gen(tgid_);
+        if (pids_.thread_published(task_.tid, gen)) return;
+        std::uint64_t r[34];
+        std::memcpy(r, task_.blocked_regs, sizeof r);
+        pids_.publish_thread_regs(task_.tid, r, gen);
+    }
+    // A sibling's half. Another thread of this process holds a trace stop:
+    // publish our registers for it (once per stop), from wherever we are --
+    // about to enter the guest, or blocked in a host wait (a thread in a
+    // syscall, which is where Linux shows it too: pc after the svc).
+    void publish_for_trace_stop(bool in_syscall = true) {
+        const std::int32_t holder = pids_.stop_tid(tgid_);
+        if (!holder || holder == task_.tid || !traced()) return;
+        const std::uint32_t gen = pids_.resume_gen(tgid_);
+        if (pids_.thread_published(task_.tid, gen)) return;
+        const auto c = cpu_.save();
+        std::uint64_t pub[34]{};
+        for (int i = 0; i < 31; ++i) pub[i] = c.x[i];
+        pub[31] = c.sp_el0; pub[32] = c.pc; pub[33] = c.cpsr;
+        if (in_syscall) {                         // mid-syscall: the guest's view is the trap frame
+            for (int i = 0; i < 31; ++i) pub[i] = regs_.x[static_cast<std::size_t>(i)];
+            pub[32] = regs_.elr; pub[33] = regs_.spsr;
+        }
+        pids_.publish_thread_regs(task_.tid, pub, gen);
+    }
+    // ...and before running guest code: wait the stop out (every thread of a
+    // stopped tracee is stopped).
+    void park_for_trace_stop() {
+        const std::int32_t holder = pids_.stop_tid(tgid_);
+        if (!holder || holder == task_.tid || !traced()) return;
+        publish_for_trace_stop(false);
+        const std::uint32_t gen = pids_.resume_gen(tgid_);
+        while (pids_.resume_gen(tgid_) == gen && pids_.stop_tid(tgid_) && traced() && !exited_)
+            ::usleep(200);
+    }
+    // NT_FPREGSET's layout (user_fpsimd_state): v0..v31, then fpsr, fpcr.
+    void publish_fp(const HvfCpu::CpuState& c) {
+        std::uint64_t fp[66]{};
+        for (int i = 0; i < 32; ++i) std::memcpy(&fp[2 * i], &c.q[i], 16);
+        const std::uint32_t sr[2] = {static_cast<std::uint32_t>(c.fpsr), static_cast<std::uint32_t>(c.fpcr)};
+        std::memcpy(&fp[64], sr, sizeof sr);
+        pids_.publish_fpregs(tgid_, fp);
+    }
     // Stop for the tracer with Linux wait status `wst` (0x7f | sig << 8),
     // publishing registers; returns once resumed. A signal the tracer passes
     // on is made pending; PTRACE_SYSCALL arms the next syscall boundary.
     void trace_point(std::int32_t wst) {
         auto c = cpu_.save();
+        publish_fp(c);
         // a stop at a syscall boundary: the live registers are in regs_
         for (int i = 0; i < 9; ++i) c.x[i] = regs_.x[static_cast<std::size_t>(i)];
         std::uint64_t pub[34]{}, back[34]{};
         for (int i = 0; i < 31; ++i) pub[i] = c.x[i];
         pub[31] = c.sp_el0; pub[32] = regs_.elr; pub[33] = regs_.spsr;
-        const auto r = pids_.trace_stop(tgid_, wst, pub, back, [this] { return traced() && !exited_; });
+        const auto r = group_trace_stop(wst, pub, back);
         if (r.regs_changed) {
             for (int i = 0; i < 9; ++i) regs_.x[static_cast<std::size_t>(i)] = back[i];
             for (int i = 0; i < 31; ++i) c.x[i] = back[i];
@@ -7813,7 +7999,13 @@ private:
                                kGetregset = 0x4204, kSetregset = 0x4205, kSeize = 0x4206,
                                kInterrupt = 0x4207, kGetsiginfo = 0x4202;
         const auto req = static_cast<std::int64_t>(regs_.arg(0));
-        const auto pid = static_cast<std::int32_t>(regs_.arg(1));
+        // ptrace here works per PROCESS: one stop holds the whole process
+        // (every thread lives in its one host process). A tid of another
+        // thread names its process -- Breakpad attaches to every thread of
+        // the crashed process in turn, then reads each one's registers.
+        const auto raw_pid = static_cast<std::int32_t>(regs_.arg(1));
+        const std::int32_t pid = raw_pid > 0 ? (pids_.group_of(raw_pid) ? pids_.group_of(raw_pid) : raw_pid) : raw_pid;
+        const bool other_thread = pid != raw_pid;
         const std::uint64_t addr = regs_.arg(2), data = regs_.arg(3);
         const GuestRam ram = machine_.ram();
         if (req == kTraceme) {
@@ -7826,7 +8018,14 @@ private:
         }
         if (pid <= 0) return -3;
         if (req == kAttach || req == kSeize) {
-            if (pid == tgid_ || pids_.tracer_of(pid)) return -1;
+            if (pid == tgid_) return -1;
+            // another thread of a process we already trace: it is held by
+            // that process's stop; its wait reports the same stop
+            if (other_thread && pids_.tracer_of(pid) == tgid_) {
+                attached_threads_.insert(raw_pid);
+                return 0;
+            }
+            if (pids_.tracer_of(pid)) return -1;
             if (!pids_.host_of(pid)) return -3;
             pids_.set_tracer(pid, tgid_);
             tracees_.insert(pid);
@@ -7843,6 +8042,9 @@ private:
                 return stopped ? 0 : -3;
             case kCont: case kSyscall: case kSinglestep: case kDetach: {
                 if (!stopped) return -3;
+                // detaching/resuming a non-leader thread: the process stays
+                // stopped until its leader is let go
+                if (other_thread) { if (req == kDetach) attached_threads_.erase(raw_pid); return 0; }
                 if (req == kDetach) { pids_.set_tracer(pid, 0); tracees_.erase(pid); }
                 pids_.trace_resume(pid, req == kSinglestep ? kCont : static_cast<std::int32_t>(req),
                                    static_cast<std::int32_t>(data));
@@ -7857,17 +8059,28 @@ private:
                 return 0;
             case kPeekuser: {
                 if (!stopped) return -3;
-                const std::uint64_t* r = pids_.trace_regs(pid);
+                const std::uint64_t* r = regs_of_thread(pid, raw_pid);
                 const std::uint64_t i = addr / 8;
                 if (!r || i >= 34 || addr % 8) return -5;                // EIO
                 return ram.put(data, r[i]) ? 0 : -14;
             }
             case kGetregset: case kSetregset: {
                 if (!stopped) return -3;
-                if (addr != 1) return -22;                             // NT_PRSTATUS only
                 GuestIovec iov{};
                 if (!ram.get(data, iov)) return -14;
-                std::uint64_t* r = pids_.trace_regs(pid);
+                if (addr == 2) {                                       // NT_FPREGSET
+                    if (req == kSetregset) return -5;                  // read-only here
+                    const std::uint64_t* f = pids_.fpregs(pid);
+                    if (!f) return -3;
+                    const std::size_t n = std::min<std::size_t>(iov.len, 66 * 8);
+                    auto w = ram.at(iov.base, n);
+                    if (w.size() != n) return -14;
+                    std::memcpy(w.data(), f, n);
+                    iov.len = n;
+                    return ram.put(data, iov) ? 0 : -14;
+                }
+                if (addr != 1) return -22;                             // NT_PRSTATUS
+                std::uint64_t* r = regs_of_thread(pid, raw_pid);
                 if (!r) return -3;
                 const std::size_t n = std::min<std::size_t>(iov.len, 34 * 8);
                 auto w = ram.at(iov.base, n);
@@ -7877,6 +8090,7 @@ private:
                     iov.len = n;
                     return ram.put(data, iov) ? 0 : -14;
                 }
+                if (r != pids_.trace_regs(pid)) return -5;            // only the stopping thread's
                 std::memcpy(r, w.data(), n);
                 pids_.mark_regs_dirty(pid);
                 return 0;
@@ -8044,6 +8258,15 @@ public:
     // Per-process nice, in the tree-wide table (see PidSpace::set_nice).
     [[nodiscard]] int nice_of(std::int32_t pid) const {
         return trap_ ? trap_->pid_space().nice_of(pid ? pid : trap_->tgid()) : 0;
+    }
+    // Yama: has `target` named the caller its ptracer (PR_SET_PTRACER)?
+    [[nodiscard]] std::int32_t group_of(std::int32_t tid) const {
+        return trap_ ? trap_->pid_space().group_of(tid) : 0;
+    }
+    [[nodiscard]] bool ptracer_allows(std::int32_t target) const {
+        if (!trap_) return false;
+        const std::int32_t who = trap_->pid_space().ptracer_of(target);
+        return who == -1 || (who != 0 && who == trap_->tgid());
     }
     void set_nice(std::int32_t pid, int n) const {
         if (trap_) trap_->pid_space().set_nice(pid ? pid : trap_->tgid(), n);

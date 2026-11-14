@@ -234,8 +234,14 @@ public:
         for (const auto& [pid, p] : procs_)
             if (std::find(p.threads.begin(), p.threads.end(), tid) != p.threads.end())
                 return pid;
+        // another backend process's thread (each guest process its own
+        // linuxity): the shared pid table knows its group
+        if (group_of_)
+            if (const std::int32_t g = group_of_(tid); g > 0 && g != tid) return g;
         return 0;
     }
+    using GroupOf = std::function<std::int32_t(std::int32_t)>;
+    void set_group_resolver(GroupOf f) { group_of_ = std::move(f); }
     void set_comm(std::int32_t pid, std::string comm) {
         auto& p = procs_[pid]; p.pid = pid; p.comm = comm;
         if (p.cmdline.empty()) p.cmdline = std::move(comm);
@@ -791,6 +797,7 @@ public:
 private:
     const LiveSource* live_{nullptr};
     HostFacts host_facts_;
+    GroupOf group_of_;
     mutable std::map<std::int32_t, ProcInfo> scratch_;
 };
 

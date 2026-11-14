@@ -369,5 +369,98 @@ def ptrace_traceme_exec_and_syscall_stops():
     ok(stops >= 4, f"syscall entry/exit stops seen ({stops})")
 
 
+_DUMP_C = r"""
+#define _GNU_SOURCE
+#include <dirent.h>
+#include <elf.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/prctl.h>
+#include <sys/ptrace.h>
+#include <sys/uio.h>
+#include <sys/wait.h>
+#include <unistd.h>
+static int fds[2];
+static pid_t victim;
+static volatile long marker = 0x5eed5eed5eed5eedL;
+static void* spin(void* _) { for (;;) pause(); return 0; }
+struct regs { unsigned long long x[31], sp, pc, pstate; };
+static int dumper(void* _) {
+    char c, path[64];
+    if (read(fds[0], &c, 1) != 1) _exit(10);
+    snprintf(path, sizeof path, "/proc/%d/auxv", victim);
+    if (open(path, O_RDONLY) < 0) _exit(11);                 /* another process's auxv */
+    snprintf(path, sizeof path, "/proc/%d/task", victim);
+    DIR* d = opendir(path);
+    if (!d) _exit(12);
+    int n = 0, distinct = 0;
+    unsigned long long sps[16];
+    struct dirent* e;
+    while ((e = readdir(d)) && n < 16) {
+        if (e->d_name[0] == '.') continue;
+        pid_t t = atoi(e->d_name);
+        if (ptrace(PTRACE_ATTACH, t, 0, 0) != 0) _exit(13);   /* every thread, PR_SET_PTRACER */
+        if (waitpid(t, 0, __WALL) != t) _exit(14);
+        snprintf(path, sizeof path, "/proc/%d/status", t);
+        if (open(path, O_RDONLY) < 0) _exit(15);              /* /proc/<tid> of another process */
+        struct regs r;
+        struct iovec io = {&r, sizeof r};
+        if (ptrace(PTRACE_GETREGSET, t, (void*)NT_PRSTATUS, &io) != 0) _exit(16);
+        unsigned char fp[528];
+        struct iovec fio = {fp, sizeof fp};
+        if (ptrace(PTRACE_GETREGSET, t, (void*)NT_FPREGSET, &fio) != 0) _exit(17);
+        int seen = 0;
+        for (int i = 0; i < n; ++i) seen |= sps[i] == r.sp;
+        if (!seen) ++distinct;
+        sps[n++] = r.sp;
+    }
+    if (n != 3) _exit(18);
+    if (distinct != 3) _exit(19);                             /* each thread its own registers */
+    if (ptrace(PTRACE_PEEKDATA, victim, (void*)&marker, 0) != marker) _exit(20);
+    _exit(0);   /* exiting detaches, as on Linux */
+}
+int main(void) {
+    pthread_t t;
+    pthread_create(&t, 0, spin, 0);
+    pthread_create(&t, 0, spin, 0);
+    usleep(100000);
+    if (pipe(fds)) return 2;
+    victim = getpid();
+    static char stack[256 * 1024];
+    pid_t c = clone(dumper, stack + sizeof stack, CLONE_FS | CLONE_UNTRACED, 0);
+    if (prctl(PR_SET_PTRACER, c, 0, 0, 0) != 0) return 3;
+    if (write(fds[1], "x", 1) != 1) return 4;
+    int st = 0;
+    if (waitpid(c, &st, __WALL) != c) return 5;
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 99;
+}
+"""
+
+
+@check(timeout=60)
+def a_crash_reporter_dumps_every_thread():
+    # Firefox's crash reporter (Breakpad): from the crashing process it
+    # clones a dump child, names it its ptracer (PR_SET_PTRACER), and the
+    # child attaches to EVERY thread, reads each one's registers and the
+    # crashed process's memory and /proc files, then exits. Every step
+    # failed here, so every Firefox crash ended in "minidump generation
+    # failed" with no report. Exit codes 10-20 name the failing step.
+    from torture import sh, have
+    cc = next((c for c in ("cc", "gcc", "clang") if have(c)), None)
+    if not cc:
+        raise Skip("no C compiler")
+    src, exe = os.path.abspath("dump.c"), os.path.abspath("dump")
+    with open(src, "w") as f:
+        f.write(_DUMP_C)
+    eq(sh(f"{cc} -O1 -pthread -o {exe} {src}")[0], 0, "compiles")
+    for _ in range(3):
+        eq(sh(exe, timeout=20)[0], 0, "the dump child attached to each thread and read it")
+
+
 if __name__ == "__main__":
     sys.exit(main("kernel interfaces"))

@@ -202,6 +202,13 @@ struct Peer {
     std::function<std::uint64_t()> resident{};
 };
 
+// Leaves about a process's own address space and image, which only its own
+// linuxity can answer (another process asks it through memsvc).
+[[nodiscard]] inline bool is_own_fact(std::string_view leaf) noexcept {
+    return leaf == "maps" || leaf == "smaps" || leaf == "smaps_rollup" || leaf == "auxv" ||
+           leaf == "environ";
+}
+
 // One fact, Linux-formatted, or nullopt for "not known here".
 [[nodiscard]] inline std::optional<std::string>
 fact(std::string_view leaf, pid_t host, const Self* self, std::optional<int> nice = std::nullopt,

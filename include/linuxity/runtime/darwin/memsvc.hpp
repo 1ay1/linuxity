@@ -32,7 +32,9 @@
 #include <cstring>
 #include <functional>
 #include <span>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -81,11 +83,15 @@ inline constexpr std::uint64_t kMaxChunk = 1 << 20;
 
 using RamFn = std::function<std::span<std::byte>(std::uint64_t, std::uint64_t)>;
 using ResidentFn = std::function<std::uint64_t()>;
+// op 4: a /proc/<pid>/<leaf> this process alone can answer (maps, smaps,
+// environ, auxv: its own address space); nullopt = not known.
+using FactFn = std::function<std::optional<std::string>(std::string_view leaf)>;
+inline constexpr std::size_t kMaxFact = 64u << 20;
 
 // The server: binds `path`, serves `ram` (guest address -> host span, empty
 // if unmapped) until the process exits. Detached; never returns an error to
 // the guest (a client that can't connect sees ESRCH).
-inline void serve(std::string path, RamFn ram, ResidentFn resident = {}) {
+inline void serve(std::string path, RamFn ram, ResidentFn resident = {}, FactFn fact = {}) {
     ::unlink(path.c_str());
     const int s = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (s < 0) return;
@@ -94,7 +100,7 @@ inline void serve(std::string path, RamFn ram, ResidentFn resident = {}) {
     if (path.size() >= sizeof a.sun_path) { ::close(s); return; }
     std::memcpy(a.sun_path, path.c_str(), path.size() + 1);
     if (::bind(s, reinterpret_cast<::sockaddr*>(&a), sizeof a) < 0 || ::listen(s, 8) < 0) { ::close(s); return; }
-    std::thread([s, ram = std::move(ram), resident = std::move(resident)] {
+    std::thread([s, ram = std::move(ram), resident = std::move(resident), fact = std::move(fact)] {
         for (;;) {
             const int c = ::accept(s, nullptr, nullptr);
             if (c < 0) { if (errno == EINTR) continue; return; }
@@ -103,6 +109,13 @@ inline void serve(std::string path, RamFn ram, ResidentFn resident = {}) {
             if (q.op == 3) {
                 std::int64_t rc = resident ? static_cast<std::int64_t>(resident()) : -ENOSYS;
                 (void)full_io(c, &rc, sizeof rc, false);
+            } else if (q.op == 4) {
+                std::string leaf(std::min<std::uint64_t>(q.len, 64), '\0');
+                if (!full_io(c, leaf.data(), leaf.size(), true)) { ::close(c); continue; }
+                const auto f = fact ? fact(leaf) : std::nullopt;
+                std::int64_t rc = f ? static_cast<std::int64_t>(std::min(f->size(), kMaxFact)) : -ENOENT;
+                (void)full_io(c, &rc, sizeof rc, false);
+                if (rc > 0) (void)full_io(c, const_cast<char*>(f->data()), static_cast<std::size_t>(rc), false);
             } else if (q.len <= kMaxChunk) {
                 auto win = ram(q.addr, q.len);
                 std::int64_t rc = win.size() == q.len ? static_cast<std::int64_t>(q.len) : -EFAULT;
@@ -166,6 +179,30 @@ inline void serve(std::string path, RamFn ram, ResidentFn resident = {}) {
     const bool ok = full_io(c, &q, sizeof q, false) && full_io(c, &rc, sizeof rc, true);
     ::close(c);
     return ok ? rc : -EIO;
+}
+
+// Another guest process's /proc/<pid>/<leaf>, as it answers it (op 4).
+[[nodiscard]] inline std::optional<std::string> fact(const std::string& path, std::string_view leaf) {
+    if (leaf.empty() || leaf.size() > 64) return std::nullopt;
+    const int c = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (c < 0) return std::nullopt;
+    const ::timeval tv{2, 0};
+    (void)::setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    (void)::setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    ::sockaddr_un a{};
+    a.sun_family = AF_UNIX;
+    std::memcpy(a.sun_path, path.c_str(), std::min(path.size() + 1, sizeof a.sun_path));
+    if (::connect(c, reinterpret_cast<::sockaddr*>(&a), sizeof a) < 0) { ::close(c); return std::nullopt; }
+    Request q{4u, 0, 0, leaf.size()};
+    std::int64_t rc = -EIO;
+    std::optional<std::string> out;
+    if (full_io(c, &q, sizeof q, false) && full_io(c, const_cast<char*>(leaf.data()), leaf.size(), false) &&
+        full_io(c, &rc, sizeof rc, true) && rc >= 0 && static_cast<std::size_t>(rc) <= kMaxFact) {
+        std::string s(static_cast<std::size_t>(rc), '\0');
+        if (rc == 0 || full_io(c, s.data(), s.size(), true)) out = std::move(s);
+    }
+    ::close(c);
+    return out;
 }
 
 }  // namespace lx::runtime::memsvc

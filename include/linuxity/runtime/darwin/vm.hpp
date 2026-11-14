@@ -1085,6 +1085,12 @@ public:
     void set_result(const GuestRegs& r, std::int64_t ret) noexcept {
         write_return(cpu_, r, ret);
     }
+    // The guest's EL0 stack pointer, cheaply (one register).
+    [[nodiscard]] std::uint64_t sp_el0() const noexcept {
+        std::uint64_t v = 0;
+        ::hv_vcpu_get_sys_reg(cpu_, HV_SYS_REG_SP_EL0, &v);
+        return v;
+    }
     // Resume at the faulting instruction itself (a fault that was repaired:
     // a chunk populated, a stale entry rewritten). r.elr/r.spsr are the
     // EL0 context for both kinds of abort.
