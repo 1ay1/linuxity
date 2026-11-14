@@ -16,6 +16,7 @@
 #if defined(__APPLE__)
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <net/if_dl.h>
@@ -196,6 +197,104 @@ inline void attr(std::string& b, std::uint16_t type, const void* data, std::size
     if (!batch.empty()) out.push_back(std::move(batch));
     return out;
 }
+
+} // namespace lx::runtime::rtnl
+
+#include <poll.h>
+#include <unistd.h>
+#include <mutex>
+#include <thread>
+
+namespace lx::runtime::rtnl {
+
+// The answering side. Each guest netlink socket is one end of a host
+// datagram pair; the responder holds the other ends and answers whatever
+// arrives there. It doesn't matter how the guest sent the request -- send,
+// sendto, sendmsg, write, writev (Firefox's quinn-udp writes, then reads)
+// -- or from which thread: the bytes land on the far end either way. The
+// first version intercepted only sendto/sendmsg on the creating thread, so
+// a write() left Firefox's socket thread waiting forever and every page
+// stopped loading.
+class Responder {
+public:
+    static Responder& get() {
+        static Responder* r = new Responder;       // process lifetime
+        return *r;
+    }
+    // Adopt `far`, the host end that answers a guest netlink socket.
+    void adopt(int far, std::uint32_t port) {
+        {
+            std::lock_guard l{mu_};
+            ends_.push_back({far, port});
+            if (!running_) {
+                running_ = true;
+                if (::pipe(wake_) == 0) {
+                    for (int fd : wake_) ::fcntl(fd, F_SETFD, FD_CLOEXEC);
+                    std::thread([this] { run(); }).detach();
+                }
+            }
+        }
+        if (wake_[1] >= 0) { const char c = 1; (void)::write(wake_[1], &c, 1); }
+    }
+
+private:
+    struct End { int fd; std::uint32_t port; };
+    void run() {
+        std::vector<char> buf(64 << 10);
+        for (;;) {
+            std::vector<pollfd> p;
+            std::vector<End> ends;
+            {
+                std::lock_guard l{mu_};
+                ends = ends_;
+            }
+            p.push_back({wake_[0], POLLIN, 0});
+            for (const End& e : ends) p.push_back({e.fd, POLLIN, 0});
+            // 5 s ticks: a datagram peer's close wakes no poller on XNU, so
+            // closed guest sockets are found by asking (getpeername)
+            const int pr = ::poll(p.data(), static_cast<nfds_t>(p.size()), 5000);
+            if (pr < 0) continue;
+            if (p[0].revents) { char c[64]; (void)::read(wake_[0], c, sizeof c); }
+            std::vector<int> gone;
+            if (pr == 0)
+                for (const End& e : ends) {
+                    ::sockaddr_storage ss{};
+                    socklen_t sl = sizeof ss;
+                    if (::getpeername(e.fd, reinterpret_cast<::sockaddr*>(&ss), &sl) != 0 && errno == ENOTCONN)
+                        gone.push_back(e.fd);
+                }
+            for (std::size_t i = 1; i < p.size(); ++i) {
+                const End& e = ends[i - 1];
+                if (p[i].revents & (POLLHUP | POLLERR | POLLNVAL)) {
+                    // the guest closed its end (every copy of it)
+                    char c;
+                    if (::recv(e.fd, &c, 1, MSG_PEEK | MSG_DONTWAIT) <= 0) { gone.push_back(e.fd); continue; }
+                }
+                if (!(p[i].revents & POLLIN)) continue;
+                for (;;) {
+                    const auto n = ::recv(e.fd, buf.data(), buf.size(), MSG_DONTWAIT);
+                    if (n <= 0) {
+                        if (n == 0 || (errno != EAGAIN && errno != EINTR)) gone.push_back(e.fd);
+                        break;
+                    }
+                    for (const std::string& d : answer(std::string(buf.data(), static_cast<std::size_t>(n)), e.port))
+                        (void)::send(e.fd, d.data(), d.size(), 0);
+                }
+            }
+            if (!gone.empty()) {
+                std::lock_guard l{mu_};
+                for (int fd : gone) {
+                    std::erase_if(ends_, [fd](const End& x) { return x.fd == fd; });
+                    ::close(fd);
+                }
+            }
+        }
+    }
+    std::mutex mu_;
+    std::vector<End> ends_;
+    bool running_{false};
+    int wake_[2]{-1, -1};
+};
 
 } // namespace lx::runtime::rtnl
 

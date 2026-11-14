@@ -95,6 +95,17 @@ inline void mark_seqpacket(int h) noexcept {
     socklen_t n = sizeof v;
     return ::getsockopt(h, SOL_SOCKET, SO_TRAFFIC_CLASS, &v, &n) == 0 && v == kSeqpacketTag;
 }
+// An emulated AF_NETLINK socket (rtnetlink.hpp), marked the same way so
+// every thread, fork child and exec'd program knows it for one.
+inline constexpr int kNetlinkTag = 500;            // SO_TC_AV, never set otherwise
+inline void mark_netlink(int h) noexcept {
+    (void)::setsockopt(h, SOL_SOCKET, SO_TRAFFIC_CLASS, &kNetlinkTag, sizeof kNetlinkTag);
+}
+[[nodiscard]] inline bool is_netlink(int h) noexcept {
+    int v = -1;
+    socklen_t n = sizeof v;
+    return ::getsockopt(h, SOL_SOCKET, SO_TRAFFIC_CLASS, &v, &n) == 0 && v == kNetlinkTag;
+}
 // The peer of a connected datagram pair has gone. XNU never WAKES a waiter
 // for that -- poll, select and kqueue all sleep through it, though a fresh
 // poll then says readable -- so a waiter must ask: getpeername() turns

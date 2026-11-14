@@ -464,6 +464,44 @@ def seqpacket_hangup_reaches_another_process():
 
 
 @check
+def netlink_answers_a_written_request_from_any_thread():
+    # Firefox's network code (quinn-udp, its link service) asks rtnetlink
+    # for addresses and routes with write()/read() from its socket thread.
+    # linuxity answered only sendto/sendmsg on the creating thread, so that
+    # request was never answered: HTTP/3 waited forever and no site loaded.
+    AF_NETLINK, NETLINK_ROUTE, RTM_GETADDR, NLM_F_REQUEST, NLM_F_DUMP = 16, 0, 22, 1, 0x300
+    s = socket.socket(AF_NETLINK, socket.SOCK_RAW, NETLINK_ROUTE)
+    s.settimeout(5)
+    req = struct.pack("=IHHII", 16 + 8, RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, 1, 0) + struct.pack("=BBBBI", 0, 0, 0, 0, 0)
+    out = {}
+
+    def ask(how):
+        try:
+            if how == "write":
+                os.write(s.fileno(), req)
+            else:
+                s.send(req)
+            types = []
+            while 3 not in types:              # NLMSG_DONE
+                data = s.recv(65536)
+                off = 0
+                while off + 16 <= len(data):
+                    ln, ty = struct.unpack_from("=IH", data, off)
+                    types.append(ty)
+                    off += (ln + 3) & ~3
+            out[how] = types
+        except Exception as e:
+            out[how] = repr(e)
+    for how in ("write", "send"):
+        t = threading.Thread(target=ask, args=(how,))
+        t.start()
+        t.join(10)
+        ok(isinstance(out.get(how), list), f"{how} from another thread is answered: {out.get(how)}")
+        ok(20 in out[how], f"{how}: RTM_NEWADDR records came back")
+    s.close()
+
+
+@check
 def broken_connections_sigpipe_and_epipe():
     a, b = socket.socketpair()
     b.close()

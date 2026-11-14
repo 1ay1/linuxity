@@ -1206,10 +1206,13 @@ private:
                         (void)::setsockopt(e, SOL_SOCKET, SO_SNDBUF, &sz, sizeof sz);
                         (void)::setsockopt(e, SOL_SOCKET, SO_RCVBUF, &sz, sizeof sz);
                     }
-                    const std::uint64_t ino = sock_ino(p[0]);
-                    rtnl_[ino] = p[1];
+                    net::mark_netlink(p[0]);
                     const int g = install_socket(p[0], (a1 & net::kSockCloexec) != 0);
-                    if (g < 0) { rtnl_.erase(ino); ::close(p[1]); }
+                    if (g < 0) { ::close(p[1]); return g; }
+                    // requests written any way (write, writev, send...) are
+                    // answered by the responder; sendto/sendmsg are still
+                    // intercepted below for their sockaddr_nl
+                    rtnl::Responder::get().adopt(p[1], static_cast<std::uint32_t>(tgid_));
                     return g;
                 }
                 const auto af = net::af_to_darwin(static_cast<std::uint16_t>(regs_.arg(0)));
@@ -1299,7 +1302,7 @@ private:
             case S::getsockname: case S::getpeername: {
                 const int h = host_fd(gfd);
                 if (h < 0) return -9;
-                if (!rtnl_.empty() && rtnl_.count(sock_ino(h))) {
+                if (net::is_netlink(h)) {
                     // struct sockaddr_nl { family 16, pad, pid, groups }
                     std::uint32_t want = 0;
                     if (!ram.get(a2, want)) return -14;
@@ -1328,9 +1331,8 @@ private:
                 if (h < 0) return -9;
                 auto buf = ram.clamp(a1, a2);
                 if (buf.empty() && a2) return -14;
-                if (!rtnl_.empty())
-                    if (auto it = rtnl_.find(sock_ino(h)); it != rtnl_.end())
-                        return rtnl_request(it->second, buf);
+                if (net::is_netlink(h))
+                    return rtnl_request(h, buf);
                 ::sockaddr_storage ss{};
                 socklen_t slen = 0;
                 if (a4) {
@@ -1622,13 +1624,12 @@ private:
     // length even when the guest's buffer was too small (the address is
     // truncated, the length is not), which is what tells a caller to retry
     // with a bigger buffer.
-    // Answer one rtnetlink request (rtnetlink.hpp): queue the reply
-    // datagrams where the guest's end reads them. The send "succeeds" with
-    // the request's length, as the kernel's does.
-    [[nodiscard]] std::int64_t rtnl_request(int far, std::span<const std::byte> req) {
-        const std::string r(reinterpret_cast<const char*>(req.data()), req.size());
-        for (const std::string& d : rtnl::answer(r, static_cast<std::uint32_t>(tgid_)))
-            if (::send(far, d.data(), d.size(), 0) < 0) return darwin::fail();
+    // Answer one rtnetlink request (rtnetlink.hpp): the request is passed on
+    // through the guest's own end of the pair, where the responder answers
+    // it like any other (a sendto/sendmsg carries a sockaddr_nl the host
+    // socket can't take). The send "succeeds" with the request's length.
+    [[nodiscard]] std::int64_t rtnl_request(int guest_end, std::span<const std::byte> req) {
+        if (::send(guest_end, req.data(), req.size(), 0) < 0) return darwin::fail();
         return static_cast<std::int64_t>(req.size());
     }
     [[nodiscard]] bool write_sockaddr(const ::sockaddr_storage& ss,
@@ -1689,12 +1690,11 @@ private:
         hm.msg_iovlen = static_cast<int>(hiov.size());
         // An emulated rtnetlink socket: a request goes to the responder; a
         // reply read gets a sockaddr_nl from the kernel (pid 0).
-        if (!rtnl_.empty())
-            if (auto it = rtnl_.find(sock_ino(h)); it != rtnl_.end()) {
+        if (net::is_netlink(h)) {
                 if (sending) {
                     std::string req;
                     for (const auto& v : hiov) req.append(static_cast<const char*>(v.iov_base), v.iov_len);
-                    return rtnl_request(it->second, std::as_bytes(std::span{req.data(), req.size()}));
+                    return rtnl_request(h, std::as_bytes(std::span{req.data(), req.size()}));
                 }
                 const auto n = ::recvmsg(h, &hm, net::msg_flags_to_darwin(flags));
                 if (n < 0) return darwin::fail();
@@ -7646,7 +7646,7 @@ private:
                 if (h < 0) return -9;
                 // an emulated netlink socket: binding to sockaddr_nl (any
                 // pid, no groups) or connecting to the kernel just works
-                if (!rtnl_.empty() && rtnl_.count(sock_ino(h))) return 0;
+                if (net::is_netlink(h)) return 0;
                 ::sockaddr_storage ss{};
                 socklen_t slen = 0;
                 if (path) {
@@ -7744,7 +7744,6 @@ private:
     std::unordered_map<std::string, std::string> bound_paths_;
     std::unordered_set<std::uint64_t> passcred_;
     // emulated rtnetlink sockets: the guest end's inode -> our (far) end
-    std::unordered_map<std::uint64_t, int> rtnl_;
     // socketpair ends this process made (or inherited): inode -> creator pid
     std::unordered_map<std::uint64_t, std::int32_t> pair_creator_;
     std::unordered_map<std::uint64_t, std::int64_t> pipe_size_;   // F_SETPIPE_SZ, by pipe inode
